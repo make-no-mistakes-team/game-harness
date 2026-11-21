@@ -988,13 +988,18 @@ final class AgentCaves {
         return true;
     }
 
+    boolean walkedWaterEdge(BlockPos from, BlockPos to) {
+        return world == client.world && player == client.player && waterLink != null
+            && (waterLink.lip.equals(from) && waterLink.shore.equals(to)
+                || waterLink.shore.equals(from) && waterLink.lip.equals(to));
+    }
+
     /** Replay the one non-adjacent edge; the ordinary trail stays grounded and records no fictitious steps. */
     boolean followWater(BlockPos from, BlockPos to, int tick) {
         resetOnWorldChange();
-        if (waterLink == null || from == null || to == null) return false;
+        if (!walkedWaterEdge(from, to)) return false;
         WaterLink link = waterLink;
-        boolean up = link.lip.equals(to) && link.shore.equals(from);
-        if (!up && !(link.shore.equals(to) && link.lip.equals(from))) return false;
+        boolean up = link.lip.equals(to);
         if (!to.equals(replayTo) || tick - replaySince > 145) {
             if (to.equals(replayTo) && tick - replaySince <= 200) {
                 if (!up && !arrived(link.lip) && atLip(link.lip) && tick - replaySince <= 175) {

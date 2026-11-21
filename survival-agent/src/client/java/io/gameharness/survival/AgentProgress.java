@@ -142,6 +142,7 @@ final class AgentProgress {
     private enum Footing { LEVEL, DOWN, STEEP, JUMP, WATER, EDGE, UNKNOWN, BLOCKED }
     enum Dig { LOOKING, CLEAR, BLOCKED, DARK, LIP, RESOURCE }
     private enum Firing { NONE, IRON, CHARCOAL }
+    enum FurnaceSite { PAID, LOCAL, RETURN, ESTABLISH }
     private enum FurnaceSide { TORCHES, LIGHT, STICKS, PICK }
     private enum Forage { ANIMAL, BERRIES, DROP }
     private enum WorkshopView {
@@ -155,8 +156,6 @@ final class AgentProgress {
 
     private record OreSight(Resource resource, BlockPos block, Vec3d point, BlockPos stance, Vec3d feet,
                             double rangeSquared) {}
-
-    private record TableReturn(BlockPos workshop, int planks, int sticks) {}
 
     private final class Station {
         final Block block;
@@ -257,6 +256,8 @@ final class AgentProgress {
     private final Predicate<ItemStack> goalItem;
     private final Station table = new Station(Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE, "crafting_table");
     private final Station furnace = new Station(Blocks.FURNACE, Items.FURNACE, "furnace");
+    private final Predicate<BlockHitResult> unreservedFurnaceFace = hit -> !reservedFurnace(hit.getBlockPos());
+    private final Predicate<BlockHitResult> currentFurnaceFace = hit -> hit.getBlockPos().equals(furnace.position);
     private final FieldBench fieldBench = new FieldBench();
     private final FieldWood fieldWood = new FieldWood();
     private DropReclaim dropReclaim;
@@ -273,10 +274,11 @@ final class AgentProgress {
     private String tableAxe;
     private int tablePlanks;
     private int tableSticks;
-    private TableReturn tableReturn;
+    private BlockPos tableReturn;
     private BlockPos failedTableReturn;
     private Firing firing = Firing.NONE;
     private BlockPos furnaceWitness;
+    private BlockPos refusedFurnace, refusedFurnaceFoot;
     private FurnaceScreen furnaceScreen;
     private ClientWorld furnaceScreenWorld;
     private int furnaceWarmUntil;
@@ -337,9 +339,17 @@ final class AgentProgress {
     private Predicate<ItemStack> pickupBlockedItem;
     private ItemEntity pickupEntity;
     private Predicate<ItemStack> pickupItem;
-    private int pickupCount;
-    private int pickupStarted;
-    private int pickupSeen;
+    private AgentPickup.Pursuit pickupPursuit;
+    private final ItemEntity[] deferredDrops = new ItemEntity[4];
+    private final int[] deferredDropUntil = new int[deferredDrops.length];
+    private int deferredDropCursor;
+    private AgentSurfaceTread pickupTread;
+    private AgentPickup.Access pickupAccessLook;
+    private int pickupLookUntil, pickupTreadTick, pickupLandedTick = -1;
+    private Predicate<ItemStack> pickupLightItem;
+    private int pickupLightUntil;
+    private int pickupLightStock;
+    private BlockPos pickupLightFoot;
     private boolean timberReady;
     private boolean departureKit;
     private boolean ordinarySurfaceWork;
@@ -457,7 +467,10 @@ final class AgentProgress {
     private int refitPickCount = -1, refitPickUntil, refitPickRetry;
     private int deadEnds;
     private int returnTo;
-    private BlockPos returnDetour;
+    private BlockPos returnFrom;
+    private boolean returnForSupplies;
+    private boolean returnForFurnace;
+    private final BiPredicate<BlockPos, BlockPos> walkedWaterReturn = this::walkedWaterReturn;
     private int returnIndex = -1;
     private int resumeIndex = -1;
     private boolean keepTrail;
@@ -621,6 +634,10 @@ final class AgentProgress {
 
     AgentStallGuard.Report stallReport() { return stallGuard.report(); }
     void observeOwnBreak(BlockPos position, BlockState state) {
+        // A dark pocket may hide the falling item even though its ore face was visible.
+        // The break buys one local light check, not inventory credit or a path into the pocket.
+        if (position.equals(target) && (miningResource == Resource.IRON || miningResource == Resource.DIAMOND)
+                && miningResource.block.test(state)) rememberPickupLight(miningResource.drop);
         body.observeHeadroomBreak(position);
         caves.changedDry(position);
         stallGuard.broken(position, state);
@@ -647,10 +664,8 @@ final class AgentProgress {
     boolean portalCollect(Predicate<ItemStack> predicate, double range) { return collect(predicate, range); }
     boolean portalApproach(Vec3d point) { return approach(point, false, false) != Walk.BLOCKED; }
     void portalSearch() {
-        if (activeTrail() > 1) {
-            beginReturn(false);
-            retreatTunnel();
-        } else explore();
+        if (activeTrail() > 1 && beginReturn()) retreatTunnel();
+        else explore();
     }
     void portalProspectLava() {
         lavaProspecting = true;
@@ -705,7 +720,7 @@ final class AgentProgress {
         trail.subList(keep, trail.size()).clear();
         litIndex = Math.min(litIndex, keep);
         if (resumeIndex >= keep) resumeIndex = resumeStep = -1;
-        if (returnIndex >= keep) returnIndex = -1;
+        if (returnIndex >= keep) clearReturn();
     }
 
     private void recordCaveFooting(BlockPos reached) {
@@ -1054,6 +1069,7 @@ final class AgentProgress {
             workReturnableMine(c.player.getBlockPos(), returnableMine.depth());
             return;
         }
+        if (prioritizeOrePickup()) return;
         if (stepLocalFurnaceSide()) return;
         if (refitMinedPick()) return;
         if (caves.active() && surveyCave(null)) return;
@@ -1185,7 +1201,8 @@ final class AgentProgress {
         timberExitFrom = timberExitTo = null;
         overland.interrupt();
         if (nextFoot != null) closeDig(nextFoot);
-        nextFoot = cavePeek = climbTo = gaitStep = exitStart = exitTo = null;
+        nextFoot = cavePeek = null;
+        endExitRecovery();
         approachGoal = routeLegStart = sweepOrigin = null;
         routeTick = -10;
         heading = Float.NaN;
@@ -1313,8 +1330,10 @@ final class AgentProgress {
     }
 
     private String stallVisibleStation(Station station) {
+        if (station == furnace && (furnaceLoaded || localFurnace != null || furnace.placed != 0)) return null;
         BlockHitResult other = body.find(state -> state.isOf(station.block), REACH - 0.5,
             hit -> !hit.getBlockPos().equals(station == stallStation ? stallStationPosition : station.position)
+                && (station != furnace || !reservedFurnace(hit.getBlockPos()))
                 && !stallOreTried.contains(hit.getBlockPos())).orElse(null);
         if (other == null) return null;
         station.position = confirmStation(station, other);
@@ -1498,21 +1517,8 @@ final class AgentProgress {
     boolean macroWorkWalk(Vec3d point, boolean levelOnly) { return approach(point, false, false, levelOnly) != Walk.BLOCKED; }
 
     private void recordStallFooting(BlockPos reached) {
-        if (returnIndex >= 0) {
-            int rejoin = trail.lastIndexOf(reached);
-            if (rejoin >= returnTo && rejoin <= returnIndex) {
-                returnIndex = rejoin;
-                returnDetour = null;
-                returnAge = tick;
-                returnClear = -1;
-            } else if (adjacent(reached, trail.get(returnIndex))) {
-                returnDetour = reached;
-                returnAge = tick;
-                returnClear = -1;
-            }
-        } else if (resumeIndex < 0 && !trail.isEmpty() && adjacent(trail.getLast(), reached) && !trail.contains(reached)) {
-            appendGrounded(reached, false);
-        }
+        // This callback identifies a landing, not the crossing that reached it.
+        if (returnIndex >= 0 && dryFieldFooting() && !rejoinReturn(reached)) abandonReturn(reached);
     }
 
     /** Only ordinary trail work may continue under a witnessed low ceiling; never widen the pillar. */
@@ -1534,21 +1540,22 @@ final class AgentProgress {
             connectedMine |= dugSteps.get(step);
         }
         if (returnIndex >= 0 && keepTrail) {
-            if (index < returnTo || index > returnIndex + 1) return null;
-            if (index <= returnIndex) returnIndex = index;
-            returnDetour = null;
-            returnAge = tick;
-            returnClear = -1;
+            if (!rejoinReturn(standing)) {
+                abandonReturn(standing);
+                return null;
+            }
             return "resuming the existing supply return on the connected mine trail";
         }
         if (!connectedMine || index != last || resumeIndex >= 0 || returnIndex >= 0 || nextFoot != null) return null;
         if (hands.count(TORCH) <= 2 || pickUses(DEEP_PICK) + pickUses(STONE_PICK) < 4) {
-            startReturn(0, true);
+            if (supplyReturnReady() || !startReturn(0, true)) return null;
+            returnForSupplies = true;
             return "returning on the connected mine trail for essential supplies";
         }
         int branch = Math.max(1, index - 3);
-        startReturn(branch, false);
-        return "backtracking to " + trail.get(branch).toShortString() + " to open a different ordinary mine branch";
+        return startReturn(branch, false)
+            ? "backtracking to " + trail.get(branch).toShortString() + " to open a different ordinary mine branch"
+            : null;
     }
 
     void acquireIron(int desired) {
@@ -2132,6 +2139,10 @@ final class AgentProgress {
                     && openOutlinedStation(furnace, center)) return;
         }
         if (job.routeTo != null && arrived(job.routeTo)) job.routeFrom = job.routeTo = null;
+        if (job.routeTo != null && dryFieldFooting() && !job.routeFrom.equals(c.player.getBlockPos())) {
+            job.routeFrom = job.routeTo = null;
+            gaitStep = null;
+        }
         if (job.routeTo == null && hands.stableCraftFooting()) {
             BlockPos foot = c.player.getBlockPos();
             int from = trail.lastIndexOf(foot), to = trail.lastIndexOf(job.footing);
@@ -2384,8 +2395,8 @@ final class AgentProgress {
             for (int i = waypoint + 1; i <= last; ++i) {
                 if (!adjacent(trail.get(i - 1), trail.get(i))) return false;
             }
+            if (!startReturn(waypoint, true)) return false;
             tripUsed = returning = true;
-            startReturn(waypoint, true);
             status = "returning along walked steps to look for portal workshop supplies";
             return true;
         }
@@ -2698,7 +2709,7 @@ final class AgentProgress {
                 double distance = c.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(hint));
                 if (distance <= REACH * REACH && recoverStation(table)) return false;
                 if (!shore && !has(table.item, 1) && distance > REACH * REACH
-                    && tryTableReturn(hint, planks, sticks)) return false;
+                    && tryTableReturn(hint)) return false;
             }
         }
         if (table.position != null || has(table.item, 1)) return ensureWood(planks, sticks);
@@ -2711,7 +2722,7 @@ final class AgentProgress {
         return false;
     }
 
-    private boolean tryTableReturn(BlockPos workshop, int planks, int sticks) {
+    private boolean tryTableReturn(BlockPos workshop) {
         int last = activeTrail() - 1;
         if (last <= 0 || !arrived(trail.get(last))) return false;
         int waypoint = stationWaypoint(workshop);
@@ -2719,8 +2730,8 @@ final class AgentProgress {
         for (int i = waypoint + 1; i <= last; i++) {
             if (!adjacent(trail.get(i - 1), trail.get(i))) return false;
         }
-        startReturn(waypoint, true);
-        tableReturn = new TableReturn(workshop, planks, sticks);
+        if (!startReturn(waypoint, true)) return false;
+        tableReturn = workshop;
         return true;
     }
 
@@ -2806,15 +2817,15 @@ final class AgentProgress {
         // workshop wood in a furnace while there is still light for another short leg.
         if (!departure && torches >= 4) return false;
 
-        boolean localFurnace = localStation(furnace, furnaceWitness);
-        if (!localFurnace) {
-            BlockHitResult seen = body.find(state -> state.isOf(furnace.block), 3.75).orElse(null);
+        boolean nearbyFurnace = localStation(furnace, furnaceWitness);
+        if (!nearbyFurnace) {
+            BlockHitResult seen = visibleLocalFurnace();
             if (seen != null) {
-                furnace.position = confirmStation(furnace, seen);
-                localFurnace = true;
+                selectVisibleFurnace(seen);
+                nearbyFurnace = true;
             }
         }
-        if (localFurnace || canSetLocalFurnace() || departure) {
+        if (nearbyFurnace || canSetLocalFurnace() || departure) {
             if (prepareCharcoal()) return true;
         } else if (has(BURNABLE_LOG, 1) && affordsWood(localTableWood() + 2, 3)
             && workOre(Resource.STONE, REACH - 0.35, false)) {
@@ -2824,11 +2835,11 @@ final class AgentProgress {
 
         if (!departure && torches >= 3) return false;
         if (canMakeTorch && recallOre(Resource.COAL, range, activeTrail())) return true;
-        if (!localFurnace && prepareCharcoalAtKnownFurnace()) return true;
+        if (!nearbyFurnace && prepareCharcoalAtKnownFurnace()) return true;
         // No coal or nearby stove. If the player already has the wood for charcoal,
         // a workbench, fuel and sticks, the missing ingredient is furnace stone.
         // The charcoal job keeps the ordinary stone miner active across ticks.
-        if (!localFurnace && torches <= 2 && has(BURNABLE_LOG, 1)
+        if (!nearbyFurnace && torches <= 2 && has(BURNABLE_LOG, 1)
             && affordsWood(localTableWood() + 4 + furnacePlanks(1), 3)) {
             int missingStone = 8 - hands.count(STONE);
             if (missingStone > 0 && pickUses(STONE_PICK) + pickUses(WOOD_PICK) >= missingStone
@@ -2846,6 +2857,14 @@ final class AgentProgress {
         if (!departure && activeTrail() <= 1 && surveyLocalLight()) return true;
         seekExpeditionSupplies(canMakeTorch ? "light" : "wood and light");
         return true;
+    }
+
+    private boolean supplyReturnReady() {
+        if (pickUses(DEEP_PICK) + pickUses(STONE_PICK) < 4
+                && !(has(STONE, 3) && affordsWood(localTableWood(), 2))) return false;
+        return has(TORCH, 3) || torchCraftBatches(LOCAL_LIGHT) > 0
+            || charcoalBatch() != 0 && (canSetLocalFurnace() || returnFurnaceInReach()
+                || visibleLocalFurnace() != null);
     }
 
     private boolean canSpareEmergencyStick(int torches) {
@@ -2890,8 +2909,20 @@ final class AgentProgress {
     }
 
     private boolean prepareCharcoal() {
+        int batch = charcoalBatch();
+        if (batch == 0) return false;
+        if (batch < 0) {
+            status = "reserving workshop wood and preparing charcoal fuel";
+            return hands.craft("planks");
+        }
+        fire(Firing.CHARCOAL, batch);
+        return true;
+    }
+
+    /** Positive for a payable batch, negative if a spare log must become fuel first. */
+    private int charcoalBatch() {
         int burnable = hands.count(BURNABLE_LOG);
-        if (burnable == 0 || has(FUEL, 1)) return false;
+        if (burnable == 0 || has(FUEL, 1)) return 0;
         var inventory = c.player.getInventory();
         var fuels = c.world.getFuelRegistry();
         int batch = 0;
@@ -2911,12 +2942,9 @@ final class AgentProgress {
             ? PLANK_BURN_TICKS * localTableWood() : 0;
         if (!fits || plankHeat < 200 * batch + heatForTable) {
             int minimum = 4 + 2 + localTableWood() + 2 * stickBatches(3);
-            if (burnable < 2 || timber < minimum) return false;
-            status = "reserving workshop wood and preparing charcoal fuel";
-            return hands.craft("planks");
+            return burnable >= 2 && timber >= minimum ? -1 : 0;
         }
-        fire(Firing.CHARCOAL, batch);
-        return true;
+        return batch;
     }
 
     private static int furnacePlanks(int batch) {
@@ -2925,6 +2953,49 @@ final class AgentProgress {
 
     private void seekExpeditionSupplies(String supplies) {
         seekTimber(supplies);
+    }
+
+    static FurnaceSite furnaceSite(boolean paid, boolean local, int walkedDistance, boolean replacement) {
+        if (paid) return FurnaceSite.PAID;
+        if (local) return FurnaceSite.LOCAL;
+        if (walkedDistance >= 0 && (!replacement || walkedDistance <= 12)) return FurnaceSite.RETURN;
+        return FurnaceSite.ESTABLISH;
+    }
+
+    private boolean reservedFurnace(BlockPos pos) {
+        var saved = pendingFurnaceMemory.current();
+        return saved != null && saved.pos().equals(pos) && saved.dimension().equals(furnaceDimension());
+    }
+
+    private BlockHitResult visibleLocalFurnace() {
+        return body.find(FURNACE_BLOCK, REACH, unreservedFurnaceFace).orElse(null);
+    }
+
+    private void selectVisibleFurnace(BlockHitResult seen) {
+        if (furnaceLoaded || localFurnace != null || furnace.placed != 0) return;
+        releaseUnpaidFurnace(null);
+        furnace.position = confirmStation(furnace, seen);
+    }
+
+    private boolean startFurnaceReturn(int waypoint) {
+        if (waypoint < 0 || !startReturn(waypoint, true)) return false;
+        returnForFurnace = true;
+        return true;
+    }
+
+    private boolean returnFurnaceInReach() {
+        return localStation(furnace, null) && (furnaceLoaded || !reservedFurnace(furnace.position))
+            && body.find(FURNACE_BLOCK, 3.75, currentFurnaceFace).isPresent();
+    }
+
+    private void releaseUnpaidFurnace(BlockPos refused) {
+        if (furnaceLoaded || localFurnace != null) return;
+        refusedFurnace = refused;
+        refusedFurnaceFoot = c.player.getBlockPos();
+        furnace.position = furnaceWitness = furnace.lastUse = null;
+        furnace.approachUntil = furnace.openAttempts = furnace.memoryProbe = 0;
+        furnace.resetSite();
+        approachGoal = null;
     }
 
     private void fire(Firing batch, int demand) {
@@ -2944,22 +3015,42 @@ final class AgentProgress {
         }
         boolean portalRefit = portalSupplies != null && portalSupplies.smelting;
         if (furnace.position == null && furnaceWitness != null) furnace.position = furnaceWitness;
-        if (furnace.position == null) {
-            BlockHitResult seen = body.find(FURNACE_BLOCK, portalRefit ? 3.75 : 5).orElse(null);
-            if (seen != null) furnace.position = confirmStation(furnace, seen);
-            else if ((!portalRefit || portalSupplies.localHint(furnace))
-                && !(batch == Firing.CHARCOAL && canSetLocalFurnace()) && recoverStation(furnace)) return;
-        }
-        if (furnace.position != null && c.player.getEyePos().distanceTo(Vec3d.ofCenter(furnace.position)) > 3.75) {
-            int bench = stationWaypoint(furnace.position);
-            if (!furnaceLoaded && (portalRefit || canSetLocalFurnace()
-                && (bench < 0 || activeTrail() - bench > 12))) {
-                // Leave the distant furnace in observation memory and use a local replacement.
-                furnace.position = furnaceWitness = null;
-                furnace.resetSite();
-            } else if (bench >= 0) {
-                startReturn(bench, true);
-                return;
+        BlockHitResult seen = null;
+        if (furnace.placed == 0) {
+            boolean near = localStation(furnace, null) && (furnaceLoaded || !reservedFurnace(furnace.position));
+            if (!furnaceLoaded && !near) {
+                seen = visibleLocalFurnace();
+                if (seen != null) {
+                    selectVisibleFurnace(seen);
+                    near = true;
+                } else if (furnace.position == null && (!portalRefit || portalSupplies.localHint(furnace))
+                        && recoverStation(furnace)) return;
+                else near = localStation(furnace, null) && !reservedFurnace(furnace.position);
+            }
+            BlockPos known = furnace.position != null ? furnace.position : memory.station(c.world, true);
+            boolean eligible = !near && known != null && (furnaceLoaded || !portalRefit && !reservedFurnace(known))
+                && !(known.equals(refusedFurnace) && c.player.getBlockPos().equals(refusedFurnaceFoot));
+            int waypoint = eligible ? stationWaypoint(known) : -1;
+            int distance = waypoint < 0 ? -1 : groundedTrailIndex() - waypoint;
+            switch (furnaceSite(furnaceLoaded, near, distance, distance > 12 && canSetLocalFurnace())) {
+                case PAID -> {
+                    if (!near) {
+                        if (!startFurnaceReturn(waypoint)) status = "no witnessed return route to the loaded furnace";
+                        return;
+                    }
+                }
+                case LOCAL -> { }
+                case RETURN -> {
+                    if (startFurnaceReturn(waypoint)) {
+                        furnace.position = known;
+                        return;
+                    }
+                    releaseUnpaidFurnace(known);
+                }
+                case ESTABLISH -> {
+                    // Keep the observation, not a work order for a distant empty stove.
+                    if (furnace.position != null) releaseUnpaidFurnace(known);
+                }
             }
         }
         if (furnace.position == null && !has(furnace.item, 1)) {
@@ -2978,16 +3069,12 @@ final class AgentProgress {
             }
             return;
         }
-        if (portalRefit && furnace.position == null) {
-            status = "placing the local furnace for portal iron";
-            placeStation(furnace);
-        } else useStation(furnace, null);
+        useStation(furnace, seen);
     }
 
     private boolean canSetLocalFurnace() {
         return has(furnace.item, 1) || has(STONE, 8) && (has(table.item, 1)
-            || table.position != null && c.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(table.position)) < 25
-            || affordsWood(4, 0));
+            || affordsWood(4, 0) || body.find(TABLE_BLOCK, REACH).isPresent());
     }
 
     private void finishFire() {
@@ -3024,16 +3111,12 @@ final class AgentProgress {
 
     private boolean recoverStation(Station station) {
         BlockPos hint = memory.station(c.world, station == furnace);
-        if (hint == null) return false;
+        if (hint == null || station == furnace && (reservedFurnace(hint)
+            || hint.equals(refusedFurnace) && c.player.getBlockPos().equals(refusedFurnaceFoot))) return false;
         Vec3d center = Vec3d.ofCenter(hint);
         if (c.player.getEyePos().squaredDistanceTo(center) > REACH * REACH) {
             station.memoryProbe = 0;
-            int bench = stationWaypoint(hint);
-            if (bench < 0) return false;
-            if (activeTrail() - bench > 12 && (station == table ? affordsWood(4, 0) :
-                    !furnaceLoaded && has(STONE, 8) && (table.position != null || affordsWood(4, 0)))) return false;
-            startReturn(bench, true);
-            return true;
+            return false;
         }
         if (station.memoryProbe == 0) station.memoryProbe = tick;
         body.aim(center);
@@ -3063,11 +3146,23 @@ final class AgentProgress {
             }
             if (seen == null && station == table)
                 seen = body.find(TABLE_BLOCK, REACH, hit -> hit.getBlockPos().equals(station.position)).orElse(null);
+            if (seen == null && station == furnace) {
+                seen = body.find(FURNACE_BLOCK, REACH, currentFurnaceFace).orElse(null);
+                if (seen == null && !station.position.equals(station.provedPlacement)
+                        && !furnaceLoaded && localFurnace == null) {
+                    if (station.memoryProbe == 0) station.memoryProbe = tick;
+                    else if (tick - station.memoryProbe >= 28) {
+                        releaseUnpaidFurnace(station.position);
+                        return;
+                    }
+                }
+            }
             if (seen == null && (distance > 3.75 || tick < station.approachUntil)) {
                 if (approach(center, false, false) == Walk.BLOCKED) {
-                    if (station == furnace && station.position.equals(furnaceWitness)) {
-                        if (activeTrail() > 1) beginReturn(true);
-                        else blockStation(station, "cannot reach the witnessed furnace");
+                    if (station == furnace) {
+                        if (furnaceLoaded || localFurnace != null)
+                            blockStation(station, "cannot reach the productive furnace");
+                        else releaseUnpaidFurnace(station.position);
                     } else if (station == table) {
                         failedTableReturn = station.position;
                         releaseTablePosition();
@@ -3075,8 +3170,6 @@ final class AgentProgress {
                 }
                 return;
             }
-            if (station == furnace)
-                seen = body.find(FURNACE_BLOCK, REACH, hit -> hit.getBlockPos().equals(station.position)).orElse(null);
             if (seen != null) {
                 confirmStation(station, seen);
                 openStation(station, seen, AgentBody.Contact.INTERACT);
@@ -3093,15 +3186,7 @@ final class AgentProgress {
             }
             return;
         }
-        // requestTable already searched for a table from this stance.
-        seen = station == furnace ? body.find(FURNACE_BLOCK, 5.0).orElse(null) : null;
-        if (seen != null) {
-            station.position = confirmStation(station, seen);
-            station.placed = 0;
-            station.approachUntil = 0;
-            approachGoal = null;
-            return;
-        }
+        // The requesting work order has already searched from this stance.
         placeStation(station);
     }
 
@@ -3342,7 +3427,10 @@ final class AgentProgress {
             blockStation(station, "cannot place " + station.recipe + ": " + reason + "; previous footing is not a dry step");
             return;
         }
-        startReturn(index - 1, true);
+        if (!startReturn(index - 1, true)) {
+            blockStation(station, "cannot place " + station.recipe + ": no earlier connected footing");
+            return;
+        }
         workshopReturn = station;
         status = "repositioning " + station.recipe + " to walked footing " + prior.toShortString() + ": " + reason;
     }
@@ -3600,7 +3688,7 @@ final class AgentProgress {
                 boolean freshHarvest = harvestTick > servedHarvest && tick - harvestTick <= 360
                     && feet.getSquaredDistance(harvestFoot) <= 36;
                 boolean firstIron = tick < ironUntil && feet.getSquaredDistance(ironBench) <= 16;
-                if (pickupItem == LOG && freshHarvest && tick - pickupSeen > 26) clearPickup();
+                if (pickupItem == LOG && freshHarvest && !pickupPursuit.canReacquire(tick)) clearPickup();
                 if (pickupItem != null) return false;
                 boolean portalBench = portalSupplies != null && !portalBenchSurveyed && portalSupplies.needsPortableBench();
                 if (!freshHarvest && !((firstIron || portalBench) && supplyEgress.outdoors())) return false;
@@ -3799,13 +3887,9 @@ final class AgentProgress {
         }
         status = "seeking " + resource.label;
         if (returnableOre != null) {
+            if (!finishingOreCut(returnableOre) && collectOre(returnableOre, 3.1)) return;
             if (target != null && miningResource == returnableOre) {
                 mineTarget(returnableOre);
-                return;
-            }
-            if (collect(returnableOre.drop, 3.1)) return;
-            if (miningResource == returnableOre && tick < pickupUntil) {
-                body.pauseWork();
                 return;
             }
             returnableOre = null;
@@ -3932,14 +4016,10 @@ final class AgentProgress {
     }
 
     private boolean workOre(Resource resource, double range, boolean remember) {
+        if (!finishingOreCut(resource) && collectOre(resource, Math.min(7, range))) return true;
         if (target != null && miningResource == resource
             && (range > REACH || targetPoint.squaredDistanceTo(c.player.getEyePos()) <= range * range)) {
             mineTarget(resource);
-            return true;
-        }
-        if (collect(resource.drop, Math.min(7, range))) return true;
-        if (resource == miningResource && tick < pickupUntil) {
-            body.pauseWork();
             return true;
         }
         BlockHitResult hit = findOre(resource, range);
@@ -3950,6 +4030,39 @@ final class AgentProgress {
             return true;
         }
         return remember && recallOre(resource, range, 24);
+    }
+
+    private boolean finishingOreCut(Resource resource) {
+        return resource != null && resource == miningResource && target != null && lastMining != 0 && tick - lastMining < 5;
+    }
+
+    private boolean prioritizeOrePickup() {
+        if (nextFoot != null || resumeIndex >= 0 || oreProbeReturning || firing != Firing.NONE
+                || caves.active() || caves.routingDry() || finishingOreCut(miningResource) || !safePickupStance())
+            return false;
+        Resource pending = pickupResource(pickupItem);
+        if (pending == null && tick < pickupUntil) pending = miningResource;
+        if (pending == null && tick < pickupLightUntil) pending = pickupResource(pickupLightItem);
+        if (pending == null && needsTimberKit() && (has(STONE_PICK, 1) || has(DEEP_PICK, 1))) {
+            if (!has(DEEP_PICK, 1) && hands.count(INGOT) + hands.count(RAW_IRON) < 3) pending = Resource.IRON;
+            else if (has(DEEP_PICK, 1) && !has(DIAMOND, portal == null ? 1 : 3)) pending = Resource.DIAMOND;
+        }
+        return pending != null && collectOre(pending, pickupItem == pending.drop ? 7 : REACH - 0.35);
+    }
+
+    private boolean collectOre(Resource resource, double range) {
+        if (collect(resource.drop, range)) return true;
+        if (resource == miningResource && tick < pickupUntil) {
+            body.pauseWork();
+            status = "waiting for the broken " + resource.label + " to drop";
+            return true;
+        }
+        return lightForPickup(resource.drop);
+    }
+
+    private static Resource pickupResource(Predicate<ItemStack> drop) {
+        return drop == RAW_IRON ? Resource.IRON : drop == DIAMOND ? Resource.DIAMOND
+            : drop == FUEL ? Resource.COAL : drop == STONE ? Resource.STONE : null;
     }
 
     private BlockHitResult findOre(Resource resource, double range) {
@@ -4029,7 +4142,10 @@ final class AgentProgress {
         }
         status = "rechecking witnessed " + resource.label;
         if (waypoint >= 0) {
-            startReturn(waypoint, true);
+            if (!startReturn(waypoint, true)) {
+                rejectOreProbe();
+                return false;
+            }
             // Travel has its own deadline; the viewpoint probe begins on arrival.
             oreProbeSince = 0;
             oreProbeReturning = true;
@@ -4435,6 +4551,15 @@ final class AgentProgress {
 
         boolean outdoors() {
             return world == c.world && dryFieldFooting() && c.player.getBlockPos().equals(openFoot);
+        }
+
+        void observeOpenFoot(BlockPos foot) {
+            if (world != c.world) {
+                world = c.world;
+                order.reset();
+                unknownFoot = null;
+            }
+            openFoot = foot;
         }
 
         boolean seek(String need) {
@@ -5612,7 +5737,11 @@ final class AgentProgress {
             abandonTarget();
             return;
         }
-        if (distance > REACH - 0.35 && c.player.getY() - target.getY() > 1.25
+        // Reachable with a pick is not necessarily collectible. For a valuable
+        // seam two levels down, use the normal checked stair before opening it.
+        boolean lowSeam = (resource == Resource.IRON || resource == Resource.DIAMOND)
+            && c.player.getBlockY() - target.getY() >= 2;
+        if ((distance > REACH - 0.35 || lowSeam) && c.player.getY() - target.getY() > 1.25
             && (resource == Resource.STONE || has(TORCH, 2))
             && c.player.isOnGround() && tick >= nextDigStart) {
             status = "cutting a staircase toward exposed " + resource.label;
@@ -5699,16 +5828,23 @@ final class AgentProgress {
 
     private boolean collect(Predicate<ItemStack> drop, double range) {
         if (tick < pickupBlockedUntil && pickupBlockedItem == drop) return false;
+        if (pickupItem == drop && pickupTread != null) return advancePickupTread();
         ItemEntity entity;
-        if (drop == LOG && timberWitness != null) {
+        if (pickupItem == drop && body.seesDrop(pickupEntity, range) && drop.test(pickupEntity.getStack())) {
+            entity = pickupEntity;
+        } else if (drop == LOG && timberWitness != null) {
             BlockPos stem = timberWitness.getBlockPos();
-            entity = (ItemEntity) body.visibleEntity(candidate -> candidate instanceof ItemEntity item && LOG.test(item.getStack())
+            entity = (ItemEntity) body.visibleEntity(candidate -> candidate instanceof ItemEntity item && canRetryDrop(item)
+                && LOG.test(item.getStack())
                 && Math.abs(item.getX() - stem.getX() - 0.5) <= 2.5
                 && Math.abs(item.getZ() - stem.getZ() - 0.5) <= 2.5, range).orElse(null);
         } else {
-            entity = body.dropped(drop, range).orElse(null);
+            entity = body.dropped(drop, range, this::canRetryDrop).orElse(null);
         }
-        return collectObserved(drop, entity);
+        if (collectObserved(drop, entity)) return true;
+        // An obstructed instance must not hide a second, independently visible stack.
+        return entity != null && pickupResource(drop) != null && safePickupStance() && !canRetryDrop(entity)
+            && collectObserved(drop, body.dropped(drop, range, this::canRetryDrop).orElse(null));
     }
 
     private boolean collectObserved(Predicate<ItemStack> drop, ItemEntity entity) {
@@ -5716,49 +5852,230 @@ final class AgentProgress {
     }
 
     private boolean collectObserved(Predicate<ItemStack> drop, ItemEntity entity, boolean requireSupportedApproach) {
-        if (pickupItem == drop && hands.count(drop) > pickupCount) {
-            clearPickup();
-            if (entity == null) return false;
+        var player = c.player;
+        if (pickupItem == drop && pickupPursuit.stockGained(hands.count(drop))) {
+            confirmPickupStock();
         }
+        if (entity != null && !canRetryDrop(entity)) entity = null;
         if (entity != null) {
             if (pickupEntity != entity) {
+                clearPickup();
                 pickupEntity = entity;
                 pickupItem = drop;
-                pickupCount = hands.count(drop);
-                pickupStarted = tick;
-            }
-            pickupSeen = tick;
+                pickupPursuit = new AgentPickup.Pursuit(tick, hands.count(drop), player.getPos(),
+                    entity.getPos(), entity.isOnGround(), drop == LOG);
+            } else pickupPursuit.observe(tick, player.getPos(), entity.getPos(), entity.isOnGround());
         }
         if (pickupItem != drop) return false;
-        if (tick - pickupStarted > (drop == LOG ? 70 : 180) || tick - pickupSeen > (drop == LOG ? 26 : 12)) {
-            abandonPickup(drop, 45);
-            return false;
+        if (!safePickupStance()) return deferPickup(false);
+        if (pickupPursuit.expired(tick) || !pickupPursuit.canReacquire(tick))
+            return deferPickup(entity == null);
+        if (entity == null) {
+            if (requireSupportedApproach) return deferPickup(false);
+            body.pauseWork();
+            continuePickupLook();
+            status = "waiting to see the witnessed drop again";
+            return true;
         }
-        switch (body.pickUpVisible(entity, null, false)) {
-            case BLOCKED -> {
-                abandonPickup(drop, 45);
-                status = "leaving the visible drop until there is a supported approach";
-                return !requireSupportedApproach;
-            }
-            case WAITING -> {
-                if (requireSupportedApproach
-                        && (entity == null || !AgentPickup.passiveOverlap(c.player.getBoundingBox(), entity.getBoundingBox()))) {
-                    clearPickup();
-                    return false;
-                }
-                status = "waiting for vanilla to collect a nearby drop";
-            }
-            case MOVING -> {
+        boolean ore = pickupResource(drop) != null;
+        if (ore && !entity.isOnGround()) {
+            // Its moving box is not evidence of a drop in the route surface. Coast
+            // on the witnessed stance and reassess the same drop once it settles.
+            if (!pickupPursuit.settling(tick)) return deferPickup(false);
+            body.pauseWork();
+            body.visibleHorizon().reportPickup(entity, "waiting_for_drop_to_settle", null);
+            status = "letting the visible ore drop settle";
+            return true;
+        }
+        if (!player.isOnGround()) {
+            body.pauseWork();
+            if (pickupPursuit.quietExpired(tick)) return deferPickup(false);
+            status = "settling on the current footing before pickup";
+            return true;
+        }
+        var result = body.pickUpVisible(entity, null, false);
+        if (result == AgentBody.PickupResult.MOVING) {
+            if (!pickupPursuit.quietExpired(tick)) {
                 rememberMotion();
                 status = "collecting visible drops on supported ground";
+                return true;
+            }
+            body.pauseWork();
+        }
+        if (ore && result == AgentBody.PickupResult.BLOCKED && !hands.stableCraftFooting()
+                && !pickupPursuit.quietExpired(tick)) {
+            status = "settling on the current footing before pickup";
+            return true;
+        }
+        if (ore && !requireSupportedApproach && pickupAccess(entity)) return true;
+        boolean passive = AgentPickup.passiveOverlap(player.getBoundingBox(), entity.getBoundingBox());
+        if (result != AgentBody.PickupResult.WAITING || pickupPursuit.quietExpired(tick)
+                || requireSupportedApproach && !passive) return deferPickup(ore && pickupAccessLook != null);
+        status = "waiting for vanilla to collect a nearby drop";
+        return true;
+    }
+
+    private boolean pickupAccess(ItemEntity drop) {
+        if (nextFoot != null || resumeIndex >= 0 || oreProbeReturning || !hands.stableCraftFooting()
+                || !AgentPickup.shouldCheckDryAccess(c.player.getBoundingBox(), drop.getBoundingBox(),
+                    drop.isOnGround(), pickupPursuit.quiet(tick))) return false;
+        BlockPos from = c.player.getBlockPos();
+        var access = AgentPickup.dryAccess(c.player.getBoundingBox(), drop.getBoundingBox(), from,
+            (foot, bearing) -> body.witnessedStockTread(from, foot, bearing));
+        if (access != null) {
+            Vec3d feet = c.player.getPos();
+            double lateral = access.bearing().getAxis() == Direction.Axis.X
+                ? feet.z - from.getZ() - 0.5 : feet.x - from.getX() - 0.5;
+            if (Math.abs(lateral) > 0.20) {
+                if (pickupPursuit.quietExpired(tick)
+                        || !body.centerOnGroundedSupport(from, body.dryCaveContact(from))) return false;
+                status = "centering on the current dry pickup tread";
+                return true;
+            }
+            var edge = new AgentSurfaceTread.Edge(from, c.world.getBlockState(from.down()),
+                access.foot(), c.world.getBlockState(access.foot().down()), access.bearing());
+            pickupTread = AgentSurfaceTread.witnessedOutbound(edge, tick);
+            pickupTreadTick = tick;
+            body.visibleHorizon().reportPickup(drop, "witnessed_dry_tread", null);
+            return true;
+        }
+        if (pickupAccessLook == null) {
+            pickupAccessLook = AgentPickup.dryAccess(c.player.getBoundingBox(), drop.getBoundingBox(), from,
+                (foot, bearing) -> true);
+            pickupLookUntil = tick + 14;
+        }
+        return continuePickupLook();
+    }
+
+    private boolean continuePickupLook() {
+        if (pickupAccessLook == null || tick >= pickupLookUntil || !hands.stableCraftFooting()) return false;
+        BlockPos from = c.player.getBlockPos();
+        BlockPos to = pickupAccessLook.foot();
+        if (to.getY() > from.getY() || !AgentSurfaceTread.cardinalTread(from, to, pickupAccessLook.bearing())) return false;
+        // Look at one candidate tread, never at the entity or its latest flight position.
+        float pitch = to.getY() < from.getY() ? 57 : AgentBody.LEVEL_ROUTE_PITCH;
+        body.turnFine(pickupAccessLook.bearing().getPositiveHorizontalDegrees(), pitch);
+        status = "checking the ground beside the witnessed drop";
+        return true;
+    }
+
+    private boolean advancePickupTread() {
+        if (pickupTreadTick != tick - 1 || !safePickupStance()) return deferPickup(false);
+        pickupTreadTick = tick;
+        body.pauseWork();
+        var player = c.player;
+        boolean underway = pickupTread.inFlight() && (!player.isOnGround()
+            || !player.getBlockPos().equals(pickupTread.from) || !hands.stableCraftFooting());
+        boolean gained = pickupPursuit.stockGained(hands.count(pickupItem));
+        if (pickupLandedTick >= 0 || !underway && gained) {
+            if (gained) {
+                confirmPickupStock();
+                return false;
+            }
+            if (tick - pickupLandedTick >= 8) return deferPickup(false);
+            status = "waiting for vanilla to collect from the dry tread";
+            return true;
+        }
+        if (!underway) {
+            if (body.seesDrop(pickupEntity, REACH) && pickupItem.test(pickupEntity.getStack())) {
+                pickupPursuit.observe(tick, player.getPos(), pickupEntity.getPos(), pickupEntity.isOnGround());
+                var destination = Vec3d.ofBottomCenter(pickupTread.to).subtract(player.getPos());
+                if (!pickupEntity.isOnGround() || !AgentPickup.passiveOverlap(
+                        player.getBoundingBox().offset(destination.x, destination.y, destination.z),
+                        pickupEntity.getBoundingBox())) {
+                    pickupTread = null;
+                    return collectObserved(pickupItem, pickupEntity);
+                }
+            } else {
+                // No new travel for a lost sighting. Keep the same bounded reacquisition.
+                pickupTread = null;
+                return collectObserved(pickupItem, null);
+            }
+            if (pickupPursuit.expired(tick)) return deferPickup(false);
+        }
+        switch (pickupTread.step(c, body, tick)) {
+            case CHECKING -> status = "checking the witnessed pickup tread";
+            case MOVING -> {
+                rememberMotion();
+                status = "approaching the drop along the witnessed dry tread";
+            }
+            case REFUSED -> { return deferPickup(false); }
+            case LANDED -> {
+                body.recordWalkedLeg(pickupTread.from, pickupTread.to);
+                body.visibleHorizon().reportPickupUnseen(pickupEntity, "dry_tread_landed");
+                pickupLandedTick = tick;
+                status = "waiting for vanilla to collect from the dry tread";
             }
         }
         return true;
     }
 
+    private boolean safePickupStance() {
+        var player = c.player;
+        return c.isWindowFocused() && c.getOverlay() == null
+            && !player.isTouchingWater() && !player.isInLava() && !player.isOnFire() && player.hurtTime == 0
+            && !player.hasVehicle() && !player.getAbilities().flying
+            && !body.lavaEmergency() && !body.macroLavaNear();
+    }
+
+    private void confirmPickupStock() {
+        body.visibleHorizon().reportPickupUnseen(pickupEntity, "inventory_gain");
+        if (miningResource != null && miningResource.drop == pickupItem) pickupUntil = 0;
+        if (pickupLightItem == pickupItem) pickupLightItem = null;
+        clearPickup();
+    }
+
+    private boolean canRetryDrop(ItemEntity entity) {
+        for (int i = 0; i < deferredDrops.length; i++)
+            if (deferredDrops[i] == entity && tick < deferredDropUntil[i]) return false;
+        return true;
+    }
+
+    private void rememberPickupLight(Predicate<ItemStack> item) {
+        if (safePickupStance() && c.player.isOnGround()
+                && c.world.getLightLevel(c.player.getBlockPos()) <= 3
+                && (has(TORCH, 1) || torchCraftBatches(4) > 0)) {
+            pickupLightItem = item;
+            pickupLightStock = hands.count(item);
+            pickupLightFoot = c.player.getBlockPos();
+            pickupLightUntil = tick + 100;
+        }
+    }
+
+    private boolean deferPickup(boolean groundUnproved) {
+        if (groundUnproved && pickupResource(pickupItem) != null) rememberPickupLight(pickupItem);
+        deferredDrops[deferredDropCursor] = pickupEntity;
+        deferredDropUntil[deferredDropCursor] = tick + 45;
+        deferredDropCursor = (deferredDropCursor + 1) % deferredDrops.length;
+        clearPickup();
+        return false;
+    }
+
+    private boolean lightForPickup(Predicate<ItemStack> drop) {
+        if (pickupLightItem != drop) return false;
+        if (tick >= pickupLightUntil || !c.player.getBlockPos().equals(pickupLightFoot) || hands.count(drop) > pickupLightStock) {
+            pickupLightItem = null;
+            return false;
+        }
+        if (!safePickupStance() || !hands.stableCraftFooting()) return false;
+        body.pauseWork();
+        if (!has(TORCH, 1)) {
+            if (craftTorches(4)) return true;
+        } else if (shouldLight(true)) {
+            status = "lighting the harvested pocket to check for a drop";
+            return true;
+        }
+        pickupLightItem = null;
+        return false;
+    }
+
     private void clearPickup() {
         pickupEntity = null;
         pickupItem = null;
+        pickupPursuit = null;
+        pickupTread = null;
+        pickupAccessLook = null;
+        pickupLandedTick = -1;
     }
 
     private void abandonPickup(Predicate<ItemStack> drop, int duration) {
@@ -6229,9 +6546,12 @@ final class AgentProgress {
         Vec3d station = Vec3d.ofCenter(position);
         double nearest = 3.55 * 3.55;
         int bench = -1;
-        // Traverse only the prefix between the player's current position and the entrance.
-        for (int i = activeTrail() - 2; i >= 0; i--) {
+        // The station's proximity to a breadcrumb says nothing about the
+        // player's connection to that breadcrumb.
+        int standing = groundedTrailIndex();
+        for (int i = standing - 1; i >= 0; i--) {
             BlockPos waypoint = trail.get(i);
+            if (!returnEdge(trail.get(i + 1), waypoint, walkedWaterReturn)) break;
             double dx = waypoint.getX() + 0.5 - station.x;
             double dy = waypoint.getY() + 1.62 - station.y;
             double dz = waypoint.getZ() + 0.5 - station.z;
@@ -6423,8 +6743,7 @@ final class AgentProgress {
         // Do not infer a route across a fall, fluid link, or recovery's vertical pillar.
         // Only an exact previously proved mine pair may seed this fallback.
         if (horizontal != 1 || !dugSteps.get(index)) return false;
-        startReturn(index - 1, false);
-        if (returnIndex < 0) return false;
+        if (!startReturn(index - 1, false)) return false;
         status = "returning on verified mine treads to look for another anchor";
         return true;
     }
@@ -6899,7 +7218,7 @@ final class AgentProgress {
                 newLegs.clear();
             }
             BlockPos mouth = opening.mouth();
-            if (mouths.contains(mouth)) return false;
+            if (mouths.contains(mouth) || !startReturn(back, false)) return false;
             if (mouths.size() == 8) mouths.removeFirst();
             mouths.add(mouth);
             shaft = earlier;
@@ -6910,7 +7229,6 @@ final class AgentProgress {
             probe = null;
             choice = 0;
             probeSince = tick;
-            startReturn(back, false);
             body.pauseWork();
             status = "leaving an unproved cave descent along the walked mine";
             return true;
@@ -6976,8 +7294,8 @@ final class AgentProgress {
         }
 
         private boolean refuse(String reason) {
-            returnIndex = -1;
-            exitStart = exitTo = null;
+            clearReturn();
+            endExitRecovery();
             body.pauseWork();
             localBlock = reason;
             reset();
@@ -6995,22 +7313,42 @@ final class AgentProgress {
         closedDig.add(position);
     }
 
-    private void beginReturn() {
-        beginReturn(false);
+    private boolean beginReturn() {
+        return startReturn(0, false);
     }
 
-    private void beginReturn(boolean preserve) {
-        startReturn(0, preserve);
+    private boolean walkedWaterReturn(BlockPos from, BlockPos to) { return caves.walkedWaterEdge(from, to); }
+
+    private static boolean returnEdge(BlockPos from, BlockPos to, BiPredicate<BlockPos, BlockPos> water) {
+        return from.equals(to) || adjacent(from, to) && !sameStem(from, to) || water.test(from, to);
     }
 
-    private void startReturn(int index, boolean preserve) {
-        int last = activeTrail() - 1;
-        if (last < index) return;
-        tableReturn = null;
-        workshopReturn = null;
-        returnIndex = last;
+    static int connectedReturnAnchor(List<BlockPos> trail, int last, int to, BlockPos standing,
+                                     BiPredicate<BlockPos, BlockPos> water) {
+        if (to < 0 || to > last || last >= trail.size()) return -1;
+        int anchor = -1;
+        for (int i = to; i <= last; i++) {
+            BlockPos cell = trail.get(i);
+            if (i > to && !returnEdge(cell, trail.get(i - 1), water)) break;
+            if (cell.equals(standing)) anchor = i;
+        }
+        return anchor;
+    }
+
+    private int groundedTrailIndex() {
+        if (!dryFieldFooting()) return -1;
+        BlockPos standing = c.player.getBlockPos();
+        for (int i = activeTrail() - 1; i >= 0; i--) if (standing.equals(trail.get(i))) return i;
+        return -1;
+    }
+
+    private boolean startReturn(int index, boolean preserve) {
+        if (!dryFieldFooting()) return false;
+        int anchor = connectedReturnAnchor(trail, activeTrail() - 1, index, c.player.getBlockPos(), walkedWaterReturn);
+        if (anchor < 0) return false;
+        clearReturn();
+        returnIndex = anchor;
         returnTo = index;
-        returnDetour = null;
         keepTrail = preserve;
         resumeIndex = -1;
         returnAge = tick;
@@ -7022,32 +7360,61 @@ final class AgentProgress {
         forcedLight = false;
         target = null;
         clearPickup();
+        return true;
+    }
+
+    private boolean rejoinReturn(BlockPos standing) {
+        int last = Math.min(trail.size() - 1, returnIndex + 1);
+        int index = connectedReturnAnchor(trail, last, returnTo, standing, walkedWaterReturn);
+        if (index < 0) return false;
+        returnIndex = index;
+        returnFrom = climbTo = gaitStep = null;
+        returnAge = tick;
+        returnClear = -1;
+        forcedLight = false;
+        return true;
     }
 
     private void retreatTunnel() {
         status = "returning along traveled steps";
         if (returnIndex < 0) return;
+        BlockPos standing = c.player.getBlockPos();
         BlockPos next = trail.get(returnIndex);
-        if (arrived(next)) {
+        if (dryFieldFooting()) {
+            if (returnForSupplies && (supplyReturnReady() || recoveryOnOpenGround())
+                    || returnForFurnace && returnFurnaceInReach()) {
+                int underfoot = groundedTrailIndex();
+                clearReturn();
+                resumeAfterReturn(standing, underfoot);
+                return;
+            }
+            if (!standing.equals(next) && !standing.equals(returnFrom)) {
+                if (!rejoinReturn(standing)) {
+                    abandonReturn(standing);
+                    return;
+                }
+                next = trail.get(returnIndex);
+            }
+        }
+        while (arrived(next)) {
             stallGuard.followedMineWaypoint();
             returnAge = tick;
             returnClear = -1;
             climbTo = null;
-            returnDetour = null;
             if (returnIndex > returnTo) {
+                returnFrom = next;
                 next = trail.get(--returnIndex);
             } else {
                 finishReturn();
                 return;
             }
         }
+        if (returnFrom == null) return; // The actor has not settled on its anchor yet.
         if (workshopReturn == null && tick - returnAge > 165) {
-            if (!replaceTableAfterFailedReturn())
-                startExitRecovery(directional(Vec3d.ofBottomCenter(next).subtract(c.player.getPos())));
+            returnBlocked(standing, next);
             return;
         }
-        BlockPos current = returnDetour != null ? returnDetour
-            : returnIndex + 1 < trail.size() ? trail.get(returnIndex + 1) : c.player.getBlockPos();
+        BlockPos current = returnFrom;
         if (workshopReturn != null) {
             Station station = workshopReturn;
             status = "retracing walked footing for " + station.recipe;
@@ -7057,12 +7424,7 @@ final class AgentProgress {
             String reason = wet ? "the retreat became wet" : expired ? "the retrace did not settle in time"
                 : gaitStepProof ? "the witnessed landing could not be reached safely"
                     : "the recorded tread had no visible safe support";
-            workshopReturn = null;
-            returnIndex = -1;
-            body.prioritizeMovement();
-            int reached = trail.lastIndexOf(c.player.getBlockPos());
-            resumeIndex = reached >= 0 && reached + 1 < trail.size() ? reached + 1 : -1;
-            resumeStep = -1;
+            abandonReturn(standing);
             blockStation(station, "cannot reposition " + station.recipe + " toward " + next.toShortString()
                 + ": " + reason);
             return;
@@ -7071,31 +7433,34 @@ final class AgentProgress {
             status = caves.status();
             return;
         }
+        if (!adjacent(current, next) || sameStem(current, next)) {
+            returnBlocked(standing, next);
+            return;
+        }
         if (forcedLight) {
-            if (shouldLight(true)) return;
+            if (!recoveryOnOpenGround() && shouldLight(true)) return;
             forcedLight = false;
         }
-        if (returnDetour == null && returnIndex + 1 < trail.size() && dugSteps.get(returnIndex + 1)
+        if (returnIndex + 1 < trail.size() && dugSteps.get(returnIndex + 1)
             && driveKnownStep(current, next) != Walk.BLOCKED) return;
         if (next.getY() == current.getY() + 1
             && Math.abs(next.getX() - current.getX()) + Math.abs(next.getZ() - current.getZ()) == 1) {
             status = "climbing a traveled step";
             if (climb(current, next) == Walk.BLOCKED) {
-                if (has(TORCH, 1) && returnLitIndex != returnIndex && tick - returnAge < 90) {
+                if (!recoveryOnOpenGround() && has(TORCH, 1) && returnLitIndex != returnIndex && tick - returnAge < 90) {
                     returnLitIndex = returnIndex;
                     forcedLight = true;
                     climbTo = null;
                     return;
                 }
                 forcedLight = false;
-                if (!replaceTableAfterFailedReturn())
-                    startExitRecovery(directional(Vec3d.ofBottomCenter(next).subtract(c.player.getPos())));
+                returnBlocked(standing, next);
             }
             return;
         }
         if (returnClear >= 0) {
             Dig result = clear(next.up(returnClear));
-            if (result == Dig.DARK && has(TORCH, 1) && returnLitIndex != returnIndex) {
+            if (result == Dig.DARK && !recoveryOnOpenGround() && has(TORCH, 1) && returnLitIndex != returnIndex) {
                 returnLitIndex = returnIndex;
                 forcedLight = true;
             } else if (result != Dig.LOOKING) returnClear--;
@@ -7106,22 +7471,17 @@ final class AgentProgress {
 
     private void finishReturn() {
         int index = returnIndex;
-        returnIndex = -1;
-        tableReturn = null;
-        workshopReturn = null;
-        gaitStep = null;
+        clearReturn();
         if (keepTrail) {
-            resumeIndex = index + 1;
-            resumeStep = -1;
+            resumeAfterReturn(trail.get(index), index);
             if (refitPickCount >= 0) refitPickUntil = tick + 180;
-            supplyExcursion.reset();
-        } else if (index > 0) {
+        } else if (index > 0 && index + 1 < trail.size()) {
             closeDig(trail.get(index + 1));
             trail.subList(index + 1, trail.size()).clear();
             litIndex = Math.min(litIndex, trail.size());
             failedDirections = stairLength = 0;
             digDirection = c.player.getHorizontalFacing().rotateYClockwise();
-        } else {
+        } else if (index == 0) {
             trail.clear();
             nextDigStart = tick + 95;
             heading = c.player.getYaw() + 75;
@@ -7129,23 +7489,46 @@ final class AgentProgress {
         }
     }
 
-    private boolean replaceTableAfterFailedReturn() {
-        TableReturn trip = tableReturn;
-        if (trip == null) return false;
-        tableReturn = null;
-        failedTableReturn = trip.workshop;
-        if (!hands.stableCraftFooting() || !affordsWood(trip.planks + (has(table.item, 1) ? 0 : 4), trip.sticks))
-            return false;
-        // Stop the workshop detour, not the mine. Do not invent a connection if the
-        // player has left the recorded route during the attempted return.
-        int standing = trail.lastIndexOf(c.player.getBlockPos());
+    private void clearReturn() {
         returnIndex = -1;
-        returnDetour = climbTo = gaitStep = null;
-        resumeIndex = standing >= 0 && standing + 1 < trail.size() ? standing + 1 : -1;
+        tableReturn = null;
+        workshopReturn = null;
+        returnForFurnace = returnForSupplies = false;
+        returnFrom = climbTo = gaitStep = null;
+        forcedLight = false;
+    }
+
+    private void abandonReturn(BlockPos standing) {
+        if (tableReturn != null) failedTableReturn = tableReturn;
+        if (returnForFurnace) {
+            if (furnaceLoaded) {
+                refusedFurnace = furnace.position;
+                refusedFurnaceFoot = standing;
+            } else releaseUnpaidFurnace(furnace.position);
+        }
+        if (oreProbeReturning) rejectOreProbe();
+        if (portalSupplies != null) portalSupplies.returning = false;
+        clearReturn();
+        endExitRecovery();
+        resumeAfterReturn(standing, groundedTrailIndex());
+        body.prioritizeMovement();
+    }
+
+    private void resumeAfterReturn(BlockPos standing, int index) {
+        if (index < 0) detachMine(standing);
+        else resumeIndex = index + 1 < trail.size()
+                && returnEdge(trail.get(index + 1), trail.get(index), walkedWaterReturn) ? index + 1 : -1;
         resumeStep = -1;
         supplyExcursion.reset();
-        status = "rechecking local crafting options after the workshop path was blocked";
-        return true;
+    }
+
+    private void returnBlocked(BlockPos standing, BlockPos next) {
+        if (tableReturn != null || returnForFurnace || returnForSupplies || oreProbeReturning
+                || portalSupplies != null && portalSupplies.returning || recoveryOnOpenGround()) {
+            abandonReturn(standing);
+        } else {
+            startExitRecovery(directional(Vec3d.ofBottomCenter(next).subtract(c.player.getPos())));
+        }
     }
 
     private void resumeTunnel() {
@@ -7169,6 +7552,10 @@ final class AgentProgress {
         }
         BlockPos next = trail.get(resumeIndex);
         BlockPos entry = trail.get(resumeIndex - 1);
+        if (!returnEdge(next, entry, walkedWaterReturn)) {
+            detachMine(current);
+            return;
+        }
         if (supplyExcursion.returningFrom(current, entry)) {
             status = "returning to the mine along witnessed supply footing";
             Walk back = supplyExcursion.back(current, entry);
@@ -7183,6 +7570,10 @@ final class AgentProgress {
         if (branchPastWorkshop(current, entry, next)) return;
         if (caves.followWater(entry, next, tick)) {
             status = caves.status();
+            return;
+        }
+        if (!adjacent(entry, next) || sameStem(entry, next)) {
+            detachMine(current);
             return;
         }
         if (resumeIndex > 0 && dugSteps.get(resumeIndex)
@@ -7455,6 +7846,11 @@ final class AgentProgress {
 
     private void startExitRecovery(Direction heading) {
         if (exitStart != null) return;
+        if (!dryFieldFooting()) return;
+        if (recoveryOnOpenGround()) {
+            finishExitRecovery(c.player.getBlockPos(), true);
+            return;
+        }
         exitStart = exitFrom = c.player.getBlockPos();
         exitTo = null;
         exitHeading = heading;
@@ -7469,9 +7865,53 @@ final class AgentProgress {
         recoveryVisited.add(exitFrom);
     }
 
+    private boolean recoveryOnOpenGround() {
+        if (!dryFieldFooting() || c.player.hasVehicle()) return false;
+        if (supplyEgress.outdoors()) return true;
+        // Under leaves the skyline can be occluded, but the actual dry grass
+        // contact is already a worksite. A missing uphill target is not a cave.
+        BlockState floor = body.dryCaveContact(c.player.getBlockPos());
+        return floor != null && (floor.isOf(Blocks.GRASS_BLOCK) || floor.isOf(Blocks.PODZOL)
+                || floor.isOf(Blocks.MYCELIUM))
+            || (body.supplyPerspective(body.defensiveViewYaw()) & AgentBody.SUPPLY_OPEN) != 0;
+    }
+
+    private void endExitRecovery() {
+        exitStart = exitFrom = exitTo = climbTo = gaitStep = null;
+        forcedLight = false;
+    }
+
+    private void finishExitRecovery(BlockPos standing, boolean open) {
+        if (open) supplyEgress.observeOpenFoot(standing);
+        if (returnIndex >= 0) abandonReturn(standing);
+        else endExitRecovery();
+        sweepOrigin = Vec3d.ofBottomCenter(standing);
+        sweepHeading = heading = c.player.getYaw();
+        headingUntil = tick + 125;
+        sweepIndex = 0;
+        status = open ? "resuming ordinary work from settled open ground" : "resuming from witnessed footing";
+    }
+
     private void recoverExit() {
         status = "searching for a visible upward exit";
+        if (pillarStage == 3 && arrived(exitFrom.up()) && !has(BUILDING, pillarCount)) {
+            reachedRecoveryStep(exitFrom.up());
+            return;
+        }
+        if (dryFieldFooting()) {
+            BlockPos standing = c.player.getBlockPos();
+            if (recoveryOnOpenGround()) {
+                finishExitRecovery(standing, true);
+                return;
+            }
+            if (!standing.equals(exitFrom) && !standing.equals(exitTo)) {
+                if (returnIndex >= 0 && rejoinReturn(standing)) endExitRecovery();
+                else finishExitRecovery(standing, false);
+                return;
+            }
+        }
         if (tick >= exitDeadline) {
+            finishExitRecovery(c.player.getBlockPos(), false);
             localBlock = "no reachable visible exit";
             status = localBlock;
             return;
@@ -7496,6 +7936,7 @@ final class AgentProgress {
         }
         if (exitSide >= 8) {
             if (!recoverPillar()) {
+                finishExitRecovery(c.player.getBlockPos(), false);
                 localBlock = "no reachable visible exit";
                 status = localBlock;
             }
@@ -7543,7 +7984,6 @@ final class AgentProgress {
     }
 
     private void reachedRecoveryStep(BlockPos reached) {
-        int rejoin = trail.lastIndexOf(reached);
         boolean rose = reached.getY() > exitFrom.getY();
         if (rose) exitDeadline = tick + 620;
         if (recoveryVisited.size() >= 48) recoveryVisited.removeFirst();
@@ -7553,31 +7993,9 @@ final class AgentProgress {
         exitSide = pillarStage = pillarStarted = 0;
         exitLevel = false;
         exitClear = 1;
-        if (returnIndex >= 0 && rejoin >= 0 && rejoin <= returnIndex) {
-            exitStart = null;
-            climbTo = null;
-            returnIndex = rejoin;
-            returnAge = tick;
-        } else if (returnIndex > returnTo && rose) {
-            // A placed station or a cave lip can occupy one old waypoint. Rejoin from the
-            // newly reached support only if the next earlier, traveled cell is a single step away.
-            int earlier = returnIndex - 1;
-            if (adjacent(reached, trail.get(earlier))) {
-                returnDetour = reached;
-                returnIndex = earlier;
-                returnAge = tick;
-                returnClear = -1;
-                exitStart = null;
-                climbTo = null;
-            }
-        } else if (returnIndex < 0) {
-            exitStart = null;
-            climbTo = null;
-            sweepOrigin = Vec3d.ofBottomCenter(reached);
-            sweepHeading = heading = c.player.getYaw();
-            headingUntil = tick + 125;
-            sweepIndex = 0;
-        }
+        if (recoveryOnOpenGround()) finishExitRecovery(reached, true);
+        else if (returnIndex >= 0 && rejoinReturn(reached)) endExitRecovery();
+        else if (returnIndex < 0) finishExitRecovery(reached, false);
     }
 
     private boolean recoverPillar() {
@@ -7586,10 +8004,6 @@ final class AgentProgress {
         if (pillarStarted == 0) {
             pillarStarted = tick;
             pillarCount = hands.count(BUILDING);
-        }
-        if (pillarStage == 3 && arrived(exitFrom.up()) && !has(BUILDING, pillarCount)) {
-            reachedRecoveryStep(exitFrom.up());
-            return true;
         }
         if (pillarCount == 0 || tick - pillarStarted > 100) return false;
         if (pillarStage < 2) {
@@ -7631,13 +8045,13 @@ final class AgentProgress {
                                 && lip.getZ() - prior.getZ() == prior.getZ() - older.getZ()) exit--;
                     }
                     closeDig(nextFoot);
-                    startReturn(Math.max(0, last - 6), false);
+                    boolean returning = startReturn(Math.max(0, last - 6), false);
                     for (int i = exit; i <= last; i++) {
                         BlockPos walked = trail.get(i);
                         if (i < last && !adjacent(trail.get(i + 1), walked)) continue;
                         if (body.preferLavaExit(Vec3d.ofBottomCenter(walked))) {
                             // Backtrack from the escape point, not toward the abandoned lip.
-                            returnIndex = i;
+                            if (returning) returnIndex = i;
                             break;
                         }
                     }
@@ -8180,8 +8594,8 @@ final class AgentProgress {
                 sweepIndex = 0;
             }
             if (sweepIndex >= SCOUT_HEADINGS.length) {
-                if (trail.size() > 1) beginReturn();
-                else startExitRecovery(directional(forward(sweepHeading)));
+                if (trail.size() <= 1 || !beginReturn())
+                    startExitRecovery(directional(forward(sweepHeading)));
                 sweepOrigin = null;
                 return;
             }

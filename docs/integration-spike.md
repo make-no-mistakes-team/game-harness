@@ -52,6 +52,8 @@ a different, visibly supported level path. A fall or lava blocks that
 handoff until the emergency is over. When the player equips a torch
 to light a mine tread, the mine stays active through that inventory
 transaction. Equipping it alone does not count as lighting the tread.
+The player can approach a low ore seam by a checked stair or light a
+dark pocket after a confirmed ore break. Neither counts as a pickup.
 Vanilla inventory or dimension evidence verifies the goal separately.
 Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.
@@ -59,7 +61,10 @@ saved campaign. Ordinary advisory play does not create skill-trial worlds.
 A useful pause is still play. For example, the player can watch the
 furnace finish one raw iron. Count the original load, not the input
 remaining: the last ore of a larger batch is still part of that batch.
-A threat takes precedence even when only one item is cooking.
+A threat takes precedence even when only one item is cooking. To use
+an old furnace, the player must be able to reach its recorded route.
+If nothing is cooking there, it can instead build one from carried
+materials. A paid batch stays with the furnace that received it.
 
 ### Explicit work-order experiments
 

@@ -199,8 +199,10 @@ of a program, for example gathering cobblestone before making a pickaxe.
 The crafting stage requires the real stock and never inherits the
 opening. With the ingredients in hand but no bench in view, the player
 can look for a nearby bench or a safe spot for a carried table. It may
-place the table only if the job has budgeted for it. Failure to find a
-spot is not a reason to mine more ingredients.
+place the table only if the job has budgeted for it. A visible lower
+shelf or side wall can work; the table must stay within reach without
+blocking the player or the way back. Failure to find a spot is not a
+reason to mine more ingredients.
 Seeing a suitable wall proves neither buried ore nor a safe
 descent. If the player is too injured to descend, it must recover first.
 

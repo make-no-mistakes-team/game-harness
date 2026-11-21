@@ -4,6 +4,7 @@ import io.gameharness.survival.AgentVisibleHorizon.Refusal;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.BooleanSupplier;
@@ -996,7 +997,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         if (!sameBlockFace(support, now) || now.isInsideBlock()) return false;
         var player = client.player;
         var placement = new ItemPlacementContext(player, Hand.MAIN_HAND, player.getMainHandStack(), now);
-        return placement.getBlockPos().equals(now.getBlockPos().offset(now.getSide()));
+        return placement.getBlockPos().equals(placementCell(now));
+    }
+
+    static BlockPos placementCell(BlockHitResult support) {
+        return support.getBlockPos().offset(support.getSide());
     }
 
     void release() {
@@ -4413,6 +4418,45 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             if (score < cost) { cost = score; best = hit; }
         }
         return best;
+    }
+
+    /** Ordinary tables may attach to any real contact in the rendered station samples. */
+    BlockHitResult benchFace(double reach, BiPredicate<BlockHitResult, BlockPos> usable,
+                            Predicate<BlockPos> preservesStationView) {
+        if (!hasView() || reach <= 0) return null;
+        if (sampleCount == 0) sampleView(reach);
+        var player = client.player;
+        Vec3d liveEye = player.getEyePos();
+        int feetY = player.getBlockY();
+        double reachSquared = reach * reach, cost = Double.POSITIVE_INFINITY;
+        BlockHitResult best = null;
+        boolean bestPreservesView = false;
+        for (int i = -1; i < sampleCount; i++) {
+            BlockHitResult hit = i < 0 ? selectedFace() : samples[i];
+            if (hit == null || hit.isInsideBlock()) continue;
+            double distance = hit.getPos().squaredDistanceTo(liveEye);
+            if (distance > reachSquared) continue;
+            if (i < 0) {
+                // The crosshair outline alone may be dark; the grid samples are already lit rays.
+                BlockHitResult lit = contactRay(hit.getPos(), reach);
+                if (!sameBlockFace(hit, lit) || lit.isInsideBlock()) continue;
+                hit = lit;
+            }
+            BlockPos dest = placementCell(hit);
+            double score = benchFaceScore(hit.getSide(), dest.getY() - feetY, distance, reachSquared);
+            boolean preservesView = preservesStationView == null || preservesStationView.test(dest);
+            if (bestPreservesView && !preservesView || preservesView == bestPreservesView && score >= cost) continue;
+            if (!usable.test(hit, dest)) continue;
+            best = hit;
+            cost = score;
+            bestPreservesView = preservesView;
+        }
+        return best;
+    }
+
+    static double benchFaceScore(Direction side, int dy, double distanceSquared, double reachSquared) {
+        if (side == Direction.UP && dy == 0) return distanceSquared;
+        return distanceSquared + reachSquared + 1 + (side == Direction.UP ? 0 : 3) + Math.abs(dy) * 2;
     }
 
     private void sampleView(double distance) {

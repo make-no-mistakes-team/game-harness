@@ -183,6 +183,29 @@ final class AgentWalkedRoute {
         return connected(footing) ? graph.returnNext(footing) : NO_CELL;
     }
 
+    /** Veto a full block in a retained traversed lane, without inferring any new lane. */
+    boolean blocksPlacement(BlockPos cell) {
+        if (anchor != NO_CELL && blocksColumn(cell, anchor, y(anchor) + 1)) return true;
+        for (int i = 0; i < count; ++i)
+            if (starts[i] != NO_CELL && blocksTread(cell, starts[i], ends[i])) return true;
+        return false;
+    }
+
+    static boolean blocksTread(BlockPos cell, BlockPos from, BlockPos to) {
+        return blocksTread(cell, from.asLong(), to.asLong());
+    }
+
+    private static boolean blocksTread(BlockPos cell, long from, long to) {
+        int a = y(from), b = y(to);
+        // The reverse jump crown spans both columns at the upper tread's height.
+        int top = a == b ? a + 1 : Math.max(a, b) + 2;
+        return blocksColumn(cell, from, top) || blocksColumn(cell, to, top);
+    }
+
+    private static boolean blocksColumn(BlockPos cell, long foot, int top) {
+        return cell.getX() == x(foot) && cell.getZ() == z(foot) && cell.getY() >= y(foot) - 1 && cell.getY() <= top;
+    }
+
     Breadcrumbs breadcrumbs(long from) {
         if (from == anchor || !connected(from)) return null;
         int size = 0;

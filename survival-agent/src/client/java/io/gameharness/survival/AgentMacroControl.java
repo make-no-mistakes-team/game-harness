@@ -354,7 +354,7 @@ final class AgentMacroControl {
         boolean diamondRoute, prospectLight, retryDiamondInset, scopedSourceLane, horizonBraking, rimSourceAccess;
         float lastCrack;
         long firedAt, placementFrame, pickupDisappeared, craftJob, priorCraftReceipt, settledAt, lastMissingFrame;
-        long workshopFaceUntil;
+        long placementFaceUntil;
         int missingFaceFrames;
         String unexpectedPickup;
         Screen opened;
@@ -4734,15 +4734,16 @@ final class AgentMacroControl {
         boolean iron = budget.policy.smeltIron();
         boolean placementGranted = budget.canPlace() && budget.policy.placeTable()
             && budget.remainingCost(Items.CRAFTING_TABLE) > 0;
+        boolean placementControls = iron || !client.options.sneakKey.isUnbound();
         int tables = count(Items.CRAFTING_TABLE);
         boolean carried = budget.limit(Items.CRAFTING_TABLE, tables) > 0;
         boolean canMakeTable = !carried && placementGranted && tables == budget.floor(Items.CRAFTING_TABLE)
             && budget.craftsLeft() >= 2 && hands.workCraftable("crafting_table", budget);
-        if (placementGranted && (carried || canMakeTable)) {
-            var support = stationSupport(iron ? this::furnaceSite : this::benchSite);
-            if (support != null && body.macroVisible(support, reach())) {
+        if (placementGranted && placementControls && (carried || canMakeTable)) {
+            var support = iron ? stationSupport(this::furnaceSite) : benchSupport();
+            if (support != null && (!iron || body.macroVisible(support, reach()))) {
                 if (canMakeTable) return startReadyWorkRecipe("crafting_table", 1, null);
-                startWorkStep(Verb.WORK_PLACE, "Place the authorized crafting table on visible footing",
+                startWorkStep(Verb.WORK_PLACE, "Place the authorized crafting table on a witnessed dry face",
                     face(support), null, Items.CRAFTING_TABLE, null);
                 return null;
             }
@@ -4757,6 +4758,8 @@ final class AgentMacroControl {
         }
         if (!iron && startBenchSurvey()) return null;
         if (!placementGranted) return "No usable crafting table is witnessed in reach, and no priced table placement remains.";
+        if (!placementControls)
+            return "No usable crafting table is witnessed in reach, and the vanilla crouch control for placement is unbound.";
         if (!carried && !canMakeTable)
             return "No usable crafting table is witnessed in reach, and no table is available to place within the craft and reserve limits.";
         return "No safe, reachable crafting-table placement site was witnessed from the current dry stance.";
@@ -5838,9 +5841,10 @@ final class AgentMacroControl {
 
     private void advanceWorkPlacement() {
         Face support = action.offer.face;
-        BlockPos dest = support.hit.getBlockPos().up();
+        BlockPos dest = AgentBody.placementCell(support.hit);
         Item item = action.offer.item;
         boolean furnace = item == Items.FURNACE;
+        boolean ordinaryBench = item == Items.CRAFTING_TABLE && !work.budget.policy.smeltIron();
         IronWorkshop shop = work.ironWorkshop;
         Block station = furnace ? Blocks.FURNACE : Blocks.CRAFTING_TABLE;
         if (action.fired) {
@@ -5875,21 +5879,29 @@ final class AgentMacroControl {
             return;
         }
         if (!body.hasRecentView()) return;
+        int stock = furnace ? 0 : count(item);
         if (!work.budget.canPlace() || client.options.useKey.isUnbound() || (furnace
                 ? !work.budget.canPlaceFurnace(player.getInventory())
-                : !work.budget.policy.placeTable() || work.budget.limit(item, count(item)) < 1) || !cursorClear()
+                : !work.budget.policy.placeTable() || work.budget.limit(item, stock) < 1) || !cursorClear()
+                || ordinaryBench && (stock != action.itemCount || client.options.sneakKey.isUnbound()
+                    || player.isUsingItem() || client.interactionManager.isBreakingBlock())
                 || shop != null && (!shop.foot.equals(player.getBlockPos()) || !ironFooting(shop.foot.down())
                     || player.isUsingItem() || client.interactionManager.isBreakingBlock())) {
             interrupt("The placement footing, cursor, control or material permission changed.", true);
             return;
         }
-        boolean space = shop == null
-            ? benchSite(dest) && !player.getBoundingBox().intersects(new Box(dest))
-            : workshopSite(dest);
-        if (!space || world.getBlockState(support.hit.getBlockPos()) != support.state || !visible(support)) {
-            if (shop != null && space && world.getBlockState(support.hit.getBlockPos()) == support.state) {
-                if (action.workshopFaceUntil == 0) action.workshopFaceUntil = tick + WORKSHOP_AIM_TICKS;
-                if (tick < action.workshopFaceUntil) {
+        boolean space = ordinaryBench ? benchSite(support.hit, dest) : support.hit.getSide() == Direction.UP
+            && (shop != null ? workshopSite(dest) : furnaceSite(dest)
+                && !work.sourceSearch.footholds.contains(dest.down()) && !pendingRouteSupport(dest.down())
+                && !player.getBoundingBox().intersects(new Box(dest)));
+        boolean sameSupport = space && world.getBlockState(support.hit.getBlockPos()) == support.state;
+        boolean seen = sameSupport && (ordinaryBench ? body.macroMineWitness(support.hit, reach()) != null
+            : body.macroVisible(support.hit, reach()));
+        if (!seen) {
+            if ((ordinaryBench || shop != null) && sameSupport) {
+                if (action.placementFaceUntil == 0) action.placementFaceUntil = tick + WORKSHOP_AIM_TICKS;
+                if (tick < action.placementFaceUntil) {
+                    if (ordinaryBench && player.getMainHandStack().isOf(item)) body.sneak();
                     body.aim(support.hit.getPos());
                     return;
                 }
@@ -5901,16 +5913,20 @@ final class AgentMacroControl {
             interrupt("The placement face or clear site could not be re-witnessed before issuing any use.", true);
             return;
         }
-        action.workshopFaceUntil = 0;
+        action.placementFaceUntil = 0;
         if (!player.getMainHandStack().isOf(item)) {
             hands.equipForUse(stack -> stack.isOf(item));
             if (hands.busy()) action.craftJob = hands.jobGeneration();
-            else if (furnace) interrupt("The authorized furnace cannot be equipped through the current inventory.", true);
+            else if (furnace || ordinaryBench)
+                interrupt("The authorized " + (furnace ? "furnace" : "table")
+                    + " cannot be equipped through the current inventory.", true);
             return;
         }
         body.sneak();
-        if (body.useContact(support.hit, AgentBody.Contact.PLACE,
-                player.isSneaking() ? AgentBody.Preparation.READY : AgentBody.Preparation.STANCE)) {
+        // With the table in hand, crouched vanilla use skips the support's interaction.
+        boolean ready = ordinaryBench ? player.shouldCancelInteraction() && body.canPlaceStationAcross(support.hit)
+            : player.isSneaking();
+        if (body.useContact(support.hit, AgentBody.Contact.PLACE, ready ? AgentBody.Preparation.READY : AgentBody.Preparation.STANCE)) {
             if (furnace) work.budget.placedFurnace();
             else work.budget.placedTable();
             action.fired = true;
@@ -5947,12 +5963,20 @@ final class AgentMacroControl {
         return body.stationFace(null, site, true);
     }
 
+    private BlockHitResult benchSupport() {
+        Vec3d eye = player.getEyePos();
+        return body.benchFace(reach(), this::benchSite, personalTable == null && personalFurnace == null ? null : pos -> {
+            Box placement = new Box(pos);
+            return !blocksStationFace(placement, eye, personalTable) && !blocksStationFace(placement, eye, personalFurnace);
+        });
+    }
+
     private static boolean blocksStationFace(Box placement, Vec3d eye, PersonalStation known) {
         // Test only the proposed full block against a previously witnessed sightline.
         return known != null && placement.raycast(eye, known.face.hit.getPos()).isPresent();
     }
 
-    private boolean dryWorkshopSupport(BlockPos floor) {
+    private static boolean dryWorkshopSupport(BlockView world, BlockPos floor) {
         BlockState state = world.getBlockState(floor);
         return state.getFluidState().isEmpty() && !(state.getBlock() instanceof FallingBlock)
             && state.isSideSolidFullSquare(world, floor, Direction.UP);
@@ -5961,18 +5985,56 @@ final class AgentMacroControl {
     private boolean ironFooting(BlockPos floor) {
         BlockPos foot = player.getBlockPos();
         return foot.getX() == floor.getX() && foot.getZ() == floor.getZ() && foot.getY() == floor.getY() + 1
-            && hands.stableCraftFooting() && settled() && dryWorkshopSupport(floor)
+            && hands.stableCraftFooting() && settled() && dryWorkshopSupport(world, floor)
             && Math.abs(player.getY() - floor.getY() - 1) <= 0.06;
     }
 
     private boolean furnaceSite(BlockPos dest) {
-        return dest.getY() == player.getBlockY() && !work.rejected.contains(dest)
-            && world.getBlockState(dest).isAir() && dryWorkshopSupport(dest.down());
+        return !work.rejected.contains(dest) && levelStationSite(world, dest, player.getBlockY());
     }
 
-    private boolean benchSite(BlockPos dest) {
-        BlockPos support = dest.down();
-        return furnaceSite(dest) && !work.sourceSearch.footholds.contains(support) && !pendingRouteSupport(support);
+    static boolean levelStationSite(BlockView world, BlockPos dest, int feetY) {
+        return dest.getY() == feetY && world.getBlockState(dest).isAir() && dryWorkshopSupport(world, dest.down());
+    }
+
+    private boolean benchSite(BlockHitResult support, BlockPos dest) {
+        if (work.rejected.contains(dest) || !world.getWorldBorder().contains(dest)) return false;
+        return benchSpace(world, support, dest, player.getBoundingBox())
+            && !blocksBenchReturn(dest) && world.getOtherEntities(player, new Box(dest)).isEmpty();
+    }
+
+    /** The adjacent cell and support of a witnessed contact can veto use, not nominate another site. */
+    static boolean benchSpace(BlockView world, BlockHitResult hit, BlockPos dest, Box avatar) {
+        int x = dest.getX(), y = dest.getY(), z = dest.getZ();
+        if (hit.getType() != HitResult.Type.BLOCK || hit.isInsideBlock()
+                || avatar.intersects(x, y, z, x + 1, y + 1, z + 1) || world.isOutOfHeightLimit(dest)) return false;
+        BlockState space = world.getBlockState(dest);
+        if (!space.isAir() || !space.getFluidState().isEmpty()) return false;
+        BlockPos support = hit.getBlockPos();
+        BlockState state = world.getBlockState(support);
+        return !state.isReplaceable() && !(state.getBlock() instanceof FallingBlock) && !AgentBody.dryCaveDanger(state)
+            && !state.getCollisionShape(world, support).isEmpty();
+    }
+
+    private boolean blocksBenchReturn(BlockPos dest) {
+        var search = work.sourceSearch;
+        if (walkedRoutes.blocksPlacement(dest) || retainedBenchSupport(dest)
+                || retainedBenchSupport(dest.down()) || retainedBenchSupport(dest.down(2))) return true;
+        for (var edge : search.stairs)
+            if (blocksBenchTread(dest, edge)) return true;
+        if (diamondRoute.rootExit != null && blocksBenchTread(dest, diamondRoute.rootExit)) return true;
+        for (var step : diamondRoute.spine)
+            if (blocksBenchTread(dest, step.edge)) return true;
+        return diamondRoute.spareExit != null
+            && AgentWalkedRoute.blocksTread(dest, diamondRoute.foot, diamondRoute.foot.offset(diamondRoute.spareExit));
+    }
+
+    private boolean retainedBenchSupport(BlockPos floor) {
+        return work.sourceSearch.footholds.contains(floor) || diamondRoute.supports.contains(floor);
+    }
+
+    private static boolean blocksBenchTread(BlockPos dest, AgentSurfaceTread.Edge edge) {
+        return AgentWalkedRoute.blocksTread(dest, edge.upper(), edge.lower());
     }
 
     /** These checks can veto a sighted site; they do not supply a new site. */
@@ -6093,7 +6155,7 @@ final class AgentMacroControl {
             BlockHitResult top = body.macroFloor(floor);
             if (top == null) continue;
             BlockState state = world.getBlockState(floor);
-            if (!dryWorkshopSupport(floor) || !world.getBlockState(floor.up()).isAir()
+            if (!dryWorkshopSupport(world, floor) || !world.getBlockState(floor.up()).isAir()
                     || !world.getBlockState(floor.up(2)).isAir() || !body.macroFlatLane(floor, state, landing)
                     || !body.macroNoVisiblePickup(landing)) continue;
             shop.alternate = new Floor(floor, state, landing);
@@ -6244,7 +6306,7 @@ final class AgentMacroControl {
             searchWork("The work order lost its verified workshop footing.");
             return false;
         }
-        if (!settled() && dryWorkshopSupport(footing)) {
+        if (!settled() && dryWorkshopSupport(world, footing)) {
             enact("hold", "Waiting for the body to settle on the current dry workshop footing.");
             return false;
         }
@@ -10938,8 +11000,7 @@ final class AgentMacroControl {
                 if (action.offer.face != null && verb != Verb.STATION_REACQUIRE && !action.workshopFaceLost
                         && (!action.retryDiamondInset || pickup != null)) {
                     BlockPos refused = action.offer.face.hit.getBlockPos();
-                    if (action.offer.key.verb == Verb.WORK_PLACE) refused = refused.up();
-                    work.rejected.add(refused);
+                    work.rejected.add(verb == Verb.WORK_PLACE ? AgentBody.placementCell(action.offer.face.hit) : refused);
                 } else if (action.offer.drop != null && action.dropPosition != null && !action.retryDropWhenVisible) {
                     work.deferredDrops.put(action.offer.drop.getId(), new PickupDeferral(player.getPos(),
                         action.dropPosition, action.dropGrounded, player.getYaw(), player.getPitch()));

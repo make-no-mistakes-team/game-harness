@@ -111,6 +111,17 @@ final class OrdinaryRollingWorkTest {
     }
 
     @Test
+    void aStandaloneRiseMustBeOneBlockUpAndCardinallyAdjacent() {
+        var from = new BlockPos(0, 0, 0);
+        assertTrue(AgentBody.adjacentScoutRise(from, from.east()));
+        assertTrue(AgentBody.adjacentScoutRise(from, from.north()));
+        assertFalse(AgentBody.adjacentScoutRise(from, from.east().up()));
+        assertFalse(AgentBody.adjacentScoutRise(from, from.east().down()));
+        assertFalse(AgentBody.adjacentScoutRise(from, from.east(2)));
+        assertFalse(AgentBody.adjacentScoutRise(from, from.east().north()));
+    }
+
+    @Test
     void paidDiamondCanStartAVisibleCaveLegOrAnApproachToActualOreWithoutASpine() {
         var paid = order("diamond", "\"prospect:minecraft:diamond\",\"break:minecraft:deepslate_diamond_ore\"",
             ",\"duringWaitFor\":\"9d0ad30c-b85c-4261-baff-f071c8e5ebc1\"");

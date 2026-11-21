@@ -2320,6 +2320,55 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return litRay(point, Ray.TERRAIN);
     }
 
+    enum ScoutRiseEvidence { RANGE, SECTOR, VISIBILITY, CONTROLS, ALIGNMENT, SUPPORT, CLEARANCE, PICKUP, OFFERED }
+    record ScoutRise(BlockHitResult top, OrdinaryGrade grade, ScoutRiseEvidence evidence) {}
+
+    static boolean adjacentScoutRise(BlockPos from, BlockPos floor) {
+        return from.getY() == floor.getY()
+            && Math.abs(from.getX() - floor.getX()) + Math.abs(from.getZ() - floor.getZ()) == 1;
+    }
+
+    boolean scoutRisePhysics() {
+        var player = client.player;
+        return dryLandingControls() && !player.isGliding() && !player.hasStatusEffect(StatusEffects.JUMP_BOOST)
+            && player.getAttributeValue(EntityAttributes.JUMP_STRENGTH) >= 0.419
+            && player.getAttributeValue(EntityAttributes.JUMP_STRENGTH) <= 0.421
+            && player.getAttributeValue(EntityAttributes.SAFE_FALL_DISTANCE) >= 2.0
+            && player.fallDistance <= 1.4;
+    }
+
+    ScoutRise scoutRise(BlockHitResult witness) {
+        var player = client.player;
+        BlockPos from = player.getBlockPos(), floor = witness.getBlockPos();
+        if (!adjacentScoutRise(from, floor))
+            return new ScoutRise(null, null, ScoutRiseEvidence.RANGE);
+        Direction bearing = AgentSurfaceTread.prospectLevelBearing(from, floor);
+        var view = horizonView();
+        if (view == null) return new ScoutRise(null, null, ScoutRiseEvidence.VISIBILITY);
+        if (!horizonBearingInView(view, bearing.getPositiveHorizontalDegrees()))
+            return new ScoutRise(null, null, ScoutRiseEvidence.SECTOR);
+        if (!matchesDryRouteTop(witness, floor) || witness.isInsideBlock())
+            return new ScoutRise(null, null, ScoutRiseEvidence.VISIBILITY);
+        if (!scoutRisePhysics() || client.options.jumpKey.isUnbound())
+            return new ScoutRise(null, null, ScoutRiseEvidence.CONTROLS);
+        if (!drySurveyLaneCentered(from, player.getX(), player.getZ(), bearing))
+            return new ScoutRise(null, null, ScoutRiseEvidence.ALIGNMENT);
+        BlockState source = ordinaryGradeSource(from, bearing), surface = client.world.getBlockState(floor);
+        if (source == null || !normalDryTraction(source) || !normalDryTraction(surface) ||
+                !stableDryRouteTop(floor, surface) || dryCaveDanger(surface))
+            return new ScoutRise(null, null, ScoutRiseEvidence.SUPPORT);
+        var proved = ordinaryGradeTop(from, bearing, source, witness);
+        if (proved == null) return new ScoutRise(null, null, ScoutRiseEvidence.CLEARANCE);
+        if (!macroNoVisiblePickup(Vec3d.ofBottomCenter(proved.to()), from.getY(), proved.to().getY() + 0.32))
+            return new ScoutRise(null, null, ScoutRiseEvidence.PICKUP);
+        return new ScoutRise(witness, proved, ScoutRiseEvidence.OFFERED);
+    }
+
+    ScoutRise scoutRise(BlockPos floor, Direction bearing) {
+        var top = ordinaryGradeTopHit(floor, bearing);
+        return top == null ? new ScoutRise(null, null, ScoutRiseEvidence.VISIBILITY) : scoutRise(top);
+    }
+
     enum DryLandingEvidence { CONTROLS, SOURCE, NO_LIT_ADJACENT_TOP, FALL_BOUND, SWEEP, PICKUP, OFFERED }
     private DryLandingEvidence dryLandingEvidence;
     DryLandingEvidence dryLandingEvidence() { return dryLandingEvidence; }

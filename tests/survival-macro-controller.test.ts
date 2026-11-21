@@ -520,9 +520,13 @@ const dryLandingScout = {
   anchor: { subject: "route:dry_landing", target: "m-47" },
 } as const;
 
-test.each(["route:dry_landing", "route:dry_vantage"] as const)(
-  "A newly witnessed %s wakes one paid choice after inspection, not from its receipt", async subject => {
-  const affordance = { ...dryLandingScout, anchor: { ...dryLandingScout.anchor, subject } };
+test.each([
+  ["route:dry_landing", "Step down to the visible dry landing"],
+  ["route:dry_vantage", "Shift for a better view from the same dry top"],
+  ["route:dry_vantage", "Climb one block to a visible dry vantage"],
+] as const)(
+  "A newly witnessed %s (%s) wakes one paid choice after inspection, not from its receipt", async (subject, summary) => {
+  const affordance = { ...dryLandingScout, summary, anchor: { ...dryLandingScout.anchor, subject } };
   const requests: MacroRequest[] = [];
   const f = await durableFixture(async request => {
     requests.push(request);

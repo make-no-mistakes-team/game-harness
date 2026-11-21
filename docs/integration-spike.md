@@ -221,6 +221,9 @@ If the lip hides the next surface, Terra may instead shift on the top
 already supporting the player to get a better view. That move cannot
 take the player off the edge. A separate, fresh landing check is still
 needed to descend.
+An explicitly offered one-block climb is different: it requires room
+for the jump from the actual stance and an exact, visible landing.
+Seeing a higher treetop in the distance is not enough.
 
 On a dry approach the player can keep looking toward a tree while
 stepping to one side. It checks the ground under the movement it

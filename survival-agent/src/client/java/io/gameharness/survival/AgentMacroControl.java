@@ -204,7 +204,13 @@ final class AgentMacroControl {
 
     private static final String DRY_VANTAGE = "route:dry_vantage";
     private record GroundScout(AgentWorkOrder.TravelAnchor anchor, Face face, long stance, Vec3d from,
-                               float bearing, Vec3d goal, AgentDryLanding landing, AgentGroundVantage vantage) {}
+                               float bearing, Vec3d goal, AgentDryLanding landing, AgentGroundVantage vantage,
+                               AgentBody.OrdinaryGrade rise) {
+        GroundScout(AgentWorkOrder.TravelAnchor anchor, Face face, long stance, Vec3d from, float bearing, Vec3d goal,
+                    AgentDryLanding landing, AgentGroundVantage vantage) {
+            this(anchor, face, stance, from, bearing, goal, landing, vantage, null);
+        }
+    }
     private record FoodClue(AgentFoodWork.Source source, Entity animal, Vec3d origin, int slot, Item hand) {}
 
     private record Offer(String id, Key key, String summary, String evidence, float yaw, float pitch,
@@ -1391,7 +1397,8 @@ final class AgentMacroControl {
             claim(local ? "local_motion" : "terra");
             if (local) ++fallbackTicks;
             state(local ? "local_in_progress" : "terra_in_progress", action.offer.summary);
-            int maxTicks = action.offer.scout != null ? GROUND_SCOUT_TICKS
+            int maxTicks = action.offer.scout != null ? action.offer.scout.rise != null
+                ? AgentSurfaceTread.ORDINARY_GRADE_TICKS + 6 : GROUND_SCOUT_TICKS
                 : STARTUP_OUTLOOK.equals(action.offer.key.activity) ? STARTUP_OUTLOOK_TICKS : action.offer.key.verb.maxTicks;
             if (!local && (input.intent == null || !input.intent.equals(action.intent))) {
                 interrupt("The host withdrew or replaced this intent.", true);
@@ -1401,7 +1408,7 @@ final class AgentMacroControl {
             } else if (action.offer.route != null && (action.intent.epoch != epoch || !cursorClear())) {
                 interrupt("The dry route's dependency epoch or clean-cursor premise changed.", true);
             } else if ((!grounded() && !progress.dryRouteInFlight(action.offer.route) && !pendingReturnInFlight()
-                    && !scoutDropInFlight())
+                    && !scoutGradeInFlight())
                     || !hazardClear || !client.isWindowFocused() || client.getOverlay() != null) {
                 interrupt("Grounding, window focus, or local safety changed.", true);
             } else {
@@ -1452,7 +1459,10 @@ final class AgentMacroControl {
         AgentVisibleHorizon.Window scoutWindow = null;
         if (refusal == null && offer.scout != null) {
             var scout = offer.scout;
-            if (scout.vantage != null) {
+            if (scout.rise != null) {
+                if (!groundScoutStance(scout) || !recheckScoutRise(scout))
+                    refusal = "The exact upper top, dry source alignment, no-damage jump clearance, or protected stock changed.";
+            } else if (scout.vantage != null) {
                 if (!groundScoutStance(scout) || groundScoutFace(scout.face) == null || !body.groundsVantage(scout.vantage))
                     refusal = "The same dry supporting top, sightline, or shifted stopping point no longer revalidates.";
             } else if (scout.landing == null) {
@@ -1478,7 +1488,10 @@ final class AgentMacroControl {
         if (offer.scout != null) {
             var scout = offer.scout;
             scoutedLandmarks.add(scout.anchor.target());
-            if (scout.landing != null)
+            if (scout.rise != null) {
+                scoutDepartures.add(scout.rise.from());
+                action.tread = AgentSurfaceTread.ordinaryGrade(scout.rise.edge(), scout.rise.from(), tick);
+            } else if (scout.landing != null)
                 attemptedDryLandings.add(dryLandingKey(scout.landing.source(), scout.landing.top().getBlockPos()));
             else if (scout.vantage != null) {
                 var vantage = scout.vantage;
@@ -7037,7 +7050,8 @@ final class AgentMacroControl {
             }
             case APPROACH, COLLECT -> {
                 if (offer.scout != null) {
-                    if (offer.scout.vantage != null) walkGroundVantage(offer.scout);
+                    if (offer.scout.rise != null) walkScoutRise(offer.scout);
+                    else if (offer.scout.vantage != null) walkGroundVantage(offer.scout);
                     else if (offer.scout.landing != null) walkDryLanding(offer.scout.landing);
                     else walkGroundScout(offer.scout);
                 }
@@ -7473,9 +7487,62 @@ final class AgentMacroControl {
         }
     }
 
-    private boolean scoutDropInFlight() {
-        return action.offer.scout != null && action.offer.scout.landing != null && action.drove
+    private boolean scoutGradeInFlight() {
+        var scout = action.offer.scout;
+        return scout != null && (scout.landing != null && action.drove || scout.rise != null && action.fired)
             && !player.isOnGround() && !player.isTouchingWater() && !player.isOnFire() && player.hurtTime == 0;
+    }
+
+    private boolean recheckScoutRise(GroundScout scout) {
+        var hit = groundScoutFace(scout.face);
+        if (hit == null) return false;
+        var proof = body.scoutRise(hit);
+        return proof.grade() != null && proof.grade().edge().equals(scout.rise.edge());
+    }
+
+    private void walkScoutRise(GroundScout scout) {
+        var tread = action.tread;
+        if (!cursorClear() || !action.walkInventory.unchanged(player.getInventory()) || player.hurtTime != 0) {
+            interrupt("The witnessed one-block rise lost safe controls or unchanged stock.", true);
+            return;
+        }
+        if (!body.hasRecentView()) return;
+        if (action.scoutStoppedFrame >= 0) {
+            if (!scout.rise.floor().equals(player.supportingBlockPos.orElse(null))
+                    || world.getBlockState(scout.rise.floor()) != scout.rise.surface()) {
+                interrupt("The exact upper support changed before the relocated view.", true);
+                return;
+            }
+            completeGroundScout("Climbed to the exact visible dry top and rendered a fresh view. No return or stock was proved.");
+            return;
+        }
+        // The physical grade proof stays live on every motor tick. Before any
+        // issued jump, also require the very same full top to still be visible.
+        if (!body.scoutRisePhysics() || !action.fired && tick != action.started && !recheckScoutRise(scout)
+                || action.fired && grounded() && !player.getBlockPos().equals(tread.to)) {
+            interrupt("The one-block climb lost its witnessed or successfully joined jump envelope.", true);
+            return;
+        }
+        switch (tread.step(client, body, tick)) {
+            case CHECKING -> { }
+            case MOVING -> {
+                if (action.fired && (player.getY() > scout.from.y + 0.30 || horizontalSquared(player.getPos(), scout.from) > 0.16))
+                    continuityWork = AgentPauseEpisodes.Work.ROUTE;
+            }
+            case REFUSED -> interrupt("The one-block climb lost its exact dry support, headroom or contiguous motion.", true);
+            case LANDED -> {
+                if (!action.fired || !scout.rise.floor().equals(player.supportingBlockPos.orElse(null))) {
+                    interrupt("The authorised jump did not land on its exact dry upper top.", true);
+                } else if (settled()) {
+                    body.pauseWork();
+                    action.scoutStoppedFrame = body.renderedFrame();
+                    if (!action.purposefulMotion) {
+                        action.purposefulMotion = true;
+                        purposeful("terra: " + action.offer.summary);
+                    }
+                }
+            }
+        }
     }
 
     private void walkGroundVantage(GroundScout scout) {
@@ -7768,6 +7835,8 @@ final class AgentMacroControl {
         }
         if (action != null && action.offer.key.verb == Verb.BREAK && (action.durable || owner.equals("terra")))
             action.fired |= client.options.attackKey.isPressed();
+        if (action != null && action.offer.scout != null && action.offer.scout.rise != null)
+            action.fired |= client.options.jumpKey.isPressed() && client.options.forwardKey.isPressed();
         float crack = advancingCrack();
         if (crack > 0) continuityWork = AgentPauseEpisodes.Work.CRACK;
         long handsEvidence = hands.workEvidence();
@@ -8947,8 +9016,13 @@ final class AgentMacroControl {
         BlockPos source = player.getBlockPos();
         var landing = body.visibleDryLanding(floor -> !attemptedDryLandings.contains(dryLandingKey(source, floor)));
         if (landing == null) {
+            var rise = addScoutRise(offers, travel, tops);
+            if (rise == AgentBody.ScoutRiseEvidence.OFFERED) {
+                noteDryLandingEvidence("ONE_BLOCK_CLIMB_OFFERED");
+                return;
+            }
             noteDryLandingEvidence(addSameTopVantage(offers, source, tops) ? "SAME_TOP_VANTAGE_OFFERED"
-                : body.dryLandingEvidence().name() + "_NO_SAFE_VANTAGE");
+                : rise != null ? "ONE_BLOCK_CLIMB_" + rise.name() : body.dryLandingEvidence().name() + "_NO_SAFE_VANTAGE");
             return;
         }
         noteDryLandingEvidence(body.dryLandingEvidence().name());
@@ -9032,6 +9106,43 @@ final class AgentMacroControl {
         return false;
     }
 
+    private AgentBody.ScoutRiseEvidence addScoutRise(List<Offer> offers, TravelWitness travel, int tops) {
+        Vec3d from = player.getPos();
+        BlockPos source = player.getBlockPos();
+        AgentBody.ScoutRiseEvidence refusal = null;
+        var hinted = travel == null ? null : travel.grade;
+        for (int i = -1; i < tops; ++i) {
+            AgentBody.ScoutRise proof;
+            if (i < 0) {
+                if (hinted == null || hinted.lookOnly() || !AgentBody.adjacentScoutRise(source, hinted.floor())) continue;
+                proof = body.scoutRise(hinted.floor(), hinted.bearing());
+            } else {
+                var top = body.nearGroundTop(i);
+                if (top.getBlockPos().getY() != source.getY()) continue;
+                proof = body.scoutRise(top);
+            }
+            var grade = proof.grade();
+            if (grade == null) {
+                if (refusal == null || proof.evidence().ordinal() > refusal.ordinal()) refusal = proof.evidence();
+                continue;
+            }
+            if (scoutDepartures.contains(grade.to())) continue;
+            var anchorKey = new Key(Verb.APPROACH, grade.floor(), 0, "ground_vantage_rise");
+            String identity = materialTarget(anchorKey);
+            if (identity == null || scoutedLandmarks.contains(identity)) continue;
+            var anchor = new AgentWorkOrder.TravelAnchor(DRY_VANTAGE, identity);
+            Vec3d goal = Vec3d.ofBottomCenter(grade.to());
+            var scout = new GroundScout(anchor, face(proof.top()), surveyOrigin, from, 0, goal, null, null, grade);
+            var key = new Key(Verb.APPROACH, grade.floor(), surveyOrigin, "ground_vantage_rise");
+            offers.add(new Offer(offerId(key), key, "Climb one block to a visible dry vantage",
+                "One vanilla jump to the lit full adjacent top " + bearing(goal, from, player.getYaw())
+                    + ". Dry takeoff, body-width headroom and landing checked. Stop for a new view; no return or stock implied.",
+                0, 0, null, null, null, null, null, null, null, null, scout));
+            return AgentBody.ScoutRiseEvidence.OFFERED;
+        }
+        return refusal;
+    }
+
     private boolean addSameTopVantage(List<Offer> offers, BlockPos source, int tops) {
         BlockPos support = source.down();
         var state = body.dryCaveContact(source);
@@ -9041,7 +9152,7 @@ final class AgentMacroControl {
         double radius = player.getWidth() * 0.5;
         for (int i = 0; i < tops; ++i) {
             var cue = body.nearGroundTop(i);
-            if (cue.getBlockPos().equals(support) || cue.getPos().y > from.y + 0.055) continue;
+            if (cue.getBlockPos().equals(support) || cue.getPos().y > from.y + 1.055) continue;
             int sector = AgentGroundVantage.sector(support, cue.getPos());
             if ((used & (1 << sector)) != 0) continue;
             Vec3d goal = AgentGroundVantage.goal(support, sector, radius);
@@ -9629,6 +9740,7 @@ final class AgentMacroControl {
 
     private void finish(String result, String detail) {
         if (action.horizonTravel != null) body.stopHorizonTravel(action.horizonTravel);
+        if (action.offer.scout != null && !owner.equals("safety")) body.pauseWork();
         if (action.offer.drop != null && !owner.equals("safety")) body.pauseWork();
         if (action.offer.key.verb == Verb.WORK_FORAGE && !owner.equals("safety")) body.pauseWork();
         if (action.ordinaryGrade != null && !result.equals("completed") && !owner.equals("safety")) body.pauseWork();

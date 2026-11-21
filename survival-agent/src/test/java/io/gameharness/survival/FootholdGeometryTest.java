@@ -213,6 +213,15 @@ final class FootholdGeometryTest {
             """).getAsJsonObject();
         var opening = AgentWorkOrder.parse(raw, "run", "constrained");
         assertEquals(new AgentWorkOrder.SurfaceAnchor("block:minecraft:grass_block", "m-8"), opening.surfaceAnchor());
+        var staged = raw.deepCopy();
+        staged.addProperty("id", "program:1");
+        staged.addProperty("nextWorkId", "program:2");
+        assertEquals(opening.surfaceAnchor(), AgentWorkOrder.parse(staged, "run", "constrained").surfaceAnchor());
+        staged.remove("nextWorkId");
+        assertNull(AgentWorkOrder.parse(staged, "run", "constrained").policy(), "unpaired first-stage scope");
+        staged.addProperty("id", "program:2");
+        staged.addProperty("nextWorkId", "program:3");
+        assertNull(AgentWorkOrder.parse(staged, "run", "constrained").policy(), "do not carry the opening into a later stage");
         raw.addProperty("maxBreaks", 1);
         assertNull(AgentWorkOrder.parse(raw, "run", "constrained").policy(), "reserve a break for the source");
         raw.addProperty("maxBreaks", 4);

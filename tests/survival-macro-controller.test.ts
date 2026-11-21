@@ -11,7 +11,7 @@ import { hasConfirmedTerraEffect } from "../src/shared/survival-agent-ui.ts";
 import {
   MACRO_DIAMOND_PROSPECT, MacroDirectory, MacroObservationRotating, parseMacroIntent, parseMacroPlanning, parseMacroVisualProbe,
   type MacroBasis, type MacroInference, type MacroIntent, type MacroObservation, type MacroOpportunity,
-  type MacroProposal, type MacroRequest, type MacroStrategist,
+  type MacroProposal, type MacroRequest, type MacroStrategist, type MacroWorkPolicy,
 } from "../src/server/survival-macro/protocol.ts";
 
 async function fixture(
@@ -1131,6 +1131,97 @@ test("A first standalone fixed survey wakes constrained planning only for newly 
     await f.clean();
   }
 });
+
+test.each(["changed paid view", "first native view", "fresh physical cap", "equal/rekeyed image", "old render", "unbound view",
+  "absent frame", "no completed read", "unsafe scope", "expired handoff", "request budget", "another survey",
+  "unsupported work", "independent work"] as const)(
+  "The post-look handoff pays only for a useful exact native view (%s)", async condition => {
+    const quote = Promise.withResolvers<void>();
+    const dispatched = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    const ground = { ...caveSurvey, id: "o-3", summary: "Survey the nearby ground" };
+    const other = { ...caveSurvey, id: "o-5", summary: "Survey right from this stance" };
+    const recipe = { id: "sticks", verb: "continue", risk: "guarded", summary: "Craft sticks in the inventory",
+      evidence: "The carried planks support this recipe.",
+      material: { subject: "recipe:stick", target: "recipe-stick", spends: { "minecraft:oak_planks": 2 } } } as const;
+    const sticks: MacroWorkPolicy = { target: { kind: "stock", item: "minecraft:stick", count: 4 },
+      allowedEffects: ["craft:stick"], costCaps: [{ item: "minecraft:oak_planks", count: 2 }], reserves: [],
+      maxBreaks: 0, maxCrafts: 1, maxPlacements: 0 };
+    const unchanged = condition === "independent work" ? [recipe] : [];
+    const scene = { ...grassyWorksite, ...visualScene, health: 16, food: 17, travelHint: undefined,
+      inventory: { ...grassyWorksite.inventory, "minecraft:oak_planks": 8 },
+      opportunities: [ground, other, ...unchanged] };
+    const changedJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAB//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8Aa3//2Q==", "base64");
+    const changedHash = createHash("sha256").update(changedJpeg).digest("hex");
+    const followupBinding = { captureId: `vc-${"f".repeat(32)}`, renderFrame: condition === "old render" ? visualBinding.renderFrame : 310 };
+    const frame: NonNullable<SurvivalMacroConfig["frame"]> = async ({ run, life, epoch, tick }, _signal, requestId) => {
+      const first = tick === 95;
+      if (!first && condition === "absent frame") return { cause: "unavailable", failure: "timeout" };
+      const data = first || condition === "equal/rekeyed image" ? captureJpeg : changedJpeg;
+      const binding = first ? condition === "first native view" ? undefined : visualBinding
+        : condition === "unbound view" ? undefined : followupBinding;
+      const sha256 = data === captureJpeg ? captureHash : changedHash;
+      return { source: "verified-game-display", run, life, epoch, tick, width: 1, height: 1, mimeType: "image/jpeg", data,
+        visualBinding: binding, artifact: { relativePath: `macro-frames/${requestId}.jpg`, sha256, verify: async () => true } };
+    };
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      const verified = await request.verifyFrameDispatch?.();
+      const frameSha256 = request.frame ? createHash("sha256").update(request.frame.data).digest("hex") : undefined;
+      const image = { frameSha256, frameVisualBinding: verified ? request.frame?.visualBinding : undefined };
+      if (requests.length === 1) {
+        dispatched.resolve();
+        await quote.promise;
+        return { ...workReply(request, condition === "first native view" ?
+          { kind: "opportunity", opportunityId: ground.id } : { kind: "work", openingViewId: ground.id, policy: surfacePolicy }), ...image };
+      }
+      return { ...workReply(request, condition === "another survey" ? { kind: "opportunity", opportunityId: other.id } :
+        condition === "unsupported work" ? { kind: "work", policy: surfacePolicy } :
+        condition === "independent work" ? { kind: "work", policy: sticks } :
+        condition === "changed paid view" ? { ...visualNomination, captureId: followupBinding.captureId, imageSha256: changedHash } :
+        { kind: "abstain" }), ...image };
+    }, "Obtain a diamond in Survival.", condition === "request budget" ? 1 : 3, () => frame);
+    try {
+      await f.observe(95, scene);
+      await dispatched.promise;
+      await f.observe(260, scene);
+      quote.resolve();
+      await pollVisual(f);
+      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      expect(intent).toMatchObject({ basisTick: 260, opportunityId: ground.id });
+      await f.receipt(intent.id, 265, "accepted");
+      await f.receipt(intent.id, 268, condition === "no completed read" ? "interrupted" : "completed",
+        "The first-person camera rendered the requested survey angle.");
+      await f.observe(268, scene);
+      expect(requests).toHaveLength(1);
+      const after = { ...scene, opportunities: [other, ...unchanged], ...(condition === "fresh physical cap" ? { surfaceOpening } :
+        condition === "unsafe scope" ? { safety: { clear: false, revision: 2 } } : {}) };
+      await f.observe(condition === "expired handoff" ? 350 : 274, after);
+      await pollVisual(f);
+      const postLook = condition === "changed paid view" || condition === "first native view" ||
+        condition === "another survey" || condition === "unsupported work" || condition === "independent work";
+      expect(requests).toHaveLength(postLook ? 2 : 1);
+      expect(f.actor.status().requests).toBe(postLook ? 2 : 1);
+      expect(f.actor.status().providerDispatches).toBe(postLook ? 2 : 1);
+      if (postLook) expect(requests[1]).toMatchObject({ observation: { tick: 274, opportunities: unchanged },
+        frame: { visualBinding: followupBinding }, visual: { mayNominate: true, postLook: true },
+        feedback: { kind: "post_look_visual", detail: expect.stringContaining("no physical work was issued") } });
+      if (condition === "fresh physical cap") expect(await f.order()).toMatchObject({ surfaceAnchor });
+      else if (condition === "independent work") expect(await f.order()).toMatchObject({ target: sticks.target, basisTick: 274 });
+      else await expect(access(f.file("work.json"))).rejects.toThrow();
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      if (condition === "changed paid view") expect(parseMacroVisualProbe(JSON.parse(await readFile(f.file("visual-probe.json"), "utf8"))))
+        .toMatchObject({ captureId: followupBinding.captureId, imageSha256: changedHash });
+      else await expect(access(f.file("visual-probe.json"))).rejects.toThrow();
+      await f.observe(380, after);
+      if (condition !== "changed paid view") expect(f.actor.status().providerDispatches).toBe(postLook ? 2 : 1);
+    } finally {
+      quote.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
 
 const visibleTimber = { kind: "resource", subject: "block:minecraft:oak_log", target: "log-a",
   footing: "dry", bearingDegrees: -12, windowBlocks: 0.9 } as const;
@@ -2802,6 +2893,123 @@ test("Approaching a live stock goal starts successor planning without publishing
     await f.clean();
   }
 });
+
+test.each(["completed", "missing cobblestone", "missing stick", "refused", "interrupted", "lost opening", "changed opening"] as const)(
+  "The MnPtXh surface program binds only its first cut and waits for confirmed crafting stock (%s)", async condition => {
+    const pick = "minecraft:wooden_pickaxe", cobble = "minecraft:cobblestone";
+    const table = "minecraft:crafting_table", stick = "minecraft:stick";
+    // Tick 19: a dry dirt cap, no exposed stone, and one of the three cobblestone already carried.
+    const opening = { block: "minecraft:dirt", target: "m-1", tool: pick, maxToolLoss: 0 } as const;
+    const inventory = { [pick]: 1, [cobble]: 1, [table]: 1, "minecraft:dirt": 6,
+      "minecraft:oak_planks": 8, "minecraft:birch_planks": 3, [stick]: 2 };
+    const scene = { goal: "diamond", epoch: 3, stance: 1, health: 16, food: 17, inventory,
+      safety: { clear: true, revision: 2 }, surfaceOpening: opening, visualReady: true,
+      opportunities: [
+        { id: "o-1", verb: "continue", risk: "guarded", summary: "Craft stick in the inventory grid",
+          evidence: "The visible inventory holds the ingredients for this vanilla recipe.",
+          material: { subject: "recipe:stick", target: "recipe-stick", spends: { "minecraft:oak_planks": 2, "minecraft:birch_planks": 2 } } },
+        { id: "o-2", verb: "survey", risk: "read", summary: "Survey the nearby ground",
+          evidence: "A fixed downward camera angle from the current stance." },
+        { id: "o-3", verb: "survey", risk: "read", summary: "Survey left from this stance",
+          evidence: "A bounded first-person turn over nearby terrain." },
+        { id: "o-4", verb: "survey", risk: "read", summary: "Survey right from this stance",
+          evidence: "A bounded first-person turn over nearby terrain." },
+      ],
+    } as const;
+    const stages = [
+      { policy: { target: { kind: "stock", item: cobble, count: 3 },
+        allowedEffects: ["break:minecraft:cobblestone", "break:minecraft:dirt", "break:minecraft:stone"],
+        costCaps: [], reserves: [], maxBreaks: 6, maxCrafts: 0, maxPlacements: 0 },
+      requires: [{ item: pick, count: 1 }] },
+      { policy: { target: { kind: "stock", item: "minecraft:stone_pickaxe", count: 1 },
+        allowedEffects: ["craft:stone_pickaxe", `place:${table}`],
+        costCaps: [{ item: cobble, count: 3 }, { item: table, count: 1 }, { item: stick, count: 2 }],
+        reserves: [], maxBreaks: 0, maxCrafts: 1, maxPlacements: 1 },
+      requires: [{ item: cobble, count: 3 }, { item: stick, count: 2 }, { item: table, count: 1 }] },
+    ] as const;
+    const quote = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length > 1) return workReply(request, { kind: "abstain" });
+      await quote.promise;
+      return workReply(request, { kind: "work-program", stages }, 1200);
+    }, "Obtain a diamond in Survival.");
+    const noWork = () => expect(access(f.file("work.json"))).rejects.toThrow();
+    try {
+      await f.observe(19, scene);
+      const request = requests[0]!;
+      expect(request).toMatchObject({ trigger: "first",
+        observation: { life: 1, epoch: 3, tick: 19, inventory, surfaceOpening: opening },
+        work: { mode: "constrained", demand: "first", protectedReserves: [], current: null } });
+      const { run } = request.observation;
+      const otherOpening = { ...opening, target: "m-2" };
+      await f.publishObservation(24, { ...scene, surfaceOpening: condition === "lost opening" ? undefined :
+        condition === "changed opening" ? otherOpening : opening });
+      quote.resolve();
+      await f.actor.poll();
+      await f.actor.poll();
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      if (condition === "lost opening" || condition === "changed opening") {
+        await noWork();
+        expect(f.actor.status()).toMatchObject({ staleDecisions: 1, issuedWorkOrders: 0, workQueuedAfter: null });
+        // The same cap returning does not revive the stale grant.
+        await f.observe(120, scene);
+        await f.actor.poll();
+        await noWork();
+        expect(f.actor.status().issuedWorkOrders).toBe(0);
+        return;
+      }
+
+      const gather = await f.order();
+      const requestId = f.actor.status().workOrder?.requestId;
+      expect(gather).toEqual({ v: 1, id: `${requestId}:1`, nextWorkId: `${requestId}:2`,
+        run, life: 1, epoch: 3, basisTick: 24, expiresTick: 1219, safetyRevision: 2, origin: "model",
+        ...stages[0].policy, surfaceAnchor: { subject: "block:minecraft:dirt", target: "m-1" } });
+      expect(f.actor.status().workOrder?.accepted).toBeNull();
+
+      const full = { ...inventory, [cobble]: 3 };
+      const cut = { ...scene, surfaceOpening: undefined };
+      const working = { id: gather.id, state: "working", detail: "Collecting cobblestone" } as const;
+      if (condition !== "refused") {
+        await f.receipt(gather.id, 25, "accepted");
+        await f.observe(35, { ...cut, inventory: { ...inventory, [cobble]: 2 }, workOrder: working });
+        expect(await f.order()).toEqual(gather);
+        expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 1, workOrder: { accepted: { tick: 25 } } });
+      }
+      await f.observe(40, { ...cut, inventory: full, workOrder: condition === "refused" ? undefined : working });
+      expect(await f.order()).toEqual(gather); // Inventory alone does not admit stage 2.
+
+      const terminal = condition === "refused" || condition === "interrupted" ? condition : "completed";
+      await f.receipt(gather.id, 50, terminal);
+      await f.observe(49, { ...cut, inventory: full });
+      await noWork(); // A completion receipt cannot use an observation older than the receipt.
+      expect(f.actor.status().issuedWorkOrders).toBe(1);
+      const observed = condition === "missing cobblestone" ? { ...full, [cobble]: 2 } :
+        condition === "missing stick" ? { ...full, [stick]: 1 } : full;
+      await f.observe(50, { ...scene, inventory: observed, surfaceOpening: otherOpening,
+        workOrder: terminal === "completed" ? { ...working, state: "complete" } : undefined });
+      if (condition === "completed") {
+        expect(await f.order()).toEqual({ v: 1, id: gather.nextWorkId, run, life: 1, epoch: 3,
+          basisTick: 50, expiresTick: 1219, safetyRevision: 2, origin: "model", ...stages[1].policy });
+        expect(f.actor.status()).toMatchObject({ issuedWorkOrders: 2, completedModelWorkOrders: 1, providerDispatches: 1 });
+      } else {
+        await noWork();
+        expect(f.actor.status().workQueuedAfter).toBeNull();
+        // Neither restored stock nor the original cap can reuse a failed grant.
+        await f.observe(55, { ...scene, inventory: full });
+        await f.observe(130, scene);
+        await f.actor.poll();
+        await noWork();
+        expect(f.actor.status().issuedWorkOrders).toBe(1);
+      }
+    } finally {
+      quote.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
 
 test("A single model work program crosses two native receipts and preserves reserves without extra approval", async () => {
   const log = "minecraft:oak_log";

@@ -194,9 +194,11 @@ a cap at the surface or an exposed side wall in an existing excavation.
 Terra can choose to prospect there for cobblestone, coal, or raw iron
 without first seeing the buried resource. A work order must cover the
 exact surface material and the desired source, keep a break for that
-source, and protect the tools it needs. The opening is not evidence that
-ore lies beneath it. If the player is too injured for a safe descent,
-the opening does not override that restriction.
+source, and protect the tools it needs. That job can be the first stage
+of a program, for example gathering cobblestone before making a pickaxe.
+The crafting stage requires the real stock and never inherits the
+opening. Seeing a suitable wall proves neither buried ore nor a safe
+descent. If the player is too injured to descend, it must recover first.
 
 An injured player without food can choose a short foraging job when
 there is an actual source in view. A ripe plant takes one interaction;
@@ -236,6 +238,9 @@ captured the image and its camera geometry together. A nomination asks
 what visible surface is there. It does not turn the camera, move the
 player, break anything, or prove a route. An ordinary desktop image
 without that binding cannot supply a target.
+If a requested camera look finds no physical start, a genuinely new
+bound image can give Terra one more chance to nominate a surface. It
+does not start another sequence of camera turns.
 
 After the client confirms a surface, Terra can authorize a separate
 scouting move toward it: up to three checked legs and six blocks of

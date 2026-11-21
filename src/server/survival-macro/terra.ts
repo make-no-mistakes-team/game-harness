@@ -42,14 +42,15 @@ Return one proposal: a short subgoal and observation-based reason, a separately 
 When work is present, prefer a durable policy over selecting individual motions or blocks. You author the subgoal and bounded resource permissions; the same native player chooses concrete actions from visible evidence. A job may take many operations and can run while you plan. For target {kind:"stock",item,count}, choose an achievable total inventory count, not a quantity to add. A target {kind:"preset",goal} must equal the invocation's goal.
 When travelHint names a useful visible resource or frontier, send matching bounded ordinary work directly, without a guarded break or a proved full return first. An approach can start only with its reserves already held. Express stock still to be gathered as the total target of a no-spend acquisition, not as a floor it cannot meet at entry. If a later stage will spend some of that stock, require the gathered total and declare the retained floor in that stage. Never lower an existing protected reserve or a floor the user requires before the first action. For resource, name the exact authorized source break. For cave_frontier, quote a finite coal, stone, raw-iron, or diamond prospecting leg with its intended exact source effects. For woodland_frontier, quote a bounded job for the exact natural log stock you need, with that log's break effect. It means visible woodland to approach and check; it is not a witnessed log, a guarantee of species, or permission to break leaves. A cave frontier does not prove ore.
 bearingDegrees is relative to the current view. windowBlocks is visible support through a short braking window, not a route length, arrival promise, or known return. A shallow crossing requires a visible dry bank. With footing one_block_grade, heightChange is the signed height of one separately witnessed dry step, not a braking window or a grade beyond that landing. The player rechecks the actual support and clearance before moving. Lava, unseen or deep drops, fast water or falls, drowning, uncertain jumps and climbs, and deliberate long returns need stronger proof. A travelHint identifies evidence, not an opportunity ID, a break or use permission, stock, or progress. It grants no new motion while an input is occupied and does not substitute for exact station recall.
-If hunger or injury makes recovery relevant, check carried food and visible food before committing to excavation. A guarded collect offer for an edible item can support ordinary stock work for that exact item with zero effect caps and no spend. A read-only forage clue instead names one currently witnessed ripe bush or adult food animal. For that one source, choose a single live stock work policy for a small total of the named food item, with exactly "forage:" plus material.subject as allowedEffects, empty costCaps, zero break/craft/placement caps, and all protected reserves. The clue is not a selectable ID or a guarantee of yield. Hunting needs a suitable hotbar axe; it does not use sweeping sword attacks. Use legitimate crafting if a seen animal warrants it, not a guessed animal or general attack grant. If no food is in view, choose an offered safe scout or a new camera view to look for food; don't infer an animal or descent from a canopy. Emergency eating is reported separately from pickup. A genuine pickup may be eaten before it can satisfy a stored-stock target; use the latest inventory, hunger, and health to judge recovery.
+Food supports the player's objective; it is not automatically the next objective whenever health or hunger is below full. Use carried or visible food when useful. If excavation is actually unsafe because of injury or hunger, a safe scout for a food source can be worthwhile. Otherwise, when no food is visible, continue a useful supported part of the main task rather than repeatedly inspecting unrelated scenery for a hypothetical meal. An offered shallow-ground check is a legitimate way to seek stone with a usable starter pick; it is not a claim that stone is hidden there.
+A guarded collect offer for an edible item can support ordinary stock work for that exact item with zero effect caps and no spend. A read-only forage clue names one currently witnessed ripe bush or adult food animal. For that source, choose a single stock work policy for a small total of the named food item, with exactly "forage:" plus material.subject as allowedEffects, empty costCaps, zero break/craft/placement caps, and all protected reserves. The clue is not a selectable ID or a guarantee of yield. Hunting needs a suitable hotbar axe. Craft one if a seen animal warrants it, not on the assumption that an animal is nearby. Emergency eating is reported separately from pickup: use the actual inventory, hunger, and health to judge recovery, not the stock target alone.
 If you need to discover a source, safer ground, or food, choose one offered low-risk scout by its opportunity ID. "Scout toward" names an exact dry travelHint landmark, not the resource you seek. "Step down" (route:dry_landing) names a checked adjacent dry landing, with no return implied. A route:dry_vantage may be a same-top shift, a short dry walk, or an explicitly labeled one-block climb. Only the climb authorizes one jump to its exact witnessed adjacent top; never jump from a visual hint. These ground-only moves need no travelHint. Name what the new view should answer. None authorizes water, pickup, breaking, or spending, and a new view proves neither stock nor a return route. Do not repeat an unchanged scout.
 If exact material, a priced surfaceOpening or prospectOpening, or a suitable route already supports the next job, use ordinary work as well. If one camera check is needed, quote the same bounded work and add an exact ID from work.openingViewIds as openingViewId. The first later safe view must show a matching physical start. After an anchored log or ore inspection, either fresh, fully priced vanilla harvest of that exact material or a current travelHint for the same target qualifies. Another trunk or the surrounding canopy cannot answer a check of an exact log. A bare turn cannot authorize movement toward an unrelated newly visible clue. If no useful start or safe alternative is supported, report what blocks it or abstain rather than looping camera checks.
 timberObstruction names one reachable dry leaf blocking the earlier physical approach toward its exact tree or woodland cue. Prefer a witnessed log or a proved route if available. If the user allows this cut, quote ordinary stock work for timberObstruction.timber with both break:<timberObstruction.block> and the exact log break, and reserve one break for the leaf in addition to the remaining logs. For woodland, timber is the earlier job's requested stock, not a species observed in the canopy. Use the normal job directly; neither target ID is a selectable opportunity. The player can clear only that one obstruction, reobserve, then continue if there is useful new evidence. Leaves give no wood and prove no route. Without permission, use a genuine alternative or stop, not another scan of the unchanged obstruction.
 If the next few production or gathering goals are already predictable, return work-program with two or three ordered stages, not one paid decision per stock threshold. Each stage includes one full work policy and requires: the minimum live stock necessary before that stage may start (empty only if there is no prerequisite). The previous job must complete and its stock/floors must still be true in the latest observation. Do not infer inventory credit from an uncompleted or pending effect. Use one original expiresTick for the entire program. Plan a useful horizon that can actually finish within it, carry each protected floor into every stage after it takes effect, and keep combined maximum breaks, crafts, and placements within 64, 64, and 8 respectively. Later stage permissions are conditional, not claims about the present world. Explicit recipes and possible vanilla sources are permission to use only after native observation; do not invent locations or ask it to act on invisible materials. When the user's meaningful finish includes the invocation goal and extra stock, make the final preset stage protect all those stock floors.
 Name exact vanilla block breaks (break:minecraft:oak_log), known native recipe keys (craft:oak_planks, craft:stick, craft:crafting_table, craft:wooden_pickaxe, craft:stone_pickaxe, craft:furnace, craft:bucket, craft:torch), and crafting table placement (place:minecraft:crafting_table). For a stock job, use the exact recipe output: craft:oak_planks rather than craft:planks. A bench recipe needs a visible table or a permitted placement; if first crafting the table, name and budget that recipe too. An offered “Reacquire recent” workstation clue allows one camera turn in place, not a click, craft, or guarantee of access. A work order may make that same check before using a bench recipe. No wildcards, general item use, portal actions, invented locations or skill code in a policy. Visible approach and collection appropriate to the target are local.
 Before choosing stock targets, add every later recipe's ingredient spend to the stock that must remain. Subtract genuinely held intermediates only to the extent they remain unspent and above their floors. Count executions, not items: two planks make four sticks, and one timber block makes four matching planks (two for a bamboo block). Placing a carried table spends one table; using an already reachable table spends none. Check exact species when a recipe requires it; mixed inputs in tag-based recipes do not satisfy an exact stock floor. If feedback reports a resource shortage, fix the target, prerequisites or explicit caps under current evidence rather than repeating the same path.
-For cobblestone, coal, or raw iron, choose between a visible source, a matching approach or cave frontier, and a witnessed surface start. A birch clue is not evidence of stone. If there is no exposed source, surfaceOpening names one exact dry cardinal cap beside the player, outside the current and retained footing. It proves only that the cut can be considered: no buried stone or ore, landing, descent, or return is known. If this is useful and compatible with the user's constraints, use one ordinary stock work order. Name break:<surfaceOpening.block> plus exact source breaks for that stock: stone or cobblestone for cobblestone; coal_ore or deepslate_coal_ore for coal; iron_ore or deepslate_iron_ore for raw iron (all with break:minecraft:). Include only permitted cover and source breaks. Reserve one break per missing stock unit, plus the cap and any further permitted excavation. A suitable source pick must remain usable; price the named tool's maxToolLoss above the protected floors. A minecraft:air clue means the native player can use a genuinely empty hand on turf with zero loss; a harvest pick is still needed for the source.
+For cobblestone, coal, or raw iron, choose between a visible source, a matching approach or cave frontier, and a witnessed surface start. A birch clue is not evidence of stone. A surfaceOpening is one exact dry block beside the player: a cap or a side wall, not the player's current or retained support. It proves only that a cut can be considered: no buried stone or ore, landing, descent, or return is known. Use a priced ordinary stock job, alone or as the first stage of a work-program. A later crafting stage must require actual stock; the opening does not guarantee it. Name break:<surfaceOpening.block> and the exact source breaks: stone or cobblestone for cobblestone; coal_ore or deepslate_coal_ore for coal; iron_ore or deepslate_iron_ore for raw iron (all with break:minecraft:). Reserve one break per missing stock unit plus the cap and any further permitted excavation. Preserve a usable source pick and price the named tool's maxToolLoss above its protected floor. A minecraft:air clue permits an empty hand on the cover, not harvesting rock without a pick.
 Do not put the surface target ID or any anchor in the reply; the host binds the exact cap and the player rechecks it before the cut. If a ground-facing camera check is offered and the cap is not yet witnessed, one paid openingViewId with the same quote may bind only after the camera reveals a fresh, matching physical start. A label or camera receipt alone cannot grant a cut. To choose a cave approach without cutting a cap, quote only source breaks. Soil and rock permissions are separate; name each permitted block exactly. A surface leg needs time to equip, cut, verify the first descent, and climb back; use a lease of at least about 650 ticks when the request allows it. The player rechecks the lease and descends one witnessed tread at a time only while light, dry footing, safety, the effect budget, and a reversible path allow it. Cover, travel, and collected stock are separate effects. Address the actual refusal before granting another leg.
 maxBreaks and maxCrafts are 0..64; maxPlacements is 0..8. costCaps bound aggregate counts of exact vanilla items spent, including ingredients and placed items; omitted items may not be spent. Set all applicable protected stock floors in reserves and preserve work.protectedReserves. Constrained mode cannot bypass these rules through a guarded primitive or a direct continuation. Choose modest effect caps and a long enough lease (up to basis.tick + maxIntentTtlTicks) for useful play and parallel planning.
 An accepted receipt identifies a native job. While work is running, free opportunities may be empty because the same actor is occupied; look at work.current.nativeState.progress for the live operation, actual stock and confirmed effects, not at empty offers for a capability-gap decision. A pending operation or a search label is not evidence of an effect. A successor demand means prepare the next objective during useful incumbent work, not that the incumbent is blocked. A cap-near warning means a bounded operation may soon exhaust, not that repeating the same permission can refill it. Renew means the current horizon is near expiry; blocked means a real refusal or native block. Judge outcomes from work.lastOutcome and fresh inventory.
@@ -84,8 +85,10 @@ If the descent lanes fail, the same job can follow a witnessed dry level foothol
 
 const WATER_PROMPT = `When a read-only ${MACRO_WATER_CLUE} clue names ${MACRO_WATER_SOURCE} and an empty bucket can be spent above its floor, choose a single live "work" action for {kind:"stock",item:"minecraft:water_bucket",count:1}. Set allowedEffects to ["${MACRO_WATER_FILL}"], costCaps to [{item:"minecraft:bucket",count:1}], and all three effect counters to zero. Preserve every reserve. The clue is not an opportunity to select: the native player stays on the same dry footing and uses only the exact rechecked source. Flowing water or a waterfall without a source clue is not enough. Await a completed native receipt and the bucket swap; do not renew a pending fill. This job does not grant movement, pouring, lava pickup, or portal casting.`;
 
-const VISUAL_PROMPT = `If the listed opportunities do not support the goal and the tool offers nominate-visible, you can ask about a specific useful region of this exact first-person image. Copy frame.captureId and frame.imageSha256. Use normalized top-left x/y and positive width/height up to 0.35, entirely inside the image. This only asks for a current visual check. It does not move, aim, act on an old pixel, or find hidden blocks.
+const VISUAL_PROMPT = `The opportunities list is not an inventory of everything you can see. With nominate-visible available, inspect the supplied image before deciding that no useful choice exists. If a specific visible surface could advance your objective but no ordinary offer identifies it, nominate its region for a current check. Not knowing whether you can walk there is not a reason to skip the read: it sends no movement or aim. If an independently witnessed job is already useful, take it directly; if the image gives no useful untried region, do not invent one. Copy frame.captureId and frame.imageSha256. Use normalized top-left x/y and positive width/height up to 0.35, entirely inside the image. Nomination neither acts on an old pixel nor reveals hidden blocks.
 visualRead reports the new check, not whether the surface is reachable. If the tool separately offers recon, use it only for useful forward exploration toward that exact checked target. Quote maxLegs (1–3) and maxBlocks (1–6 cumulative), using the smallest useful bounds. Each leg needs fresh footing, clearance and stopping evidence. Recon does not authorize breaking, placing, using, spending, pickup, or blind jumps. An absent recon offer means no movement was authorized by the read; choose a separate supported action or abstain. Do not repeat an unchanged nomination.`;
+const POST_LOOK_PROMPT = "This is the single visual reconsideration after a completed camera read. Nominate a useful region in the supplied image, " +
+  "abstain, or choose one stock job with an independently witnessed start. Do not request another camera turn, work program, recon, or skill.";
 
 const string = { type: "string" };
 const integer = { type: "integer" };
@@ -148,7 +151,8 @@ function smeltSuccessorId(work?: MacroRequest["work"]): string | undefined {
       work.current.nativeState?.progress?.smeltBurn)
     return work.current.id;
 }
-type VisualTool = { readonly nomination?: { readonly captureId: string; readonly imageSha256: string }; readonly reconId?: string };
+type VisualTool = { readonly nomination?: { readonly captureId: string; readonly imageSha256: string }; readonly reconId?: string;
+  readonly postLook?: true };
 
 const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroRequest["work"],
   observation?: MacroRequest["observation"], visual?: VisualTool): Tool => {
@@ -166,15 +170,16 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
   const openingViewIds = work?.openingViewIds;
   const unit = { type: "number", minimum: 0, maximum: 1 };
   const extent = { type: "number", exclusiveMinimum: 0, maximum: 0.35 };
+  const nomination = visual?.nomination ? action("nominate-visible", {
+    captureId: ticketId(visual.nomination.captureId), imageSha256: ticketId(visual.nomination.imageSha256),
+    region: strictObject({ x: unit, y: unit, width: extent, height: extent }),
+  }) : undefined;
   const otherActions = smeltId ? [] : [
     ...(work && !work.duringWaitFor ? [action("work", { policy: singleWorkPolicy }), action("work-program", { stages: workStages })] : []),
     ...(openingViewIds?.length ? [action("work", { policy: singleWorkPolicy,
       openingViewId: { type: "string", enum: openingViewIds } })] : []),
     ...(work?.current ? [action("revoke-work", { workOrderId: ticketId(work.current.id) })] : [
-      ...(visual?.nomination ? [action("nominate-visible", {
-        captureId: ticketId(visual.nomination.captureId), imageSha256: ticketId(visual.nomination.imageSha256),
-        region: strictObject({ x: unit, y: unit, width: extent, height: extent }),
-      })] : []),
+      ...(nomination ? [nomination] : []),
       ...(visual?.reconId ? [action("recon", { opportunityId: ticketId(visual.reconId),
         maxLegs: { type: "integer", enum: [1, 2, 3] }, maxBlocks: { type: "integer", enum: [1, 2, 3, 4, 5, 6] },
       })] : []),
@@ -201,7 +206,8 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
     parameters: { ...strictObject({
       subgoal: string, reason: string, successCondition: string, contingency: string, alternative: string,
       expiresTick: integer,
-      action: { anyOf: noParkedView ? [action("gap", { capability: string }), action("abstain")] : [
+      action: { anyOf: visual?.postLook ? [nomination!, action("work", { policy: independentWorkPolicy }), action("abstain")] :
+        noParkedView ? [action("gap", { capability: string }), action("abstain")] : [
         ...(renewal ? [action("renew-work", { workOrderId: ticketId(renewal.workOrderId) })] : []),
         ...(predecessorIds.length ? [action("work", { policy: singleWorkPolicy, afterWorkId }),
           action("work-program", { stages: workStages, afterWorkId })] : []),
@@ -368,7 +374,8 @@ function visualTool(request: MacroRequest, basis: MacroBasis, image?: ImageConte
   const exact = checked ?? verifiedImage(frame);
   if (!exact || image.mimeType !== exact.image.mimeType || image.data !== exact.image.data) return { reconId };
   try { validateMacroCaptureId(binding.captureId); } catch { return { reconId }; }
-  return { nomination: { captureId: binding.captureId, imageSha256: exact.sha256 }, reconId };
+  return visual.postLook ? { postLook: true, nomination: { captureId: binding.captureId, imageSha256: exact.sha256 } } :
+    { nomination: { captureId: binding.captureId, imageSha256: exact.sha256 }, reconId };
 }
 
 export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image?: ImageContent,
@@ -381,6 +388,7 @@ function buildPlanContext(request: MacroRequest, basis: MacroBasis, image?: Imag
   const { observation, objective, feedback, lastReceipt, strategicEpisodes, trigger, capabilitiesVersion,
     skillGeneration, skillVerbs, selectedSkillHash, testedSkills, maxSkillEffects,
     maxIntentTtlTicks, maxPlanTtlTicks, frame, nativeReview, lookahead, work } = request;
+  if (request.visual?.postLook && !visual?.postLook) return;
   if (preparedStock && (work?.mode !== "constrained" || work.demand !== "first" || work.current || lookahead ||
       !preparedStockView(observation, preparedStock))) return;
   const receipt = lastReceipt?.run === basis.run && lastReceipt.life === basis.life && lastReceipt.tick <= basis.tick
@@ -411,13 +419,15 @@ function buildPlanContext(request: MacroRequest, basis: MacroBasis, image?: Imag
     opportunities: observation.opportunities.filter(offer => offer.verb !== MACRO_RECON || offer.id === visual?.reconId)
       .map(({ id, verb, summary, risk, evidence, material, anchor }) =>
       ({ id, verb, summary, risk, evidence, material, anchor })),
-    ...(image && frame ? { frame: { tick: frame.tick, width: frame.width, height: frame.height, ...visual?.nomination } } : {}),
+    ...(image && frame ? { frame: { tick: frame.tick, width: frame.width, height: frame.height,
+      ...(visual?.nomination ? { readAction: "nominate-visible", ...visual.nomination } : {}) } } : {}),
   });
   if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) return;
   return {
     systemPrompt: preparedStock ? [PREPARED_STOCK_PROMPT] : [
       PROMPT, ...(work && !lookahead ? [FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT] : []),
       ...(visualActive ? [VISUAL_PROMPT] : []),
+      ...(visual?.postLook ? [POST_LOOK_PROMPT] : []),
     ],
     messages: [{
       role: "user", timestamp: Date.now(),
@@ -538,6 +548,10 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
       request.lookahead.candidates.some(offer => offer.id === action.opportunityId)) ? proposal : "successor";
   }
   if (action.kind === "successor") return "successor";
+  if (visual?.postLook && action.kind !== "nominate-visible" && action.kind !== "abstain" &&
+      (action.kind !== "work" || action.policy.target.kind !== "stock" ||
+        action.openingViewId || action.afterWorkId || action.duringWait || action.duringWaitFor))
+    return "post_look_visual";
   if (action.kind === "nominate-visible")
     return visual?.nomination?.captureId === action.captureId && visual.nomination.imageSha256 === action.imageSha256 ?
       proposal : "visual_nomination";
@@ -755,6 +769,7 @@ async function infer(
   const frame = request.frame ? verifiedImage(request.frame) : undefined;
   if (request.frame && !frame) return finish("invalid");
   const visual = options.preparedStock ? undefined : visualTool(request, basis, frame?.image, frame);
+  if (request.visual?.postLook && (!visual?.postLook || !request.verifyFrameDispatch)) return finish("stale");
   const context = buildPlanContext(request, basis, frame?.image, options.preparedStock, visual);
   if (!context) return finish("invalid");
   const result = await exchange<MacroProposal>(session, options, context, scope, started, raw => proposalFor(raw, request, basis, visual),

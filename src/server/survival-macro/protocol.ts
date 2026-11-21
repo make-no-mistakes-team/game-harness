@@ -433,6 +433,8 @@ export type MacroVisualProbeResult = MacroVisualProbeScope & { readonly tick: nu
 
 export interface MacroVisualContext {
   readonly mayNominate: boolean;
+  /** One exact image after a completed camera read; never another camera primitive. */
+  readonly postLook?: true;
   readonly read?: MacroVisualOutcome & { readonly tick: number; readonly region: MacroVisualRegion };
   readonly reconOpportunityId?: string;
 }
@@ -566,6 +568,7 @@ const replyRejections = {
   missing_opportunity: "Select an exact opportunityId offered in the current observation.",
   visual_nomination: "Nominate only a region of the exact native-bound image supplied for this request.",
   visual_recon: "Recon needs a separate bounded choice of the exact offered recon opportunity after its confirmed read.",
+  post_look_visual: "After a completed camera read, nominate a useful visible region, abstain, or quote a single already witnessed job without another camera read.",
   opening_view: "Use an offered openingViewId only for a camera check relevant to the quoted physical job; otherwise use ordinary work without it.",
   guarded_opportunity: "Constrained work mode does not admit guarded primitives. Use a bounded work policy with explicit costs and reserves for supported effects.",
   continuation: "A continuation needs direct authority and currently witnessed material selectors. Constrained mode does not admit continuations.",
@@ -847,7 +850,9 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   if (Object.hasOwn(record, "surfaceAnchor")) {
     const raw = shape(record.surfaceAnchor, "work surface anchor", ["subject", "target"]);
     surfaceAnchor = parseStartAnchor(raw, "surface anchor");
-    if (origin !== "model" || duringWaitFor || nextWorkId || /:[123]$/.test(id) || travelAnchor || harvestAnchor ||
+    // The successor ID is checked below. Only the first stage may bind this entry sight.
+    const staged = nextWorkId !== undefined || /:[123]$/.test(id);
+    if (origin !== "model" || duringWaitFor || (staged && !(nextWorkId && id.endsWith(":1"))) || travelAnchor || harvestAnchor ||
         !surfaceTargetPattern.test(surfaceAnchor.target) || !surfaceAnchorMatchesPolicy(surfaceAnchor, policy))
       invalid("work surface anchor scope");
   }

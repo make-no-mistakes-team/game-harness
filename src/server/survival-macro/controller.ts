@@ -92,6 +92,8 @@ const FIRST_ACTIONABLE_VIEW_TICKS = 10;
 const FIRST_ACTIONABLE_VIEW_MS = 600;
 const VISUAL_PROBE_TICKS = 40;
 const VISUAL_WITNESS_MS = 30_000;
+const POST_LOOK_TICKS = 80;
+const POST_LOOK_MS = 4_000;
 
 type TrialResult =
   | { readonly status: "passed"; readonly detail: string; readonly verb: string }
@@ -293,6 +295,8 @@ interface Decision {
   readonly firstLiveReadOf?: string;
   readonly visual?: MacroRequest["visual"];
   readonly visualFollowup?: true;
+  readonly postLook?: PostLook;
+  providerDispatched?: true;
   deliveredVisual?: MacroVisualBinding & { readonly imageSha256: string; readonly verify: () => Promise<boolean> };
 }
 
@@ -308,6 +312,13 @@ interface VisualFinding {
   readonly result: MacroVisualProbeResult;
   readonly receivedAt: number;
   followedUp?: true;
+}
+
+interface PostLook {
+  readonly issued: Issued;
+  readonly terminalTick: number;
+  readonly until: number;
+  readonly expiresTick: number;
 }
 
 class FrameRejected extends Error {
@@ -364,6 +375,8 @@ interface Issued {
   readonly scope: MacroObservation;
   readonly offer: MacroOpportunity;
   readonly openingWorkView?: true;
+  readonly paidCameraRead?: true;
+  readonly cameraFrame?: Pick<NonNullable<Decision["deliveredVisual"]>, "captureId" | "renderFrame" | "imageSha256">;
   readonly reserves?: readonly MacroStockFloor[];
   readonly priorTargets?: ReadonlySet<string>;
   readonly reconUntil?: number;
@@ -394,7 +407,7 @@ interface WorkJob {
 
 interface QueuedWork {
   readonly after: WorkJob | null;
-  readonly plan: Pick<Plan, "requestId" | "observation" | "replyKey" | "correction"> & {
+  readonly plan: Pick<Plan, "requestId" | "observation" | "replyKey" | "correction" | "postLook"> & {
     readonly proposal: Pick<MacroProposal, "expiresTick">;
   };
   readonly stages: readonly MacroWorkStage[];
@@ -846,6 +859,13 @@ function witnessedSideStart(observation: MacroObservation, policy: MacroWorkPoli
     preflightVanillaWork(observation, [{ policy, requires: [] }]).kind === "possible";
 }
 
+function postLookWorkStart(observation: MacroObservation, policy: MacroWorkPolicy): boolean {
+  return policy.target.kind === "stock" && hasStock(observation, policy.reserves) && stock(observation, policy.target.item) < policy.target.count &&
+    (witnessedSideStart(observation, policy) || !!foodWorkWitness(observation, policy) ||
+      !!matchingTravelHint(observation, policy) || !!openingWorkWitness(observation, policy, {}) ||
+      !!pricedTimberObstruction(observation, policy));
+}
+
 function workEvidence(observation: MacroObservation, lastReceipt: MacroReceipt | null): string {
   const pending = observation.pendingWork;
   return digest([observation.run, observation.life, observation.goal, observation.stance, observation.safety,
@@ -929,6 +949,8 @@ export class SurvivalMacroController {
   private visualProbe?: VisualProbe;
   private visualFinding?: VisualFinding;
   private readonly visualBases = new Set<string>();
+  private postLook?: PostLook;
+  private readonly postLookBases = new Set<string>();
   private readonly jobs = new Map<string, WorkJob>();
   private job?: WorkJob;
   /** Until candidate acceptance, native still owns this exact older lease. */
@@ -1154,6 +1176,49 @@ export class SurvivalMacroController {
         observation.tick - finding.result.tick < FIRST_ACTIONABLE_VIEW_TICKS &&
         performance.now() - finding.receivedAt < FIRST_ACTIONABLE_VIEW_MS) return;
     return finding;
+  }
+
+  private armPostLook(issued: Issued): void {
+    const receipt = issued.terminal;
+    if (!issued.paidCameraRead || !this.config.frame || this.config.preparedStockReady || this.closing ||
+        this.capabilitiesVersion !== MACRO_CAPABILITIES_VERSION || this.requests >= this.limits.maxRequests ||
+        !issued.accepted || receipt?.status !== "completed" || issued.withdrawn || issued.scope.stance === undefined) return;
+    const { run, life, goal, stance } = issued.scope;
+    const key = digest([run, life, goal, stance]);
+    if (this.postLookBases.has(key)) return;
+    this.postLookBases.add(key);
+    this.postLook = { issued, terminalTick: receipt.tick, until: performance.now() + POST_LOOK_MS,
+      expiresTick: Math.min(issued.intent.expiresTick, receipt.tick + POST_LOOK_TICKS) };
+  }
+
+  private retainedPostLook(look: PostLook, current: MacroObservation): boolean {
+    return sameOpeningStance(look.issued.scope, current) && current.tick < look.expiresTick &&
+      performance.now() < look.until;
+  }
+
+  private postLookHasOrdinaryStart(look: PostLook, observation: MacroObservation): boolean {
+    return !!(observation.travelHint || observation.prospectOpening || observation.surfaceOpening || observation.timberObstruction ||
+      observation.opportunities.some(offer => !isOpeningView(offer) &&
+        (meaningfulPrimitive(offer) || offer.verb === MACRO_FOOD_CLUE || offer.verb === MACRO_WATER_CLUE) &&
+        !offersAffordance(look.issued.scope, offer)));
+  }
+
+  private async tryPostLook(view: View): Promise<void> {
+    const look = this.postLook;
+    if (!look) return;
+    const { observation } = view;
+    if (!this.retainedPostLook(look, observation) || this.job || this.pending || this.lastReceipt?.id !== look.issued.intent.id) {
+      this.postLook = undefined;
+      return;
+    }
+    if (observation.tick <= look.terminalTick || !this.visualContext(observation)?.mayNominate ||
+        this.closing || !this.config.strategist || this.unavailable || this.requests >= this.limits.maxRequests) return;
+    const reserves = this.floorScope?.life === observation.life ? this.floorScope.reserves : [];
+    if (!hasStock(observation, reserves) || this.postLookHasOrdinaryStart(look, observation)) return;
+    this.postLook = undefined;
+    const workDemand: MacroWorkDemand = { mode: this.workMode!, demand: "changed", protectedReserves: reserves,
+      current: null, lastOutcome: null };
+    await this.begin(view, { workDemand }, undefined, look);
   }
 
   private async finishVisualProbe(reason: string, result?: MacroVisualProbeResult): Promise<void> {
@@ -1470,6 +1535,7 @@ export class SurvivalMacroController {
     if (this.workMode) {
       if (this.requests === 0 && this.config.preparedStockReady && !this.config.preparedStockReady(current)) return;
       await this.scheduleWork(this.view!, undefined, this.visualWake(current));
+      if (!this.busy && !this.job && !this.pending && this.view?.observation === current) await this.tryPostLook(this.view);
       return;
     }
     if (!this.config.strategist || !alive(current) || current.safety?.clear === false ||
@@ -1930,7 +1996,7 @@ export class SurvivalMacroController {
       key = evidence;
     }
     const asked = this.lastAsked?.observation;
-    const visualStart = !job && !queue && asked?.visualReady !== true && this.visualContext(observation)?.mayNominate
+    const visualStart = !job && !queue && !this.postLook && asked?.visualReady !== true && this.visualContext(observation)?.mayNominate
       ? digest(["first visual handoff", this.visualBasis(observation)]) : undefined;
     const newVisualStart = !!asked && !!visualStart && !this.workHandoffQueries.has(visualStart);
     const scout = !job && !queue && this.isCurrentHandoff(observation) && hasStock(observation,
@@ -2230,12 +2296,12 @@ export class SurvivalMacroController {
     if (!after && approach?.kind !== "resource" && this.workMode === "constrained" && !this.job &&
         hasSurfaceCoverEffect(policy) && !offeredOpeningStart(plan.observation, policy)) {
       const witness = openingWorkWitness(plan.observation, policy, {});
-      if (witness && "surfaceOpening" in witness && !stage) {
+      if (witness && "surfaceOpening" in witness && (!stage || (index === 0 && stageOffset === 0))) {
         surface = witness;
       } else if (!approach && (!witness || "surfaceOpening" in witness)) {
         this.queuedWork = undefined;
         await this.disposition("proposal_refused", { requestId: plan.requestId,
-          reason: "Surface entry needs a single ordinary job with a witnessed exact cap, a permitted stock source, and enough tools, costs, reserves, and breaks." });
+          reason: "Surface entry needs a witnessed exact opening and a fully priced ordinary stock job, either alone or as the first stage." });
         return;
       }
     }
@@ -2321,6 +2387,8 @@ export class SurvivalMacroController {
           await this.rejectStale(plan, "correction_context_changed_before_work_admission");
           return false;
         }
+        if (plan.postLook && (!sameOpeningStance(plan.observation, fresh) || !postLookWorkStart(fresh, policy)))
+          return false;
         if (food) return true; // The exact live recheck admits one source, not a projected yield.
         const checked = preflightVanillaWork(fresh, [stages[index]!]);
         if (afterSmelt && checked.kind !== "possible") {
@@ -2342,9 +2410,12 @@ export class SurvivalMacroController {
           return false;
         }
         return true;
-      }, duringWaitFor, undefined, currentStart ? (before, latest) =>
-        latest.tick - before.tick >= WORK_ADMISSION_TICKS ? withoutStart(latest, "physical_work_admission_basis_aged") :
-          currentStart(latest) : undefined,
+      }, duringWaitFor, undefined, currentStart || plan.postLook ? (before, latest) => {
+        if (latest.tick - before.tick >= WORK_ADMISSION_TICKS)
+          return withoutStart(latest, "physical_work_admission_basis_aged");
+        return (!plan.postLook || sameOpeningStance(plan.observation, latest) && postLookWorkStart(latest, policy)) &&
+          (currentStart?.(latest) ?? true);
+      } : undefined,
       travel ? () => ({ travelAnchor: { subject: travel.subject, target: travel.target } }) :
         timber ? () => ({ travelAnchor: timber.toward }) :
         surface ? () => ({ surfaceAnchor: surfaceAnchor(surface.surfaceOpening) }) : undefined);
@@ -2701,7 +2772,8 @@ export class SurvivalMacroController {
     if (standaloneSurvey && eligible && receipt.status === "completed" && record.accepted && this.workQuery) {
       this.workQuery.mayRecoverOnAffordance = true;
       await this.record("survey_awaiting_witness", { requestId: record.requestId, intentId: record.intent.id,
-        reason: "The fixed camera view completed. A changed physical affordance, not this receipt, can wake work planning." });
+        reason: "The fixed camera view completed. Only a fresh physical affordance or a checked new native image can wake planning." });
+      this.armPostLook(record);
     }
     const scout = isGroundScout(record.offer);
     const recon = !!record.intent.recon;
@@ -2849,11 +2921,12 @@ export class SurvivalMacroController {
     view: View, { lookahead, workDemand, workOverlap, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf }:
       Pick<Decision, "lookahead" | "workDemand" | "workOverlap" | "correction" | "reconsideration" | "reacquiredTravelOf" | "firstLiveReadOf">,
     visualWake?: VisualFinding,
+    postLook?: PostLook,
   ): Promise<void> {
     const trigger = this.trigger(view);
     const observation = view.observation;
     let disclosed = observation;
-    if (workDemand && !lookahead) {
+    if (workDemand && !lookahead && !postLook) {
       const lostOpening = reconsideration?.kind === "superseded-opening" ||
         (reconsideration?.kind === "alternative" && reconsideration.opening) ? reconsideration.offer : undefined;
       const canScout = !workDemand.current && !observation.pendingWork && this.isCurrentHandoff(observation) &&
@@ -2872,7 +2945,7 @@ export class SurvivalMacroController {
     }
     const observedAt = this.observedAt;
     const requestId = randomUUID();
-    const skills = lookahead || workDemand?.current ? undefined : this.config.skills;
+    const skills = lookahead || workDemand?.current || postLook ? undefined : this.config.skills;
     const selection = skills?.selection();
     const skillVerbs = this.config.trial && this.skillCandidates < this.limits.maxSkillCandidates &&
       this.testedCandidates.size === 0 ? skills?.allowedVerbs() : undefined;
@@ -2880,11 +2953,13 @@ export class SurvivalMacroController {
       skills?.status(selection.hash) === "active" ? selection.hash : undefined;
     const testedSkills = this.availableCandidates(selection?.generation);
     const generation = selection && (selectedSkillHash || skillVerbs?.length || testedSkills.length) ? selection.generation : null;
-    const visual = !lookahead && !workDemand?.current && !workDemand?.parkedWorksite && !reconsideration ?
+    const visual: MacroRequest["visual"] = postLook ? { mayNominate: true, postLook: true } :
+      !lookahead && !workDemand?.current && !workDemand?.parkedWorksite && !reconsideration ?
       this.visualContext(observation) : undefined;
     const resultingRead = visual?.read && (visualWake ?? this.currentVisualFinding(observation));
     // Candidate IDs outside this request's independently confirmed read are not planner or skill affordances.
-    const opportunities = disclosed.opportunities.filter(offer => offer.verb !== MACRO_RECON || offer.id === visual?.reconOpportunityId);
+    const opportunities = disclosed.opportunities.filter(offer => (offer.verb !== MACRO_RECON || offer.id === visual?.reconOpportunityId) &&
+      (!postLook || !isOpeningView(offer)));
     if (opportunities.length !== disclosed.opportunities.length) disclosed = { ...disclosed, opportunities };
     const request: MacroRequest = {
       observation: disclosed, objective: this.objective, trigger, capabilitiesVersion: this.capabilitiesVersion,
@@ -2893,7 +2968,11 @@ export class SurvivalMacroController {
       maxResponseBytes: this.limits.maxResponseBytes, maxIntentTtlTicks: this.limits.maxIntentTtlTicks,
       maxPlanTtlTicks: this.limits.maxPlanTtlTicks,
       lastReceipt: this.lastReceipt?.life === observation.life ? this.lastReceipt : null,
-      feedback: reconsideration?.kind === "superseded-opening" ? openingSupersessionFeedback(reconsideration) :
+      feedback: postLook ? { kind: "post_look_visual", detail: "The camera read completed, but no physical work was issued. " +
+        (postLook.issued.cameraFrame ? "This is the newly rendered view after that look. " :
+          "This is the first native-bound image for that look; it does not establish what the earlier pixels showed. ") +
+        "Nominate a useful visible region, abstain, or quote separate ordinary work only if a current structured witness supports it. Do not request another camera read." } :
+        reconsideration?.kind === "superseded-opening" ? openingSupersessionFeedback(reconsideration) :
         reconsideration?.kind === "alternative" ? {
         kind: "failed_intent",
         detail: reconsideration.opening
@@ -2904,17 +2983,20 @@ export class SurvivalMacroController {
       ...(workDemand ? { work: workDemand } : {}),
       ...(visual ? { visual } : {}),
     };
-    if (!lookahead) {
+    if (!lookahead && !postLook) {
+      this.postLook = undefined; // A normal follow-up took the slot instead of the optional image.
       this.queryKeys.add(view.query);
       this.lastAsked = view;
     }
-    const replyKey = !correction && !reconsideration && !lookahead && !workDemand?.current && !this.job && !this.queuedWork &&
+    const replyKey = !postLook && !correction && !reconsideration && !lookahead && !workDemand?.current && !this.job && !this.queuedWork &&
       sameLiveCorrectionScope(observation, observation) ? this.liveReplyKey(observation) : undefined;
     await this.record("request", { requestId, evidenceKey: view.evidence, request,
       ...(correction ? { correctionOf: correction.requestId } : {}),
       ...(reconsideration ? { reconsiderationOf: reconsideration.requestId, reconsideration: reconsideration.kind } : {}),
       ...(reacquiredTravelOf ? { reacquiredTravelOf } : {}),
       ...(firstLiveReadOf ? { firstLiveReadOf } : {}),
+      ...(postLook ? { postLookOf: postLook.issued.requestId, cameraIntentId: postLook.issued.intent.id,
+        cameraTerminalTick: postLook.terminalTick } : {}),
       ...(resultingRead ? { visualFollowupOf: resultingRead.probe.wire.requestId } : {}) });
     if (this.closing || performance.now() - this.startedAt! >= this.limits.maxRuntimeMs) {
       await this.disposition("request_not_dispatched", { requestId, reason: this.closing ? "stop" : "runtime_wall_limit" });
@@ -2941,7 +3023,7 @@ export class SurvivalMacroController {
       this.intentRecovery = undefined;
     const context: Decision = { requestId, observation, generation, testedSkills, selectedSkillHash,
       lookahead, workDemand, workOverlap, replyKey, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf, visual,
-      ...(visualWake ? { visualFollowup: true } : {}) };
+      ...(visualWake ? { visualFollowup: true } : {}), ...(postLook ? { postLook } : {}) };
     this.busy = {
       kind: "inference",
       work: this.work(context, this.limits.requestTimeoutMs, async signal => {
@@ -2976,9 +3058,20 @@ export class SurvivalMacroController {
         }
         // Authoring source and the in-memory history projection are not copied to the request log.
         const input = {
-          ...request, nativeReview: workDemand?.current ? undefined : this.config.nativeReview?.context,
+          ...request, nativeReview: workDemand?.current || postLook ? undefined : this.config.nativeReview?.context,
           strategicEpisodes: this.episodeMemory.forObservation(observation),
         };
+        if (postLook) {
+          const prior = postLook.issued.cameraFrame;
+          const next = sample?.visualBinding;
+          // The accepted camera completion proves a real look; neither an ID
+          // change nor heartbeat alone supplies the new image.
+          if (!next || prior && (next.captureId === prior.captureId || next.renderFrame <= prior.renderFrame ||
+              sample?.artifact?.sha256 === prior.imageSha256)) {
+            if (sample) await discardFrame(sample);
+            throw new FrameRejected("stale", "The completed camera read did not supply a distinct native-bound image.");
+          }
+        }
         if (!sample) return this.config.strategist!(input, signal);
         const { artifact, visualBinding, ...ordinaryFrame } = sample;
         const verify = artifact?.verify;
@@ -2990,13 +3083,16 @@ export class SurvivalMacroController {
           if (verify && !await verify()) {
             await this.record("request_frame_omitted", { requestId, basis: basis(observation), cause: "unavailable",
               reason: "The archived image was replaced before dispatch." });
+            if (postLook) throw new FrameRejected("stale", "The post-look image was replaced before dispatch.");
             return this.config.strategist!(input, signal);
           }
           signal.throwIfAborted();
           let dispatchVerified = false;
           const verifyFrameDispatch = binding && verify ? async () => {
             const latest = await this.ipc!.read("observation.json", parseMacroObservation);
-            dispatchVerified = sameNativeFrameScope(observation, latest) && await verify();
+            dispatchVerified = sameNativeFrameScope(observation, latest) &&
+              (!postLook || latest !== null && this.retainedPostLook(postLook, latest) &&
+                !this.postLookHasOrdinaryStart(postLook, latest) && hasStock(latest, workDemand!.protectedReserves)) && await verify();
             return dispatchVerified;
           } : verify;
           const result = await this.config.strategist!({ ...input, frame, verifyFrameDispatch }, signal);
@@ -3181,12 +3277,21 @@ export class SurvivalMacroController {
   ): Promise<void> {
     let proposal: MacroProposal | null = null;
     const inference = result.ok ? result.value : null;
+    if (inference?.dispatched === true) context.providerDispatched = true;
     const model = inference?.model && /^[A-Za-z0-9._:/-]{1,128}$/.test(inference.model) ? inference.model : null;
     if (model) this.models.add(model);
     if (typeof inference?.dispatched === "boolean") {
       this.unreportedDispatches--;
       if (inference.dispatched) this.providerDispatches++;
     } else if (!result.ok && result.preflight) this.unreportedDispatches--;
+    if (context.postLook && (inference?.dispatched === false || !result.ok && result.preflight)) {
+      // No provider received an eligible post-look image. Releasing the reserved
+      // slot does not recreate the one-shot camera handoff.
+      this.requests--;
+      await this.record("post_look_visual_skipped", { requestId: context.requestId,
+        cameraIntentId: context.postLook.issued.intent.id,
+        reason: result.ok ? result.value.outcome : result.detail });
+    }
     if (inference) {
       this.lastProviderOutcome = inference.outcome;
       this.lastProviderLatencyMs = positiveFinite(inference.latencyMs);
@@ -3281,6 +3386,7 @@ export class SurvivalMacroController {
       latencyMs: Math.round(result.settledAt - startedAt), providerLatencyMs: positiveFinite(inference?.latencyMs),
       frameSha256: inference?.frameSha256 && /^[a-f0-9]{64}$/.test(inference.frameSha256) ? inference.frameSha256 : null,
       ...(context.deliveredVisual ? { captureId: context.deliveredVisual.captureId, renderFrame: context.deliveredVisual.renderFrame } : {}),
+      ...(context.postLook ? { postLookOf: context.postLook.issued.requestId } : {}),
       disposition, reason, proposal: recordedProposal,
       ...(filtered ? { filteredAction: proposal?.action.kind } : {}),
       ...(correction ? { correctionOf: correction.requestId } : {}),
@@ -3354,6 +3460,14 @@ export class SurvivalMacroController {
       return;
     }
     const action = proposal.action;
+    if (context.postLook && (!context.deliveredVisual || !sameOpeningStance(original, current) ||
+        (action.kind !== "nominate-visible" && action.kind !== "abstain" &&
+          (action.kind !== "work" || action.openingViewId || action.afterWorkId || action.duringWaitFor || action.duringWait ||
+            !postLookWorkStart(original, action.policy) || !postLookWorkStart(current, action.policy))))) {
+      await this.record("post_look_visual_refused", { requestId: context.requestId,
+        reason: "The checked image allows nomination, abstention, or independently witnessed ordinary work without another look." });
+      return;
+    }
     if (action.kind === "work" && isFoodWork(action.policy) &&
         (this.job || action.afterWorkId || action.duringWaitFor || action.duringWait || action.openingViewId ||
           !foodWorkWitness(original, action.policy))) {
@@ -3896,6 +4010,7 @@ export class SurvivalMacroController {
       this.workQuery.mayRecoverOnAffordance = true;
       this.workQuery.failedOpeningPolicy = opening.policy;
     }
+    if (reason === "no_supported_physical_start") this.armPostLook(opening.issued);
     await this.record("opening_view_finished", { requestId: opening.plan.requestId, intentId: opening.issued.intent.id,
       terminalTick: opening.issued.terminal?.tick ?? null, reason,
       workOrderId: reason === "work_issued" ? this.job?.order.id : null });
@@ -4133,6 +4248,10 @@ export class SurvivalMacroController {
     }
     const macro: Issued = { requestId: plan.requestId, intent, scope: refreshed, offer: after!,
       ...(openingPolicy ? { openingWorkView: true } : {}),
+      ...(plan.providerDispatched && !authority && (openingPolicy || before.verb === "survey" && before.risk === "read" && !before.anchor)
+        ? { paidCameraRead: true, ...(plan.deliveredVisual ? { cameraFrame: {
+          captureId: plan.deliveredVisual.captureId, renderFrame: plan.deliveredVisual.renderFrame, imageSha256: plan.deliveredVisual.imageSha256,
+        } } : {}) } : {}),
       ...(reconFinding ? { reserves, reconUntil: Math.min(performance.now() + MACRO_RECON_MAX_TICKS * 50,
         reconFinding.probe.startedAt + VISUAL_WITNESS_MS) } : {}),
       ...(direct ? { reserves: direct.action.reserves, priorTargets: direct.usedTargets } : {}),
@@ -4251,6 +4370,7 @@ export class SurvivalMacroController {
     const ipc = this.ipc;
     if (!ipc) return;
     this.intentRecovery = undefined;
+    this.postLook = undefined;
     if (this.pending) this.pending.withdrawn = true;
     const errors: unknown[] = [];
     try { await ipc.remove("active.json"); this.markerLive = false; } catch (error) { errors.push(error); }

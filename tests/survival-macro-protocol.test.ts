@@ -67,6 +67,13 @@ test("Terra exposes region nomination only for the exact native-bound image incl
   expect(JSON.stringify(context.tools)).toContain('"nominate-visible"');
   expect(JSON.stringify(context.tools)).toContain(binding.captureId);
   expect(JSON.stringify(context.messages)).toContain(sha256);
+  const postLook = { ...request, visual: { mayNominate: true, postLook: true as const } };
+  const postLookSchema = JSON.stringify(terraPlanContext(postLook, observation, image)?.tools);
+  expect(postLookSchema).toContain('"nominate-visible"');
+  expect(postLookSchema).toContain('["work"]');
+  for (const action of ["opportunity", "openingViewId", "work-program", "preset", "recon", "skill", "gap"])
+    expect(postLookSchema).not.toContain(`"${action}"`);
+  expect(terraPlanContext(postLook, observation)).toBeUndefined();
   for (const candidate of [
     terraPlanContext(request, observation),
     terraPlanContext({ ...request, work: undefined }, observation, image),
@@ -239,7 +246,7 @@ test("A dry surface cap is read-only and an empty hand cannot spend a tool or ha
   expect(JSON.stringify(context!.tools)).not.toContain("m-5");
 });
 
-test("A surface entry order is a host-only single stock job with exact cover and source effects", () => {
+test("Only a standalone or first stock stage can bind the host's exact surface opening", () => {
   const surfaceAnchor = { subject: "block:minecraft:grass_block", target: "m-5" };
   const policy = { target: { kind: "stock", item: "minecraft:cobblestone", count: 3 },
     allowedEffects: ["break:minecraft:grass_block", "break:minecraft:stone"],
@@ -249,6 +256,7 @@ test("A surface entry order is a host-only single stock job with exact cover and
     safetyRevision: 2, origin: "model", ...policy, surfaceAnchor,
   };
   expect(parseMacroWorkOrder(order)).toMatchObject({ surfaceAnchor, ...policy });
+  expect(parseMacroWorkOrder({ ...order, id: "work:1", nextWorkId: "work:2" })).toMatchObject({ surfaceAnchor, nextWorkId: "work:2" });
   for (const invalid of [
     { maxBreaks: 1 }, { allowedEffects: ["break:minecraft:grass_block"] }, { target: { ...policy.target, item: "minecraft:oak_log" } },
     { surfaceAnchor: { ...surfaceAnchor, subject: "block:minecraft:dirt" } },
@@ -256,7 +264,7 @@ test("A surface entry order is a host-only single stock job with exact cover and
     { surfaceAnchor: { ...surfaceAnchor, target: "m-0" } },
     { travelAnchor: { subject: "block:minecraft:stone", target: "m-7" } },
     { harvestAnchor: { subject: "block:minecraft:stone", target: "m-7" } },
-    { id: "work:1", nextWorkId: "work:2" }, { duringWaitFor: "paid-ticket" },
+    { id: "work:1" }, { id: "work:2", nextWorkId: "work:3" }, { id: "work:3" }, { duringWaitFor: "paid-ticket" },
   ]) expect(() => parseMacroWorkOrder({ ...order, ...invalid })).toThrow("work surface anchor scope");
   expect(() => parseMacroProposal({ action: { kind: "work", policy, surfaceAnchor }, expiresTick: 1200,
     subgoal: "Find stone", reason: "Dry cap is visible beside the player", successCondition: "Cobblestone appears in inventory",

@@ -387,8 +387,10 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
             SurfaceAnchor surfaceAnchor = null;
             if (value.has("surfaceAnchor")) {
                 var raw = value.getAsJsonObject("surfaceAnchor");
-                if (!mode.equals("constrained") || duringWaitFor != null || nextWorkId != null || travelAnchor != null
-                        || harvestAnchor != null || stageSuffix(envelope.id)
+                // A successor, when present, has already passed adjacentStage.
+                boolean staged = nextWorkId != null || stageSuffix(envelope.id);
+                if (!mode.equals("constrained") || duringWaitFor != null || travelAnchor != null
+                        || harvestAnchor != null || staged && !(nextWorkId != null && envelope.id.endsWith(":1"))
                         || !raw.keySet().equals(Set.of("subject", "target"))) return envelope;
                 String subject = text(raw, "subject"), identity = text(raw, "target");
                 if (!MATERIAL_ID.matcher(identity).matches() || !blockAnchorSubject(subject)) return envelope;

@@ -67,6 +67,13 @@ test("Terra exposes region nomination only for the exact native-bound image incl
   expect(JSON.stringify(context.tools)).toContain('"nominate-visible"');
   expect(JSON.stringify(context.tools)).toContain(binding.captureId);
   expect(JSON.stringify(context.messages)).toContain(sha256);
+  // The advertised deadline must respect both the image lifetime and a shorter run policy.
+  for (const [maxIntentTtlTicks, expected] of [[1200, 717], [60, 177]] as const) {
+    const [msg] = terraPlanContext({ ...request, maxIntentTtlTicks }, observation, image)!.messages;
+    if (msg?.role !== "user" || !Array.isArray(msg.content) || msg.content[0]?.type !== "text")
+      throw new Error("verified visual frame missing from the provider message");
+    expect(JSON.parse(msg.content[0].text).frame.readExpiresTick).toBe(expected);
+  }
   const postLook = { ...request, visual: { mayNominate: true, postLook: true as const } };
   const postLookSchema = JSON.stringify(terraPlanContext(postLook, observation, image)?.tools);
   expect(postLookSchema).toContain('"nominate-visible"');

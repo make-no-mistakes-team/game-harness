@@ -237,7 +237,9 @@ Terra can nominate a region of a first-person image when the client
 captured the image and its camera geometry together. A nomination asks
 what visible surface is there. It does not turn the camera, move the
 player, break anything, or prove a route. An ordinary desktop image
-without that binding cannot supply a target.
+without that binding cannot supply a target. The image includes its
+read deadline because the game keeps ticking while Terra answers. A
+late answer cannot extend the deadline or authorize a move.
 If a requested camera look finds no physical start, a genuinely new
 bound image can give Terra one more chance to nominate a surface. It
 does not start another sequence of camera turns.

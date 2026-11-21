@@ -86,6 +86,7 @@ If the descent lanes fail, the same job can follow a witnessed dry level foothol
 const WATER_PROMPT = `When a read-only ${MACRO_WATER_CLUE} clue names ${MACRO_WATER_SOURCE} and an empty bucket can be spent above its floor, choose a single live "work" action for {kind:"stock",item:"minecraft:water_bucket",count:1}. Set allowedEffects to ["${MACRO_WATER_FILL}"], costCaps to [{item:"minecraft:bucket",count:1}], and all three effect counters to zero. Preserve every reserve. The clue is not an opportunity to select: the native player stays on the same dry footing and uses only the exact rechecked source. Flowing water or a waterfall without a source clue is not enough. Await a completed native receipt and the bucket swap; do not renew a pending fill. This job does not grant movement, pouring, lava pickup, or portal casting.`;
 
 const VISUAL_PROMPT = `The opportunities list is not an inventory of everything you can see. With nominate-visible available, inspect the supplied image before deciding that no useful choice exists. If a specific visible surface could advance your objective but no ordinary offer identifies it, nominate its region for a current check. Not knowing whether you can walk there is not a reason to skip the read: it sends no movement or aim. If an independently witnessed job is already useful, take it directly; if the image gives no useful untried region, do not invent one. Copy frame.captureId and frame.imageSha256. Use normalized top-left x/y and positive width/height up to 0.35, entirely inside the image. Nomination neither acts on an old pixel nor reveals hidden blocks.
+For a nomination, set expiresTick to frame.readExpiresTick unless the read must expire sooner. The game keeps ticking during inference. This is the last usable tick boundary for the photo, not a movement lease; the short physical recheck begins only after delivery.
 visualRead reports the new check, not whether the surface is reachable. If the tool separately offers recon, use it only for useful forward exploration toward that exact checked target. Quote maxLegs (1–3) and maxBlocks (1–6 cumulative), using the smallest useful bounds. Each leg needs fresh footing, clearance and stopping evidence. Recon does not authorize breaking, placing, using, spending, pickup, or blind jumps. An absent recon offer means no movement was authorized by the read; choose a separate supported action or abstain. Do not repeat an unchanged nomination.`;
 const POST_LOOK_PROMPT = "This is the single visual reconsideration after a completed camera read. Nominate a useful region in the supplied image, " +
   "abstain, or choose one stock job with an independently witnessed start. Do not request another camera turn, work program, recon, or skill.";
@@ -420,7 +421,8 @@ function buildPlanContext(request: MacroRequest, basis: MacroBasis, image?: Imag
       .map(({ id, verb, summary, risk, evidence, material, anchor }) =>
       ({ id, verb, summary, risk, evidence, material, anchor })),
     ...(image && frame ? { frame: { tick: frame.tick, width: frame.width, height: frame.height,
-      ...(visual?.nomination ? { readAction: "nominate-visible", ...visual.nomination } : {}) } } : {}),
+      ...(visual?.nomination ? { readAction: "nominate-visible", ...visual.nomination,
+        readExpiresTick: basis.tick + Math.min(maxIntentTtlTicks, MACRO_VISUAL_WITNESS_MAX_TICKS) } : {}) } } : {}),
   });
   if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) return;
   return {

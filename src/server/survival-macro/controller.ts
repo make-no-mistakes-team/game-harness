@@ -3325,7 +3325,9 @@ export class SurvivalMacroController {
       ? filterPreparedStockProposal(proposal.action, original) : undefined;
     const disposition = filtered?.disposition ?? decision;
     const reason = rotation ? "A rotating observation deferred the correction before provider dispatch." :
-      rejection ? macroReplyRejectionDetail(rejection) : filtered?.reason ?? (result.ok ? null : result.detail);
+      rejection ? macroReplyRejectionDetail(rejection) : expired ?
+        `The reply expired at tick ${proposal!.expiresTick} before admission at tick ${current!.tick}.` :
+        filtered?.reason ?? (result.ok ? null : result.detail);
     if (this.config.preparedStockReady) this.preparedStockDecision = {
       requestId: context.requestId, disposition, reason: reason ?? (
         decision === "proposed" ? "No stock order could be published from the current physical witness." :

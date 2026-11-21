@@ -104,6 +104,10 @@ final class AgentSurfaceTread {
 
     boolean inFlight() { return drivingSince >= 0; }
 
+    boolean refusedOnTakeoff(BlockPos foot, boolean grounded) {
+        return !returning && grounded && from.equals(foot);
+    }
+
     /** Look ahead only along the next exact walked level edge, never around a corner or over a riser. */
     AgentSurfaceTread recallSuccessor(MinecraftClient client, BlockPos next, long tick) {
         if (!isolated || !straightLevelContinuation(from, to, next, travel)) return null;

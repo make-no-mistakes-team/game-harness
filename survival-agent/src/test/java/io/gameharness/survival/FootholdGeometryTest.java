@@ -263,6 +263,44 @@ final class FootholdGeometryTest {
     }
 
     @Test
+    void stoppedStonePickupDoesNotConsumeAShallowStairThatWasNeverTaken() {
+        var rim = new BlockPos(-21, 61, 16);
+        var landing = rim.north().down();
+        var edge = new AgentSurfaceTread.Edge(rim, Blocks.GRASS_BLOCK.getDefaultState(), landing,
+            Blocks.STONE.getDefaultState(), Direction.NORTH);
+        var outbound = new AgentSurfaceTread(edge, false, 255);
+        assertTrue(outbound.refusedOnTakeoff(rim, true), "the rim remains the actual working stance");
+        assertFalse(outbound.refusedOnTakeoff(rim, false), "airborne interruption is not a safe reset");
+        assertFalse(outbound.refusedOnTakeoff(landing, true), "a changed foot position is not a refusal on takeoff");
+        assertFalse(new AgentSurfaceTread(edge, true, 255).refusedOnTakeoff(landing, true),
+            "a refused reverse edge still preserves the outstanding return");
+
+        var player = new Box(-20.78, 61, 16.17, -20.18, 62.8, 16.77);
+        var inReach = new Box(-20.8, 60.4, 15.42, -20.55, 60.65, 15.67);
+        assertTrue(AgentPickup.passiveOverlap(player, inReach), "vanilla may collect from the rim without walking");
+        assertFalse(AgentPickup.passiveOverlap(player, inReach.offset(0, -0.3, 0)),
+            "a drop outside passive overlap is not pickup authority or proof");
+    }
+
+    @Test
+    void exposedRimWallDoesNotNominateEitherSupportAsAResource() {
+        var rim = new BlockPos(-21, 61, 16);
+        var opening = rim.north().down();
+        var farWall = opening.north();
+        var towardRim = new BlockHitResult(Vec3d.ofCenter(farWall).add(0, 0, 0.5), Direction.SOUTH, farWall, false);
+        assertEquals(opening, AgentMacroControl.rimSourceOpening(rim, towardRim));
+        assertNull(AgentMacroControl.rimSourceOpening(rim,
+            new BlockHitResult(towardRim.getPos(), Direction.NORTH, farWall, false)), "the far face is not a local rim wall");
+        assertNull(AgentMacroControl.rimSourceOpening(rim,
+            new BlockHitResult(Vec3d.ofBottomCenter(opening), Direction.UP, opening.down(), false)), "protect the lower tread");
+        assertNull(AgentMacroControl.rimSourceOpening(rim,
+            new BlockHitResult(Vec3d.ofCenter(rim.down()).add(0, 0, -0.5), Direction.NORTH, rim.down(), false)),
+            "protect the player's rim");
+        assertNull(AgentMacroControl.rimSourceOpening(rim,
+            BlockHitResult.createMissed(towardRim.getPos(), Direction.SOUTH, farWall)), "never infer stone from a miss");
+    }
+
+    @Test
     void aFlatDryShelfCanSpareOneAdjacentFloorForAStair() {
         var foot = new BlockPos(0, 30, 0);
         var east = foot.east();

@@ -37,6 +37,13 @@ final class AgentPickup {
 
     private AgentPickup() {}
 
+    /** No movement needed; inventory confirmation still belongs to vanilla. */
+    static boolean passiveOverlap(Box player, Box drop) {
+        return drop.maxY > player.minY - 0.5 && drop.minY < player.maxY + 0.5
+            && drop.maxX > player.minX - 1 && drop.minX < player.maxX + 1
+            && drop.maxZ > player.minZ - 1 && drop.minZ < player.maxZ + 1;
+    }
+
     static Input input(Box player, Box drop, boolean onGround, Vec3d waypoint, float yaw) {
         // PlayerEntity checks intersecting item boxes, not distance to their centers or the crosshair.
         if (drop.maxY <= player.minY - 0.5 || drop.minY >= player.maxY + 0.5)

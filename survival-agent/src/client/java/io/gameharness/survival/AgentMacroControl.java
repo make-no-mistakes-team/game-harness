@@ -265,6 +265,7 @@ final class AgentMacroControl {
                             TimberObstruction timberObstruction, SurfaceOpening surfaceOpening) {}
     private record SurfaceOpening(AgentWorkOrder.SurfaceAnchor anchor, BlockPos foot, BlockState support,
                                   Face face, Item tool, int loss) {}
+    private record SourceRefusal(BlockHitResult hit, BlockState state, String reason) {}
     private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity,
                           String skillHash, AgentVisualRecon.Bounds recon) {}
     private record Handoff(int life, long epoch, long basis, long expires) {}
@@ -371,7 +372,7 @@ final class AgentMacroControl {
         boolean timberApproached, timberWorkStance;
         long dropSeen, pickupProgress;
         Vec3d dropPosition, pickupFooting;
-        boolean dropGrounded, retryDropWhenVisible;
+        boolean dropGrounded, retryDropWhenVisible, passivePickup;
         TimberObstruction timberOpening;
         int timberLogsNeeded;
         AgentSurfaceTread tread;
@@ -518,6 +519,7 @@ final class AgentMacroControl {
         BlockPos lastHarvest;
         long lastHarvestTick;
         Item lastHarvestItem;
+        int lastHarvestStock;
         TimberSight timberLook;
         long timberLookUntil, timberLookFrame;
         boolean timberLookUsed;
@@ -526,6 +528,9 @@ final class AgentMacroControl {
         Face timberClosing;
         Face sourceLook;
         long sourceLookUntil;
+        String outwardTreadRefusal;
+        AgentSurfaceTread.Edge refusedOutwardTread;
+        SourceRefusal sourceRefusal;
         long lastEffectTick, completedTick;
         long recoveryProof;
         String lastEffect;
@@ -1112,6 +1117,8 @@ final class AgentMacroControl {
     private int stationSequence;
     private long timberFrame = -1;
     private SourceSearch surfaceSearch = new SourceSearch();
+    private long rimProofTick = -1;
+    private int rimSampled, rimProved;
     private DiamondRoute diamondRoute = new DiamondRoute();
     private PersonalCraft personalCraft;
     private AgentPauseEpisodes.Work continuityWork;
@@ -2048,6 +2055,7 @@ final class AgentMacroControl {
             return;
         }
         work.sourceBlock = null;
+        work.sourceRefusal = null;
         var target = work.order.policy().target();
         Item goalStock = goalStock(target);
         boolean goalReached = goalStock != null && count(goalStock) >= goalAmount(target);
@@ -2124,7 +2132,9 @@ final class AgentMacroControl {
             if (action != null) runWorkStep(progress);
             return;
         }
-        if (!personal && work.lastHarvest != null && tick - work.lastHarvestTick <= (deepWork() ? 70 : 15)) {
+        if (!personal && work.lastHarvest != null && (!AgentWorkOrder.earlySurfaceStock(work.lastHarvestItem)
+                || count(work.lastHarvestItem) <= work.lastHarvestStock)
+                && tick - work.lastHarvestTick <= (deepWork() ? 70 : 15)) {
             Item expected = work.lastHarvestItem;
             if (work.lowerHarvest && expected == Items.DIAMOND && deepWork()
                     && footOfDiamondTread(player.getBlockPos(), work.lastHarvest)) {
@@ -2136,12 +2146,23 @@ final class AgentMacroControl {
                     return;
                 }
             }
-            if (work.lowerHarvest && surfaceStepOrigin(sourceSearch, player.getBlockPos())
-                    && work.lastHarvest.equals(AgentSurfaceTread.nextFoot(player.getBlockPos(), sourceSearch.cutBearing))) {
+            if (work.lowerHarvest && !deepWork()) {
+                boolean nextTread = surfaceStepOrigin(sourceSearch, player.getBlockPos())
+                    && work.lastHarvest.equals(AgentSurfaceTread.nextFoot(player.getBlockPos(), sourceSearch.cutBearing));
+                Vec3d harvested = Vec3d.ofCenter(work.lastHarvest);
                 ItemEntity drop = (ItemEntity) body.visibleEntity(entity -> entity instanceof ItemEntity item
-                    && item.getBlockPos().equals(work.lastHarvest) && item.getStack().isOf(expected)
+                    && item.getPos().squaredDistanceTo(harvested) <= 2.25
+                    && item.getStack().isOf(expected)
                     && roomFor(item.getStack()), 3.25).orElse(null);
-                if (drop != null && prepareNextTread(player.getBlockPos(), progress, state -> AgentWorkOrder.harvest(state) == expected
+                if (drop != null && AgentPickup.passiveOverlap(player.getBoundingBox(), drop.getBoundingBox())) {
+                    startWorkPickup(drop);
+                    action.passivePickup = true;
+                    work.lastHarvest = null;
+                    runWorkStep(progress);
+                    return;
+                }
+                if (nextTread && drop != null && drop.isOnGround() && drop.getBlockPos().equals(work.lastHarvest)
+                        && prepareNextTread(player.getBlockPos(), progress, state -> AgentWorkOrder.harvest(state) == expected
                         && work.budget.policy.breakAllowed(state), sourceSearch)) {
                     if (action != null && action.tread != null) {
                         action.stairDrop = drop;
@@ -2399,13 +2420,7 @@ final class AgentMacroControl {
             diamondRoute.freshRaysPending = false;
             return prospectForDiamond(progress, wanted, null);
         }
-        Predicate<BlockHitResult> eligible = hit -> {
-            BlockPos pos = hit.getBlockPos();
-            if (work.rejected.contains(pos)) return false;
-            BlockState state = world.getBlockState(pos);
-            return scopedSourceHit(hit) && workResourceSafe(hit, state, progress)
-                && workToolSlot(pos, state) >= 0 && roomFor(new ItemStack(AgentWorkOrder.harvest(state)));
-        };
+        Predicate<BlockHitResult> eligible = hit -> eligibleWorkSource(hit, progress);
         double reach = reach();
         if (diamond && diamondRoute.cutting) {
             // Keep the next paid action in the established heading. An already rendered
@@ -2429,7 +2444,12 @@ final class AgentMacroControl {
             if (workGatherTimber(progress, wanted, eligible, required)) return true;
             if (work.sourceBlock != null) return false;
         }
-        var found = body.find(wanted, reach, hit -> eligible.test(hit) && body.macroMineWitness(hit, reach) != null).orElse(null);
+        var found = body.find(wanted, reach, hit -> {
+            if (!eligible.test(hit)) return false;
+            if (body.macroMineWitness(hit, reach) != null) return true;
+            noteSourceRefusal(hit, world.getBlockState(hit.getBlockPos()), "The visible face has no current exact within-reach mining contact.");
+            return false;
+        }).orElse(null);
         if (found != null) {
             Face face = face(found);
             return startWorkBreak(face, AgentWorkOrder.harvest(face.state), false);
@@ -2465,6 +2485,27 @@ final class AgentMacroControl {
         if (!deepWork() && work.sourceSearch.stairs.isEmpty() && startSourceCaveStep(progress, found)) return true;
         if (startContactHorizonSource(sourceTravel) || startContactHorizonSource(caveTravel)) return true;
         return prospectForSource(progress, wanted);
+    }
+
+    private boolean eligibleWorkSource(BlockHitResult hit, AgentProgress progress) {
+        BlockPos pos = hit.getBlockPos();
+        BlockState state = world.getBlockState(pos);
+        String reason;
+        if (work.rejected.contains(pos)) reason = "The visible source already failed physical revalidation in this work order.";
+        else if (!scopedSourceHit(hit)) reason = "The visible source does not match the work's exact approach scope.";
+        else {
+            reason = workResourceRefusal(hit, state, progress, player.getBlockPos(), work.sourceSearch);
+            if (reason == null && workToolSlot(pos, state) < 0)
+                reason = "No carried, equippable harvest tool fits this exact source and its remaining cost and reserves.";
+        }
+        if (reason == null) return true;
+        noteSourceRefusal(hit, state, reason);
+        return false;
+    }
+
+    private void noteSourceRefusal(BlockHitResult hit, BlockState state, String reason) {
+        if (work.sourceRefusal == null && AgentWorkOrder.earlySurfaceStock(work.order.policy().target().item()))
+            work.sourceRefusal = new SourceRefusal(hit, state, reason);
     }
 
     private boolean startSourceCaveStep(AgentProgress progress, BlockHitResult source) {
@@ -3180,16 +3221,52 @@ final class AgentMacroControl {
     }
 
     private boolean workResourceSafe(BlockHitResult hit, BlockState block, AgentProgress progress) {
+        return workResourceRefusal(hit, block, progress, player.getBlockPos(), work.sourceSearch) == null;
+    }
+
+    private String workResourceRefusal(BlockHitResult hit, BlockState block, AgentProgress progress,
+                                       BlockPos foot, SourceSearch search) {
         BlockPos cell = hit.getBlockPos();
-        BlockPos foot = player.getBlockPos();
-        var search = work.sourceSearch;
+        if (cell.equals(foot.down()) || search.footholds.contains(cell)) return "The visible resource is retained footing.";
+        Item stock = AgentWorkOrder.harvest(block);
+        String unsafe = dryWorkBreakRefusal(cell, block, stock, progress);
+        if (unsafe != null) return unsafe;
+        if (cell.getY() >= foot.getY()) return null;
         boolean nextTreadSource = surfaceStepOrigin(search, foot) && cell.getY() == foot.getY() - 1
             && AgentSurfaceTread.plannedCell(foot, cell, search.cutBearing, hit.getSide())
             && retainedProspectStance(foot, cell, search);
         boolean diamondTreadSource = deepWork() && footOfDiamondTread(foot, cell)
-            && diamondCutGeometry(foot, cell) && AgentWorkOrder.harvest(block) == Items.DIAMOND;
-        return (cell.getY() >= foot.getY() || nextTreadSource || diamondTreadSource) && !search.footholds.contains(cell)
-            && dryWorkBreakSafe(cell, block, AgentWorkOrder.harvest(block), progress);
+            && diamondCutGeometry(foot, cell) && stock == Items.DIAMOND;
+        if (nextTreadSource || diamondTreadSource) return null;
+        return AgentWorkOrder.earlySurfaceStock(stock) && witnessedRimSource(hit, foot, search)
+            ? null : "The visible resource is below the stance without a verified non-supporting rim face.";
+    }
+
+    /** Mine a lit inward wall from the rim; the lower tread is kept and no movement is inferred. */
+    static BlockPos rimSourceOpening(BlockPos foot, BlockHitResult wall) {
+        if (wall == null || wall.getType() != HitResult.Type.BLOCK || wall.isInsideBlock()
+                || wall.getBlockPos().getY() != foot.getY() - 1 || !wall.getSide().getAxis().isHorizontal()
+                || wall.getBlockPos().equals(foot.down())) return null;
+        BlockPos opening = wall.getBlockPos().offset(wall.getSide());
+        return cardinallyAdjacent(foot.down(), opening) ? opening : null;
+    }
+
+    private boolean witnessedRimSource(BlockHitResult hit, BlockPos foot, SourceSearch search) {
+        BlockPos opening = rimSourceOpening(foot, hit);
+        if (opening == null || !grounded() || !dryProspectStance(foot) || !world.getBlockState(opening).isAir()
+                || !retainedCutSpace(foot, hit.getBlockPos(), player.getBoundingBox(), search.footholds)) return false;
+        if (rimProofTick != tick) {
+            rimProofTick = tick;
+            rimSampled = rimProved = 0;
+        }
+        int dx = opening.getX() - foot.getX(), dz = opening.getZ() - foot.getZ();
+        int bearing = dx == 0 ? dz < 0 ? 1 : 2 : dx < 0 ? 4 : 8;
+        if ((rimSampled & bearing) == 0) {
+            rimSampled |= bearing;
+            Vec3d floor = Vec3d.ofBottomCenter(opening).add(0.24 * dx, -0.032, 0.24 * dz);
+            if (body.dryRouteFloor(floor, opening.down()) != null) rimProved |= bearing;
+        }
+        return (rimProved & bearing) != 0;
     }
 
     private boolean dryWorkBreakSafe(BlockPos pos, BlockState block, Item drop, AgentProgress progress) {
@@ -4325,6 +4402,10 @@ final class AgentMacroControl {
         search.stairAim = null;
         var edge = new AgentSurfaceTread.Edge(foot, takeoff, opening,
             world.getBlockState(floor.getBlockPos()), bearing);
+        if (edge.equals(work.refusedOutwardTread)) {
+            work.sourceBlock = work.outwardTreadRefusal;
+            return false;
+        }
         startSurfaceTread(edge, false);
         return true;
     }
@@ -4530,7 +4611,7 @@ final class AgentMacroControl {
         float speed = 0;
         for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
             ItemStack hand = inventory.getStack(i);
-            if (block.isToolRequired() && !hand.isSuitableFor(block)) continue;
+            if (block.isToolRequired() && !hand.isSuitableFor(block) || !prospectEquip.test(i)) continue;
             if (!AgentMiningStock.lootCompatible(hand, block)) continue;
             int loss = AgentMiningStock.maxLoss(hand, block, world, pos);
             if (loss < 0 || loss > 0 && work.budget.limit(hand.getItem(), count(hand.getItem())) < loss) continue;
@@ -4634,6 +4715,26 @@ final class AgentMacroControl {
             work.sourceSearch.blockedAt = player.getBlockPos();
             reason = "Bounded surface search found no new actionable source. " + work.sourceBlock + " Remaining grant: "
                 + work.budget.breaksLeft() + " breaks, " + Math.max(0, workTicksLeft()) + " ticks.";
+        }
+        var refused = work.sourceRefusal;
+        if (AgentWorkOrder.earlySurfaceStock(work.order.policy().target().item())) {
+            var evidence = header(run);
+            evidence.addProperty("life", life);
+            evidence.addProperty("tick", tick);
+            evidence.addProperty("frame", body.renderedFrame());
+            evidence.addProperty("feet", player.getBlockPos().toShortString());
+            evidence.addProperty("rays_remaining", body.generalRaysRemaining());
+            if (refused != null) {
+                evidence.addProperty("cell", refused.hit.getBlockPos().toShortString());
+                evidence.addProperty("side", refused.hit.getSide().name());
+                evidence.addProperty("witnessed", refused.state.toString());
+                evidence.addProperty("denial", refused.reason);
+                reason += " " + refused.reason;
+            } else {
+                evidence.addProperty("denial", "No matching source contact was validated in the current view.");
+            }
+            if (work.sourceBlock != null) evidence.addProperty("route_denial", work.sourceBlock);
+            ipc.evidence("source-refused-" + life + "-" + tick + ".json", evidence.toString());
         }
         if (returnFromSurfaceStairs()) {
             if (work.active()) work.sourceSearch.returnReason = reason;
@@ -5100,7 +5201,7 @@ final class AgentMacroControl {
             interrupt(mismatch, true);
             return;
         }
-        boolean fungibleStock = fungibleStockPickup();
+        boolean fungibleStock = !action.passivePickup && fungibleStockPickup();
         int gain = count(offer.item) - action.itemCount;
         if (gain > 0 && (fungibleStock || drop.isRemoved())) {
             body.visibleHorizon().reportPickupUnseen(drop, "inventory_gain");
@@ -5128,7 +5229,7 @@ final class AgentMacroControl {
             return;
         }
         action.dropSeen = tick;
-        if (!drop.getStack().isOf(offer.item) || !roomFor(drop.getStack()) || dropInProspectOpening(drop)
+        if (!drop.getStack().isOf(offer.item) || !roomFor(drop.getStack()) || !action.passivePickup && dropInProspectOpening(drop)
                 || deepWork() && drop.getBlockPos().getY() != player.getBlockY()) {
             body.pauseWork();
             interrupt("The witnessed item, available inventory space, or authorized footing changed.", true);
@@ -5147,7 +5248,10 @@ final class AgentMacroControl {
             interrupt("No safe collection step or vanilla pickup was confirmed for the witnessed drop.", true);
             return;
         }
-        if (fungibleStock)
+        if (action.passivePickup) {
+            body.visibleHorizon().reportPickup(drop, "passive_wait", null);
+            body.pauseWork();
+        } else if (fungibleStock)
             body.pickUpVisible(drop, null, AgentPickup.Scope.MATCHING_STOCK, stockPickupFooting);
         else body.pickUpVisible(drop, null, true);
         if (timberItem(offer.item)) rememberTimberView();
@@ -7483,6 +7587,7 @@ final class AgentMacroControl {
                 } else {
                     work.lastHarvest = target;
                     work.lastHarvestItem = action.tracked;
+                    work.lastHarvestStock = count(action.tracked);
                     work.lastHarvestTick = tick;
                     work.lowerHarvest = target.getY() < player.getBlockY();
                 }
@@ -9258,6 +9363,8 @@ final class AgentMacroControl {
     }
 
     private boolean repeatedSourceView() {
+        if (work != null && work.refusedOutwardTread != null && surfaceSearch.stairs.isEmpty() && !surfaceSearch.stairUsed
+                && work.refusedOutwardTread.upper().equals(player.getBlockPos())) return false;
         return surfaceSearch.blockedAt != null && (surfaceSearch.blockedAt.equals(player.getBlockPos())
             || surfaceSearch.footholds.contains(player.getBlockPos().down()));
     }
@@ -10557,8 +10664,10 @@ final class AgentMacroControl {
                 } else if (action.offer.key.verb == Verb.WORK_TREAD) {
                     work.sourceSearch.returnFailed = action.tread.returning;
                     if (action.tread.returning) work.sourceSearch.returnReason = null;
-                    work.sourceSearch.stairUsed = true;
-                    if (action.tread.returning || !player.getBlockPos().equals(action.tread.from)) {
+                    if (action.tread.refusedOnTakeoff(player.getBlockPos(), grounded())) {
+                        work.refusedOutwardTread = action.tread.edge;
+                        work.outwardTreadRefusal = detail;
+                    } else {
                         retireWork("blocked", "interrupted", detail);
                     }
                 }
@@ -10579,7 +10688,8 @@ final class AgentMacroControl {
             } else if (result.equals("completed")) {
                 if (action.scopedSourceLane) work.travelAnchorUsed = true;
                 if (workshopWalk) work.ironWorkshop.arrived(action.offer.floor.pos.up());
-                if (action.offer.key.verb == Verb.APPROACH || action.prospectCover)
+                if (action.offer.key.verb == Verb.APPROACH || action.prospectCover
+                        || action.offer.drop != null && AgentWorkOrder.earlySurfaceStock(action.offer.item))
                     work.sourceSearch.freshAfter = body.renderedFrame();
                 if (action.offer.key.verb == Verb.BREAK && action.timberOpening == null || action.offer.key.verb == Verb.CONTINUE
                         || action.offer.key.verb == Verb.WORK_TREAD

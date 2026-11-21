@@ -3,6 +3,7 @@ package io.gameharness.survival;
 import io.gameharness.survival.AgentVisibleHorizon.Refusal;
 import java.util.Arrays;
 import java.util.Optional;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -66,6 +67,8 @@ final class AgentBody {
     private static final float[] HORIZON_CUE_V = {0.24f, 0, 0, -0.24f, 0, 0, 0.30f, 0.30f, 0.55f, -0.32f, -0.32f};
     private static final int HORIZON_CUE_RAYS = 1 + HORIZON_CUE_U.length;
     private static final int HORIZON_WITNESS_RAYS = 4;
+    private static final int LEVEL_WALL_RAYS = 8; // Four bearings, at most one feet and one head cell each.
+    private static final int LEVEL_WALL_WITNESS_TICKS = 10;
     private static final double HORIZON_CUE_RANGE = 16;
     private static final double MAX_RANGE = 32;
     private static final double TURN_SPEED = 230;
@@ -148,6 +151,8 @@ final class AgentBody {
     private final BlockPos.Mutable overlandProbe = new BlockPos.Mutable();
     private final BlockHitResult[] samples = new BlockHitResult[COLUMNS * ROWS];
     private final BlockHitResult[] horizonCueSamples = new BlockHitResult[HORIZON_CUE_U.length];
+    private final LevelWallSight levelWallSight = new LevelWallSight(this::inView,
+        end -> raycast(end, Ray.FLUIDS), this::litFace, hit -> clientBlockState(hit.getBlockPos()));
     private final AgentHazards hazards = new AgentHazards();
     private final AgentHeadroom headroom;
     private final AgentVisibleHorizon visibleHorizon = new AgentVisibleHorizon(this);
@@ -299,6 +304,7 @@ final class AgentBody {
         safetySpend = null;
         raysLeft = RAY_BUDGET - MOVEMENT_RAYS - HORIZON_TERRAIN_RAYS - HORIZON_GRADE_RAYS
             - HORIZON_CUE_RAYS - HORIZON_WITNESS_RAYS;
+        levelWallSight.release();
         horizonTerrainRays = HORIZON_TERRAIN_RAYS;
         horizonGradeRays = HORIZON_GRADE_RAYS;
         horizonGradeChecked = 0;
@@ -315,6 +321,7 @@ final class AgentBody {
         nightVision = client.player != null && client.player.hasStatusEffect(StatusEffects.NIGHT_VISION);
         resetIntentions();
         if (hazardWorld != client.world || hazardPlayer != client.player) {
+            levelWallSight.forget();
             hazards.clear();
             headroom.reset();
             stepSupport = null;
@@ -479,12 +486,16 @@ final class AgentBody {
             observedPitchSpeed = (pitch - observedPitch) / seconds;
         } else {
             observedYawSpeed = observedPitchSpeed = 0;
-            if (!sameView) clearContact();
+            if (!sameView) {
+                levelWallSight.forget();
+                clearContact();
+            }
         }
         observedWorld = context.world();
         observedPlayer = client.player;
         observedAtTick = tick;
         eye = context.camera().getPos();
+        levelWallSight.observePose(eye, yaw, pitch);
         observedYaw = yaw;
         observedPitch = pitch;
         observedAtNanos = now;
@@ -501,6 +512,7 @@ final class AgentBody {
         eye = null;
         renderedCrosshair = null;
         observedAtNanos = 0;
+        levelWallSight.forget();
         threats.begin(0);
         clearContact();
     }
@@ -3450,31 +3462,169 @@ final class AgentBody {
         return find(matches, distance, eligible, false);
     }
 
-    /** Recheck at most one existing sample per adjacent wall cell, with fluids opaque. */
-    <T> T sampledLevelWall(BlockPos foot, double reach, Function<BlockHitResult, T> usable) {
-        if (!hasView() || raysLeft <= 0 || reach <= 0) return null;
-        double max = reach * reach;
-        Vec3d playerEye = client.player.getEyePos();
-        int checked = 0;
-        for (int i = -1; i < sampleCount && raysLeft > 0; ++i) {
-            var hit = i < 0 ? renderedCrosshair instanceof BlockHitResult block ? block : null : samples[i];
-            if (hit == null || hit.getType() != HitResult.Type.BLOCK || hit.isInsideBlock()) continue;
-            BlockPos cell = hit.getBlockPos();
-            Direction bearing = AgentSurfaceTread.prospectLevelBearing(foot, cell);
-            if (bearing == null || hit.getSide() != bearing.getOpposite()) continue;
-            int bit = 1 << (2 * bearing.ordinal() + cell.getY() - foot.getY());
-            if ((checked & bit) != 0) continue;
-            Vec3d point = hit.getPos();
-            double distance = point.squaredDistanceTo(eye);
-            if (distance <= 0.0001 || distance > max || point.squaredDistanceTo(playerEye) > max || !inView(point)) continue;
-            checked |= bit;
-            double inset = 0.02 / Math.sqrt(distance);
-            var live = litHit(point.add((point.x - eye.x) * inset, (point.y - eye.y) * inset, (point.z - eye.z) * inset), Ray.FLUIDS);
-            if (!sameBlockFace(hit, live) || live.isInsideBlock()) continue;
-            T result = usable.apply(live);
-            if (result != null) return result;
+    /** Recheck at most one witnessed point per adjacent wall cell, with fluids opaque. */
+    <T> T sampledLevelWall(BlockPos foot, int stance, double reach, BiFunction<BlockHitResult, BlockState, T> usable) {
+        if (!hasView()) {
+            levelWallSight.noView();
+            return null;
         }
-        return null;
+        return levelWallSight.find(foot, stance, tick, reach, client.player.getEyePos(), renderedCrosshair, samples,
+            sampleFrame == frameSequence ? sampleCount : 0, usable);
+    }
+
+    private BlockState clientBlockState(BlockPos pos) { return client.world.getBlockState(pos); }
+
+    LevelWallSight levelWallSight() { return levelWallSight; }
+    int generalRaysRemaining() { return raysLeft; }
+
+    void reserveLevelWallRays() {
+        if (hasView()) raysLeft -= levelWallSight.reserve(raysLeft);
+    }
+
+    void releaseLevelWallRays() { raysLeft += levelWallSight.release(); }
+
+    enum WallVisual {
+        NO_RENDER, NO_ADJACENT_FACE, OUT_OF_REACH, OUT_OF_VIEW, RAY_BUDGET, RECHECK_MISS,
+        RECHECK_OCCLUDED_OR_CHANGED, RECHECK_DARK;
+
+        static final WallVisual[] ALL = values();
+        final int bit = 1 << ordinal();
+    }
+
+    static final class LevelWallSight {
+        private final Predicate<Vec3d> inView;
+        private final Function<Vec3d, BlockHitResult> raycast;
+        private final Predicate<BlockHitResult> litFace;
+        private final Function<BlockHitResult, BlockState> stateOfWitnessed;
+        private int raysLeft, rechecks, visualRefusals;
+        private boolean usedRetainedWitness;
+        private Vec3d cameraEye;
+        private float yaw, pitch;
+        // An aim point, not a permission. Only a new fluid-opaque lit ray and the live consumer can return it.
+        private BlockHitResult witness;
+        private BlockState witnessState;
+        private BlockPos witnessFoot;
+        private Vec3d witnessPlayerEye;
+        private int witnessStance, witnessTick;
+
+        LevelWallSight(Predicate<Vec3d> inView, Function<Vec3d, BlockHitResult> raycast,
+                       Predicate<BlockHitResult> litFace, Function<BlockHitResult, BlockState> stateOfWitnessed) {
+            this.inView = inView;
+            this.raycast = raycast;
+            this.litFace = litFace;
+            this.stateOfWitnessed = stateOfWitnessed;
+        }
+
+        void observePose(Vec3d eye, float yaw, float pitch) {
+            if (witness != null && (!eye.equals(cameraEye) || yaw != this.yaw || pitch != this.pitch)) forget();
+            cameraEye = eye;
+            this.yaw = yaw;
+            this.pitch = pitch;
+        }
+
+        void forget() {
+            witness = null;
+            witnessState = null;
+            witnessFoot = null;
+            witnessPlayerEye = null;
+        }
+
+        int reserve(int generalRays) {
+            int reserved = Math.min(generalRays, LEVEL_WALL_RAYS - raysLeft);
+            raysLeft += reserved;
+            return reserved;
+        }
+
+        int release() {
+            int unused = raysLeft;
+            raysLeft = 0;
+            return unused;
+        }
+
+        int raysLeft() { return raysLeft; }
+        int rechecks() { return rechecks; }
+        int visualRefusals() { return visualRefusals; }
+        boolean usedRetainedWitness() { return usedRetainedWitness; }
+
+        void noView() {
+            forget();
+            usedRetainedWitness = false;
+            rechecks = 0;
+            visualRefusals = WallVisual.NO_RENDER.bit;
+        }
+
+        <T> T find(BlockPos foot, int stance, int tick, double reach, Vec3d playerEye, HitResult crosshair,
+                   BlockHitResult[] samples, int count, BiFunction<BlockHitResult, BlockState, T> usable) {
+            rechecks = visualRefusals = 0;
+            usedRetainedWitness = false;
+            boolean hold = witness != null && stance == witnessStance && foot.equals(witnessFoot)
+                && playerEye.equals(witnessPlayerEye) && tick - witnessTick <= LEVEL_WALL_WITNESS_TICKS;
+            BlockHitResult retained = hold ? witness : null;
+            BlockState retainedState = hold ? witnessState : null;
+            forget();
+            if (reach <= 0) {
+                visualRefusals = WallVisual.OUT_OF_REACH.bit;
+                return null;
+            }
+            double max = reach * reach;
+            Vec3d eye = cameraEye;
+            int checked = 0;
+            for (int i = -2; i < count; ++i) {
+                HitResult candidate = i == -2 ? crosshair : i == -1 ? retained : samples[i];
+                if (!(candidate instanceof BlockHitResult hit) || hit.getType() != HitResult.Type.BLOCK
+                        || hit.isInsideBlock()) continue;
+                BlockPos cell = hit.getBlockPos();
+                Direction bearing = AgentSurfaceTread.prospectLevelBearing(foot, cell);
+                if (bearing == null || hit.getSide() != bearing.getOpposite()) continue;
+                int bit = 1 << (2 * bearing.ordinal() + cell.getY() - foot.getY());
+                if ((checked & bit) != 0) continue;
+                Vec3d point = hit.getPos();
+                double distance = point.squaredDistanceTo(eye);
+                if (distance <= 0.0001 || distance > max || point.squaredDistanceTo(playerEye) > max) {
+                    visualRefusals |= WallVisual.OUT_OF_REACH.bit;
+                    continue;
+                }
+                if (!inView.test(point)) {
+                    visualRefusals |= WallVisual.OUT_OF_VIEW.bit;
+                    continue;
+                }
+                if (raysLeft <= 0) {
+                    visualRefusals |= WallVisual.RAY_BUDGET.bit;
+                    break;
+                }
+                checked |= bit;
+                --raysLeft;
+                ++rechecks;
+                double inset = 0.02 / Math.sqrt(distance);
+                var live = raycast.apply(point.add((point.x - eye.x) * inset, (point.y - eye.y) * inset,
+                    (point.z - eye.z) * inset));
+                if (live.getType() != HitResult.Type.BLOCK) visualRefusals |= WallVisual.RECHECK_MISS.bit;
+                else if (!sameBlockFace(hit, live) || live.isInsideBlock())
+                    visualRefusals |= WallVisual.RECHECK_OCCLUDED_OR_CHANGED.bit;
+                else if (!inView.test(live.getPos())) visualRefusals |= WallVisual.OUT_OF_VIEW.bit;
+                else if (!litFace.test(live)) visualRefusals |= WallVisual.RECHECK_DARK.bit;
+                else {
+                    BlockState state = stateOfWitnessed.apply(live);
+                    if (i == -1 && state != retainedState) {
+                        visualRefusals |= WallVisual.RECHECK_OCCLUDED_OR_CHANGED.bit;
+                        continue;
+                    }
+                    T result = usable.apply(live, state);
+                    if (result != null) {
+                        witness = live;
+                        witnessState = state;
+                        witnessFoot = foot;
+                        witnessPlayerEye = playerEye;
+                        witnessStance = stance;
+                        witnessTick = tick;
+                        usedRetainedWitness = i == -1;
+                        return result;
+                    }
+                }
+            }
+            if (rechecks == 0 && visualRefusals == 0) visualRefusals = WallVisual.NO_ADJACENT_FACE.bit;
+            return null;
+        }
     }
 
     private Optional<BlockHitResult> find(Predicate<BlockState> matches, double distance, Predicate<BlockHitResult> eligible,

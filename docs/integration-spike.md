@@ -239,7 +239,10 @@ one below the current footing, Terra must also request
 `prospect:minecraft:diamond` and name the cover it may break. A
 `prospectOpening` can show where to start mining even when a dry rock wall
 blocks the walking lane. The clue names one reachable wall face, its
-tool, and possible item loss. It cannot be selected as an opportunity
+tool, and possible item loss. When the camera's regular samples miss the
+face, the player can aim a fresh sight check at the last observed point.
+The check must hit the same lit, unobstructed face; memory alone cannot
+authorize a cut. The clue cannot be selected as an opportunity
 and proves no future landing or ore. A torch costs
 one carried torch and requires its own placement permission. The optional
 `place:minecraft:cobblestone` effect needs an exact cobblestone cost cap

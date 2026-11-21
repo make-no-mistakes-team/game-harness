@@ -931,10 +931,12 @@ public final class AgentClient implements ClientModInitializer {
         }
         recordHorizon(body.visibleHorizon().takeWadeEvidence());
         JsonObject surveyTransition = macro == null ? null : macro.takeSurveyTransition(tick);
+        JsonObject wallTransition = macro == null ? null : macro.takeProspectWallTransition(tick);
+        boolean privateTransition = surveyTransition != null || wallTransition != null;
         boolean touchingWater = player != null && player.isTouchingWater();
         boolean changed = screenChanged || ownerChanged || planningChanged || newReturnableDrop || !status.equals(lastStatus)
             || !handStatus.equals(lastHands) || stall.eventSequence() != stallSequence || touchingWater != lastTouchingWater;
-        if (changed || surveyTransition != null || boundary || tick % 20 == 0 || ended || tick == 1) {
+        if (changed || privateTransition || boundary || tick % 20 == 0 || ended || tick == 1) {
             JsonObject event = new JsonObject();
             event.addProperty("tick", tick);
             event.addProperty("wall_ms", boundary ? wallMs : System.currentTimeMillis());
@@ -1036,10 +1038,11 @@ public final class AgentClient implements ClientModInitializer {
             event.addProperty("personal_opens", personalOpens);
             event.addProperty("bench_opens", benchOpens);
             boolean updateProgress = tick == 1 || tick % 20 == 0 || boundary || ended || newlyBlocked || ownerChanged || planningChanged;
-            String line = surveyTransition == null || updateProgress ? event + "\n" : null;
+            String line = !privateTransition || updateProgress ? event + "\n" : null;
             try {
-                if (surveyTransition != null) {
-                    event.add("macro_survey_transition", surveyTransition);
+                if (privateTransition) {
+                    if (surveyTransition != null) event.add("macro_survey_transition", surveyTransition);
+                    if (wallTransition != null) event.add("macro_prospect_wall_transition", wallTransition);
                     append("events.jsonl", event + "\n");
                 } else if (changed || boundary || ended || tick % 100 == 0) append("events.jsonl", line);
                 if (updateProgress) {

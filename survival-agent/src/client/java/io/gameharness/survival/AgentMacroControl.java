@@ -844,6 +844,14 @@ final class AgentMacroControl {
     private final long[] horizonCandidateCells = new long[HORIZON_CANDIDATES];
     private final ArrayDeque<String> recent = new ArrayDeque<>(8);
     private final AgentSurveyEvidence surveyEvidence = new AgentSurveyEvidence();
+    private static final int MAX_PROSPECT_WALL_TRANSITIONS = 32;
+    private String prospectWallRefusal;
+    private boolean prospectWallSampled;
+    private String lastWallStage, lastWallResult, lastWallRefusal;
+    private int lastWallLife, lastWallStance, lastWallVisual, wallTransitions;
+    private boolean lastWallPressure, lastWallApproach, lastWallRetained;
+    private long wallTransitionTick;
+    private JsonObject wallTransition;
     private record ProspectLandmark(BlockPos foot, BlockHitResult hit, long at, BlockState approachSupport) {
         boolean from(BlockPos source, long now) {
             return foot.equals(source) && now >= at && now - at <= STATION_RECALL_TICKS;
@@ -1041,6 +1049,12 @@ final class AgentMacroControl {
     long lastPurposefulTick() { return lastPurposefulTick; }
     long planningIdleDeadlineNanos() { return idleSince + PLANNING_IDLE_LIMIT_NS; }
     JsonObject takeSurveyTransition(long tick) { return surveyEvidence.take(tick); }
+    JsonObject takeProspectWallTransition(long tick) {
+        if (wallTransitionTick != tick) return null;
+        JsonObject result = wallTransition;
+        wallTransition = null;
+        return result;
+    }
 
     private static double millis(long nanos) { return nanos / 1_000_000.0; }
 
@@ -2819,26 +2833,40 @@ final class AgentMacroControl {
     /** One sampled level cut, shared by idle evidence and the paid level fallback. */
     private ProspectWall sampledDiamondWall(BlockPos foot, AgentProgress progress, AgentWorkOrder.Budget budget) {
         var route = diamondRoute;
-        if (route.unjoined != null || route.foot != null && !foot.equals(route.foot) || route.spareFloor
-                || budget != null && !budget.canCutCover()
-                || client.options.attackKey.isUnbound() || diamondCutStanceRefusal(foot) != null) return null;
+        prospectWallSampled = false;
+        prospectWallRefusal = route.unjoined != null ? "retained_route_unjoined"
+            : route.foot != null && !foot.equals(route.foot) ? "retained_footing_changed"
+            : route.spareFloor ? "spare_floor_in_progress"
+            : budget != null && !budget.canCutCover() ? "cover_budget_exhausted"
+            : client.options.attackKey.isUnbound() ? "attack_unbound" : diamondCutStanceRefusal(foot);
+        if (prospectWallRefusal != null) return null;
         var bounds = player.getBoundingBox();
-        return body.sampledLevelWall(foot, reach(), hit -> {
+        prospectWallSampled = true;
+        return body.sampledLevelWall(foot, surveyOrigin, reach(), (hit, state) -> {
             var cell = hit.getBlockPos();
             Direction bearing = hit.getSide().getOpposite();
-            if (!route.open(bearing, 0) || route.cutting && (route.grade != 0 || route.bearing != bearing)
-                    || route.attemptedSpareFloors.contains(cell)
-                    || surfaceSearch.footholds.contains(cell) || route.supports.contains(cell)
-                    || budget != null && work.rejected.contains(cell)
-                    || diamondCutOverlaps(bounds, cell) || !diamondSupportsUnprotected(foot, bearing, 0)) return null;
-            BlockState state = world.getBlockState(cell);
+            if (!route.open(bearing, 0) || route.cutting && (route.grade != 0 || route.bearing != bearing))
+                return refuseProspectWall("bearing_not_available");
+            if (route.attemptedSpareFloors.contains(cell) || surfaceSearch.footholds.contains(cell)
+                    || route.supports.contains(cell) || !diamondSupportsUnprotected(foot, bearing, 0))
+                return refuseProspectWall("protected_or_unverified_support");
+            if (budget != null && work.rejected.contains(cell)) return refuseProspectWall("already_refused");
+            if (diamondCutOverlaps(bounds, cell)) return refuseProspectWall("body_overlap");
             Item debris = AgentWorkOrder.prospectCoverDrop(state);
             // The first clue covers common rock only; no soil, ore, station or falling material.
-            if (debris == Items.AIR || debris == Items.DIRT || budget != null && !budget.policy.prospectCoverAllowed(state)
-                    || diamondCoverSafetyRefusal(cell, state, debris, bearing, progress) != null) return null;
+            if (debris == Items.AIR || debris == Items.DIRT) return refuseProspectWall("not_stable_common_rock");
+            if (budget != null && !budget.policy.prospectCoverAllowed(state))
+                return refuseProspectWall("cover_material_not_authorized");
+            String refusal = diamondCoverSafetyRefusal(cell, state, debris, bearing, progress);
+            if (refusal != null) return refuseProspectWall(refusal);
             int slot = workToolSlot(cell, state, true, budget);
-            return slot < 0 ? null : new ProspectWall(hit, state, bearing, slot);
+            return slot < 0 ? refuseProspectWall("no_cover_tool") : new ProspectWall(hit, state, bearing, slot);
         });
+    }
+
+    private ProspectWall refuseProspectWall(String reason) {
+        if (prospectWallRefusal == null) prospectWallRefusal = reason;
+        return null;
     }
 
     static boolean diamondCutOverlaps(Box playerBox, BlockPos cell) {
@@ -2899,6 +2927,19 @@ final class AgentMacroControl {
             return false;
         }
         boolean scoped = travelAnchorOutstanding();
+        boolean reserveWall = !scoped && !route.cutting && !route.spareFloor && route.unjoined == null
+            && work.budget.canCutCover() && !client.options.attackKey.isUnbound();
+        if (reserveWall) body.reserveLevelWallRays();
+        try {
+            return prospectDiamondTread(foot, progress, wanted, source, scoped);
+        } finally {
+            if (reserveWall) body.releaseLevelWallRays();
+        }
+    }
+
+    private boolean prospectDiamondTread(BlockPos foot, AgentProgress progress, Predicate<BlockState> wanted,
+                                         BlockHitResult source, boolean scoped) {
+        var route = diamondRoute;
         if (!route.spareFloor && (!scoped || source != null) && followDiamondLane(progress, source, true)) {
             action.scopedSourceLane = scoped;
             return true;
@@ -3320,6 +3361,8 @@ final class AgentMacroControl {
         for (int option = 0; option < 3; ++option) {
             if (option == 1) {
                 var wall = sampledDiamondWall(foot, progress, work.budget);
+                noteProspectWall("paid", wall != null ? "candidate" : "denied", false);
+                body.releaseLevelWallRays();
                 if (wall != null) {
                     route.select(wall.bearing, 0, true);
                     return prepareDiamondTread(progress, null, wall);
@@ -7068,7 +7111,7 @@ final class AgentMacroControl {
         // Age two is a missed render, not negative world evidence. Skip the
         // write, not the witness checks; the latest snapshot keeps its old tick.
         if (due && !deferIdleObservation(observationAge, body.renderedViewAgeTicks(), !forced && sameIdlePose))
-            publish(progress, crack);
+            publish(progress, crack, releasedSurvey);
     }
 
     static boolean deferIdleObservation(long observationAge, int renderAge, boolean sameIdlePose) {
@@ -7866,18 +7909,34 @@ final class AgentMacroControl {
         return material;
     }
 
-    private JsonObject prospectOpening(AgentProgress progress, PlayerInventory inventory) {
-        if (!prospectBodyUsable() || work != null && work.budget.missingFloor(inventory) != null
-                || !roomFor(new ItemStack(Items.DIAMOND)) || !diamondToolAvailable(null, -1, true)) return null;
+    private String prospectOpeningRefusal(PlayerInventory inventory) {
+        if (!prospectBodyUsable()) return "health_food_or_controls";
+        if (work != null && work.budget.missingFloor(inventory) != null) return "inventory_floor_missing";
+        if (!roomFor(new ItemStack(Items.DIAMOND))) return "no_diamond_inventory_room";
+        if (!diamondToolAvailable(null, -1, true)) return "no_spare_diamond_tool";
+        return null;
+    }
+
+    private JsonObject prospectOpening(AgentProgress progress, PlayerInventory inventory, String refusal) {
+        if (refusal != null) {
+            prospectWallSampled = false;
+            prospectWallRefusal = refusal;
+            return null;
+        }
         var wall = sampledDiamondWall(player.getBlockPos(), progress, null);
         if (wall == null) return null;
         ItemStack tool = inventory.getStack(wall.toolSlot);
-        if (tool.isEmpty()) return null;
         BlockPos cell = wall.hit.getBlockPos();
-        int loss = AgentMiningStock.maxLoss(tool, wall.state, world, cell);
-        if (loss < 0) return null;
+        int loss = tool.isEmpty() ? AgentMiningStock.UNKNOWN : AgentMiningStock.maxLoss(tool, wall.state, world, cell);
+        if (loss < 0) {
+            prospectWallRefusal = "cover_tool_cost_unknown";
+            return null;
+        }
         String target = materialTarget(new Key(Verb.BREAK, cell, Block.getRawIdFromState(wall.state), "prospect-wall"));
-        if (target == null) return null;
+        if (target == null) {
+            prospectWallRefusal = "target_capacity";
+            return null;
+        }
         var clue = new JsonObject();
         clue.addProperty("block", Registries.BLOCK.getId(wall.state.getBlock()).toString());
         clue.addProperty("target", target);
@@ -7991,10 +8050,10 @@ final class AgentMacroControl {
     }
 
     private void publish(AgentProgress progress) {
-        publish(progress, 0);
+        publish(progress, 0, false);
     }
 
-    private void publish(AgentProgress progress, float crack) {
+    private void publish(AgentProgress progress, float crack, boolean releasedSurvey) {
         lastObservation = tick;
         lastPublishedEpoch = epoch;
         JsonObject value = header(run);
@@ -8036,6 +8095,19 @@ final class AgentMacroControl {
         String caveSource = null;
         var ticket = pendingEntry();
         boolean idleView = idlePublicationPremise();
+        String viewBlocker = progress == null ? null : worldViewBlocker();
+        boolean trackProspect = progress != null && ipc.workMode != null && surveyOrigin > 0
+            && action == null && !hasActiveWorkOrder();
+        boolean checkProspect = trackProspect && idleView && viewBlocker == null;
+        String prospectStage = releasedSurvey ? "after_outlook" : "idle";
+        String openingRefusal = checkProspect ? prospectOpeningRefusal(inv) : null;
+        if (checkProspect && openingRefusal == null && !client.options.attackKey.isUnbound())
+            body.reserveLevelWallRays();
+        if (trackProspect && !checkProspect) {
+            prospectWallSampled = false;
+            prospectWallRefusal = viewBlocker == null ? "idle_premise_unavailable" : viewBlocker;
+            noteProspectWall(prospectStage, "publication_blocked", false);
+        }
         var travel = idleView ? travelWitness(progress) : null;
         if (travel != null) value.add("travelHint", travelObservation(travel));
         boolean yieldable = pendingCanYield();
@@ -8053,12 +8125,19 @@ final class AgentMacroControl {
                 pendingRecheckedUntil = 0;
             }
         }
-        if (progress != null && observableWorld()) {
+        if (progress != null && viewBlocker == null) {
             if (action == null || yieldable) {
                 visible = offers(progress);
                 if (parked || yieldable) caveSource = visibleCaveSource();
-                if (ipc.workMode != null && surveyOrigin > 0 && idleView) {
-                    JsonObject clue = prospectOpening(progress, inv);
+                if (checkProspect) {
+                    JsonObject clue = prospectOpening(progress, inv, openingRefusal);
+                    boolean approach = false;
+                    for (Offer offer : visible) if (offer.key.verb == Verb.APPROACH) {
+                        approach = true;
+                        break;
+                    }
+                    noteProspectWall(prospectStage, clue != null ? "offered" : "denied", approach);
+                    body.releaseLevelWallRays();
                     if (clue != null) value.add("prospectOpening", clue);
                     addStartupOutlook(visible, travel != null || clue != null);
                 }
@@ -8195,6 +8274,54 @@ final class AgentMacroControl {
             losses.addProperty(survey.id, reason);
         }
         transition.add("lost", losses);
+    }
+
+    /** Private event journal only: publish on semantic changes, not on every camera sample. */
+    private void noteProspectWall(String stage, String result, boolean approach) {
+        // Alternating idle sample grids must not use up the outlook/paid trace.
+        if (wallTransitions >= MAX_PROSPECT_WALL_TRANSITIONS
+                || stage.equals("idle") && wallTransitions >= MAX_PROSPECT_WALL_TRANSITIONS - 4) return;
+        var sight = body.levelWallSight();
+        int visual = prospectWallSampled ? sight.visualRefusals() : 0;
+        int rechecks = prospectWallSampled ? sight.rechecks() : 0;
+        int general = body.generalRaysRemaining();
+        boolean pressure = prospectWallSampled && (general == 0 || rechecks > general);
+        boolean retained = prospectWallSampled && sight.usedRetainedWitness();
+        String refusal = result.equals("offered") || result.equals("candidate") ? null : prospectWallRefusal;
+        if (life == lastWallLife && surveyOrigin == lastWallStance && stage.equals(lastWallStage)
+                && result.equals(lastWallResult) && Objects.equals(refusal, lastWallRefusal) && visual == lastWallVisual
+                && approach == lastWallApproach && pressure == lastWallPressure && retained == lastWallRetained) return;
+        lastWallLife = life;
+        lastWallStance = surveyOrigin;
+        lastWallStage = stage;
+        lastWallResult = result;
+        lastWallRefusal = refusal;
+        lastWallVisual = visual;
+        lastWallApproach = approach;
+        lastWallPressure = pressure;
+        lastWallRetained = retained;
+        ++wallTransitions;
+        wallTransitionTick = tick;
+        var event = new JsonObject();
+        event.addProperty("stage", stage);
+        event.addProperty("result", result);
+        event.addProperty("stance", surveyOrigin);
+        event.addProperty("render_age_ticks", body.renderedViewAgeTicks());
+        event.addProperty("approach_offered", approach);
+        if (refusal != null) event.addProperty("refusal", refusal);
+        if (prospectWallSampled) {
+            event.addProperty("general_rays_remaining", general);
+            event.addProperty("wall_rays_remaining", sight.raysLeft());
+            event.addProperty("wall_rechecks", rechecks);
+            event.addProperty("general_ray_pressure", pressure);
+            event.addProperty("retained_witness_rechecked", retained);
+            if (visual != 0) {
+                var rejected = new JsonArray();
+                for (var code : AgentBody.WallVisual.ALL) if ((visual & code.bit) != 0) rejected.add(code.name());
+                event.add("visual_refusals", rejected);
+            }
+        }
+        wallTransition = event;
     }
 
     private JsonObject pendingObservation(AgentPendingFurnaceMemory.Entry ticket, boolean yieldable, boolean parked,

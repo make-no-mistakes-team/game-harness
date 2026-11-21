@@ -264,6 +264,88 @@ final class DryCaveViewTest {
     }
 
     @Test
+    void aRenderedCornerHasItsOwnBoundedWallRechecksWithoutTreatingSamplesAsProof() {
+        var eye = Vec3d.ofBottomCenter(SOURCE).add(0, 1.62, 0);
+        var west = new BlockHitResult(eye.add(-0.5, -0.18, -0.47), Direction.EAST, SOURCE.west().up(), false);
+        var north = new BlockHitResult(eye.add(-0.45, -0.18, -0.5), Direction.SOUTH, SOURCE.north().up(), false);
+        var fluid = new BlockHitResult(eye.add(-0.20, -0.07, -0.19), Direction.EAST, SOURCE.up(), false);
+        var sampled = new BlockHitResult[] {west, north};
+        var offered = new AgentBody.LevelWallSight(point -> true,
+            end -> end.x < SOURCE.getX() ? fluid : north, hit -> true, hit -> Blocks.DEEPSLATE.getDefaultState());
+        offered.observePose(eye, 132, -89);
+        int shared = 8;
+        shared -= offered.reserve(shared);
+        assertEquals(0, shared, "ordinary offers have no general rays left at the wall consumer");
+        assertEquals(north, offered.find(SOURCE, 1, 25, 4.5, eye, west, sampled, sampled.length, (hit, state) -> hit),
+            "a different first hit vetoes the dry crosshair ray; an exact wall from the same frame can still qualify");
+        assertEquals(6, offered.raysLeft(), "duplicate hits on the crosshair cell do not spend another ray");
+
+        assertNull(offered.find(SOURCE, 1, 25, 4.5, eye, north, sampled, sampled.length, (hit, state) -> null),
+            "a rendered, fluid-opaque face still cannot override the work consumer's safety veto");
+        assertEquals(4, offered.release(), "the remainder goes back to the general pool");
+        var unlit = new AgentBody.LevelWallSight(point -> true, end -> north, hit -> false,
+            hit -> Blocks.DEEPSLATE.getDefaultState());
+        unlit.observePose(eye, 132, -89);
+        unlit.reserve(8);
+        assertNull(unlit.find(SOURCE, 1, 25, 4.5, eye, north, sampled, sampled.length, (hit, state) -> hit),
+            "a vanilla outline alone does not make a dark face eligible");
+    }
+
+    @Test
+    void alternatingCornerSamplesKeepOnlyOneCurrentOpticallyRecheckedWall() {
+        var eye = Vec3d.ofBottomCenter(SOURCE).add(0, 1.62, 0);
+        var cell = SOURCE.west().up();
+        var hit = new BlockHitResult(eye.add(-0.5, 0.18, -0.47), Direction.EAST, cell, false);
+        var live = new BlockHitResult(hit.getPos(), Direction.EAST, cell, false);
+        var sampled = new BlockHitResult[] {hit};
+        var currentHit = new BlockHitResult[] {live};
+        var currentState = new BlockState[] {Blocks.DEEPSLATE.getDefaultState()};
+        var sight = new AgentBody.LevelWallSight(point -> true, point -> currentHit[0], face -> true,
+            face -> currentState[0]);
+
+        sight.observePose(eye, 132, -89);
+        sight.reserve(8);
+        assertEquals(live, sight.find(SOURCE, 1, 25, 4.5, eye, null, sampled, 1, (face, state) -> face));
+        sight.release();
+        sight.observePose(eye, 132, -89);
+        sight.reserve(8);
+        assertEquals(live, sight.find(SOURCE, 1, 30, 4.5, eye, null, sampled, 0, (face, state) -> face),
+            "the next grid phase contributes no candidate, but the same wall is still actually in view");
+        assertTrue(sight.usedRetainedWitness());
+        assertEquals(1, sight.rechecks());
+        assertNull(sight.find(SOURCE, 1, 35, 4.5, eye, null, sampled, 0, (face, state) -> null),
+            "the consumer's current refusal still vetoes an optically rechecked face");
+        assertNull(sight.find(SOURCE, 1, 40, 4.5, eye, null, sampled, 0, (face, state) -> face));
+        assertEquals(0, sight.rechecks(), "a refused witness is not retried from memory");
+
+        assertEquals(live, sight.find(SOURCE, 1, 45, 4.5, eye, null, sampled, 1, (face, state) -> face));
+        currentState[0] = Blocks.STONE.getDefaultState();
+        assertNull(sight.find(SOURCE, 1, 50, 4.5, eye, null, sampled, 0, (face, state) -> face),
+            "a different state on the same face is not admitted from memory");
+        assertEquals(live, sight.find(SOURCE, 1, 65, 4.5, eye, null, sampled, 1, (face, state) -> face));
+        sight.observePose(eye, 133, -89);
+        sight.observePose(eye, 132, -89);
+        assertNull(sight.find(SOURCE, 1, 70, 4.5, eye, null, sampled, 0, (face, state) -> face),
+            "turning away and then back invalidates the retained aim point");
+
+        assertEquals(live, sight.find(SOURCE, 1, 85, 4.5, eye, null, sampled, 1, (face, state) -> face));
+        sight.release();
+        sight.reserve(8);
+        assertNull(sight.find(SOURCE, 2, 90, 4.5, eye, null, sampled, 0, (face, state) -> face),
+            "a new stance does not inherit the witness");
+        assertEquals(live, sight.find(SOURCE, 2, 95, 4.5, eye, null, sampled, 1, (face, state) -> face));
+        currentHit[0] = new BlockHitResult(hit.getPos(), Direction.SOUTH, cell, false);
+        assertNull(sight.find(SOURCE, 2, 100, 4.5, eye, null, sampled, 0, (face, state) -> face),
+            "the first hit must still be on the exact remembered face");
+
+        currentHit[0] = live;
+        assertEquals(live, sight.find(SOURCE, 2, 105, 4.5, eye, null, sampled, 1, (face, state) -> face));
+        assertNull(sight.find(SOURCE, 2, 125, 4.5, eye, null, sampled, 0, (face, state) -> face),
+            "a long gap in current evidence expires even a stationary witness");
+        assertEquals(0, sight.rechecks());
+    }
+
+    @Test
     void paidTunnelKeepsCuttingForwardThroughThreeOpenedTreadsThenStopsAtVisibleFluid() {
         var stone = Blocks.STONE.getDefaultState();
         var budget = new AgentWorkOrder.Budget(new AgentWorkOrder.Policy(false,

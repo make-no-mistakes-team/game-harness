@@ -1224,6 +1224,99 @@ test("Rotated observation IPC defers both settlement and an uncharged correction
   }
 });
 
+test.each(["corrected", "unchanged", "abstained"] as const)(
+  "The ordinary Terra oak approach gets one candid reserve correction (%s)",
+  async response => {
+    const log = "minecraft:oak_log";
+    const objective = "Gather enough wood to carry six logs for travel and continue toward a diamond.";
+    // Ordinary run: empty first view, then the dry tick-97 oak approach with two logs held.
+    const first = { goal: "diamond", epoch: 3, inventory: { [log]: 2, "minecraft:crafting_table": 1 },
+      safety: { clear: true, revision: 2 } } as const;
+    const anchor = { subject: `block:${log}`, target: "m-1" };
+    const visible: Partial<MacroObservation> = {
+      ...first, stance: 1,
+      travelHint: { ...anchor, kind: "resource", bearingDegrees: 2.4176788, footing: "dry", windowBlocks: 1.6 },
+      recent: ["dry route: Witnessed 4 paired dry edges in one forward strip."],
+      opportunities: [
+        { id: "o-1", verb: "follow", summary: "Follow a witnessed dry cave segment", risk: "guarded",
+          evidence: "4 witnessed level edges with a distinct endpoint and a witnessed return. Recheck each edge before moving.",
+          anchor: { subject: "route:dry", target: "m-2" } },
+        { id: "o-2", verb: "continue", summary: "Craft planks in the inventory grid", risk: "guarded",
+          evidence: "The visible inventory holds the ingredients for this vanilla recipe.",
+          material: { subject: "recipe:planks", target: "recipe-planks", spends: { [log]: 1 } } },
+        { id: "o-3", verb: "survey", summary: "Survey left from this stance", risk: "read",
+          evidence: "A bounded first-person turn over nearby terrain." },
+        { id: "o-4", verb: "survey", summary: "Survey right from this stance", risk: "read",
+          evidence: "A bounded first-person turn over nearby terrain." },
+        { id: "o-5", verb: "inspect", summary: `Center the visible ${log}`, risk: "read",
+          evidence: "A lit face is visible away from the current crosshair.", anchor },
+      ],
+    };
+    const refused = {
+      target: { kind: "stock", item: log, count: 8 }, allowedEffects: [`break:${log}`], costCaps: [],
+      reserves: [{ item: log, count: 6 }], maxBreaks: 6, maxCrafts: 0, maxPlacements: 0,
+    } as const;
+    const corrected = { ...refused, reserves: [{ item: log, count: 2 }] };
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) return workReply(request, { kind: "abstain" }, 200);
+      if (requests.length === 2) return workReply(request, { kind: "work", policy: refused }, 1200);
+      return workReply(request, response === "abstained" ? { kind: "abstain" } :
+        { kind: "work", policy: response === "corrected" ? corrected : refused }, 1200);
+    }, objective, 32);
+    try {
+      await f.observe(1, first);
+      await f.actor.poll();
+      await f.observe(97, visible);
+      await f.actor.poll();
+
+      expect(requests.map(request => request.observation.tick)).toEqual([1, 97]);
+      expect(requests[1]).toMatchObject({ objective, work: { mode: "constrained", demand: "changed",
+        protectedReserves: [], current: null, lastOutcome: null, openingViewIds: ["o-3", "o-4", "o-5"] } });
+      expect(f.actor.status()).toMatchObject({ lastProviderOutcome: "completed", lastDisposition: "proposal_refused",
+        issued: 0, issuedWorkOrders: 0, unresolvedWorkOrders: 0 });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+
+      await f.observe(177, visible);
+      await f.actor.poll();
+      expect(requests[2]).toMatchObject({ observation: { tick: 177, inventory: first.inventory, travelHint: visible.travelHint },
+        lastReceipt: null, work: { mode: "constrained", protectedReserves: [], current: null, lastOutcome: null },
+        feedback: { kind: "invalid_reply", detail: expect.stringContaining("6 minecraft:oak_log reserved at entry, but only 2 are carried") } });
+      const history = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      const proposals = (await readFile(f.file("proposals.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      const original = proposals[1];
+      expect(original).toMatchObject({ basis: { tick: 97 }, providerOutcome: "completed", disposition: "proposed",
+        proposal: { expiresTick: 1297, action: { kind: "work", policy: refused } } });
+      expect(proposals[2].correctionOf).toBe(original.requestId);
+      expect(history).toContainEqual(expect.objectContaining({ event: "proposal_refused", requestId: original.requestId,
+        basis: expect.objectContaining({ tick: 97 }),
+        reason: expect.stringContaining("6 minecraft:oak_log reserved at entry, but only 2 are carried") }));
+      expect(history.some(event => event.event === "work_order_prepared" && event.requestId === original.requestId)).toBe(false);
+
+      if (response === "corrected") {
+        expect(await f.order()).toMatchObject({ origin: "model", basisTick: 177, travelAnchor: anchor, ...corrected });
+      } else {
+        await f.observe(265, visible);
+        await f.observe(355, { ...visible, opportunities: visible.opportunities!.map((offer, index) =>
+          ({ ...offer, id: `rekeyed-${index}` })) });
+        await f.actor.poll();
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+      }
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      expect(requests).toHaveLength(3);
+      expect(await readFile(f.file("receipts.jsonl"), "utf8")).toBe("");
+      expect(hasConfirmedTerraEffect(f.actor.status())).toBe(false);
+      expect(f.actor.status()).toMatchObject({ requests: 3, providerDispatches: 3, unreportedDispatches: 0, issued: 0,
+        issuedWorkOrders: response === "corrected" ? 1 : 0, completedModelWorkOrders: 0,
+        lastDisposition: response === "corrected" ? "work_order_issued" : response === "unchanged" ? "proposal_refused" : "abstained" });
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test("An admitted preset works during a paid request and an equivalent authorization leaves the job untouched", async () => {
   const request = Promise.withResolvers<MacroRequest>();
   const reply = Promise.withResolvers<void>();

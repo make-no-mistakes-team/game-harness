@@ -70,6 +70,12 @@ the crafting table. Reaching the request limit
 stops new calls; it does not grant more materials, extend a job, or end
 Minecraft. A locally selected preset alone does not count as a Terra action.
 
+For a travel job, a reserve is stock the player must already hold.
+With two logs in hand, eight logs can be the target, but six cannot
+be the starting reserve. The host explains that refusal to Terra
+and allows one corrected proposal on the same evidence. It never
+lowers the reserve on the model's behalf.
+
 If a requested survey disappears before the player turns, Terra can report
 the missing view. Its return under the same safe conditions permits one
 fresh decision. The player never executes the old turn on a stale view.

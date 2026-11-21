@@ -343,7 +343,9 @@ interface WorkJob {
 
 interface QueuedWork {
   readonly after: WorkJob | null;
-  readonly plan: Pick<Plan, "requestId" | "observation" | "correction"> & { readonly proposal: Pick<MacroProposal, "expiresTick"> };
+  readonly plan: Pick<Plan, "requestId" | "observation" | "replyKey" | "correction"> & {
+    readonly proposal: Pick<MacroProposal, "expiresTick">;
+  };
   readonly stages: readonly MacroWorkStage[];
   readonly next: number;
   readonly bootstrap?: { readonly branchIndex: number; readonly declaredStages: number; readonly stageOffset: number };
@@ -1842,10 +1844,16 @@ export class SurvivalMacroController {
     const currentWall = wall ? (fresh: MacroObservation) =>
       this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
       sameProspectOpening(wall, pricedProspectOpening(fresh, policy)) : undefined;
+    let travelRefusal: { observation: MacroObservation; reason: string } | undefined;
     const currentTravel = travel ? (fresh: MacroObservation) => {
-      const current = matchingTravelHint(fresh, policy);
-      return this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
-        sameTravelHint(travel, current);
+      if (!this.isCurrentHandoff(fresh) || !sameOpeningStance(plan.observation, fresh) ||
+          !sameTravelHint(travel, fresh.travelHint) || fresh.tick >= plan.proposal.expiresTick) return false;
+      const missing = policy.reserves.find(({ item, count }) => stock(fresh, item) < count);
+      if (!missing) return true;
+      const { item, count } = missing;
+      travelRefusal = { observation: fresh,
+        reason: `The witnessed approach requires ${count} ${item} reserved at entry, but only ${stock(fresh, item)} are carried.` };
+      return false;
     } : undefined;
     const currentTimber = timber ? (fresh: MacroObservation) =>
       this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
@@ -1908,6 +1916,15 @@ export class SurvivalMacroController {
     if (job === null) return; // A rotating observation is not a denied program stage.
     if (!job && (bootstrap || afterSmelt || duringWaitFor)) return this.discardQueuedWork(queued, rejection);
     this.queuedWork = undefined;
+    if (!job && travelRefusal) {
+      const { observation, reason } = travelRefusal;
+      // This is not a lost opportunity ID. Keep the concrete reason on this decision and its bounded correction only.
+      await this.disposition("proposal_refused", { requestId: plan.requestId, basis: basis(observation), reason }, null);
+      this.offerReplyCorrection(plan, observation, { kind: "invalid_reply",
+        detail: `${reason} No work was issued. Set the stock target to the desired total after gathering. ` +
+          "An approach can reserve only carried stock at entry, and it must preserve work.protectedReserves. " +
+          "If you cannot meet those protections, choose a witnessed alternative or abstain." });
+    }
     if (job) {
       if (queued.preparedSide) job.preparedSide = queued.preparedSide;
       if (queued.pendingPurpose) job.pendingPurpose = queued.pendingPurpose;
@@ -2105,8 +2122,8 @@ export class SurvivalMacroController {
   }
 
   private liveReplyKey(observation: MacroObservation): string {
-    const { run, life, epoch, goal, safety, food } = observation;
-    return digest([run, life, epoch, goal, safety, guardBand(food), liveCorrectionEvidence(observation),
+    const { run, life, epoch, goal, stance, safety, food } = observation;
+    return digest([run, life, epoch, goal, stance, safety, guardBand(food), liveCorrectionEvidence(observation),
       this.lastReceipt?.life === life ? this.lastReceipt.id : null, this.lastJobOutcome?.terminal?.id,
       this.config.skills?.selection().generation, this.floorScope?.reserves]);
   }
@@ -2115,6 +2132,14 @@ export class SurvivalMacroController {
     if (correction.renewal) return this.sameReplyContext(correction, current);
     return !this.job && !this.previousJob && !this.queuedWork && !this.pending && !this.direct && !this.segment &&
       !this.conditional && !this.lease && this.sameReplyContext(correction, current);
+  }
+
+  private offerReplyCorrection(context: Pick<Decision, "requestId" | "observation" | "replyKey" | "correction">,
+    current: MacroObservation, feedback: MacroFeedback): void {
+    const key = context.replyKey;
+    if (this.closing || context.correction || !key || this.correctedContexts.has(key)) return;
+    const correction = { requestId: context.requestId, observation: context.observation, key, feedback };
+    if (this.replyCorrectionApplies(correction, current)) this.replyCorrection = correction;
   }
 
   private sameReplyContext(correction: ReplyCorrection, current: MacroObservation): boolean {
@@ -2667,11 +2692,9 @@ export class SurvivalMacroController {
         this.correctedContexts.add(correction.key);
         if (this.workQuery) this.workQuery.tick = original.tick;
       }
-    } else if (disposition === "invalid" && reason && rejection && inference?.dispatched === true && current &&
-        !this.closing && context.replyKey && !this.correctedContexts.has(context.replyKey)) {
-      const pending = { requestId: context.requestId, observation: original, key: context.replyKey,
-        feedback: { kind: "invalid_reply", detail: `The previous tool reply was invalid. No effect was authorized. ${reason}` } };
-      if (this.replyCorrectionApplies(pending, current)) this.replyCorrection = pending;
+    } else if (disposition === "invalid" && reason && rejection && inference?.dispatched === true && current) {
+      this.offerReplyCorrection(context, current,
+        { kind: "invalid_reply", detail: `The previous tool reply was invalid. No effect was authorized. ${reason}` });
     }
     if (disposition === "stale") this.staleDecisions++;
     this.unavailable = disposition === "provider_unavailable";
@@ -2816,7 +2839,7 @@ export class SurvivalMacroController {
         return;
       }
       const stages = action.kind === "work-program" ? action.stages : [{ policy: action.policy, requires: [] }];
-      const plan = { ...context, proposal };
+      const plan = { ...context, proposal, replyKey: inference?.dispatched === true ? context.replyKey : undefined };
       if (stages.some(({ policy: { target } }) => target.kind === "preset" && target.goal !== current.goal)) {
         await this.disposition("proposal_refused", { requestId: context.requestId, reason: "Work preset does not match the live goal." });
         return;
@@ -3569,11 +3592,10 @@ export class SurvivalMacroController {
     await this.record(kind, { requestId, stage: stageIndex + 1, detail, basis: basis(observation) });
   }
 
-  private async disposition(event: string, fields: Record<string, unknown> = {}): Promise<void> {
+  private async disposition(event: string, fields: Record<string, unknown> = {}, detail = FEEDBACK[event] ?? null): Promise<void> {
     this.lastDisposition = event;
     await this.record(event, fields);
     if (typeof fields.requestId === "string") this.episodeMemory.rejected(fields.requestId, event);
-    const detail = FEEDBACK[event];
     if (detail && this.view && !(event === "proposal_refused" && this.feedback?.requestId === fields.requestId &&
         this.currentFeedback(this.view.observation)?.kind === "work_resource_shortage")) {
       const { observation, evidence } = this.view;

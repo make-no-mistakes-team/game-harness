@@ -263,8 +263,10 @@ step. An unseen tile beyond the last support remains unproved.
 Mining needs the crosshair; picking up a drop does not. If a nearby
 drop is falling into reach, the player can keep looking at the trunk
 and let it fall. For a more distant visible drop it walks into pickup
-range without tracking the item with the camera. Only the actual
-pickup counts toward the requested stock.
+range without tracking the item with the camera. From a quarry edge
+it can step down one block if it sees a dry landing within pickup
+range and a clear way back. Seeing the drop below a ledge is not
+enough. Only an inventory gain counts toward the requested stock.
 
 After an actual timber approach stops, `timberObstruction` can identify
 one rendered leaf in reach and the retained tree or woodland direction

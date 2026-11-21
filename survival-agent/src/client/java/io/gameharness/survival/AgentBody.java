@@ -3434,10 +3434,16 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private boolean pickupSweepClear(Vec3d landing, double minimumFeetY, double maximumFeetY,
                                      double driftX, double driftZ, ItemEntity target, AgentPickup.Scope scope,
                                      Predicate<ItemEntity> stockFooting) {
+        return pickupSweepClear(landing, minimumFeetY, maximumFeetY, driftX, driftZ, target,
+            target == null ? ItemStack.EMPTY : target.getStack(), scope, stockFooting);
+    }
+
+    private boolean pickupSweepClear(Vec3d landing, double minimumFeetY, double maximumFeetY,
+                                     double driftX, double driftZ, ItemEntity target, ItemStack selected,
+                                     AgentPickup.Scope scope, Predicate<ItemEntity> stockFooting) {
         if (!hasView() || raysLeft <= 0) return false;
         var player = client.player;
         Box sweep = pickupSweep(landing, minimumFeetY, maximumFeetY, driftX, driftZ);
-        ItemStack selected = target == null ? ItemStack.EMPTY : target.getStack();
         for (ItemEntity item : client.world.getEntitiesByClass(ItemEntity.class, sweep,
                 candidate -> candidate != target && candidate.isAlive() && !candidate.isInvisibleTo(player))) {
             if (raysLeft <= 0) return false;
@@ -3447,6 +3453,28 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                     || stockFooting == null || !stockFooting.test(item))) return false;
         }
         return raysLeft > 0;
+    }
+
+    boolean pickupTreadClear(AgentSurfaceTread.Edge edge, ItemEntity target, ItemStack witnessed,
+                             AgentPickup.Scope scope, Predicate<ItemEntity> stockFooting) {
+        return pickupSweepClear(Vec3d.ofBottomCenter(edge.lower()), edge.lower().getY(), edge.upper().getY(),
+            0, 0, target, witnessed, scope, stockFooting);
+    }
+
+    /** Collision may veto this exact visible path, but cannot supply a top or passage ray. */
+    boolean witnessedStockTread(BlockPos from, BlockPos to, Direction bearing) {
+        int grade = to.getY() - from.getY();
+        if (grade < -1 || grade > 0 || !AgentSurfaceTread.cardinalTread(from, to, bearing)
+                || !client.player.isOnGround() || client.options.forwardKey.isUnbound()
+                || grade < 0 && client.options.jumpKey.isUnbound() || dryCaveContact(from) == null) return false;
+        Vec3d center = Vec3d.ofBottomCenter(to);
+        int dx = bearing.getOffsetX(), dz = bearing.getOffsetZ();
+        if (dryRouteFloor(center.add(0.28 * dx, -0.032, 0.28 * dz), to.down()) == null
+                && dryRouteFloor(center.add(-0.22 * dx, -0.032, -0.22 * dz), to.down()) == null) return false;
+        return dryRouteClear(center.add(0, 1.32, 0)) == DryRouteSample.CLEAR
+            && dryRouteClear(center.add(0, 1.76, 0)) == DryRouteSample.CLEAR
+            && walkedLaneDry(from, to, bearing) && AgentSurfaceTread.retainedLaneClear(client, from, to, bearing)
+            && dryRouteSweep(from, to);
     }
 
     private Box pickupSweep(Vec3d landing, double minimumFeetY, double maximumFeetY, double driftX, double driftZ) {

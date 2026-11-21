@@ -16,6 +16,7 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -43,6 +44,56 @@ final class AgentPickupTest {
         assertEquals(WAIT, AgentPickup.input(PLAYER, item(2, 2.4, 0.12), false, null, 180));
         assertEquals(WAIT, AgentPickup.input(PLAYER.offset(0.6, 0, 0), item(2, 0, 0.12), true, null, 180));
         assertEquals(FORWARD, AgentPickup.input(PLAYER, item(-0.8, 0, 2), true, null, 7));
+    }
+
+    @Test
+    void lowerQuarryDropThatFailsFlatInputCanBeCollectedFromAWitnessedTread() {
+        var rim = new BlockPos(0, 61, 0);
+        var lower = rim.north().down();
+        var player = PLAYER.offset(0.53, 61, 0.48);
+        var drop = item(0.28, 60, -1.32);
+
+        assertEquals(UNREACHABLE, AgentPickup.input(player, drop, true, null, 180));
+        assertTrue(AgentPickup.shouldCheckDryAccess(player, drop, true, 0));
+        assertEquals(new AgentPickup.Access(lower, Direction.NORTH),
+            AgentPickup.dryAccess(player, drop, rim, (step, bearing) -> step.equals(lower)));
+        assertTrue(AgentPickup.passiveOverlap(PLAYER.offset(0.5, 60, -0.5), drop));
+    }
+
+    @Test
+    void visibleDropBelowAnUnprovedOrDeepOpeningDoesNotAuthorizeAStep() {
+        var rim = new BlockPos(0, 61, 0);
+        var player = PLAYER.offset(0.53, 61, 0.48);
+        var drop = item(0.28, 60, -1.32);
+        assertNull(AgentPickup.dryAccess(player, drop, rim, (step, bearing) -> false),
+            "a visible entity does not establish a dry route or return");
+        assertNull(AgentPickup.dryAccess(player, drop.offset(0, -1, 0), rim, (step, bearing) -> {
+            throw new AssertionError("a drop in a deeper hole cannot nominate any tread to probe");
+        }));
+    }
+
+    @Test
+    void apparentRimOverlapGetsABoundedWaitThenACloserWitnessedStance() {
+        var rim = new BlockPos(0, 61, 0);
+        var player = PLAYER.offset(0.53, 61, 0.48);
+        var drop = item(0.31, 60.4, -0.52);
+        assertEquals(WAIT, AgentPickup.input(player, drop, true, null, 180));
+        assertFalse(AgentPickup.shouldCheckDryAccess(player, drop, true, 9), "give vanilla time to accept pickup");
+        assertFalse(AgentPickup.shouldCheckDryAccess(player, drop, false, 24), "do not chase a falling item");
+        assertTrue(AgentPickup.shouldCheckDryAccess(player, drop, true, 12), "overlap without stock is not a receipt");
+        assertEquals(new AgentPickup.Access(rim.north().down(), Direction.NORTH),
+            AgentPickup.dryAccess(player, drop, rim, (step, bearing) -> true));
+    }
+
+    @Test
+    void aSameLevelDropCanUseAnAlternateWitnessedTreadRatherThanTheUnprovedDirectBearing() {
+        var from = new BlockPos(0, 61, 0);
+        var player = PLAYER.offset(0.5, 61, 0.5);
+        var drop = item(1.4, 61, 1.3);
+        assertEquals(new AgentPickup.Access(from.east(), Direction.EAST),
+            AgentPickup.dryAccess(player, drop, from, (step, bearing) -> true));
+        assertEquals(new AgentPickup.Access(from.south(), Direction.SOUTH),
+            AgentPickup.dryAccess(player, drop, from, (step, bearing) -> step.equals(from.south())));
     }
 
     @Test

@@ -111,6 +111,7 @@ final class AgentMacroControl {
     private static final int MIN_GRADE_LEASE_TICKS = GRADE_GLANCE_TICKS + AgentSurfaceTread.ORDINARY_GRADE_TICKS;
     private static final double TIMBER_ARRIVAL = 0.96;
     private static final String SURFACE_CAP = "surface_cap";
+    private static final String DRY_TREAD_PICKUP = "dry_tread_pickup";
     private static final String SURFACE_OUTLOOK = "surface_outlook";
     private static final String SURFACE_RETURN_OUTLOOK = "surface_return_outlook";
     private static final float SURFACE_OUTLOOK_PITCH = 63;
@@ -348,7 +349,7 @@ final class AgentMacroControl {
         final Offer[] keepVisible;
         final float pathYaw, pathPitch;
         boolean drove, fired, broken, purposefulMotion, durable, tableInReach, prospectCover;
-        boolean diamondRoute, prospectLight, retryDiamondInset, scopedSourceLane, horizonBraking;
+        boolean diamondRoute, prospectLight, retryDiamondInset, scopedSourceLane, horizonBraking, rimSourceAccess;
         float lastCrack;
         long firedAt, placementFrame, pickupDisappeared, craftJob, priorCraftReceipt, settledAt, lastMissingFrame;
         long workshopFaceUntil;
@@ -370,9 +371,11 @@ final class AgentMacroControl {
         long gradeLookUntil;
         boolean secondHop;
         boolean timberApproached, timberWorkStance;
-        long dropSeen, pickupProgress;
+        long dropSeen, pickupProgress, pickupAccessLookUntil, pickupLandedTick = -1;
+        float pickupAccessYaw, pickupAccessPitch;
         Vec3d dropPosition, pickupFooting;
-        boolean dropGrounded, retryDropWhenVisible, passivePickup;
+        boolean dropGrounded, retryDropWhenVisible, harvestPickup, matchingPickupTread;
+        ItemStack pickupTreadStock;
         TimberObstruction timberOpening;
         int timberLogsNeeded;
         AgentSurfaceTread tread;
@@ -513,6 +516,7 @@ final class AgentMacroControl {
         final SourceSearch sourceSearch;
         final Set<BlockPos> rejected = new HashSet<>();
         final Map<Integer, PickupDeferral> deferredDrops = new HashMap<>();
+        final Set<Integer> spentPickupTreads = new HashSet<>();
         final Set<BlockPos> horizonAttempts = new HashSet<>();
         final Set<BlockPos> caveSurveys = new HashSet<>();
         long deadline;
@@ -1069,6 +1073,7 @@ final class AgentMacroControl {
     private final Predicate<ItemStack> safetySpend = this::canSpendSafetyStock;
     private final BooleanSupplier reconInputGrant = this::reconInputCurrent;
     private final Predicate<ItemEntity> stockPickupFooting = drop -> !dropInProspectOpening(drop) && roomFor(drop.getStack());
+    private final Predicate<ItemEntity> stockPickupRoom = drop -> roomFor(drop.getStack());
     private List<Offer> reservedOffers = List.of();
     private static final Offer[] NO_ANCHORS = {};
     private long reservationEpoch, reservationUntil;
@@ -1477,7 +1482,8 @@ final class AgentMacroControl {
             state(local ? "local_in_progress" : "terra_in_progress", action.offer.summary);
             int maxTicks = action.offer.scout != null ? action.offer.scout.rise != null
                 ? AgentSurfaceTread.ORDINARY_GRADE_TICKS + 6 : GROUND_SCOUT_TICKS
-                : STARTUP_OUTLOOK.equals(action.offer.key.activity) ? STARTUP_OUTLOOK_TICKS : action.offer.key.verb.maxTicks;
+                : STARTUP_OUTLOOK.equals(action.offer.key.activity) ? STARTUP_OUTLOOK_TICKS
+                : DRY_TREAD_PICKUP.equals(action.offer.key.activity) ? AgentSurfaceTread.ACTION_TICKS + 8 : action.offer.key.verb.maxTicks;
             if (!local && (input.intent == null || !input.intent.equals(action.intent))) {
                 interrupt("The host withdrew or replaced this intent.", true);
             } else if ((local ? now - action.startedAt >= PLANNING_IDLE_LIMIT_NS : tick > action.intent.expires)
@@ -1486,7 +1492,8 @@ final class AgentMacroControl {
             } else if (action.offer.route != null && (action.intent.epoch != epoch || !cursorClear())) {
                 interrupt("The dry route's dependency epoch or clean-cursor premise changed.", true);
             } else if ((!grounded() && !progress.dryRouteInFlight(action.offer.route) && !pendingReturnInFlight()
-                    && !scoutGradeInFlight())
+                    && !scoutGradeInFlight() && !(DRY_TREAD_PICKUP.equals(action.offer.key.activity)
+                        && action.tread != null && action.tread.inFlight() && !player.isTouchingWater() && !player.hasVehicle()))
                     || !hazardClear || !client.isWindowFocused() || client.getOverlay() != null) {
                 interrupt("Grounding, window focus, or local safety changed.", true);
             } else {
@@ -2146,30 +2153,16 @@ final class AgentMacroControl {
                     return;
                 }
             }
-            if (work.lowerHarvest && !deepWork()) {
-                boolean nextTread = surfaceStepOrigin(sourceSearch, player.getBlockPos())
-                    && work.lastHarvest.equals(AgentSurfaceTread.nextFoot(player.getBlockPos(), sourceSearch.cutBearing));
+            if (!deepWork() && (work.lowerHarvest || !sourceSearch.stairs.isEmpty())) {
                 Vec3d harvested = Vec3d.ofCenter(work.lastHarvest);
                 ItemEntity drop = (ItemEntity) body.visibleEntity(entity -> entity instanceof ItemEntity item
                     && item.getPos().squaredDistanceTo(harvested) <= 2.25
-                    && item.getStack().isOf(expected)
+                    && pickupEligible(item) && item.getStack().isOf(expected)
                     && roomFor(item.getStack()), 3.25).orElse(null);
-                if (drop != null && AgentPickup.passiveOverlap(player.getBoundingBox(), drop.getBoundingBox())) {
+                if (drop != null) {
                     startWorkPickup(drop);
-                    action.passivePickup = true;
+                    action.harvestPickup = true;
                     work.lastHarvest = null;
-                    runWorkStep(progress);
-                    return;
-                }
-                if (nextTread && drop != null && drop.isOnGround() && drop.getBlockPos().equals(work.lastHarvest)
-                        && prepareNextTread(player.getBlockPos(), progress, state -> AgentWorkOrder.harvest(state) == expected
-                        && work.budget.policy.breakAllowed(state), sourceSearch)) {
-                    if (action != null && action.tread != null) {
-                        action.stairDrop = drop;
-                        action.tracked = expected;
-                        action.stairStock = count(expected);
-                        work.lastHarvest = null;
-                    }
                     runWorkStep(progress);
                     return;
                 }
@@ -2182,7 +2175,7 @@ final class AgentMacroControl {
             if (work.lowerHarvest || tick - work.lastHarvestTick <= 8) {
                 body.pauseWork();
                 enact("search", work.lowerHarvest
-                    ? "Checking the confirmed harvest from the rim without entering the opening."
+                    ? "Checking for a matching drop and a safely reachable collection stance."
                     : "Checking beside the confirmed harvest for a visible drop; no pickup confirmed yet.");
                 return;
             }
@@ -2333,9 +2326,11 @@ final class AgentMacroControl {
 
     private boolean workPickup(Predicate<ItemStack> wanted) {
         if (!work.sourceSearch.stairs.isEmpty() || travelAnchorOutstanding()) return false;
+        boolean canUseTread = fungibleStockPickup();
         var seen = body.visibleEntity(entity -> entity instanceof ItemEntity drop && pickupEligible(drop)
             && (!deepWork() || drop.getBlockPos().getY() == player.getBlockY())
-            && !dropInProspectOpening(drop) && wanted.test(drop.getStack()) && roomFor(drop.getStack()), 8.0).orElse(null);
+            && (canUseTread || !dropInProspectOpening(drop)) && wanted.test(drop.getStack())
+            && roomFor(drop.getStack()), 8.0).orElse(null);
         if (!(seen instanceof ItemEntity found)) return false;
         return startWorkPickup(found);
     }
@@ -2352,6 +2347,7 @@ final class AgentMacroControl {
 
     /** Reconsider a blocked drop only when the currently visible item or the player's pose actually changes. */
     private boolean pickupEligible(ItemEntity drop) {
+        if (work.spentPickupTreads.contains(drop.getId())) return false;
         PickupDeferral prior = work.deferredDrops.get(drop.getId());
         return prior == null || drop.isOnGround() != prior.grounded
             || drop.getPos().squaredDistanceTo(prior.drop) >= 0.0225
@@ -2444,15 +2440,23 @@ final class AgentMacroControl {
             if (workGatherTimber(progress, wanted, eligible, required)) return true;
             if (work.sourceBlock != null) return false;
         }
-        var found = body.find(wanted, reach, hit -> {
+        Predicate<BlockHitResult> exactSource = hit -> {
             if (!eligible.test(hit)) return false;
             if (body.macroMineWitness(hit, reach) != null) return true;
             noteSourceRefusal(hit, world.getBlockState(hit.getBlockPos()), "The visible face has no current exact within-reach mining contact.");
             return false;
-        }).orElse(null);
+        };
+        int footY = player.getBlockY();
+        var found = body.find(wanted, reach,
+            hit -> (diamond || hit.getBlockPos().getY() >= footY) && exactSource.test(hit)).orElse(null);
+        if (found == null && !diamond)
+            found = body.findSampled(wanted, reach, hit -> hit.getBlockPos().getY() < footY && exactSource.test(hit)).orElse(null);
         if (found != null) {
             Face face = face(found);
-            return startWorkBreak(face, AgentWorkOrder.harvest(face.state), false);
+            BlockPos opening = !deepWork() && !travelAnchorOutstanding() ? rimSourceOpening(player.getBlockPos(), found) : null;
+            if (opening == null) return startWorkBreak(face, AgentWorkOrder.harvest(face.state), false);
+            if (startRimSourceAccess(found, opening)) return true;
+            noteSourceRefusal(found, face.state, "The low wall has no available dry access with a verified reverse edge.");
         }
         var search = work.sourceSearch;
         if (work.order.surfaceAnchor() != null && !search.stairUsed && search.lastCover != null
@@ -2485,6 +2489,25 @@ final class AgentMacroControl {
         if (!deepWork() && work.sourceSearch.stairs.isEmpty() && startSourceCaveStep(progress, found)) return true;
         if (startContactHorizonSource(sourceTravel) || startContactHorizonSource(caveTravel)) return true;
         return prospectForSource(progress, wanted);
+    }
+
+    private boolean startRimSourceAccess(BlockHitResult source, BlockPos opening) {
+        var search = work.sourceSearch;
+        if (!settled() || !prospectBodyUsable()
+                || !AgentSurfaceTread.canExtend(workTicksLeft() - Verb.BREAK.maxTicks, search.stairs.size())) return false;
+        BlockPos from = player.getBlockPos();
+        Direction bearing = null;
+        for (Direction candidate : CARDINAL)
+            if (AgentSurfaceTread.nextFoot(from, candidate).equals(opening)) { bearing = candidate; break; }
+        if (bearing == null || !body.witnessedStockTread(from, opening, bearing)) return false;
+        var edge = stockTreadEdge(from, opening, bearing);
+        if (edge.equals(work.refusedOutwardTread) || !body.macroNoVisiblePickup(Vec3d.ofBottomCenter(opening),
+                opening.getY(), from.getY())) return false;
+        startSurfaceTread(edge, false, AgentSurfaceTread.witnessedOutbound(edge, tick));
+        action.rimSourceAccess = true;
+        action.walkInventory = new InventoryWitness(player.getInventory());
+        rememberSourceBearing(source);
+        return true;
     }
 
     private boolean eligibleWorkSource(BlockHitResult hit, AgentProgress progress) {
@@ -4556,7 +4579,8 @@ final class AgentMacroControl {
 
     private static boolean surfaceStepOrigin(SourceSearch search, BlockPos foot) {
         return search.cutBearing != null && (search.stairs.isEmpty() ? search.sideEntry && !search.stairUsed
-            && foot.equals(search.cutFrom) : search.stairs.getLast().lower().equals(foot));
+            && foot.equals(search.cutFrom) : search.stairs.getLast().lower().equals(foot)
+                && isShallowEdge(search, search.stairs.getLast()));
     }
 
     private boolean retainedProspectStance(BlockPos foot, BlockPos cell, SourceSearch search) {
@@ -4781,6 +4805,18 @@ final class AgentMacroControl {
         trackDiamondRecoveryWalk();
         var search = work.sourceSearch;
         var tread = action.tread;
+        if (action.rimSourceAccess) {
+            String mismatch = unexpectedPickup();
+            if (mismatch != null) {
+                interrupt(mismatch, true);
+                return;
+            }
+            if (!body.hasRecentView() || body.dryRouteRaysSpent()) return;
+            if (!body.macroNoVisiblePickup(Vec3d.ofBottomCenter(tread.to), tread.to.getY(), tread.from.getY())) {
+                interrupt("The witnessed approach to the low source is no longer clear of visible pickups.", true);
+                return;
+            }
+        }
         switch (tread.step(client, body, tick)) {
             case CHECKING -> {}
             case MOVING -> {
@@ -4806,7 +4842,7 @@ final class AgentMacroControl {
                     if (tread.returning) search.stairs.removeLast();
                     else {
                         search.stairs.addLast(tread.edge);
-                        search.stairUsed = true;
+                        if (!action.rimSourceAccess || isShallowEdge(search, tread.edge)) search.stairUsed = true;
                     }
                     search.footholds.add(tread.from.down());
                     search.footholds.add(tread.to.down());
@@ -5196,12 +5232,18 @@ final class AgentMacroControl {
     private void advanceWorkPickup() {
         Offer offer = action.offer;
         ItemEntity drop = offer.drop;
+        if (action.tread != null) {
+            advancePickupTread();
+            return;
+        }
         String mismatch = unexpectedPickup();
         if (mismatch != null) {
             interrupt(mismatch, true);
             return;
         }
-        boolean fungibleStock = !action.passivePickup && fungibleStockPickup();
+        boolean fungibleStock = fungibleStockPickup();
+        boolean routed = work.foodClue == null && (fungibleStock || action.harvestPickup);
+        boolean retained = !work.sourceSearch.stairs.isEmpty();
         int gain = count(offer.item) - action.itemCount;
         if (gain > 0 && (fungibleStock || drop.isRemoved())) {
             body.visibleHorizon().reportPickupUnseen(drop, "inventory_gain");
@@ -5222,6 +5264,10 @@ final class AgentMacroControl {
         if (!body.seesDrop(drop, 8)) {
             body.visibleHorizon().reportPickupUnseen(drop, "not_rendered");
             body.pauseWork();
+            if (tick < action.pickupAccessLookUntil) {
+                body.turnFine(action.pickupAccessYaw, action.pickupAccessPitch);
+                return;
+            }
             if (tick - action.dropSeen > 23) {
                 action.retryDropWhenVisible = true;
                 interrupt("The witnessed drop left the rendered view.", true);
@@ -5229,7 +5275,7 @@ final class AgentMacroControl {
             return;
         }
         action.dropSeen = tick;
-        if (!drop.getStack().isOf(offer.item) || !roomFor(drop.getStack()) || !action.passivePickup && dropInProspectOpening(drop)
+        if (!drop.getStack().isOf(offer.item) || !roomFor(drop.getStack()) || !routed && dropInProspectOpening(drop)
                 || deepWork() && drop.getBlockPos().getY() != player.getBlockY()) {
             body.pauseWork();
             interrupt("The witnessed item, available inventory space, or authorized footing changed.", true);
@@ -5242,21 +5288,144 @@ final class AgentMacroControl {
             action.pickupFooting = player.getPos();
             action.pickupProgress = tick;
         }
-        if (tick - action.pickupProgress > 24) {
+        long quiet = tick - action.pickupProgress;
+        boolean below = drop.getY() < player.getY() - 0.35;
+        if (routed && (below || retained) && startPickupAccess(drop, fungibleStock, quiet)) return;
+        if (quiet > 24 && tick >= action.pickupAccessLookUntil) {
             body.visibleHorizon().reportPickup(drop, "no_collection_progress", null);
             body.pauseWork();
             interrupt("No safe collection step or vanilla pickup was confirmed for the witnessed drop.", true);
             return;
         }
-        if (action.passivePickup) {
-            body.visibleHorizon().reportPickup(drop, "passive_wait", null);
+        if (retained) {
+            // An ordinary rolling pickup must not walk away from the origin of a retained reverse edge.
+            body.visibleHorizon().reportPickup(drop, "waiting_on_retained_tread", null);
             body.pauseWork();
-        } else if (fungibleStock)
-            body.pickUpVisible(drop, null, AgentPickup.Scope.MATCHING_STOCK, stockPickupFooting);
-        else body.pickUpVisible(drop, null, true);
+            return;
+        }
+        var result = fungibleStock
+            ? body.pickUpVisible(drop, null, AgentPickup.Scope.MATCHING_STOCK, stockPickupFooting)
+            : body.pickUpVisible(drop, null, true);
+        if (routed && !below && result != AgentBody.PickupResult.MOVING
+                && startPickupAccess(drop, fungibleStock, quiet)) return;
         if (timberItem(offer.item)) rememberTimberView();
         if (action.drove && player.getVelocity().horizontalLengthSquared() > SETTLED_SPEED_SQUARED)
             continuityWork = AgentPauseEpisodes.Work.ROUTE;
+    }
+
+    private AgentSurfaceTread.Edge pickupAccessEdge(ItemEntity drop) {
+        BlockPos from = player.getBlockPos();
+        var access = AgentPickup.dryAccess(player.getBoundingBox(), drop.getBoundingBox(), from,
+            (to, bearing) -> body.witnessedStockTread(from, to, bearing));
+        return access == null ? null : stockTreadEdge(from, access.foot(), access.bearing());
+    }
+
+    private AgentSurfaceTread.Edge stockTreadEdge(BlockPos from, BlockPos to, Direction bearing) {
+        return new AgentSurfaceTread.Edge(from, world.getBlockState(from.down()), to, world.getBlockState(to.down()), bearing);
+    }
+
+    private boolean startPickupAccess(ItemEntity drop, boolean matching, long quiet) {
+        if (!grounded() || !settled() || !AgentPickup.shouldCheckDryAccess(player.getBoundingBox(), drop.getBoundingBox(),
+                drop.isOnGround(), quiet) || !surfaceBodyAllowsExtension()
+                || !AgentSurfaceTread.canExtend(workTicksLeft(), work.sourceSearch.stairs.size())) return false;
+        var edge = pickupAccessEdge(drop);
+        if (edge != null && !edge.equals(work.refusedOutwardTread) && attachPickupTread(drop, edge, matching)) return true;
+        if (action.pickupAccessLookUntil == 0) {
+            var candidate = AgentPickup.dryAccess(player.getBoundingBox(), drop.getBoundingBox(), player.getBlockPos(),
+                (to, bearing) -> true);
+            if (candidate == null) return false;
+            action.pickupAccessLookUntil = tick + 14;
+            action.pickupAccessYaw = candidate.bearing().getPositiveHorizontalDegrees();
+            action.pickupAccessPitch = candidate.foot().getY() < player.getBlockY() ? 57 : AgentBody.LEVEL_ROUTE_PITCH;
+        }
+        if (tick >= action.pickupAccessLookUntil) return false;
+        body.pauseWork();
+        body.turnFine(action.pickupAccessYaw, action.pickupAccessPitch);
+        return true;
+    }
+
+    private boolean attachPickupTread(ItemEntity drop, AgentSurfaceTread.Edge edge, boolean matching) {
+        ItemStack selected = matching ? drop.getStack() : ItemStack.EMPTY;
+        var scope = matching ? AgentPickup.Scope.MATCHING_STOCK : AgentPickup.Scope.EXACT_ENTITY;
+        if (!body.pickupTreadClear(edge, drop, selected, scope, stockPickupRoom)) return false;
+        body.pauseWork();
+        body.visibleHorizon().reportPickup(drop, "witnessed_dry_tread", null);
+        action.tread = AgentSurfaceTread.witnessedOutbound(edge, tick);
+        action.pickupTreadStock = matching ? selected.copy() : ItemStack.EMPTY;
+        action.matchingPickupTread = matching;
+        return true;
+    }
+
+    private void advancePickupTread() {
+        Offer offer = action.offer;
+        var tread = action.tread;
+        ItemEntity drop = offer.drop;
+        String mismatch = unexpectedPickup();
+        if (mismatch != null) {
+            interruptPickupTread(mismatch);
+            return;
+        }
+        if (!tread.inFlight() && drop.isRemoved()) {
+            body.pauseWork();
+            if (action.pickupDisappeared == 0) action.pickupDisappeared = tick;
+            if (count(offer.item) > action.itemCount) {
+                body.visibleHorizon().reportPickupUnseen(drop, "inventory_gain");
+                continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+                complete("The witnessed drop disappeared with a matching inventory gain before stepping onto the tread.");
+            } else if (tick - action.pickupDisappeared > 6) {
+                interrupt("The witnessed drop disappeared before the collection step without a matching inventory gain.", true);
+            }
+            return;
+        }
+        if (action.pickupLandedTick >= 0) {
+            body.pauseWork();
+            int gain = count(offer.item) - action.itemCount;
+            if (gain > 0 && (action.matchingPickupTread || drop.isRemoved())) {
+                body.visibleHorizon().reportPickupUnseen(drop, "inventory_gain");
+                continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+                complete("Vanilla confirmed a " + gain + " item gain of " + Registries.ITEM.getId(offer.item)
+                    + " after walking the witnessed dry tread.");
+            } else if (tick - action.pickupLandedTick >= 8) {
+                body.visibleHorizon().reportPickupUnseen(drop, "landed_without_inventory_gain");
+                interrupt("Grounded on the verified tread, but no matching pickup was confirmed.", true);
+            }
+            return;
+        }
+        if (!body.hasRecentView() || body.dryRouteRaysSpent()) return;
+        var scope = action.matchingPickupTread ? AgentPickup.Scope.MATCHING_STOCK : AgentPickup.Scope.EXACT_ENTITY;
+        if (!body.pickupTreadClear(tread.edge, drop, action.pickupTreadStock, scope, stockPickupRoom)) {
+            interruptPickupTread("The witnessed pickup tread no longer has a clear collection sweep.");
+            return;
+        }
+        switch (tread.step(client, body, tick)) {
+            case CHECKING -> { }
+            case MOVING -> {
+                if (player.getVelocity().horizontalLengthSquared() > SETTLED_SPEED_SQUARED)
+                    continuityWork = AgentPauseEpisodes.Work.ROUTE;
+            }
+            case REFUSED -> interruptPickupTread(tread.refusal());
+            case LANDED -> {
+                body.recordWalkedLeg(tread.from, tread.to);
+                action.pickupLandedTick = tick;
+                if (action.durable) {
+                    var search = work.sourceSearch;
+                    search.stairs.addLast(tread.edge);
+                    search.footholds.add(tread.from.down());
+                    search.footholds.add(tread.to.down());
+                    search.freshAfter = body.renderedFrame();
+                    if (isShallowEdge(search, tread.edge)) search.stairUsed = true;
+                    else search.returning = true;
+                    work.spentPickupTreads.add(drop.getId());
+                }
+                body.visibleHorizon().reportPickupUnseen(drop, "dry_tread_landed");
+            }
+        }
+    }
+
+    private void interruptPickupTread(String reason) {
+        if (action.durable && action.pickupLandedTick < 0 && !action.tread.refusedOnTakeoff(player.getBlockPos(), grounded()))
+            retireWork("blocked", "interrupted", reason + " No new footing or return was confirmed.");
+        interrupt(reason, true);
     }
 
     private void advanceHorizonWork(AgentProgress progress) {
@@ -7282,8 +7451,9 @@ final class AgentMacroControl {
                 ? "That footing was already checked without finding a new source."
                 : !floorCurrent(offer.floor) ? "The adjacent footing is no longer visible and clear." :
                 !body.macroNoVisiblePickup(offer.floor.landing) ? "A visible pickup overlaps the walking lane, or the view cannot check it." : null;
-            case COLLECT -> dropVisible(offer) && floorCurrent(offer.floor)
-                && dropNearLanding(offer.drop, offer.floor) && roomFor(offer.drop.getStack())
+            case COLLECT -> (DRY_TREAD_PICKUP.equals(offer.key.activity) ? currentOfferedPickupTread(offer) != null
+                : dropVisible(offer) && floorCurrent(offer.floor)
+                    && dropNearLanding(offer.drop, offer.floor) && roomFor(offer.drop.getStack()))
                 ? null : "The drop, adjacent footing, or inventory room changed.";
             case BREAK -> (SURFACE_CAP.equals(offer.key.activity) ? directCapCurrent(offer.face, progress)
                 : visibleFace(offer.face) && canBreak(offer.face, progress))
@@ -7702,6 +7872,10 @@ final class AgentMacroControl {
     private void collectOnOfferedFloor(Offer offer) {
         Floor floor = offer.floor;
         ItemEntity drop = offer.drop;
+        if (action.tread != null) {
+            advancePickupTread();
+            return;
+        }
         if (drop.isRemoved()) {
             body.pauseWork();
             if (action.pickupDisappeared == 0) action.pickupDisappeared = tick;
@@ -7717,6 +7891,12 @@ final class AgentMacroControl {
             return;
         }
         if (!body.hasRecentView()) return;
+        if (DRY_TREAD_PICKUP.equals(offer.key.activity)) {
+            var edge = currentOfferedPickupTread(offer);
+            if (edge == null || !attachPickupTread(drop, edge, false))
+                interrupt("The offered lower pickup tread or its exact drop changed before movement.", true);
+            return;
+        }
         if (!dropVisible(offer) || !dropNearLanding(drop, floor) || !roomFor(drop.getStack())
                 || !body.macroFlatLane(floor.pos, floor.state, floor.landing)) {
             body.pauseWork();
@@ -9167,6 +9347,7 @@ final class AgentMacroControl {
         var offers = new ArrayList<Offer>(MAX_OFFERS);
         addGroundScout(offers, travel);
         for (Offer reserved : reservation()) if (liveMaterialFace(reserved, progress)) offers.add(reserved);
+        if (ipc.workMode != null && neutralWorkView()) addLowerDrop(offers, player.getPitch());
         if (!trial) addDryRouteOffer(offers, progress);
         if (!trial && ipc.workMode != null) addWaterClue(offers);
         var player = client.player;
@@ -9246,6 +9427,27 @@ final class AgentMacroControl {
                 "A rendered drop is on this adjacent dry tile; the matching item fits in inventory.",
                 0, pitch, floor, null, drop, item, null);
         }
+    }
+
+    private void addLowerDrop(List<Offer> offers, float pitch) {
+        var drop = (ItemEntity) body.visibleEntity(entity -> entity instanceof ItemEntity item
+            && item.isOnGround() && item.getY() < player.getY() - 0.35 && roomFor(item.getStack()), 3.25).orElse(null);
+        if (drop == null) return;
+        var edge = pickupAccessEdge(drop);
+        if (edge == null || !body.pickupTreadClear(edge, drop, ItemStack.EMPTY, AgentPickup.Scope.EXACT_ENTITY, null)) return;
+        Item item = drop.getStack().getItem();
+        var floor = new Floor(edge.lower().down(), edge.lowerSupport(), Vec3d.ofBottomCenter(edge.lower()));
+        offer(offers, new Key(Verb.COLLECT, floor.pos, drop.getId(), DRY_TREAD_PICKUP),
+            "Collect visible " + Registries.ITEM.getId(item),
+            "One rendered dry tread leads down to a stance within pickup range, with a clear reverse jump.",
+            0, pitch, floor, null, drop, item, null);
+    }
+
+    private AgentSurfaceTread.Edge currentOfferedPickupTread(Offer offer) {
+        if (!dropVisible(offer) || !offer.drop.isOnGround() || !roomFor(offer.drop.getStack())) return null;
+        var edge = pickupAccessEdge(offer.drop);
+        return edge != null && edge.lower().down().equals(offer.floor.pos) && edge.lowerSupport() == offer.floor.state
+            && body.pickupTreadClear(edge, offer.drop, ItemStack.EMPTY, AgentPickup.Scope.EXACT_ENTITY, null) ? edge : null;
     }
 
     private String addFoodClues(List<Offer> offers, AgentProgress progress) {

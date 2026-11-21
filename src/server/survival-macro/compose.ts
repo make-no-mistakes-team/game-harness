@@ -36,7 +36,7 @@ export interface TrustedSurvivalDisplay {
 }
 
 export function declareTerraStrategy(
-  options: { maxRequests: number; task?: string; startup?: "allow" | "off" }, wallMs: number,
+  options: { maxRequests: number; task?: string; startup?: "allow" | "off"; skillTrials?: "allow" | "off" }, wallMs: number,
   lane?: { preparedDiagnostic: true; shallowWork?: true; brakeWork?: never } |
     { preparedDiagnostic: true; brakeWork: true; shallowWork?: never },
 ) {
@@ -52,7 +52,8 @@ export function declareTerraStrategy(
     limits: { maxRequests: options.maxRequests, maxRuntimeMs: wallMs, requestTimeoutMs: REQUEST_TIMEOUT_MS,
       planningIdleMs: MACRO_MAX_PLANNING_IDLE_MS },
     frame: { source: "verified-game-display", format: "image/jpeg", maxBytes: FRAME_BYTES, timeoutMs: FRAME_TIMEOUT_MS },
-    authoring: preparedDiagnostic ? null : { adapterVersion: MACRO_TRIAL_ADAPTER_VERSION, lowRiskVerbs: LOW_RISK_VERBS },
+    authoring: preparedDiagnostic || options.skillTrials === "off" ? null
+      : { adapterVersion: MACRO_TRIAL_ADAPTER_VERSION, lowRiskVerbs: LOW_RISK_VERBS },
   };
 }
 

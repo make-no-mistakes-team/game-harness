@@ -116,7 +116,7 @@ class Stop extends Error {
 
 const usage = `Minecraft Survival Agent
 
-Usage: bun run play:agent [--strategy terra [--macro-requests N] [--startup allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --replay-incident) RUN_BASENAME]]
+Usage: bun run play:agent [--strategy terra [--macro-requests N] [--startup allow|off] [--skill-trials allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --replay-incident) RUN_BASENAME]]
        bun run diagnose:pool [SECONDS]
        bun run play:agent --diagnostic-descent (${descentVariants.join(" | ")}) [SECONDS]
        bun run play:agent --diagnostic-terrain (${terrainVariants.join(" | ")}) [SECONDS]
@@ -127,6 +127,7 @@ GOAL: ${GOALS.join(" | ")}
 --strategy terra: use gpt-6.1-terra for this ordinary run; omitted means no model.
 --macro-requests: finite call budget for this attempt (default 8). --task adds a strategic objective without replacing the vanilla goal verifier.
 --startup off: wait for the first live observation before spending any Terra request. Ordinary Terra otherwise may plan from the task alone during loading.
+--skill-trials off: keep play in the chosen world; do not start a separate world to test an authored skill.
 SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SECONDS}).
 --continue-from: copy a closed, recorded Survival world. Retry its goal or pursue a later one.
 --replay-incident: replay an ordinary save in the diagnostic lane; never a fresh run.

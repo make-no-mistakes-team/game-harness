@@ -63,6 +63,11 @@ advice grants no action. A rejected plan or a failed
 startup can still use that request. Pass `--startup off` before the goal
 to wait for the first observation before making a paid call.
 
+For a single-world campaign, pass `--skill-trials off` before the goal
+and `--continue-from RUN_BASENAME` after the time limit. Terra still
+plans and plays in that save; the runner does not create side worlds
+to test authored skills.
+
 Here Terra can make eight requests during a 360-second attempt. While it
 thinks, the local player can continue an authorized job. For example, an
 order can request a stock of planks and protect the last log. The player

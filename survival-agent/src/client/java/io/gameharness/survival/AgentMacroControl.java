@@ -106,6 +106,10 @@ final class AgentMacroControl {
     private static final int MIN_GRADE_LEASE_TICKS = GRADE_GLANCE_TICKS + AgentSurfaceTread.ORDINARY_GRADE_TICKS;
     private static final double TIMBER_ARRIVAL = 0.96;
     private static final String SURFACE_CAP = "surface_cap";
+    private static final String STARTUP_OUTLOOK = "startup_outlook";
+    private static final float STARTUP_CEILING_PITCH = -78;
+    static final float STARTUP_OUTLOOK_PITCH = 18;
+    static final int STARTUP_OUTLOOK_TICKS = 45;
     private static final double INSPECT_REACH = 16;
     private static final double TIMBER_RECALL_RANGE = 9;
     private static final int TIMBER_RECALL_TICKS = 220;
@@ -901,6 +905,8 @@ final class AgentMacroControl {
     private AgentPauseEpisodes.Work continuityWork;
     private long lastHandsEvidence;
     private long waterReceiptUntil;
+    private long surveyReleaseFrame = -1;
+    private boolean firstOutlookPending, startupInputsClear;
     private boolean suspended, visited, owned, hazardClear, lastHazard, quiescent, urgent, blocked, deadlineMeasured;
     private boolean urgentInput;
     private boolean rawPending, rawWorking;
@@ -927,6 +933,7 @@ final class AgentMacroControl {
         this.pendingFurnaceMemory = pendingFurnaceMemory;
         this.activated = mode != null;
         this.trial = trial;
+        firstOutlookPending = !trial && "constrained".equals(mode);
         ipc = new Ipc(directory, run, mode);
     }
 
@@ -945,7 +952,10 @@ final class AgentMacroControl {
         input = ipc.inbox;
         owner = engaged() ? "safety" : "deterministic";
         if (this.life != life || world != client.world || player != client.player) {
-            if (this.life != 0) invalidatePending("The player life, connection or dimension changed.");
+            if (this.life != 0) {
+                firstOutlookPending = false;
+                invalidatePending("The player life, connection or dimension changed.");
+            }
             interrupt("The player life or dimension changed.", false);
             retireWork("needs_replan", "interrupted", "The player life or dimension changed.");
             work = null;
@@ -982,6 +992,7 @@ final class AgentMacroControl {
             scopedMainHand = ItemStack.EMPTY;
             lastHazard = false;
             localSteps.clear();
+            surveyReleaseFrame = -1;
             reservedOffers = List.of();
             routeOffer = drySurveyOffer = null;
             dryOfferEvidence = null;
@@ -1148,6 +1159,8 @@ final class AgentMacroControl {
         hazardClear = !body.lavaEmergency() && !body.macroLavaNear()
             && !client.player.isOnFire() && !client.player.isInLava() && client.player.hurtTime == 0;
 
+        if (firstOutlookPending || lastObservation == 0 && "constrained".equals(ipc.workMode))
+            startupInputsClear = body.keysNeutral() && !hands.busy() && !hands.holdsWorkInventory();
         if (!input.active) {
             claim(trial ? "trial_idle" : "local_handoff");
             interrupt("The host revoked macro authority.", true);
@@ -1183,10 +1196,11 @@ final class AgentMacroControl {
             claim(local ? "local_motion" : "terra");
             if (local) ++fallbackTicks;
             state(local ? "local_in_progress" : "terra_in_progress", action.offer.summary);
+            int maxTicks = STARTUP_OUTLOOK.equals(action.offer.key.activity) ? STARTUP_OUTLOOK_TICKS : action.offer.key.verb.maxTicks;
             if (!local && (input.intent == null || !input.intent.equals(action.intent))) {
                 interrupt("The host withdrew or replaced this intent.", true);
             } else if ((local ? now - action.startedAt >= PLANNING_IDLE_LIMIT_NS : tick > action.intent.expires)
-                    || tick - action.started > action.offer.key.verb.maxTicks) {
+                    || tick - action.started > maxTicks) {
                 interrupt(timeoutDetail(), true);
             } else if (action.offer.route != null && (action.intent.epoch != epoch || !cursorClear())) {
                 interrupt("The dry route's dependency epoch or clean-cursor premise changed.", true);
@@ -1225,8 +1239,11 @@ final class AgentMacroControl {
             return;
         }
         Offer offer = snapshots.get(intent.basis).offers.get(intent.opportunity);
-        String refusal = !available() ? "No neutral, grounded, safe first-person view." :
+        String refusal = !available() || offer.key.verb == Verb.SURVEY && !stationaryWorldControls()
+            ? "No neutral, grounded, safe first-person view." :
             trial && (trialUsed || !diagnosticVerb(offer.key.verb)) ? "The diagnostic admits one isolated reader action."
+            : STARTUP_OUTLOOK.equals(offer.key.activity) && intent.skillHash != null
+                ? "Only a direct model instruction may frame the startup outlook."
             : offer.key.verb == Verb.COLLECT_PENDING && (intent.skillHash != null || tick - intent.basis >= MAX_WORK_ADMISSION_AGE)
                 ? "Collection requires a fresh, direct instruction for the exact pending ticket."
             : SURFACE_CAP.equals(offer.key.activity) && intent.skillHash != null ? "A generated skill cannot cut cover."
@@ -1242,6 +1259,7 @@ final class AgentMacroControl {
             return;
         }
         markConsumed(intent.id);
+        firstOutlookPending = false;
         owner = "terra";
         if (offer.route != null || offer.drySurvey != null) routeOwner = progress;
         action = new Action(intent, offer, client, tick, now, body.renderedFrame(),
@@ -6355,10 +6373,20 @@ final class AgentMacroControl {
     private String validate(Offer offer, AgentProgress progress) {
         var player = client.player;
         return switch (offer.key.verb) {
-            case SURVEY -> repeatedSourceView() || retiredViews.contains(offer.key) || offer.key.entity != surveyOrigin || anchor == null
-                || horizontalSquared(anchor, player.getPos()) > 0.64
-                || angle(player.getYaw(), player.getPitch(), offer.yaw, offer.pitch) < 5
-                ? "The bounded survey is already done or its origin changed." : null;
+            case SURVEY -> {
+                if (STARTUP_OUTLOOK.equals(offer.key.activity)) {
+                    var ceiling = firstOutlookPending && startupInputsClear && work == null && pendingEntry() == null
+                        && offer.key.entity == surveyOrigin && stationaryWorldControls()
+                        && Math.abs(MathHelper.wrapDegrees(player.getYaw() - offer.yaw)) <= 2 ? startupCeiling() : null;
+                    yield ceiling == null || !offer.key.pos.equals(ceiling.getBlockPos())
+                        || world.getBlockState(ceiling.getBlockPos()) != offer.key.state
+                        ? "The inherited ceiling view or its neutral starting stance changed." : null;
+                }
+                yield repeatedSourceView() || retiredViews.contains(offer.key) || offer.key.entity != surveyOrigin || anchor == null
+                    || horizontalSquared(anchor, player.getPos()) > 0.64
+                    || angle(player.getYaw(), player.getPitch(), offer.yaw, offer.pitch) < 5
+                    ? "The bounded survey is already done or its origin changed." : null;
+            }
             case STATION_REACQUIRE -> {
                 var clue = personalStation(offer.face.state.getBlock());
                 yield !stationRecallReady(clue) || clue.sequence != offer.key.entity
@@ -6418,20 +6446,7 @@ final class AgentMacroControl {
         switch (offer.key.verb) {
             case DRY_SURVEY -> surveyDryRoute(offer, progress);
             case STATION_REACQUIRE -> advanceStationRecall();
-            case SURVEY -> {
-                var player = client.player;
-                if (horizontalSquared(action.position, player.getPos()) > 0.12) {
-                    interrupt("The survey lost its stationary stance.", true);
-                } else if (!body.hasRecentView()) {
-                    // A missed frame is not motion or a negative witness. Hold until the
-                    // next rendered view or the survey's existing bounded deadline.
-                    return;
-                } else if (body.renderedFrame() > action.startingFrame
-                        && body.renderedDirection(action.camera.yaw, action.camera.pitch, 4)
-                        && angle(action.yaw, action.pitch, player.getYaw(), player.getPitch()) >= 5) {
-                    complete("The first-person camera rendered the requested survey angle.");
-                } else body.turnScan(action.camera.yaw, action.camera.pitch);
-            }
+            case SURVEY -> fixedSurvey();
             case INSPECT -> {
                 if (!body.hasRecentView()) return;
                 boolean witnessed = "contact".equals(offer.key.activity) ? visibleFace(offer.face) : visible(offer.face, INSPECT_REACH);
@@ -6460,6 +6475,31 @@ final class AgentMacroControl {
             }
             case WATER_CLUE, DEFER_PENDING, WORK_WALK, WORK_EQUIP, WORK_PLACE, WORK_TREAD, WORK_SMELT, WORK_FILL ->
                 throw new IllegalStateException("Expected work step dispatch");
+        }
+    }
+
+    enum FixedSurveyStep { TURN, FRAMED, INTERRUPT }
+
+    static FixedSurveyStep fixedSurveyStep(boolean stationary, long frame, long admittedFrame, boolean targetRendered) {
+        if (!stationary) return FixedSurveyStep.INTERRUPT;
+        return frame > admittedFrame && targetRendered ? FixedSurveyStep.FRAMED : FixedSurveyStep.TURN;
+    }
+
+    private void fixedSurvey() {
+        Camera target = action.camera;
+        boolean stationary = stationaryWorldControls() && action.position.squaredDistanceTo(player.getPos()) <= 0.0144;
+        boolean targetRendered = body.renderedDirection(target.yaw, target.pitch, 4)
+            && Math.abs(MathHelper.wrapDegrees(player.getYaw() - target.yaw)) <= 4
+            && Math.abs(player.getPitch() - target.pitch) <= 4
+            && angle(action.yaw, action.pitch, player.getYaw(), player.getPitch()) >= 5;
+        switch (fixedSurveyStep(stationary, body.renderedFrame(), action.startingFrame, targetRendered)) {
+            case INTERRUPT -> interrupt("The survey lost its stationary neutral controls.", true);
+            case FRAMED -> complete(STARTUP_OUTLOOK.equals(action.offer.key.activity)
+                ? "The first-person camera rendered the outlook ahead."
+                : "The first-person camera rendered the requested survey angle.");
+            // Missing preceding renders cannot retarget or complete this action,
+            // but need not cut the same already-authorized camera command.
+            case TURN -> body.turnScan(target.yaw, target.pitch);
         }
     }
 
@@ -6995,7 +7035,21 @@ final class AgentMacroControl {
         if (rawWorking && continuityWork != AgentPauseEpisodes.Work.MECHANICAL_WAIT
                 && action != null && action.durable && tick - lastPurposefulTick >= 10)
             purposeful("work " + action.offer.key.verb.id + ": " + continuityWork.name());
-        boolean forced = lastObservation == 0 || epoch != lastPublishedEpoch || hazardClear != lastHazard
+        // The first constrained request is irrevocably paid even if the model can
+        // only abstain. Don't publish an apparent handoff before a real render.
+        if (lastObservation == 0 && "constrained".equals(ipc.workMode)
+                && (!startupInputsClear || !available() || !stationaryWorldControls())) return;
+        boolean releasedSurvey = false;
+        if (surveyReleaseFrame >= 0) {
+            boolean idle = idlePublicationPremise();
+            releasedSurvey = idle && body.hasRecentView() && body.renderedFrame() > surveyReleaseFrame;
+            // The camera receipt is not a new view. Keep waiting while the
+            // same safe owner has only a stale image; publish lost safety/ownership normally.
+            if (!releasedSurvey && (idle || "terra".equals(owner) && action == null
+                    && visited && hazardClear && !urgent && grounded() && stationaryWorldControls())) return;
+            surveyReleaseFrame = -1;
+        }
+        boolean forced = releasedSurvey || lastObservation == 0 || epoch != lastPublishedEpoch || hazardClear != lastHazard
             || personalCraft != null && work.completedTick == tick
             || timberReplan != null && timberReplanAt == tick
             || action != null && action.furnace != null && action.furnace.releaseTick == tick
@@ -7029,10 +7083,32 @@ final class AgentMacroControl {
     private boolean neutralWorkView() {
         return !trial && visited && !urgent && hazardClear && !hasActiveWorkOrder() && personalCraft == null && pendingEntry() == null
             && player != null && player == client.player && world != null && world == client.world && player.isAlive()
-            && grounded() && settled() && neutral() && cursorClear() && player.currentScreenHandler == player.playerScreenHandler
-            && !player.isUsingItem() && !player.isSprinting() && !player.isSneaking() && !client.interactionManager.isBreakingBlock()
+            && action == null && grounded() && stationaryWorldControls();
+    }
+
+    private boolean stationaryWorldControls() {
+        return settled() && body != null && body.keysNeutral() && !hands.busy() && !hands.holdsWorkInventory() && cursorClear()
+            && player.currentScreenHandler == player.playerScreenHandler && !player.isUsingItem()
+            && !player.isSprinting() && !player.isSneaking() && !client.interactionManager.isBreakingBlock()
             && client.currentScreen == null && client.getOverlay() == null && client.isWindowFocused() && !client.isPaused()
             && client.getCameraEntity() == player && client.options.getPerspective().isFirstPerson();
+    }
+
+    static boolean startupCover(float pitch, BlockHitResult hit, Vec3d eye, BlockState state, int light) {
+        return pitch <= STARTUP_CEILING_PITCH && hit.getSide() == Direction.DOWN && !hit.isInsideBlock()
+            && hit.getPos().squaredDistanceTo(eye) <= 1.75 * 1.75 && light > 0
+            && state.getFluidState().isEmpty() && AgentWorkOrder.prospectCoverDrop(state) != Items.AIR;
+    }
+
+    private BlockHitResult startupCeiling() {
+        float pitch = player.getPitch(), yaw = player.getYaw();
+        if (pitch > STARTUP_CEILING_PITCH || !body.renderedDirection(yaw, pitch, 2)) return null;
+        // No overhead probe: the rendered and current vanilla outlines must
+        // agree before checking the open side and state of this one face.
+        var hit = body.selectedFace();
+        return hit != null && body.renderedAim(hit.getPos(), 4)
+            && startupCover(pitch, hit, player.getEyePos(), world.getBlockState(hit.getBlockPos()), body.observedFaceLight(hit))
+            ? hit : null;
     }
 
     /** Death/transport shutdown leaves vanilla in charge of the old screen and cursor. */
@@ -7648,6 +7724,24 @@ final class AgentMacroControl {
             offer(offers, key, title, evidence, yaw, survey.pitch, null, null, null, null, null);
     }
 
+    private void addStartupOutlook(List<Offer> offers, boolean physicalClue) {
+        if (!firstOutlookPending || work != null || !startupInputsClear
+                || !prospectBodyUsable() || !body.renderedDirection(player.getYaw(), player.getPitch(), 2)) return;
+        if (!physicalClue && offers.stream().noneMatch(offer -> offer.key.verb != Verb.SURVEY)) {
+            var hit = startupCeiling();
+            if (hit != null) {
+                offers.clear();
+                var key = new Key(Verb.SURVEY, hit.getBlockPos(), surveyOrigin, STARTUP_OUTLOOK,
+                    hit.getSide(), world.getBlockState(hit.getBlockPos()));
+                offer(offers, key, "Frame the outlook ahead", "The current first-person view points almost straight up at nearby lit cover. "
+                    + "Look forward from the same stance; no movement or contact is authorized.",
+                    player.getYaw(), STARTUP_OUTLOOK_PITCH, null, null, null, null, null);
+                return;
+            }
+        }
+        firstOutlookPending = false;
+    }
+
     private void inspect(List<Offer> offers, Face face) {
         Key key = faceKey(Verb.INSPECT, face, null);
         if (!retiredViews.contains(key) && !body.renderedAim(face.hit.getPos(), 7))
@@ -7966,6 +8060,7 @@ final class AgentMacroControl {
                 if (ipc.workMode != null && surveyOrigin > 0 && idleView) {
                     JsonObject clue = prospectOpening(progress, inv);
                     if (clue != null) value.add("prospectOpening", clue);
+                    addStartupOutlook(visible, travel != null || clue != null);
                 }
                 // Publish with the newly blocked work, not a heartbeat later:
                 // the host can already see and act on the terminal receipt.
@@ -8278,6 +8373,10 @@ final class AgentMacroControl {
         }
         if (action.offer.key.verb == Verb.BREAK && (owner.equals("terra") || action.durable)
                 && !owner.equals("safety")) body.pauseWork();
+        if (action.offer.key.verb == Verb.SURVEY && !owner.equals("safety")) {
+            body.pauseWork();
+            if (!trial && ipc.workMode != null && result.equals("completed")) surveyReleaseFrame = body.renderedFrame();
+        }
         if (action.offer.route != null) {
             if (routeOwner != null) routeOwner.cancelFollowDryRoute(action.offer.route);
             routeOwner = null;

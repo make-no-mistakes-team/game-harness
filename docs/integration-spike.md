@@ -203,9 +203,21 @@ available before the check. Looking at one log can bind a start to
 that log in reach or to a safe approach to it; another trunk or a
 woodland cue does not count. The host then issues the priced work
 without another model request.
+
+The first constrained observation waits for a safe, settled first-person
+render. If that view points almost straight up at a nearby lit ceiling and
+shows no better work evidence, the actor offers one forward view instead of
+the usual stance surveys. Terra must choose it; the actor keeps the current
+bearing and neither walks nor makes contact. Once any fixed survey starts,
+a missed render does not reset its aim or extend its deadline. Completion
+requires a new frame at the requested angle, and the actor releases the
+camera before publishing the next rendered observation.
+
 The camera receipt does not prove a route or count as physical progress. An unchanged stance
 does not gain a second bare survey from a new angle or ID; an exact new
-face or lane can still be inspected. If the job already has a usable
+face or lane can still be inspected. A standalone first survey wakes
+constrained planning only when the later observation adds physical
+evidence or otherwise changes the work premise. If the job already has a usable
 witness, Terra should send `work` without an opening view. If an exact
 opening clue disappears before the read starts, the host allows one new
 decision when the matching physical offer or a distinct usable alternative

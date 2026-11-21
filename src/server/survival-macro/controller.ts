@@ -2231,8 +2231,18 @@ export class SurvivalMacroController {
       else this.lateCompletedReceipts++;
     }
     if (eligible && (!this.lastReceipt || this.lastReceipt.tick <= receipt.tick)) this.lastReceipt = receipt;
-    // A camera receipt explains the last decision but does not wake another.
-    if (eligible && !record.openingWorkView && (!this.lastWorkQueryReceipt || this.lastWorkQueryReceipt.tick <= receipt.tick))
+    // A completed first camera-only check is not a physical change. A
+    // standalone check may wake planning when the released view adds evidence.
+    const standaloneFirstSurvey = eligible && receipt.status === "completed" && !!record.accepted && !record.openingWorkView &&
+      this.workMode === "constrained" && this.workQuery?.key === `first:${record.intent.life}` &&
+      record.offer.verb === "survey" && record.offer.risk === "read" && !record.offer.anchor;
+    if (standaloneFirstSurvey && this.workQuery) {
+      this.workQuery.mayRecoverOnAffordance = true;
+      await this.record("survey_awaiting_witness", { requestId: record.requestId, intentId: record.intent.id,
+        reason: "The fixed camera view completed. A changed physical affordance, not this receipt, can wake work planning." });
+    }
+    if (eligible && !record.openingWorkView && !standaloneFirstSurvey &&
+        (!this.lastWorkQueryReceipt || this.lastWorkQueryReceipt.tick <= receipt.tick))
       this.lastWorkQueryReceipt = receipt;
     if (this.pending === record) {
       this.pending = undefined;
@@ -2257,7 +2267,7 @@ export class SurvivalMacroController {
           receipt.status === "completed" ? "missing_native_acceptance" : `native_${receipt.status}`);
       }
     }
-    this.handoffAfterTick = Math.max(this.handoffAfterTick, receipt.tick - 1);
+    this.handoffAfterTick = Math.max(this.handoffAfterTick, standaloneFirstSurvey ? receipt.tick : receipt.tick - 1);
     if (this.view) this.view = { ...this.view, query: this.queryKey(this.view.observation, this.view.evidence) };
   }
 

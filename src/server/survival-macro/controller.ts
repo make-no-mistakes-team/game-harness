@@ -9,13 +9,16 @@ import {
 } from "./bootstrap.ts";
 import { filterPreparedStockProposal } from "./prepared-stock.ts";
 import {
-  MACRO_CAPABILITIES_VERSION, MACRO_COLLECT_PENDING, MACRO_DEFER_PENDING, MACRO_DIAMOND_PROSPECT, MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
+  MACRO_CAPABILITIES_VERSION, MACRO_COLLECT_PENDING, MACRO_DEFER_PENDING, MACRO_DIAMOND_PROSPECT, MACRO_FOOD_CLUE,
+  MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
   MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
   MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
   MacroDirectory, MacroObservationRotating, MacroValidationError,
-  hasDirectAuthority, isIndependentPendingPolicy, isOpeningView, isPendingWorkVerb, liveCorrectionEvidence, macroReplyRejectionDetail,
-  harvestAnchorMatchesPolicy, matchesMaterial, openingViewMatchesPolicy, sameTravelTarget, travelHintMatchesPolicy,
+  foodWorkWitness, hasDirectAuthority, isFoodWork, isGroundScout, isIndependentPendingPolicy,
+  isOpeningView, isPendingWorkVerb, liveCorrectionEvidence, macroReplyRejectionDetail,
+  harvestAnchorMatchesPolicy, hasSurfaceCoverEffect, matchesMaterial, openingViewMatchesPolicy,
+  sameTravelTarget, surfaceAnchorMatchesPolicy, travelHintMatchesPolicy,
   parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
   parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroWorkOrder, sameLiveCorrectionScope, validateMacroId,
   type MacroBasis, type MacroDirectAction, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
@@ -508,11 +511,12 @@ function workAffordance(offer: MacroOpportunity): boolean {
 }
 
 function meaningfulPrimitive(offer: MacroOpportunity): boolean {
-  return !isPendingWorkVerb(offer.verb) && offer.verb !== MACRO_WATER_CLUE &&
+  return !isPendingWorkVerb(offer.verb) && offer.verb !== MACRO_WATER_CLUE && offer.verb !== MACRO_FOOD_CLUE &&
     (workAffordance(offer) || offer.verb === "inspect");
 }
 
 function primitiveEffectKey(observation: MacroObservation, offer: MacroOpportunity): string {
+  if (isGroundScout(offer)) return digest(["ground scout", observation.life, observation.goal, offer.anchor.target]);
   if (isOpeningView(offer)) {
     // Left, right and down are one unanchored read of this stance.
     return digest(["view", observation.life, observation.goal, observation.stance, observation.safety?.revision, offer.anchor]);
@@ -586,7 +590,7 @@ function evidenceKey(observation: MacroObservation): string {
   return digest([
     observation.life, observation.epoch, observation.goal, guardBand(observation.health), guardBand(observation.food),
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b)),
-    orderedOpportunities(observation), observation.quiescent, observation.prospectOpening, observation.timberObstruction,
+    orderedOpportunities(observation), observation.quiescent, observation.prospectOpening, observation.surfaceOpening, observation.timberObstruction,
     [...new Set(observation.recent)].sort(),
   ]);
 }
@@ -606,6 +610,12 @@ function sameOpeningStance(source: MacroObservation, current: MacroObservation):
 }
 
 type ProspectOpening = NonNullable<MacroObservation["prospectOpening"]>;
+type SurfaceOpening = NonNullable<MacroObservation["surfaceOpening"]>;
+
+function sameOpeningCut(left: SurfaceOpening, right: SurfaceOpening | undefined): boolean {
+  return right !== undefined && left.target === right.target && left.block === right.block &&
+    left.tool === right.tool && left.maxToolLoss === right.maxToolLoss;
+}
 
 function pricedProspectOpening(observation: MacroObservation, policy: MacroWorkPolicy): ProspectOpening | undefined {
   const clue = observation.prospectOpening;
@@ -618,11 +628,6 @@ function pricedProspectOpening(observation: MacroObservation, policy: MacroWorkP
   if (carriedTool < 1 || carriedTool - clue.maxToolLoss < floor ||
       clue.maxToolLoss > (costCaps.find(({ item }) => item === clue.tool)?.count ?? 0)) return;
   return clue;
-}
-
-function sameProspectOpening(left: ProspectOpening, right: ProspectOpening | undefined): boolean {
-  return right !== undefined && left.target === right.target && left.block === right.block &&
-    left.tool === right.tool && left.maxToolLoss === right.maxToolLoss;
 }
 
 type TimberObstruction = NonNullable<MacroObservation["timberObstruction"]>;
@@ -641,8 +646,35 @@ function pricedTimberObstruction(observation: MacroObservation, policy: MacroWor
   if (missing > 0 && maxBreaks > missing) return clue;
 }
 
-type OpeningWitness = MacroOpportunity | ProspectOpening | MacroTravelHint;
-type WorkStart = Pick<MacroWorkOrder, "travelAnchor" | "harvestAnchor">;
+type SurfaceWitness = { readonly surfaceOpening: SurfaceOpening };
+type OpeningWitness = MacroOpportunity | ProspectOpening | MacroTravelHint | SurfaceWitness;
+type WorkStart = Pick<MacroWorkOrder, "travelAnchor" | "harvestAnchor" | "surfaceAnchor">;
+
+const ironHarvestPicks = ["minecraft:stone_pickaxe", "minecraft:iron_pickaxe", "minecraft:diamond_pickaxe",
+  "minecraft:netherite_pickaxe"] as const;
+const earlyHarvestPicks = ["minecraft:wooden_pickaxe", "minecraft:golden_pickaxe", ...ironHarvestPicks] as const;
+
+function surfaceAnchor(clue: SurfaceOpening): NonNullable<MacroWorkOrder["surfaceAnchor"]> {
+  return { subject: `block:${clue.block}`, target: clue.target };
+}
+
+function pricedSurfaceOpening(observation: MacroObservation, policy: MacroWorkPolicy): SurfaceOpening | undefined {
+  const clue = observation.surfaceOpening;
+  const { target, costCaps, reserves, maxBreaks } = policy;
+  if (!clue || target.kind !== "stock" || !surfaceAnchorMatchesPolicy(surfaceAnchor(clue), policy) ||
+      !hasStock(observation, reserves)) return;
+  if (clue.tool !== "minecraft:air") {
+    const count = stock(observation, clue.tool);
+    const floor = reserves.find(({ item }) => item === clue.tool)?.count ?? 0;
+    const cap = costCaps.find(({ item }) => item === clue.tool)?.count ?? 0;
+    if (count < 1 || count - clue.maxToolLoss < floor || clue.maxToolLoss > cap) return;
+  }
+  // Inventory proves only a carried type. Native rechecks the exact usable stack, wear, and room.
+  const picks = target.item === "minecraft:raw_iron" ? ironHarvestPicks : earlyHarvestPicks;
+  if (!picks.some(item => stock(observation, item) > (item === clue.tool ? clue.maxToolLoss : 0))) return;
+  const missing = target.count - stock(observation, target.item);
+  if (missing > 0 && maxBreaks > missing) return clue;
+}
 
 function sameTravelHint(left: MacroTravelHint, right: MacroTravelHint | undefined): boolean {
   return left.kind === right?.kind && sameTravelTarget(left, right) &&
@@ -661,7 +693,8 @@ function sameTravelReacquisitionHint(source: MacroTravelHint, fresh: MacroTravel
 
 function sameOpeningWitness(left: OpeningWitness, right: OpeningWitness): boolean {
   if ("footing" in left) return "footing" in right && sameTravelHint(left, right);
-  if ("block" in left) return "block" in right && sameProspectOpening(left, right);
+  if ("block" in left) return "block" in right && sameOpeningCut(left, right);
+  if ("surfaceOpening" in left) return "surfaceOpening" in right && sameOpeningCut(left.surfaceOpening, right.surfaceOpening);
   return "verb" in right && sameAffordance(left, right);
 }
 
@@ -689,9 +722,12 @@ function openingWorkWitness(observation: MacroObservation, policy: MacroWorkPoli
   if (material) return material;
   // A bare turn did not name a particular resource or frontier. It cannot
   // acquire a rolling approach to whichever unrelated clue happened to render.
-  if (!anchor) return;
-  const travel = matchingTravelHint(observation, policy);
-  if (travel && sameTravelTarget(anchor, travel)) return travel;
+  if (anchor) {
+    const travel = matchingTravelHint(observation, policy);
+    if (travel && sameTravelTarget(anchor, travel)) return travel;
+  }
+  const surface = pricedSurfaceOpening(observation, policy);
+  if (surface && (!anchor || sameTravelTarget(anchor, surfaceAnchor(surface)))) return { surfaceOpening: surface };
 }
 
 function replacementOpeningWitness(observation: MacroObservation, policy: MacroWorkPolicy,
@@ -1576,6 +1612,7 @@ export class SurvivalMacroController {
       native?.id === order.id && (native.state === "working" || native.state === "needs_replan") &&
       workScope(job.source, observation, job.health) &&
       !policy.allowedEffects.includes(MACRO_IRON_SMELT) && !policy.allowedEffects.includes(MACRO_WATER_FILL) &&
+      !isFoodWork(policy) &&
       (!order.duringWaitFor || this.parkedOrdinaryWindow(order.duringWaitFor, observation, job));
   }
 
@@ -1688,10 +1725,24 @@ export class SurvivalMacroController {
       key = evidence;
     }
     const asked = this.lastAsked?.observation;
+    const scout = !job && !queue && this.isCurrentHandoff(observation) && hasStock(observation,
+      this.floorScope?.life === observation.life ? this.floorScope.reserves : [])
+      ? observation.opportunities.find(offer => isGroundScout(offer) && !this.effectKeys.has(primitiveEffectKey(observation, offer)))
+      : undefined;
+    const scoutQuery = scout ? digest(["ground scout available", observation.life, observation.stance,
+      observation.safety?.revision, scout.anchor]) : null;
+    const newScout = !!asked && !!scout && !!scoutQuery &&
+      !offersAffordance(asked, scout) && !this.workHandoffQueries.has(scoutQuery);
     const obstruction = !job && !travel ? observation.timberObstruction : undefined;
     const obstructionQuery = obstruction ? digest(["timber obstruction", observation.life, observation.stance,
       observation.safety?.revision, obstruction, stock(observation, obstruction.timber)]) : null;
     const newObstruction = obstruction && !!asked && !sameTimberObstruction(obstruction, asked.timberObstruction);
+    const surface = !job && !queue && this.workMode === "constrained" && this.isCurrentHandoff(observation)
+      ? observation.surfaceOpening : undefined;
+    const surfaceQuery = surface ? digest(["surface opening", observation.life, observation.stance,
+      observation.safety?.revision, surface]) : null;
+    const newSurfaceStart = !!asked && !!surface && !sameOpeningCut(surface, asked.surfaceOpening) &&
+      !!surfaceQuery && !this.workHandoffQueries.has(surfaceQuery);
     const failedOpening = previous?.failedOpeningPolicy;
     const newTravelStart = !!asked && previous?.mayRecoverOnAffordance && travel && this.isCurrentHandoff(observation) &&
       !sameTravelHint(travel, asked.travelHint) && (!failedOpening || !!matchingTravelHint(observation, failedOpening));
@@ -1701,7 +1752,7 @@ export class SurvivalMacroController {
       this.supersededOpeningCurrent(candidate, observation, evidence) ? candidate : undefined;
     if (candidate?.kind === "superseded-opening" && !superseded) this.intentRecovery = undefined;
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew" &&
-        !newTravelStart && !newObstruction && !reacquiredTravelOf && !superseded) return;
+        !newTravelStart && !newObstruction && !newSurfaceStart && !newScout && !reacquiredTravelOf && !superseded) return;
     const pendingCorrection = this.replyCorrection;
     const correction = pendingCorrection?.renewal
       ? demand === "renew" && pendingCorrection.renewal === job && observation.tick > pendingCorrection.observation.tick
@@ -1718,21 +1769,23 @@ export class SurvivalMacroController {
     // An idle abstention can recover on a genuinely new actionable witness or
     // neutral handoff, not when the same affordance is issued a different ID.
     if (unchanged && !correction && !reconsideration && !reacquiredTravelOf) {
-      if (job || !previous.mayRecoverOnAffordance || !asked ||
+      if (!newSurfaceStart && !newScout && (job || !previous.mayRecoverOnAffordance || !asked ||
           (!(observation.quiescent && !asked.quiescent) &&
-            !(observation.prospectOpening && !sameProspectOpening(observation.prospectOpening, asked.prospectOpening)) &&
+            !(observation.prospectOpening && !sameOpeningCut(observation.prospectOpening, asked.prospectOpening)) &&
             !newObstruction &&
             !newTravelStart &&
             !observation.opportunities.some(offer =>
-            workAffordance(offer) && !offersAffordance(asked, offer)))) return;
+            !isGroundScout(offer) && workAffordance(offer) && !offersAffordance(asked, offer))))) return;
     }
-    const handoffQuery = !job && (observation.quiescent || observation.prospectOpening || observation.travelHint || obstruction ||
+    const handoffQuery = !job && (observation.quiescent || observation.prospectOpening || surface || observation.travelHint || obstruction ||
       observation.opportunities.some(workAffordance))
       ? digest([evidence, liveCorrectionEvidence({ ...observation, opportunities: observation.opportunities.filter(workAffordance) })]) : null;
     if (unchanged && !correction && !reconsideration && !reacquiredTravelOf &&
         (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
     if (obstructionQuery) this.workHandoffQueries.add(obstructionQuery);
+    if (surfaceQuery) this.workHandoffQueries.add(surfaceQuery);
+    if (scoutQuery) this.workHandoffQueries.add(scoutQuery);
     if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
     if (overlap?.smeltBurnTick !== undefined) overlap.incumbent.smeltLookedAhead = true;
     else if (overlap && owner) this.workOverlapRequests.add(owner);
@@ -1954,14 +2007,29 @@ export class SurvivalMacroController {
   private async startWorkStage(queued: QueuedWork): Promise<void> {
     const { plan, stages, next: index, after, bootstrap } = queued;
     const { policy, requires } = stages[index]!;
+    const food = foodWorkWitness(plan.observation, policy);
     const stageOffset = bootstrap?.stageOffset ?? 0;
     const duringWaitFor = after?.order.duringWaitFor;
     const stage = stages.length > 1 && !duringWaitFor ? workStageIds(plan.requestId, stages, index, stageOffset) : undefined;
     const afterSmelt = queued.smeltSuccessor && index === 0 ? after : null;
     const clue = !after ? plan.observation.travelHint : undefined;
-    const travel = clue && travelHintMatchesPolicy(clue, policy) ? clue : undefined;
-    const wall = !after && !travel && pricedProspectOpening(plan.observation, policy);
-    const timberClue = !after && !travel && !wall ? plan.observation.timberObstruction : undefined;
+    const approach = clue && travelHintMatchesPolicy(clue, policy) ? clue : undefined;
+    let surface: SurfaceWitness | undefined;
+    if (!after && approach?.kind !== "resource" && this.workMode === "constrained" && !this.job &&
+        hasSurfaceCoverEffect(policy) && !offeredOpeningStart(plan.observation, policy)) {
+      const witness = openingWorkWitness(plan.observation, policy, {});
+      if (witness && "surfaceOpening" in witness && !stage) {
+        surface = witness;
+      } else if (!approach && (!witness || "surfaceOpening" in witness)) {
+        this.queuedWork = undefined;
+        await this.disposition("proposal_refused", { requestId: plan.requestId,
+          reason: "Surface entry needs a single ordinary job with a witnessed exact cap, a permitted stock source, and enough tools, costs, reserves, and breaks." });
+        return;
+      }
+    }
+    const travel = surface ? undefined : approach;
+    const wall = !after && !travel && !surface ? pricedProspectOpening(plan.observation, policy) : undefined;
+    const timberClue = !after && !travel && !wall && !surface ? plan.observation.timberObstruction : undefined;
     const timber = timberClue ? pricedTimberObstruction(plan.observation, policy) : undefined;
     if (timberClue && !timber && policy.target.kind === "stock" && policy.target.item === timberClue.timber) {
       this.queuedWork = undefined;
@@ -1976,14 +2044,22 @@ export class SurvivalMacroController {
       return false;
     };
     let travelRefusal: { observation: MacroObservation; reason: string } | undefined;
-    const physical = travel ?? wall ?? timber;
-    const currentStart = physical ? (fresh: MacroObservation) => {
+    const physical = travel ?? wall ?? timber ?? surface;
+    const currentStart = food ? (fresh: MacroObservation) => {
+      const current = foodWorkWitness(fresh, policy);
+      return (this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
+        current?.material?.target === food.material!.target) ||
+        withoutStart(fresh, "food_source_no_longer_witnessed");
+    } : physical ? (fresh: MacroObservation) => {
       if (!this.isCurrentHandoff(fresh) || !sameOpeningStance(plan.observation, fresh) ||
           fresh.tick >= plan.proposal.expiresTick) return withoutStart(fresh, "physical_work_scope_or_ttl_changed");
+      if ("surfaceOpening" in physical)
+        return sameOpeningCut(physical.surfaceOpening, pricedSurfaceOpening(fresh, policy)) ||
+          withoutStart(fresh, "surface_opening_no_longer_witnessed_or_priced");
       if (!("footing" in physical)) return "timber" in physical
         ? sameTimberObstruction(physical, pricedTimberObstruction(fresh, policy)) ||
           withoutStart(fresh, "timber_obstruction_no_longer_witnessed_or_priced")
-        : sameProspectOpening(physical, pricedProspectOpening(fresh, policy)) ||
+        : sameOpeningCut(physical, pricedProspectOpening(fresh, policy)) ||
           withoutStart(fresh, "prospect_opening_no_longer_witnessed_or_priced");
       if (wait) {
         if (fresh.tick - wait.tick > FIRST_ACTIONABLE_VIEW_TICKS || performance.now() >= wait.until)
@@ -2033,6 +2109,7 @@ export class SurvivalMacroController {
           await this.rejectStale(plan, "correction_context_changed_before_work_admission");
           return false;
         }
+        if (food) return true; // The exact live recheck admits one source, not a projected yield.
         const checked = preflightVanillaWork(fresh, [stages[index]!]);
         if (afterSmelt && checked.kind !== "possible") {
           rejection = "smelt_successor_live_path_not_confirmed";
@@ -2057,7 +2134,8 @@ export class SurvivalMacroController {
         latest.tick - before.tick >= WORK_ADMISSION_TICKS ? withoutStart(latest, "physical_work_admission_basis_aged") :
           currentStart(latest) : undefined,
       travel ? () => ({ travelAnchor: { subject: travel.subject, target: travel.target } }) :
-        timber ? () => ({ travelAnchor: timber.toward }) : undefined);
+        timber ? () => ({ travelAnchor: timber.toward }) :
+        surface ? () => ({ surfaceAnchor: surfaceAnchor(surface.surfaceOpening) }) : undefined);
     if (job === null) return; // A rotating observation is not a denied program stage.
     if (!job && (bootstrap || afterSmelt || duringWaitFor)) return this.discardQueuedWork(queued, rejection);
     if (!job && failedStart) {
@@ -2119,6 +2197,10 @@ export class SurvivalMacroController {
       return;
     }
     const previous = this.job;
+    if (previous && isFoodWork(previous.policy)) {
+      if (requestId) await this.disposition("proposal_refused", { requestId, reason: "Wait for the one-source food work to settle." });
+      return;
+    }
     if ((previous?.policy.allowedEffects.includes(MACRO_IRON_SMELT) && duringWaitFor !== previous.order.id) ||
         previous?.policy.allowedEffects.includes(MACRO_WATER_FILL)) {
       if (requestId) await this.disposition("proposal_refused", { requestId, reason: previous.policy.allowedEffects.includes(MACRO_WATER_FILL)
@@ -2150,7 +2232,7 @@ export class SurvivalMacroController {
       return previous;
     }
     if (preflight && !await preflight(fresh)) return;
-    const { travelAnchor, harvestAnchor } = renewal?.order ?? bindStart?.(fresh) ?? {};
+    const { travelAnchor, harvestAnchor, surfaceAnchor } = renewal?.order ?? bindStart?.(fresh) ?? {};
     const order = parseMacroWorkOrder({
       v: 1, id: stage?.id ?? randomUUID(), run: fresh.run, life: fresh.life, epoch: fresh.epoch, basisTick: fresh.tick,
       expiresTick: Math.min(expiresTick, fresh.tick + this.limits.maxIntentTtlTicks),
@@ -2158,6 +2240,7 @@ export class SurvivalMacroController {
       ...(!equivalent && stage?.nextWorkId ? { nextWorkId: stage.nextWorkId } : {}),
       ...(duringWaitFor ? { duringWaitFor } : {}),
       ...(travelAnchor ? { travelAnchor } : {}), ...(harvestAnchor ? { harvestAnchor } : {}),
+      ...(surfaceAnchor ? { surfaceAnchor } : {}),
     });
     await this.record("work_order_prepared", { requestId, order, previousId: previous?.order.id ?? null, equivalent });
     if (recheck) {
@@ -2394,17 +2477,17 @@ export class SurvivalMacroController {
       else this.lateCompletedReceipts++;
     }
     if (eligible && (!this.lastReceipt || this.lastReceipt.tick <= receipt.tick)) this.lastReceipt = receipt;
-    // A completed first camera-only check is not a physical change. A
-    // standalone check may wake planning when the released view adds evidence.
-    const standaloneFirstSurvey = eligible && receipt.status === "completed" && !!record.accepted && !record.openingWorkView &&
-      this.workMode === "constrained" && this.workQuery?.key === `first:${record.intent.life}` &&
+    // A constrained camera-only check can wake planning on a new affordance,
+    // not on a receipt. A scout likewise needs its fresh displaced stance.
+    const standaloneSurvey = !record.openingWorkView && this.workMode === "constrained" &&
       record.offer.verb === "survey" && record.offer.risk === "read" && !record.offer.anchor;
-    if (standaloneFirstSurvey && this.workQuery) {
+    if (standaloneSurvey && eligible && receipt.status === "completed" && record.accepted && this.workQuery) {
       this.workQuery.mayRecoverOnAffordance = true;
       await this.record("survey_awaiting_witness", { requestId: record.requestId, intentId: record.intent.id,
         reason: "The fixed camera view completed. A changed physical affordance, not this receipt, can wake work planning." });
     }
-    if (eligible && !record.openingWorkView && !standaloneFirstSurvey &&
+    const scout = isGroundScout(record.offer);
+    if (eligible && !record.openingWorkView && !standaloneSurvey && !scout &&
         (!this.lastWorkQueryReceipt || this.lastWorkQueryReceipt.tick <= receipt.tick))
       this.lastWorkQueryReceipt = receipt;
     if (this.pending === record) {
@@ -2430,7 +2513,7 @@ export class SurvivalMacroController {
           receipt.status === "completed" ? "missing_native_acceptance" : `native_${receipt.status}`);
       }
     }
-    this.handoffAfterTick = Math.max(this.handoffAfterTick, standaloneFirstSurvey ? receipt.tick : receipt.tick - 1);
+    this.handoffAfterTick = Math.max(this.handoffAfterTick, standaloneSurvey || scout ? receipt.tick : receipt.tick - 1);
     if (this.view) this.view = { ...this.view, query: this.queryKey(this.view.observation, this.view.evidence) };
   }
 
@@ -2553,9 +2636,12 @@ export class SurvivalMacroController {
     if (workDemand && !lookahead) {
       const lostOpening = reconsideration?.kind === "superseded-opening" ||
         (reconsideration?.kind === "alternative" && reconsideration.opening) ? reconsideration.offer : undefined;
+      const canScout = !workDemand.current && !observation.pendingWork && this.isCurrentHandoff(observation) &&
+        hasStock(observation, workDemand.protectedReserves);
       const opportunities = observation.opportunities.filter(offer =>
         (!lostOpening || !sameAffordance(lostOpening, offer)) &&
-        (!isOpeningView(offer) || !this.effectKeys.has(primitiveEffectKey(observation, offer))));
+        (isGroundScout(offer) ? canScout && !this.effectKeys.has(primitiveEffectKey(observation, offer)) :
+          !isOpeningView(offer) || !this.effectKeys.has(primitiveEffectKey(observation, offer))));
       if (opportunities.length !== observation.opportunities.length) disclosed = { ...observation, opportunities };
       if (workDemand.current === null && !workDemand.parkedWorksite && !observation.pendingWork && !observation.working &&
           observation.stance !== undefined && observation.safety?.clear === true &&
@@ -2986,6 +3072,13 @@ export class SurvivalMacroController {
       return;
     }
     const action = proposal.action;
+    if (action.kind === "work" && isFoodWork(action.policy) &&
+        (this.job || action.afterWorkId || action.duringWaitFor || action.duringWait || action.openingViewId ||
+          !foodWorkWitness(original, action.policy))) {
+      await this.disposition("proposal_refused", { requestId: context.requestId,
+        reason: "Food work needs a single exact live source with the protected stock already held." });
+      return;
+    }
     if (context.workDemand?.parkedWorksite === "view-unavailable" && action.kind !== "abstain" && action.kind !== "gap") {
       await this.disposition("proposal_refused", { requestId: context.requestId,
         reason: "A parked worksite with no current world view grants no live action." });
@@ -3127,7 +3220,7 @@ export class SurvivalMacroController {
           reason: "Name the outstanding ticket with duringWaitFor to continue independent work." });
         return;
       }
-      await this.previewWorkResources(context.requestId, current, stages);
+      if (action.kind !== "work" || !isFoodWork(action.policy)) await this.previewWorkResources(context.requestId, current, stages);
       await this.preemptQueuedWork(context.requestId);
       this.queuedWork = { after: null, plan, stages, next: 0,
         ...(action.kind === "work" && action.policy.allowedEffects.includes(MACRO_IRON_SMELT)
@@ -3488,6 +3581,7 @@ export class SurvivalMacroController {
           const witnessed = openingWorkWitness(fresh, policy, issued.offer);
           if (!witnessed) return;
           if ("footing" in witnessed) return { travelAnchor: { subject: witnessed.subject, target: witnessed.target } };
+          if ("surfaceOpening" in witnessed) return { surfaceAnchor: surfaceAnchor(witnessed.surfaceOpening) };
           if (issued.offer.anchor && "material" in witnessed && witnessed.material) {
             const { subject, target } = witnessed.material;
             return { harvestAnchor: { subject, target } };
@@ -3644,18 +3738,29 @@ export class SurvivalMacroController {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "The refused opening view is not a distinct recovery action." });
       return false;
     }
-    if (before.verb === MACRO_WATER_CLUE) {
-      await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "A water clue grants no primitive or skill action." });
+    if (before.verb === MACRO_WATER_CLUE || before.verb === MACRO_FOOD_CLUE) {
+      await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "A source clue grants no primitive or skill action." });
       return false;
     }
     const action = plan.proposal.action;
     const pendingAction = action.kind === "collect-pending" || action.kind === "defer-pending" ? action : undefined;
     const openingPolicy = action.kind === "work" && action.openingViewId === opportunityId ? action.policy : undefined;
+    const scout = isGroundScout(before);
+    const reserves = this.floorScope?.life === current.life ? this.floorScope.reserves : [];
+    if (scout && (!this.workMode || authority || action.kind !== "opportunity" || this.queuedWork || this.pendingSuccessor ||
+        !hasStock(witnessed, reserves))) {
+      await this.disposition("proposal_refused", { requestId: plan.requestId,
+        reason: "Ground reconnaissance needs a standalone model choice with all protected stock already held." });
+      return false;
+    }
     if (isPendingWorkVerb(before.verb) !== !!pendingAction || (pendingAction && authority)) {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "Pending station use needs explicit ticket authorization." });
       return false;
     }
     const usableHandoff = (observation: MacroObservation) => {
+      if (scout) return this.isCurrentHandoff(observation) && sameOpeningStance(witnessed, observation) &&
+        hasStock(observation, reserves) && observation.travelHint?.footing === "dry" &&
+        sameTravelTarget(before.anchor, observation.travelHint);
       if (openingPolicy) return this.openingHandoff(witnessed, observation, openingPolicy) &&
         !openingWorkWitness(observation, openingPolicy, before);
       if (!pendingAction) return this.isCurrentHandoff(observation);
@@ -3670,7 +3775,6 @@ export class SurvivalMacroController {
         this.parkedCollectionOwned(ticket, observation.life) &&
         this.isCurrentHandoff(observation);
     };
-    const reserves = this.floorScope?.life === current.life ? this.floorScope.reserves : [];
     if (!pendingAction && !openingPolicy && before.risk === "guarded" && (this.workMode === "constrained" ||
         (reserves.length && !protectsStock(reserves, current, before)))) {
       await this.disposition("proposal_refused", { requestId: plan.requestId,

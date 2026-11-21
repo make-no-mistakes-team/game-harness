@@ -37,6 +37,44 @@ final class OrdinaryRollingWorkTest {
     static void initializeVanilla() { VanillaTestResources.initialize(); }
 
     @Test
+    void groundReconnaissanceUsesOnlyTheDryVisibleStoppingWindow() {
+        var dry = AgentVisibleHorizon.Medium.DRY;
+        assertEquals(0.64, AgentMacroControl.scoutAdvance(scoutWindow(0.8, 0.295, dry, false), 3), 0.001);
+        assertEquals(1.44, AgentMacroControl.scoutAdvance(scoutWindow(1.6, 0.295, dry, false), 10), 0.001);
+        assertEquals(0, AgentMacroControl.scoutAdvance(scoutWindow(0.8, 0.80, dry, false), 3));
+        assertEquals(0, AgentMacroControl.scoutAdvance(scoutWindow(0.64, 0.295, dry, false), 3));
+        assertEquals(0, AgentMacroControl.scoutAdvance(scoutWindow(1.6, 0.295, dry, true), 3));
+        assertEquals(0, AgentMacroControl.scoutAdvance(scoutWindow(1.6, 0.295, dry, false), 0.75));
+        assertEquals(0, AgentMacroControl.scoutAdvance(scoutWindow(1.6, 0.295,
+            AgentVisibleHorizon.Medium.SHALLOW_WATER, false), 3));
+        assertEquals(0, AgentMacroControl.scoutAdvance(scoutWindow(1.6, 0.295,
+            AgentVisibleHorizon.Medium.UNKNOWN, false), 3));
+        assertEquals(0, AgentMacroControl.scoutAdvance(null, 3));
+    }
+
+    @Test
+    void groundReconnaissanceNeedsRealGoalwardDisplacementEvenInsideOneCell() {
+        Vec3d from = new Vec3d(0.1, 0, 0.65), goal = new Vec3d(0.74, 0, 0.65);
+        var scout = new AgentBody.HorizonMotion(from, goal, true);
+        var ordinary = new AgentBody.HorizonMotion(from, goal);
+        assertTrue(scout.observe(from, from, true, false, true));
+        assertFalse(scout.moved());
+        assertFalse(AgentMacroControl.scoutReached(from, goal, from));
+        assertFalse(AgentMacroControl.scoutReached(from, goal, from.add(0, 0, -0.5)));
+        Vec3d feet = new Vec3d(0.6, 0, 0.65);
+        assertTrue(scout.observe(from, feet, true, false, true));
+        assertTrue(ordinary.observe(from, feet, true, false, true));
+        assertTrue(scout.moved());
+        assertTrue(AgentMacroControl.scoutReached(from, goal, feet));
+        assertFalse(ordinary.moved(), "walking only for a view does not certify a crossing");
+    }
+
+    private static AgentVisibleHorizon.Window scoutWindow(double known, double braking,
+                                                          AgentVisibleHorizon.Medium medium, boolean contact) {
+        return new AgentVisibleHorizon.Window(null, -90, known, braking, medium, 1, 0, 0, null, contact);
+    }
+
+    @Test
     void paidDiamondCanStartAVisibleCaveLegOrAnApproachToActualOreWithoutASpine() {
         var paid = order("diamond", "\"prospect:minecraft:diamond\",\"break:minecraft:deepslate_diamond_ore\"",
             ",\"duringWaitFor\":\"9d0ad30c-b85c-4261-baff-f071c8e5ebc1\"");

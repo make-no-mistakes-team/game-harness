@@ -35,10 +35,23 @@ export const MACRO_PROSPECT_SUPPORT = "place:minecraft:cobblestone";
 export const MACRO_WATER_FILL = "fill:minecraft:water";
 export const MACRO_WATER_CLUE = "fill_water";
 export const MACRO_WATER_SOURCE = "fluid:minecraft:water_source";
+export const MACRO_FOOD_CLUE = "forage";
+const foodSources: ReadonlyMap<string, string> = new Map([
+  ["block:minecraft:sweet_berry_bush", "minecraft:sweet_berries"],
+  ["block:minecraft:cave_vines", "minecraft:glow_berries"],
+  ["block:minecraft:cave_vines_plant", "minecraft:glow_berries"],
+  ["entity:minecraft:cow", "minecraft:beef"],
+  ["entity:minecraft:mooshroom", "minecraft:beef"],
+  ["entity:minecraft:pig", "minecraft:porkchop"],
+  ["entity:minecraft:sheep", "minecraft:mutton"],
+  ["entity:minecraft:rabbit", "minecraft:rabbit"],
+]);
+const foodEffectPrefix = "forage:";
 export const MACRO_WORK_TABLE_PLACEMENT = "place:minecraft:crafting_table";
 export const MACRO_LIVE_ONLY_EFFECTS = [
   MACRO_IRON_SMELT, MACRO_FURNACE_PLACEMENT, MACRO_DIAMOND_PROSPECT,
   MACRO_PROSPECT_TORCH, MACRO_PROSPECT_SUPPORT, MACRO_WATER_FILL,
+  ...Array.from(foodSources.keys(), subject => `${foodEffectPrefix}${subject}`),
 ] as const;
 export const MACRO_BREAK_EFFECTS: readonly string[] = Object.freeze(
   [...VANILLA_HARVEST.keys(), ...VANILLA_TIMBER_LEAVES].map(id => `break:${id}`),
@@ -85,7 +98,7 @@ export interface MacroOpportunity {
   readonly evidence: string;
   /** Stable identity of a rendered local clue, independent of the offer ID or camera bearing. */
   readonly anchor?: { readonly subject: string; readonly target: string };
-  /** Native evidence for a guarded primitive or a read-only water clue; spends bound item-count loss. */
+  /** Native evidence for a guarded primitive or a read-only source clue; spends bound item-count loss. */
   readonly material?: {
     readonly subject: string;
     readonly target: string;
@@ -95,6 +108,8 @@ export interface MacroOpportunity {
 
 const prospectRock = ["minecraft:stone", "minecraft:deepslate", "minecraft:andesite",
   "minecraft:diorite", "minecraft:granite", "minecraft:tuff"] as const;
+const surfaceCaps = ["minecraft:grass_block", "minecraft:dirt", ...prospectRock] as const;
+const MIN_GROUND_SCOUT_WINDOW = 0.75; // Matches the native level, advance-and-stop admission bound.
 
 export interface MacroTravelAnchor {
   readonly subject: string;
@@ -131,6 +146,13 @@ export interface MacroObservation extends MacroBasis {
   /** A reachable dry natural wall contact, not a selectable opportunity or a proved passage. */
   readonly prospectOpening?: {
     readonly block: (typeof prospectRock)[number];
+    readonly target: string;
+    readonly tool: string;
+    readonly maxToolLoss: 0 | 1;
+  };
+  /** One witnessed dry cap beside the stance. It proves no buried stock, descent, or opportunity. */
+  readonly surfaceOpening?: {
+    readonly block: (typeof surfaceCaps)[number];
     readonly target: string;
     readonly tool: string;
     readonly maxToolLoss: 0 | 1;
@@ -272,6 +294,8 @@ export interface MacroWorkOrder extends MacroWorkPolicy {
   readonly travelAnchor?: MacroTravelAnchor;
   /** First harvest is bound to this exact in-reach material, not a route or a new break permission. */
   readonly harvestAnchor?: MacroTravelAnchor;
+  /** First surface cut is bound to this exact cap, not to a guessed source or neighboring tile. */
+  readonly surfaceAnchor?: MacroTravelAnchor;
 }
 export interface MacroWorkState {
   readonly id: string;
@@ -611,12 +635,29 @@ function workPolicy(raw: Record<string, unknown>): MacroWorkPolicy {
       parsedTarget.item !== "minecraft:water_bucket" || parsedTarget.count !== 1 ||
       policy.maxBreaks || policy.maxCrafts || policy.maxPlacements || policy.costCaps.length !== 1 ||
       policy.costCaps[0]!.item !== "minecraft:bucket" || policy.costCaps[0]!.count !== 1)) invalid("water fill scope or cost");
+  if (effects.some(effect => effect.startsWith(foodEffectPrefix)) &&
+      (effects.length !== 1 || parsedTarget.kind !== "stock" ||
+        parsedTarget.item !== foodSources.get(effects[0]!.slice(foodEffectPrefix.length)) ||
+        policy.maxBreaks || policy.maxCrafts || policy.maxPlacements || policy.costCaps.length))
+    invalid("food forage scope or cost");
   return Object.freeze(policy);
+}
+
+export function isFoodWork(policy: MacroWorkPolicy): boolean {
+  return policy.allowedEffects.some(effect => effect.startsWith(foodEffectPrefix));
+}
+
+export function foodWorkWitness(observation: MacroObservation, policy: MacroWorkPolicy): MacroOpportunity | undefined {
+  if (!isFoodWork(policy) || policy.target.kind !== "stock" || !observation.safety?.clear || observation.pendingWork ||
+      (observation.inventory[policy.target.item] ?? 0) >= policy.target.count ||
+      policy.reserves.some(({ item, count }) => (observation.inventory[item] ?? 0) < count)) return;
+  return observation.opportunities.find(offer => offer.verb === MACRO_FOOD_CLUE && offer.risk === "read" &&
+    offer.material && policy.allowedEffects[0] === `${foodEffectPrefix}${offer.material.subject}`);
 }
 
 function singleLiveWork(policy: MacroWorkPolicy) {
   return policy.allowedEffects.includes(MACRO_IRON_SMELT) || policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT) ||
-    policy.allowedEffects.includes(MACRO_WATER_FILL);
+    policy.allowedEffects.includes(MACRO_WATER_FILL) || isFoodWork(policy);
 }
 
 function pendingSidePolicy(policy: MacroWorkPolicy): MacroWorkPolicy {
@@ -632,7 +673,7 @@ function pendingSidePolicy(policy: MacroWorkPolicy): MacroWorkPolicy {
 
 export function isIndependentPendingPolicy(policy: MacroWorkPolicy): boolean {
   return policy.target.kind === "stock" && policy.target.item !== "minecraft:iron_ingot" &&
-    !policy.allowedEffects.includes(MACRO_IRON_SMELT);
+    !policy.allowedEffects.includes(MACRO_IRON_SMELT) && !isFoodWork(policy);
 }
 
 function pendingOrdinaryPolicy(policy: MacroWorkPolicy): MacroWorkPolicy {
@@ -705,7 +746,7 @@ function parseWorkProgress(value: unknown, tick: number): NonNullable<MacroWorkS
 export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
   const record = shape(value, "work order", [
     "v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "safetyRevision", "origin", ...WORK_POLICY_KEYS,
-  ], ["nextWorkId", "duringWaitFor", "travelAnchor", "harvestAnchor"]);
+  ], ["nextWorkId", "duringWaitFor", "travelAnchor", "harvestAnchor", "surfaceAnchor"]);
   const id = validateMacroId(record.id, "work id");
   const origin = choice(record.origin, "work origin", ["preset", "model"] as const);
   const policy = workPolicy(record);
@@ -729,6 +770,14 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
         !harvestAnchorMatchesPolicy(harvestAnchor, policy))
       invalid("work harvest anchor scope");
   }
+  let surfaceAnchor: MacroTravelAnchor | undefined;
+  if (Object.hasOwn(record, "surfaceAnchor")) {
+    const raw = shape(record.surfaceAnchor, "work surface anchor", ["subject", "target"]);
+    surfaceAnchor = parseStartAnchor(raw, "surface anchor");
+    if (origin !== "model" || duringWaitFor || nextWorkId || /:[123]$/.test(id) || travelAnchor || harvestAnchor ||
+        !surfaceTargetPattern.test(surfaceAnchor.target) || !surfaceAnchorMatchesPolicy(surfaceAnchor, policy))
+      invalid("work surface anchor scope");
+  }
   if (duringWaitFor) {
     if (origin !== "model" || nextWorkId || duringWaitFor === id || /:[123]$/.test(id)) invalid("pending ordinary order scope");
     pendingOrdinaryPolicy(policy);
@@ -746,7 +795,8 @@ export function parseMacroWorkOrder(value: unknown): MacroWorkOrder {
     expiresTick: whole(record.expiresTick, "work expiry", basisTick + 1, basisTick + MACRO_MAX_INTENT_TTL_TICKS),
     safetyRevision: whole(record.safetyRevision, "work safety revision", 1), origin,
     ...(nextWorkId ? { nextWorkId } : {}), ...(duringWaitFor ? { duringWaitFor } : {}),
-    ...(travelAnchor ? { travelAnchor } : {}), ...(harvestAnchor ? { harvestAnchor } : {}), ...policy,
+    ...(travelAnchor ? { travelAnchor } : {}), ...(harvestAnchor ? { harvestAnchor } : {}),
+    ...(surfaceAnchor ? { surfaceAnchor } : {}), ...policy,
   });
 }
 
@@ -793,6 +843,7 @@ function directMaterialPrefix(verb: string): string | undefined {
 
 const woodlandAnchorSubject = "landmark:woodland";
 const travelKinds = ["resource", "cave_frontier", "woodland_frontier"] as const;
+const surfaceTargetPattern = /^m-[1-9][0-9]*$/;
 
 function parseStartAnchor(record: Record<string, unknown>, field: string): MacroTravelAnchor {
   const subject = record.subject;
@@ -804,7 +855,7 @@ function parseStartAnchor(record: Record<string, unknown>, field: string): Macro
 export function parseMacroObservation(value: unknown): MacroObservation {
   const record = shape(value, "observation", [
     "v", "run", "life", "tick", "epoch", "goal", "health", "food", "inventory", "opportunities", "recent", "quiescent",
-  ], ["safety", "working", "workOrder", "pendingWork", "stance", "prospectOpening", "timberObstruction", "travelHint"]);
+  ], ["safety", "working", "workOrder", "pendingWork", "stance", "prospectOpening", "surfaceOpening", "timberObstruction", "travelHint"]);
   const inventory = Object.create(null) as Record<string, number>;
   const entries = Object.entries(object(record.inventory, "inventory"));
   if (entries.length > 128) invalid("inventory");
@@ -820,15 +871,18 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     const verb = validateMacroId(offer.verb, "verb");
     const risk = choice(offer.risk, "risk", ["read", "low", "guarded"] as const);
     const waterClue = verb === MACRO_WATER_CLUE;
+    const foodClue = verb === MACRO_FOOD_CLUE;
     if (waterClue && risk !== "read") invalid("water clue risk");
+    if (foodClue && (risk !== "read" || !Object.hasOwn(offer, "material"))) invalid("food clue risk or material");
     let anchor: MacroOpportunity["anchor"];
     if (Object.hasOwn(offer, "anchor")) {
       const raw = shape(offer.anchor, "rendered anchor", ["subject", "target"]);
       const subject = itemKey(raw.subject, "rendered anchor subject");
       const valid = verb === "inspect" && risk === "read" || verb === "survey" && risk === "read"
         ? subject.startsWith("block:minecraft:")
-        : (verb === "survey" && risk === "guarded" || verb === "follow" && risk === "guarded" ||
-            verb === "approach" && risk === "low") && subject === "route:dry";
+        : verb === "approach" && risk === "low"
+          ? subject === "route:dry" || subject === woodlandAnchorSubject || subject.startsWith("block:minecraft:")
+          : (verb === "survey" || verb === "follow") && risk === "guarded" && subject === "route:dry";
       if (!valid) invalid("rendered anchor subject/verb");
       anchor = Object.freeze({ subject, target: validateMacroId(raw.target, "rendered anchor target") });
     }
@@ -838,9 +892,11 @@ export function parseMacroObservation(value: unknown): MacroObservation {
       const raw = shape(offer.material, "material", ["subject", "target", "spends"]);
       const subject = itemKey(raw.subject, "material subject");
       const costs = Object.entries(object(raw.spends, "material spends"));
-      if (waterClue ? subject !== MACRO_WATER_SOURCE || costs.length !== 1 ||
+      if (foodClue && (!foodSources.has(subject) || costs.length !== 0 || typeof raw.target !== "string" ||
+          !surfaceTargetPattern.test(raw.target))) invalid("food clue material");
+      if (!foodClue && (waterClue ? subject !== MACRO_WATER_SOURCE || costs.length !== 1 ||
           costs[0]![0] !== "minecraft:bucket" || costs[0]![1] !== 1 :
-          risk !== "guarded" || !prefix || !subject.startsWith(prefix) || subject.length === prefix.length) invalid("material subject/verb");
+          risk !== "guarded" || !prefix || !subject.startsWith(prefix) || subject.length === prefix.length)) invalid("material subject/verb");
       if (costs.length > 36) invalid("material spends");
       const spends = Object.create(null) as Record<string, number>;
       for (const [item, count] of costs) spends[itemKey(item, "spend item")] = whole(count, "spend count", 1, 64);
@@ -945,6 +1001,22 @@ export function parseMacroObservation(value: unknown): MacroObservation {
       maxToolLoss,
     });
   }
+  let surfaceOpening: MacroObservation["surfaceOpening"];
+  if (Object.hasOwn(record, "surfaceOpening")) {
+    const raw = shape(record.surfaceOpening, "surface opening", ["block", "target", "tool", "maxToolLoss"]);
+    if (record.stance === undefined || !safety?.clear || working || pendingWork ||
+        workOrder?.state === "working" || workOrder?.state === "needs_replan")
+      invalid("surface opening scope");
+    const { maxToolLoss } = raw;
+    if (maxToolLoss !== 0 && maxToolLoss !== 1) invalid("surface opening tool loss");
+    const block = choice(raw.block, "surface opening cap", surfaceCaps);
+    const target = validateMacroId(raw.target, "surface opening target");
+    if (!surfaceTargetPattern.test(target)) invalid("surface opening target");
+    const tool = raw.tool === "minecraft:air" ? raw.tool : vanillaItem(raw.tool, "surface opening tool");
+    if (tool === "minecraft:air" && (maxToolLoss !== 0 || block !== "minecraft:grass_block" && block !== "minecraft:dirt"))
+      invalid("surface opening empty hand scope");
+    surfaceOpening = Object.freeze({ block, target, tool, maxToolLoss });
+  }
   let timberObstruction: MacroObservation["timberObstruction"];
   if (Object.hasOwn(record, "timberObstruction")) {
     const raw = shape(record.timberObstruction, "timber obstruction", ["block", "target", "toward", "timber"]);
@@ -985,6 +1057,17 @@ export function parseMacroObservation(value: unknown): MacroObservation {
       travelHint = Object.freeze({ ...anchor, kind, bearingDegrees, footing, windowBlocks });
     }
   }
+  let scoutSeen = false;
+  for (const offer of opportunities) if (isGroundScout(offer)) {
+    if (scoutSeen || travelHint?.footing !== "dry" || travelHint.windowBlocks < MIN_GROUND_SCOUT_WINDOW ||
+        !sameTravelTarget(offer.anchor, travelHint) || workOrder?.state === "needs_replan" || workOrder?.state === "parked")
+      invalid("ground reconnaissance requires one current dry landmark");
+    scoutSeen = true;
+  }
+  const food = opportunities.filter(offer => offer.verb === MACRO_FOOD_CLUE);
+  if (food.length && (record.stance === undefined || !safety?.clear || working || pendingWork || workOrder?.state === "working" ||
+      food.length > 2 || new Set(food.map(offer => offer.material!.subject)).size !== food.length))
+    invalid("food clue scope");
   return Object.freeze({
     v: version(record.v), ...basis(record), goal: text(record.goal, "goal", 256),
     health: finite(record.health, "health", 1_024), food: whole(record.food, "food", 0, 20),
@@ -992,6 +1075,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     recent: Object.freeze(bounds(record.recent, "recent", 32).map(entry => text(entry, "recent entry", 512))),
     quiescent: record.quiescent, ...(safety ? { safety } : {}), ...(working ? { working } : {}),
     ...(prospectOpening ? { prospectOpening } : {}), ...(travelHint ? { travelHint } : {}),
+    ...(surfaceOpening ? { surfaceOpening } : {}),
     ...(timberObstruction ? { timberObstruction } : {}),
     ...(workOrder ? { workOrder } : {}), ...(pendingWork ? { pendingWork } : {}),
     ...(Object.hasOwn(record, "stance") ? { stance: whole(record.stance, "stance", 1) } : {}),
@@ -1196,6 +1280,10 @@ export function matchesMaterial(offer: MacroOpportunity, selector: MacroDirectAc
   return offer.risk === "guarded" && offer.verb === selector.verb && offer.material?.subject === selector.subject;
 }
 
+export function isGroundScout(offer: MacroOpportunity): offer is MacroOpportunity & { readonly anchor: MacroTravelAnchor } {
+  return offer.verb === "approach" && offer.risk === "low" && !!offer.anchor && offer.anchor.subject !== "route:dry";
+}
+
 export function isOpeningView(offer: MacroOpportunity): boolean {
   return offer.verb === "survey" && (offer.anchor ? offer.risk === "guarded" && offer.anchor.subject === "route:dry" :
     offer.risk === "read") || offer.verb === "inspect" && offer.risk === "read" && !!offer.anchor;
@@ -1216,6 +1304,27 @@ const earlyCaveSources: Readonly<Record<string, readonly string[]>> = {
 const diamondOreSources = ["diamond_ore", "deepslate_diamond_ore"] as const;
 const woodlandStock = /^minecraft:(?:oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|pale_oak)_log$/;
 
+function earlySurfaceSources(target: MacroWorkTarget): readonly string[] | undefined {
+  return target.kind === "stock" && (target.item === "minecraft:cobblestone" || target.item === "minecraft:coal" ||
+    target.item === "minecraft:raw_iron") ? earlyCaveSources[target.item] : undefined;
+}
+
+export function hasSurfaceCoverEffect(policy: MacroWorkPolicy): boolean {
+  const sources = earlySurfaceSources(policy.target);
+  return !!sources && surfaceCaps.some(block => !sources.includes(block.slice("minecraft:".length)) &&
+    policy.allowedEffects.includes(`break:${block}`));
+}
+
+export function surfaceAnchorMatchesPolicy(anchor: MacroTravelAnchor, policy: MacroWorkPolicy): boolean {
+  const sources = earlySurfaceSources(policy.target);
+  return !!sources && rollingGatheringPolicy(policy) && policy.maxBreaks >= 2 &&
+    surfaceCaps.some(block => anchor.subject === `block:${block}` &&
+      !sources.includes(block.slice("minecraft:".length)) && policy.allowedEffects.includes(`break:${block}`)) &&
+    sources.some(block => policy.allowedEffects.includes(`break:minecraft:${block}`)) &&
+    policy.allowedEffects.every(effect => sources.some(block => effect === `break:minecraft:${block}`) ||
+      surfaceCaps.some(block => effect === `break:${block}`));
+}
+
 function naturalFrontier(subject: string): boolean {
   return prospectRock.some(block => subject === `block:${block}`);
 }
@@ -1232,7 +1341,9 @@ function resourceTravelSubject(subject: string): boolean {
 }
 
 function resourceMatchesPolicy(subject: string, policy: MacroWorkPolicy): boolean {
+  const earlySources = earlySurfaceSources(policy.target);
   return resourceTravelSubject(subject) && policy.allowedEffects.includes(`break:${subject.slice(6)}`) &&
+    (!earlySources || earlySources.some(block => subject === `block:minecraft:${block}`)) &&
     (!policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT) ||
       diamondOreSources.some(block => subject === `block:minecraft:${block}`));
 }
@@ -1263,7 +1374,9 @@ export function harvestAnchorMatchesPolicy(anchor: MacroTravelAnchor, policy: Ma
 export function openingViewMatchesPolicy(offer: MacroOpportunity, policy: MacroWorkPolicy): boolean {
   return isOpeningView(offer) && rollingGatheringPolicy(policy) &&
     (!offer.anchor || (offer.anchor.subject === "route:dry" ? policy.allowedEffects.includes(MACRO_DIAMOND_PROSPECT) :
-      policy.allowedEffects.includes(`break:${offer.anchor.subject.slice(6)}`) ||
+      (earlySurfaceSources(policy.target) ?
+        resourceMatchesPolicy(offer.anchor.subject, policy) || surfaceAnchorMatchesPolicy(offer.anchor, policy) :
+        policy.allowedEffects.includes(`break:${offer.anchor.subject.slice(6)}`)) ||
       frontierMatchesPolicy(offer.anchor.subject, policy)));
 }
 
@@ -1279,7 +1392,7 @@ export function sameLiveCorrectionScope(source: MacroObservation, current: Macro
     source.epoch === current.epoch && current.health > 0 && current.health >= source.health &&
     current.safety?.clear !== false && current.safety?.revision === source.safety?.revision &&
     !current.working && current.workOrder?.state !== "working" && current.workOrder?.state !== "needs_replan" &&
-    (current.quiescent || current.opportunities.length > 0 || !!current.travelHint || !!current.timberObstruction);
+    (current.quiescent || current.opportunities.length > 0 || !!current.travelHint || !!current.timberObstruction || !!current.surfaceOpening);
 }
 
 export function liveCorrectionEvidence(observation: MacroObservation): string {
@@ -1288,7 +1401,7 @@ export function liveCorrectionEvidence(observation: MacroObservation): string {
     JSON.stringify(anchor ? [verb, risk, anchor, material] : [verb, summary, risk, evidence, material])).sort();
   const pending = observation.pendingWork;
   const travel = observation.travelHint;
-  return JSON.stringify([observation.quiescent, offers, observation.prospectOpening ?? null, observation.timberObstruction ?? null,
+  return JSON.stringify([observation.quiescent, offers, observation.prospectOpening ?? null, observation.surfaceOpening ?? null, observation.timberObstruction ?? null,
     travel ? [travel.kind, travel.subject, travel.target, travel.footing,
       travel.footing === "one_block_grade" ? travel.heightChange : null] : null,
     pending ? [pending.id, pending.state, pending.parked, pending.yieldable, !!pending.collectOfferId, !!pending.deferOfferId] : null,

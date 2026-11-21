@@ -433,6 +433,10 @@ final class AgentVisibleHorizon {
         return prepare(target) ? checkedWindow(target, yaw, true) : null;
     }
 
+    Window dryWindow(Target target, float yaw) {
+        return prepare(target) ? checkedWindow(target, yaw, false) : null;
+    }
+
     Window dryKeyWindow(AgentBody.HorizonTravel travel, float yaw, float goal, float yawStep, float blocked,
                         boolean left, boolean right) {
         if (!prepare(travel.target)) return null;

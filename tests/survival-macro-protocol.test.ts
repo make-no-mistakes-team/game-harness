@@ -6,8 +6,8 @@ import { convertOpenAICodexResponsesTools } from "@oh-my-pi/pi-ai/providers/open
 import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
-  MACRO_CAPABILITIES_VERSION, MacroDirectory, MacroObservationRotating, hasDirectAuthority,
-  parseMacroObservation, parseMacroProposal, parseMacroWorkOrder, type MacroWorkDemand,
+  MACRO_CAPABILITIES_VERSION, MacroDirectory, MacroObservationRotating, foodWorkWitness, hasDirectAuthority,
+  parseMacroObservation, parseMacroProposal, parseMacroWorkOrder, parseMacroWorkPolicy, type MacroWorkDemand,
 } from "../src/server/survival-macro/protocol.ts";
 import { terraPlanContext } from "../src/server/survival-macro/terra.ts";
 
@@ -76,6 +76,98 @@ test("A prospect opening is a bounded dry wall clue, never a material opportunit
     safety: { clear: false, revision: 2 } })).toThrow("prospect opening scope");
 });
 
+test("Low-health food work requires a current exact source with its reserves held", () => {
+  const clue = { id: "o-meal", verb: "forage", risk: "read", summary: "Witnessed adult pig",
+    material: { subject: "entity:minecraft:pig", target: "m-7", spends: {} }, evidence: "A dry local contact." };
+  const raw = {
+    v: 1, run: "run", life: 1, epoch: 1, tick: 133, goal: "stone_pickaxe", stance: 1,
+    health: 7, food: 17, inventory: { "minecraft:wooden_axe": 1 },
+    opportunities: [clue], recent: [], quiescent: false, safety: { clear: true, revision: 2 },
+  };
+  const live = parseMacroObservation(raw);
+  const quote = { target: { kind: "stock", item: "minecraft:porkchop", count: 1 },
+    allowedEffects: ["forage:entity:minecraft:pig"], costCaps: [], reserves: [{ item: "minecraft:wooden_axe", count: 1 }],
+    maxBreaks: 0, maxCrafts: 0, maxPlacements: 0 };
+  const policy = parseMacroWorkPolicy(quote);
+  expect(foodWorkWitness(live, policy)?.id).toBe(clue.id);
+  expect(foodWorkWitness(parseMacroObservation({ ...raw, inventory: {} }), policy)).toBeUndefined();
+  expect(foodWorkWitness(parseMacroObservation({ ...raw, opportunities: [] }), policy)).toBeUndefined();
+  expect(hasDirectAuthority({ kind: "continuation", opportunityId: clue.id, reserves: [],
+    steps: [{ selector: { verb: "forage", subject: clue.material.subject }, maxEffects: 1, until: null }] },
+  live, MACRO_CAPABILITIES_VERSION)).toBe(false);
+  for (const invalid of [
+    { ...clue, risk: "guarded" }, { ...clue, material: { ...clue.material, subject: "entity:minecraft:player" } },
+    { ...clue, material: { ...clue.material, spends: { "minecraft:wooden_axe": 1 } } },
+    { ...clue, material: { ...clue.material, target: "42" } },
+  ]) expect(() => parseMacroObservation({ ...raw, opportunities: [invalid] })).toThrow("food clue");
+  expect(() => parseMacroObservation({ ...raw, safety: { clear: false, revision: 3 } })).toThrow("food clue scope");
+  expect(() => parseMacroWorkPolicy({ ...quote, target: { ...quote.target, item: "minecraft:beef" } })).toThrow("food forage");
+  expect(() => parseMacroWorkPolicy({ ...quote, maxBreaks: 1 })).toThrow("food forage");
+  const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: quote.reserves, current: null, lastOutcome: null };
+  const context = terraPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+    lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200, maxPlanTtlTicks: 7_200 }, live);
+  expect(context!.systemPrompt?.join("\n")).toContain("Emergency eating is reported separately from pickup");
+  expect(JSON.stringify(context!.tools)).toContain(quote.allowedEffects[0]!);
+  expect(JSON.stringify(context!.tools)).not.toContain(clue.id);
+});
+
+test("A dry surface cap is read-only and an empty hand cannot spend a tool or harvest rock", () => {
+  const observation = {
+    v: 1, run: "run", life: 1, epoch: 1, tick: 133, goal: "diamond", health: 20, food: 20, stance: 1,
+    inventory: { "minecraft:wooden_pickaxe": 1 }, opportunities: [], recent: [], quiescent: false,
+    safety: { clear: true, revision: 2 },
+  };
+  const surfaceOpening = { block: "minecraft:grass_block", target: "m-5", tool: "minecraft:air", maxToolLoss: 0 } as const;
+  expect(parseMacroObservation(observation).surfaceOpening).toBeUndefined();
+  const live = parseMacroObservation({ ...observation, surfaceOpening });
+  expect(live).toMatchObject({ surfaceOpening, opportunities: [] });
+  expect(hasDirectAuthority({
+    kind: "continuation", opportunityId: surfaceOpening.target, reserves: [],
+    steps: [{ selector: { verb: "break", subject: "block:minecraft:grass_block" }, maxEffects: 1, until: null }],
+  }, live, MACRO_CAPABILITIES_VERSION)).toBe(false);
+  for (const invalid of [
+    { ...surfaceOpening, block: "minecraft:gravel" }, { ...surfaceOpening, block: "minecraft:crafting_table" },
+    { ...surfaceOpening, block: "minecraft:diamond_ore" }, { ...surfaceOpening, block: "minecraft:stone" },
+    { ...surfaceOpening, maxToolLoss: 1 }, { ...surfaceOpening, target: "o-5" }, { ...surfaceOpening, landing: true },
+  ]) expect(() => parseMacroObservation({ ...observation, surfaceOpening: invalid })).toThrow("surface opening");
+  for (const invalid of [
+    { stance: undefined }, { safety: { clear: false, revision: 3 } },
+    { workOrder: { id: "live", state: "needs_replan", detail: "Still working" } },
+  ]) expect(() => parseMacroObservation({ ...observation, ...invalid, surfaceOpening })).toThrow("surface opening scope");
+
+  const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
+  const context = terraPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+    lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200, maxPlanTtlTicks: 7_200 }, live);
+  expect(JSON.stringify(context!.messages[0]!.content)).toContain("surfaceOpening");
+  expect(context!.systemPrompt?.join("\n")).toContain("no buried stone or ore");
+  expect(JSON.stringify(context!.tools)).not.toContain("surfaceAnchor");
+  expect(JSON.stringify(context!.tools)).not.toContain("m-5");
+});
+
+test("A surface entry order is a host-only single stock job with exact cover and source effects", () => {
+  const surfaceAnchor = { subject: "block:minecraft:grass_block", target: "m-5" };
+  const policy = { target: { kind: "stock", item: "minecraft:cobblestone", count: 3 },
+    allowedEffects: ["break:minecraft:grass_block", "break:minecraft:stone"],
+    costCaps: [], reserves: [], maxBreaks: 8, maxCrafts: 0, maxPlacements: 0 };
+  const order = {
+    v: 1, id: "stone-leg", run: "run", life: 1, epoch: 1, basisTick: 133, expiresTick: 1200,
+    safetyRevision: 2, origin: "model", ...policy, surfaceAnchor,
+  };
+  expect(parseMacroWorkOrder(order)).toMatchObject({ surfaceAnchor, ...policy });
+  for (const invalid of [
+    { maxBreaks: 1 }, { allowedEffects: ["break:minecraft:grass_block"] }, { target: { ...policy.target, item: "minecraft:oak_log" } },
+    { surfaceAnchor: { ...surfaceAnchor, subject: "block:minecraft:dirt" } },
+    { surfaceAnchor: { ...surfaceAnchor, subject: "block:minecraft:stone" } },
+    { surfaceAnchor: { ...surfaceAnchor, target: "m-0" } },
+    { travelAnchor: { subject: "block:minecraft:stone", target: "m-7" } },
+    { harvestAnchor: { subject: "block:minecraft:stone", target: "m-7" } },
+    { id: "work:1", nextWorkId: "work:2" }, { duringWaitFor: "paid-ticket" },
+  ]) expect(() => parseMacroWorkOrder({ ...order, ...invalid })).toThrow("work surface anchor scope");
+  expect(() => parseMacroProposal({ action: { kind: "work", policy, surfaceAnchor }, expiresTick: 1200,
+    subgoal: "Find stone", reason: "Dry cap is visible beside the player", successCondition: "Cobblestone appears in inventory",
+    contingency: "Stop if no safe tread appears", alternative: "Seek a cave" })).toThrow();
+});
+
 test("Only supported near-term footing can carry a travel clue, never native input", () => {
   const observation = {
     v: 1, run: "run", life: 1, epoch: 1, tick: 20, goal: "diamond", health: 20, food: 20, stance: 1,
@@ -107,6 +199,35 @@ test("Only supported near-term footing can carry a travel clue, never native inp
     { ...grade, heightChange: 0 }, { ...grade, heightChange: 2 }, { ...grade, heightChange: -2 },
     { ...travelHint, heightChange: 1 }, { ...grade, footing: "side_only" },
   ]) expect(() => parseMacroObservation({ ...observation, travelHint: unsupported })).toThrow("travel hint");
+});
+
+test("Ground reconnaissance selects only an exact dry landmark and grants no stock effect", () => {
+  const view = {
+    v: 1, run: "run", life: 1, epoch: 1, tick: 133, goal: "diamond", health: 20, food: 20, stance: 1,
+    inventory: {}, recent: [], quiescent: false, safety: { clear: true, revision: 2 },
+  };
+  const anchor = { subject: "block:minecraft:birch_log", target: "m-3" };
+  const travelHint = { ...anchor, kind: "resource", footing: "dry", bearingDegrees: -40.1, windowBlocks: 0.8 };
+  const scout = { id: "walk-observe", verb: "approach", risk: "low", summary: "Scout toward the visible birch",
+    evidence: "Stop on the witnessed dry ground for a new view; no harvest.", anchor };
+  const live = parseMacroObservation({ ...view, travelHint, opportunities: [scout] });
+  const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
+  const context = terraPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+    lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200,
+    maxPlanTtlTicks: 7_200 }, live)!;
+  expect(JSON.stringify(context.tools)).toContain('"enum":["walk-observe"]');
+  expect(live.opportunities[0]?.material).toBeUndefined();
+  expect(live.inventory).toEqual({});
+  expect(hasDirectAuthority({
+    kind: "continuation", opportunityId: scout.id, reserves: [],
+    steps: [{ selector: { verb: "break", subject: anchor.subject }, maxEffects: 1, until: null }],
+  }, live, MACRO_CAPABILITIES_VERSION)).toBe(false);
+  for (const bad of [
+    { travelHint: undefined }, { travelHint: { ...travelHint, target: "m-4" } },
+    { travelHint: { ...travelHint, footing: "shallow_water_with_bank" } },
+    { travelHint: { ...travelHint, windowBlocks: 0.4 } }, { stance: undefined },
+    { opportunities: [scout, { ...scout, id: "other-walk" }] },
+  ]) expect(() => parseMacroObservation({ ...view, travelHint, opportunities: [scout], ...bad })).toThrow();
 });
 
 test("A work approach names one target without pricing its material", () => {

@@ -184,6 +184,21 @@ break, the host rejects the whole policy before issuing it. The player keeps
 at least one break for the source.
 Cover breaks, grounded travel, and stock pickups are confirmed separately.
 
+`surfaceOpening` describes one visible, dry cap beside the player.
+Terra can choose to prospect there for cobblestone, coal, or raw iron
+without first seeing the buried resource. A work order must cover the
+exact surface material and the desired source, keep a break for that
+source, and protect the tools it needs. The cap is not evidence that
+ore lies beneath it. If the player is too injured for a safe descent,
+the opening does not override that restriction.
+
+An injured player without food can choose a short foraging job when
+there is an actual source in view. A ripe plant takes one interaction;
+hunting requires a visible adult food animal and a usable axe. An item
+on the ground still needs to be picked up. Reaching a source, gaining
+food, eating it, and recovering health are separate events. If no source
+is visible, the player can scout; a forest is not evidence of food.
+
 For ordinary travel the player needs visible support through its
 stopping distance, not a proved round trip to every waypoint.
 `travelHint` names a visible resource or frontier and how far the
@@ -192,6 +207,12 @@ frontier even when no ore is visible. `woodland_frontier` points to a
 visible canopy, not a known log or a species claim. Neither cue prices
 a break or reports stock. The player checks each new view and brakes
 when the known ground runs out.
+
+Terra can also approach a visible landmark for a better view without
+ordering a harvest. This short scouting move needs dry support and
+continues only while the same landmark and safe stopping lane hold.
+The player must actually move and settle before reporting the new view.
+Reaching a tree this way does not mean that stone or food was found.
 
 On a dry approach the player can keep looking toward a tree while
 stepping to one side. It checks the ground under the movement it

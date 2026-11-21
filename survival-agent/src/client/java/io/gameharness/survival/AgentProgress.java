@@ -11,9 +11,7 @@ import java.util.function.Supplier;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
-import net.minecraft.block.CaveVines;
 import net.minecraft.block.LeavesBlock;
-import net.minecraft.block.SweetBerryBushBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.DeathScreen;
 import net.minecraft.client.gui.screen.ingame.CraftingScreen;
@@ -23,7 +21,6 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityPose;
-import net.minecraft.entity.EntityType;
 import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
@@ -112,9 +109,7 @@ final class AgentProgress {
         && !stack.isOf(Items.ROTTEN_FLESH) && !stack.isOf(Items.SPIDER_EYE)
         && !stack.isOf(Items.POISONOUS_POTATO) && !stack.isOf(Items.PUFFERFISH)
         && !stack.isOf(Items.CHICKEN) && !stack.isOf(Items.SUSPICIOUS_STEW) && !stack.isOf(Items.CHORUS_FRUIT);
-    private static final Predicate<BlockState> RIPE_BERRIES = state ->
-        state.isOf(Blocks.SWEET_BERRY_BUSH) && state.get(SweetBerryBushBlock.AGE) >= 2
-        || (state.isOf(Blocks.CAVE_VINES) || state.isOf(Blocks.CAVE_VINES_PLANT)) && state.get(CaveVines.BERRIES);
+    private static final Predicate<BlockState> RIPE_BERRIES = state -> AgentFoodWork.ripe(state) != null;
     private static final int FOOD_RESERVE = 12; // nutrition points, not stack size
     private static final double FORAGE_LEASH_SQUARED = 36;
 
@@ -7037,6 +7032,35 @@ final class AgentProgress {
 
     int mealsEaten() { return mealsEaten; }
     int foodPickedUp() { return foodPickedUp; }
+    void confirmMacroFoodPickup(int count) { foodPickedUp += count; }
+    static boolean ordinaryFood(ItemStack stack) { return FOOD.test(stack); }
+
+    boolean macroFoodSafe() {
+        return tick >= mealQuietUntil && (retreatUntil == 0 || tick >= retreatUntil + 10)
+            && !c.player.isOnFire() && c.player.hurtTime == 0;
+    }
+
+    boolean macroFoodRelevant() {
+        return macroFoodSafe() && (c.player.getHungerManager().getFoodLevel() < 18
+            || c.player.getHealth() <= c.player.getMaxHealth() / 2) && foodNutrition() < FOOD_RESERVE;
+    }
+
+    boolean approachMacroFood(Vec3d target) {
+        if (stuck >= 12 || !macroFoodSafe()) return false;
+        Vec3d feet = c.player.getPos();
+        float bearing = yaw(target.subtract(feet));
+        body.lookAlongGait(bearing, 32);
+        float facing = c.player.getYaw();
+        if (bearingDistance(bearing, facing) > 7 || c.player.getPitch() < 25) return true;
+        Vec3d lane = forward(facing);
+        if (dangerInForageLane(feet.add(lane.multiply(1.15)).add(0, 0.35, 0))) return false;
+        Footing ground = footing(feet, lane, facing, false);
+        if (ground == Footing.LEVEL) {
+            if (!body.macroNoVisiblePickup(feet.add(lane.multiply(0.85)))) return false;
+            walk(false);
+        }
+        return ground == Footing.LEVEL || ground == Footing.UNKNOWN;
+    }
 
     private boolean wantsHealingMeal() {
         int hunger = c.player.getHungerManager().getFoodLevel();
@@ -7056,10 +7080,16 @@ final class AgentProgress {
     }
 
     private boolean macroEmergencyMeal(AgentMacroControl macro) {
+        // The item may already be in inventory on the tick emergency use takes
+        // input back. Record the acquisition before making any meal decision.
+        macro.observeFoodPickup(this);
         int hunger = c.player.getHungerManager().getFoodLevel();
         int before = mealsEaten;
+        Item eaten = mealItem;
+        int priorHunger = mealStartHunger;
         confirmMeal(hunger);
-        if (mealsEaten > before) macro.safetyEffect("emergency meal consumed");
+        if (mealsEaten > before)
+            macro.safetyEffect("emergency meal consumed: " + Registries.ITEM.getId(eaten) + "; hunger " + priorHunger + " -> " + hunger);
         if (emergencyMealJob != 0) {
             if (hands.busy() && hands.jobGeneration() == emergencyMealJob) {
                 macro.urgent("equipping emergency food");
@@ -7419,10 +7449,7 @@ final class AgentProgress {
     }
 
     private static boolean edibleAnimal(Entity entity) {
-        var type = entity.getType();
-        return (type == EntityType.COW || type == EntityType.PIG || type == EntityType.SHEEP
-            || type == EntityType.MOOSHROOM || type == EntityType.RABBIT)
-            && entity instanceof LivingEntity animal && !animal.isBaby() && !animal.isTouchingWater();
+        return AgentFoodWork.adult(entity) != null;
     }
 
     private void explore() {

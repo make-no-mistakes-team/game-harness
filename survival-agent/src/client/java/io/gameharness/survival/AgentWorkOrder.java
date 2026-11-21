@@ -18,11 +18,12 @@ import net.minecraft.util.Identifier;
 /** A finite, host-issued lease. Geometry, recipes and inputs are native decisions. */
 record AgentWorkOrder(String id, int life, long epoch, long basis, long expires, long safetyRevision,
                       Policy policy, String nextWorkId, String duringWaitFor, TravelAnchor travelAnchor,
-                      HarvestAnchor harvestAnchor) {
+                      HarvestAnchor harvestAnchor, SurfaceAnchor surfaceAnchor) {
     static final int MAX_TICKS = 1_200;
     static final int MAX_BREAKS = 64;
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._:-]{1,128}");
     private static final Pattern ITEM_ID = Pattern.compile("minecraft:[a-z0-9_]{1,96}");
+    private static final Pattern MATERIAL_ID = Pattern.compile("m-[1-9][0-9]{0,125}");
     private static final Set<String> FIELDS = Set.of("v", "id", "run", "life", "epoch", "basisTick", "expiresTick",
         "safetyRevision", "origin", "target", "allowedEffects", "costCaps", "reserves",
         "maxBreaks", "maxCrafts", "maxPlacements");
@@ -40,10 +41,17 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     private static final Set<String> NATURAL_FRONTIERS = Set.of(
         "block:minecraft:stone", "block:minecraft:deepslate", "block:minecraft:andesite",
         "block:minecraft:diorite", "block:minecraft:granite", "block:minecraft:tuff");
+    static final BlockState[] EARLY_SOURCES = {
+        Blocks.STONE.getDefaultState(), Blocks.COBBLESTONE.getDefaultState(),
+        Blocks.DEEPSLATE.getDefaultState(), Blocks.COBBLED_DEEPSLATE.getDefaultState(),
+        Blocks.COAL_ORE.getDefaultState(), Blocks.DEEPSLATE_COAL_ORE.getDefaultState(),
+        Blocks.IRON_ORE.getDefaultState(), Blocks.DEEPSLATE_IRON_ORE.getDefaultState()
+    };
 
     record Target(Item item, int count, String goal) {}
     record TravelAnchor(String subject, String target) {}
     record HarvestAnchor(String subject, String target) {}
+    record SurfaceAnchor(String subject, String target) {}
 
     enum TravelKind {
         RESOURCE("resource"), CAVE_FRONTIER("cave_frontier"), WOODLAND_FRONTIER("woodland_frontier");
@@ -68,6 +76,25 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                 : namedBreak(state));
         }
 
+        boolean surfaceAnchorAllowed(BlockState cap) {
+            if (preset || !earlySurfaceStock(target.item) || maxBreaks < 2 || !prospectCoverAllowed(cap)
+                    || harvest(cap) == target.item) return false;
+            boolean sourceAllowed = false;
+            for (String effect : effects) {
+                if (!effect.startsWith("break:")) return false;
+                BlockState block = Registries.BLOCK.get(Identifier.of(effect.substring("break:".length()))).getDefaultState();
+                boolean source = false;
+                for (BlockState exact : EARLY_SOURCES)
+                    if (block == exact && harvest(exact) == target.item) {
+                        source = true;
+                        break;
+                    }
+                if (source) sourceAllowed = true;
+                else if (prospectCoverDrop(block) == Items.AIR) return false;
+            }
+            return sourceAllowed;
+        }
+
         private boolean namedBreak(BlockState state) {
             if (state.isOf(Blocks.DIAMOND_ORE)) return effects.contains("break:minecraft:diamond_ore");
             if (state.isOf(Blocks.DEEPSLATE_DIAMOND_ORE)) return effects.contains("break:minecraft:deepslate_diamond_ore");
@@ -85,9 +112,12 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         boolean placeProspectTorch() { return diamondProspecting() && effects.contains(PROSPECT_TORCH); }
         boolean placeProspectSupport() { return diamondProspecting() && effects.contains(PROSPECT_SUPPORT); }
         boolean waterFill() { return !preset && target.item == Items.WATER_BUCKET && effects.contains(WATER_FILL); }
+        AgentFoodWork.Source foodSource() {
+            return effects.size() == 1 ? AgentFoodWork.effect(effects.iterator().next()) : null;
+        }
         boolean pendingOrdinary() {
             return !preset && target.item != null && target.item != Items.IRON_INGOT
-                && !effects.contains(IRON_SMELT) && !effects.contains(FURNACE);
+                && !effects.contains(IRON_SMELT) && !effects.contains(FURNACE) && foodSource() == null;
         }
 
         boolean travelAnchorAllowed(String subject, TravelKind kind) {
@@ -250,7 +280,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         if (mode == null || value == null || !value.keySet().containsAll(FIELDS)
                 || value.size() != FIELDS.size() + (value.has("nextWorkId") ? 1 : 0)
                     + (value.has("duringWaitFor") ? 1 : 0) + (value.has("travelAnchor") ? 1 : 0)
-                    + (value.has("harvestAnchor") ? 1 : 0)) return null;
+                    + (value.has("harvestAnchor") ? 1 : 0) + (value.has("surfaceAnchor") ? 1 : 0)) return null;
         AgentWorkOrder envelope;
         try {
             if (integer(value, "v") != 1 || !run.equals(text(value, "run"))) return null;
@@ -262,7 +292,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                     || expires <= basis || expires - basis > MAX_TICKS) return null;
             // Keep the attempted handoff distinct from withdrawing the underlying furnace lease, even if its fields fail validation.
             envelope = new AgentWorkOrder(id, (int) life, epoch, basis, expires, safety, null, null,
-                value.has("duringWaitFor") ? "" : null, null, null);
+                value.has("duringWaitFor") ? "" : null, null, null, null);
         } catch (RuntimeException invalid) {
             return null;
         }
@@ -306,6 +336,11 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                 bounded(value, "maxBreaks", 0, preset ? 32 : MAX_BREAKS),
                 bounded(value, "maxCrafts", 0, preset ? 24 : 64),
                 bounded(value, "maxPlacements", 0, preset ? 2 : 8));
+            for (String effect : effects) if (effect.startsWith(AgentFoodWork.EFFECT)) {
+                if (duringWaitFor != null || nextWorkId != null || stageSuffix(envelope.id)
+                        || !AgentFoodWork.policy(AgentFoodWork.effect(effect), desired, caps, effects.size(),
+                            policy.maxBreaks, policy.maxCrafts, policy.maxPlacements)) return envelope;
+            }
             if (duringWaitFor != null && !policy.pendingOrdinary()) return envelope;
             if (effects.contains(IRON_SMELT) || effects.contains(FURNACE) || effects.contains(DIAMOND_PROSPECT)
                     || effects.contains(WATER_FILL)) {
@@ -349,8 +384,20 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
                         || !policy.travelAnchorAllowed(subject, TravelKind.RESOURCE)) return envelope;
                 harvestAnchor = new HarvestAnchor(subject, identity);
             }
+            SurfaceAnchor surfaceAnchor = null;
+            if (value.has("surfaceAnchor")) {
+                var raw = value.getAsJsonObject("surfaceAnchor");
+                if (!mode.equals("constrained") || duringWaitFor != null || nextWorkId != null || travelAnchor != null
+                        || harvestAnchor != null || stageSuffix(envelope.id)
+                        || !raw.keySet().equals(Set.of("subject", "target"))) return envelope;
+                String subject = text(raw, "subject"), identity = text(raw, "target");
+                if (!MATERIAL_ID.matcher(identity).matches() || !blockAnchorSubject(subject)) return envelope;
+                BlockState cap = Registries.BLOCK.get(Identifier.of(subject.substring("block:".length()))).getDefaultState();
+                if (!policy.surfaceAnchorAllowed(cap)) return envelope;
+                surfaceAnchor = new SurfaceAnchor(subject, identity);
+            }
             return new AgentWorkOrder(envelope.id, envelope.life, envelope.epoch, envelope.basis, envelope.expires,
-                envelope.safetyRevision, policy, nextWorkId, duringWaitFor, travelAnchor, harvestAnchor);
+                envelope.safetyRevision, policy, nextWorkId, duringWaitFor, travelAnchor, harvestAnchor, surfaceAnchor);
         } catch (RuntimeException invalid) {
             return envelope;
         }
@@ -378,6 +425,7 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
 
     private static boolean validEffect(String effect) {
         if (effect.startsWith("craft:")) return AgentHands.workRecipe(effect.substring("craft:".length()));
+        if (effect.startsWith(AgentFoodWork.EFFECT)) return AgentFoodWork.effect(effect) != null;
         if (effect.equals(TABLE) || effect.equals(IRON_SMELT) || effect.equals(FURNACE)
                 || effect.equals(DIAMOND_PROSPECT) || effect.equals(PROSPECT_TORCH)
                 || effect.equals(PROSPECT_SUPPORT) || effect.equals(WATER_FILL)) return true;
@@ -436,6 +484,10 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
     }
 
     static boolean resource(BlockState state) { return harvest(state) != Items.AIR; }
+
+    static boolean earlySurfaceStock(Item item) {
+        return item == Items.COBBLESTONE || item == Items.COAL || item == Items.RAW_IRON;
+    }
 
     static boolean timberLeaf(BlockState state) {
         return state.isOf(Blocks.OAK_LEAVES) || state.isOf(Blocks.SPRUCE_LEAVES) || state.isOf(Blocks.BIRCH_LEAVES)

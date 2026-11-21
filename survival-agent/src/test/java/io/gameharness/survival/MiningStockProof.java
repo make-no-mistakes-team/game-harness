@@ -781,7 +781,7 @@ final class MiningStockProof {
             "renewal does not change the separately paid obligation");
         var smelt = AgentWorkOrder.parse(ironWorkQuote(), "run", "preset");
         var freshSmelt = new AgentWorkOrder("renewed-smelt", smelt.life(), smelt.epoch(), 50, 950,
-            smelt.safetyRevision(), smelt.policy(), null, null, null, null);
+            smelt.safetyRevision(), smelt.policy(), null, null, null, null, null);
         require(!AgentMacroControl.canRenewWork(smelt, smelt, freshSmelt),
             "the paid batch is not an ordinary session");
     }

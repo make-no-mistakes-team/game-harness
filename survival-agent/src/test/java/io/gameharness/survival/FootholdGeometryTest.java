@@ -16,6 +16,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class FootholdGeometryTest {
@@ -172,6 +173,63 @@ final class FootholdGeometryTest {
         build.seekingContact = true;
         assertEquals(refused, build.view(empty, clipped, false), "contact that clips either proof isn't re-aimed");
         assertFalse(build.confirms(40, wrongFace, Blocks.COBBLESTONE.getDefaultState(), 0));
+    }
+
+    @Test
+    void firstSurfaceCutNeedsARealAdjacentTopOutsideFootprintAndRetainedTiles() {
+        var foot = new BlockPos(0, 70, 0);
+        var cap = foot.east().down();
+        var hit = new BlockHitResult(Vec3d.ofBottomCenter(cap.up()), Direction.UP, cap, false);
+        var stance = new Box(0.2, 70, 0.2, 0.8, 71.8, 0.8);
+        assertTrue(AgentMacroControl.firstSurfaceCap(foot, hit, stance, Set.of(foot.down())));
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot, hit, stance, Set.of(cap)), "retained footing");
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot, hit, stance.offset(0.1, 0, 0), Set.of()),
+            "the expanded player footprint reaches the cut column");
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot, null, stance, Set.of()), "no witness");
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot,
+            BlockHitResult.createMissed(hit.getPos(), Direction.UP, cap), stance, Set.of()), "inferred top");
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot,
+            new BlockHitResult(hit.getPos(), Direction.UP, cap, true), stance, Set.of()), "origin inside the outline");
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot,
+            new BlockHitResult(hit.getPos(), Direction.WEST, cap, false), stance, Set.of()), "side");
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot,
+            new BlockHitResult(hit.getPos().subtract(0, 0.5, 0), Direction.UP, cap, false), stance, Set.of()), "partial top");
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot,
+            new BlockHitResult(Vec3d.ofBottomCenter(foot), Direction.UP, foot.down(), false), stance, Set.of()), "own support");
+        var diagonal = cap.south();
+        assertFalse(AgentMacroControl.firstSurfaceCap(foot,
+            new BlockHitResult(Vec3d.ofBottomCenter(diagonal.up()), Direction.UP, diagonal, false), stance, Set.of()),
+            "diagonal is not a cardinal tread");
+    }
+
+    @Test
+    void exactSurfaceAnchorNeedsAnEarlyStockSourceAndAPricedSeparateCut() {
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"surface-entry","run":"run","life":1,"epoch":1,"basisTick":5,"expiresTick":650,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:cobblestone","count":3},
+             "allowedEffects":["break:minecraft:stone","break:minecraft:grass_block"],
+             "maxBreaks":4,"maxCrafts":0,"maxPlacements":0,"costCaps":[],"reserves":[],
+             "surfaceAnchor":{"subject":"block:minecraft:grass_block","target":"m-8"}}
+            """).getAsJsonObject();
+        var opening = AgentWorkOrder.parse(raw, "run", "constrained");
+        assertEquals(new AgentWorkOrder.SurfaceAnchor("block:minecraft:grass_block", "m-8"), opening.surfaceAnchor());
+        raw.addProperty("maxBreaks", 1);
+        assertNull(AgentWorkOrder.parse(raw, "run", "constrained").policy(), "reserve a break for the source");
+        raw.addProperty("maxBreaks", 4);
+        var anchor = raw.getAsJsonObject("surfaceAnchor");
+        anchor.addProperty("target", "grass");
+        assertNull(AgentWorkOrder.parse(raw, "run", "constrained").policy());
+        anchor.addProperty("target", "m-8");
+        anchor.addProperty("subject", "block:minecraft:stone");
+        assertNull(AgentWorkOrder.parse(raw, "run", "constrained").policy(), "a source is not cover");
+        anchor.addProperty("subject", "block:minecraft:dirt");
+        assertNull(AgentWorkOrder.parse(raw, "run", "constrained").policy(), "unquoted cover effect");
+        anchor.addProperty("subject", "block:minecraft:grass_block");
+        raw.getAsJsonArray("allowedEffects").remove(0);
+        assertNull(AgentWorkOrder.parse(raw, "run", "constrained").policy(), "no corresponding source effect");
+        raw.getAsJsonArray("allowedEffects").add("break:minecraft:stone");
+        raw.getAsJsonArray("allowedEffects").add("break:minecraft:sand");
+        assertNull(AgentWorkOrder.parse(raw, "run", "constrained").policy(), "falling blocks are not safe cover");
     }
 
     @Test

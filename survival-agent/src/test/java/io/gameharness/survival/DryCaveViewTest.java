@@ -525,7 +525,7 @@ final class DryCaveViewTest {
             Set.of("prospect:minecraft:diamond", "break:minecraft:deepslate_diamond_ore", "break:minecraft:deepslate",
                 "place:minecraft:cobblestone", "place:minecraft:torch"),
             Map.of(Items.COBBLESTONE, 4, Items.TORCH, torchCost), Map.of(Items.IRON_PICKAXE, 1), 48, 0, placements);
-        return new AgentWorkOrder(id, 1, 20, basis, expires, 2, policy, null, null, null, null);
+        return new AgentWorkOrder(id, 1, 20, basis, expires, 2, policy, null, null, null, null, null);
     }
 
     @Test

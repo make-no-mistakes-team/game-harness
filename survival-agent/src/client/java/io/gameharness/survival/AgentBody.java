@@ -1517,6 +1517,7 @@ final class AgentBody implements AgentFuseEscape.Terrain {
         final double arrival;
         final boolean allowWade;
         private final AgentVisibleHorizon.ContactPulse pulse;
+        private final boolean groundScout;
         private int stoppedAt = -1, precisionTicks;
         private boolean issued, beenDriven, wet, wadeStarted;
         private boolean glanceUsed, glancing;
@@ -1530,11 +1531,21 @@ final class AgentBody implements AgentFuseEscape.Terrain {
         }
 
         HorizonTravel(AgentVisibleHorizon.Target target, Vec3d goal, double arrival, boolean allowWade, boolean allowPulse) {
+            this(target, goal, arrival, allowWade, allowPulse, false);
+        }
+
+        private HorizonTravel(AgentVisibleHorizon.Target target, Vec3d goal, double arrival, boolean allowWade,
+                              boolean allowPulse, boolean groundScout) {
             this.target = target;
             this.goal = goal;
             this.arrival = arrival;
             this.allowWade = allowWade;
             pulse = allowPulse ? new AgentVisibleHorizon.ContactPulse() : null;
+            this.groundScout = groundScout;
+        }
+
+        static HorizonTravel groundScout(AgentVisibleHorizon.Target target, Vec3d goal, double arrival) {
+            return new HorizonTravel(target, goal, arrival, false, false, true);
         }
 
         boolean moved() { return motion != null && motion.moved(); }
@@ -1554,13 +1565,19 @@ final class AgentBody implements AgentFuseEscape.Terrain {
     /** Forward input and camera rotation aren't receipts; sample displacement after vanilla consumed the keys. */
     static final class HorizonMotion {
         private final Vec3d origin, goal;
+        private final boolean allowSameCell;
         private double nearest;
         private boolean valid = true, moved, progressed, recovered;
         private boolean contact;
 
         HorizonMotion(Vec3d origin, Vec3d goal) {
+            this(origin, goal, false);
+        }
+
+        HorizonMotion(Vec3d origin, Vec3d goal, boolean allowSameCell) {
             this.origin = origin;
             this.goal = goal;
+            this.allowSameCell = allowSameCell;
             nearest = horizontalDistanceSquared(origin, goal);
         }
 
@@ -1573,7 +1590,7 @@ final class AgentBody implements AgentFuseEscape.Terrain {
             if (displacement > 0.0004 && (issued || moved) && remaining < nearest) {
                 nearest = remaining;
                 moved |= horizontalDistanceSquared(feet, origin) >= 0.16
-                    && (MathHelper.floor(feet.x) != MathHelper.floor(origin.x)
+                    && (allowSameCell || MathHelper.floor(feet.x) != MathHelper.floor(origin.x)
                         || MathHelper.floor(feet.z) != MathHelper.floor(origin.z));
                 progressed = moved;
             }
@@ -1794,7 +1811,7 @@ final class AgentBody implements AgentFuseEscape.Terrain {
         Vec3d feet = player.getPos();
         double dx = travel.goal.x - feet.x, dz = travel.goal.z - feet.z;
         double distance = Math.hypot(dx, dz);
-        if (travel.motion == null) travel.motion = new HorizonMotion(feet, travel.goal);
+        if (travel.motion == null) travel.motion = new HorizonMotion(feet, travel.goal, travel.groundScout);
         if (!travel.motion.valid) return horizonBlocked(Refusal.MOTION_INTERRUPTED);
         horizonIntent = travel;
         if (travel.moved() && player.isOnGround() && !player.isTouchingWater()

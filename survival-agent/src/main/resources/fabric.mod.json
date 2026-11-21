@@ -6,6 +6,6 @@
   "environment": "client",
   "entrypoints": { "client": ["io.gameharness.survival.AgentClient"] },
   "mixins": ["survival-agent.mixins.json"],
-  "custom": { "gameharness:terra_work_wire": 10 },
+  "custom": { "gameharness:terra_work_wire": 11 },
   "depends": { "minecraft": "1.21.4", "java": ">=21", "fabricloader": ">=0.16.10", "fabric-api": "*" }
 }

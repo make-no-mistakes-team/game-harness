@@ -104,6 +104,44 @@ function workReply(request: MacroRequest, action: MacroProposal["action"], ttl =
   };
 }
 
+test.each(["same source", "different source", "missing source", "reserve lost"] as const)(
+  "Paid recovery checks its exact food source and floors before dispatch (%s)", async condition => {
+    const reply = Promise.withResolvers<void>();
+    const quote = {
+      target: { kind: "stock", item: "minecraft:sweet_berries", count: 1 },
+      allowedEffects: ["forage:block:minecraft:sweet_berry_bush"], costCaps: [],
+      reserves: [{ item: "minecraft:wooden_pickaxe", count: 1 }], maxBreaks: 0, maxCrafts: 0, maxPlacements: 0,
+    } as const;
+    const clue = {
+      id: "o-berry", verb: "forage", risk: "read", summary: "Witnessed ripe sweet berry bush",
+      evidence: "An accessible ripe contact from dry footing.",
+      material: { subject: "block:minecraft:sweet_berry_bush", target: "m-8", spends: {} },
+    } as const;
+    const f = await durableFixture(async request => {
+      await reply.promise;
+      return workReply(request, { kind: "work", policy: quote });
+    }, "Recover safely from injury.", 1);
+    const scene = { stance: 2, health: 7.5, food: 17, inventory: { "minecraft:wooden_pickaxe": 1 }, opportunities: [clue] };
+    try {
+      await f.observe(10, scene);
+      const opportunities = condition === "missing source" ? [] : [{ ...clue, id: "o-fresh-berry",
+        material: { ...clue.material, target: condition === "different source" ? "m-9" : "m-8" } }];
+      await f.publishObservation(15, { ...scene, opportunities, ...(condition === "reserve lost" ? { inventory: {} } : {}) });
+      reply.resolve();
+      await f.actor.poll();
+      await f.actor.poll();
+      if (condition === "same source") {
+        expect(await f.order()).toMatchObject({ basisTick: 15, ...quote });
+      } else await expect(access(f.file("work.json"))).rejects.toThrow();
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 const captureJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAAf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AH//Z", "base64");
 const captureHash = createHash("sha256").update(captureJpeg).digest("hex");
 
@@ -455,6 +493,309 @@ const wall = { block: "minecraft:stone", target: "wall-a", tool: "minecraft:iron
 const wallPolicy = { ...cavePolicy, allowedEffects: [...cavePolicy.allowedEffects, "break:minecraft:stone"],
   reserves: [...cavePolicy.reserves, { item: "minecraft:raw_iron", count: 2 }] } as const;
 const wallState = { ...caveState, inventory: { ...caveState.inventory, "minecraft:raw_iron": 2 } } as const;
+
+// Tick 133 in JzX8Kz: a bench and birch were visible, but neither was a stone source.
+const grassyWorksite = {
+  goal: "diamond", epoch: 3, stance: 1, safety: { clear: true, revision: 2 },
+  inventory: { "minecraft:oak_log": 6, "minecraft:wooden_pickaxe": 1, "minecraft:oak_planks": 3, "minecraft:stick": 2 },
+  opportunities: [
+    { id: "o-3", verb: "inspect", risk: "read", summary: "Center the visible minecraft:crafting_table",
+      evidence: "A lit face is visible away from the current crosshair.",
+      anchor: { subject: "block:minecraft:crafting_table", target: "m-1" } },
+    { id: "o-9", verb: "inspect", risk: "read", summary: "Center the visible minecraft:birch_log",
+      evidence: "A lit face is visible away from the current crosshair.",
+      anchor: { subject: "block:minecraft:birch_log", target: "m-4" } },
+  ],
+  travelHint: { kind: "resource", subject: "block:minecraft:birch_log", target: "m-3",
+    footing: "dry", bearingDegrees: -40.1, windowBlocks: 0.8 },
+} as const;
+const birchScout = {
+  id: "scout-birch", verb: "approach", risk: "low", summary: "Scout toward the visible birch",
+  evidence: "Advance along the current dry stopping window for a new view.",
+  anchor: { subject: grassyWorksite.travelHint.subject, target: grassyWorksite.travelHint.target },
+} as const;
+
+test("Ground reconnaissance opens a fresh dry view, not stock authority or a receipt-only request", async () => {
+  const requests: MacroRequest[] = [];
+  const reply = Promise.withResolvers<void>();
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    if (requests.length === 1) return workReply(request, { kind: "gap", capability: "No safe new view" });
+    if (requests.length === 2) {
+      await reply.promise;
+      return workReply(request, { kind: "opportunity", opportunityId: birchScout.id });
+    }
+    return workReply(request, { kind: "abstain" });
+  }, "Find a dry stone source without cutting the tree.", 5);
+  try {
+    await f.observe(128, grassyWorksite);
+    await f.actor.poll();
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    const scene = { ...grassyWorksite, opportunities: [birchScout] };
+    await f.observe(133, scene);
+    expect(requests.map(request => request.observation.tick)).toEqual([128, 133]);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    reply.resolve();
+    await f.observe(138, scene);
+    const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+    expect(intent).toMatchObject({ basisTick: 138, opportunityId: birchScout.id, skillHash: null });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await f.receipt(intent.id, 139, "accepted");
+    await f.receipt(intent.id, 150, "completed", "Stopped on dry ground and rendered a new view.");
+    await f.observe(150, scene);
+    await f.observe(215, { ...grassyWorksite, opportunities: [] });
+    expect(requests).toHaveLength(2);
+    await f.observe(220, { ...scene, stance: 2, opportunities: [{ ...birchScout, id: "rekeyed-birch" }] });
+    expect(requests).toHaveLength(3);
+    expect(requests[2]?.observation).toMatchObject({ stance: 2, inventory: grassyWorksite.inventory, opportunities: [] });
+    expect(requests[2]?.work?.current).toBeNull();
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+  } finally {
+    reply.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each(["moved stance", "lost lane", "new landmark", "unsafe"] as const)(
+  "Ground reconnaissance never issues from stale evidence (%s)", async condition => {
+    const reply = Promise.withResolvers<void>();
+    const f = await durableFixture(async request => {
+      await reply.promise;
+      return workReply(request, { kind: "opportunity", opportunityId: birchScout.id });
+    }, "Survey dry ground for safer footing.", 1);
+    const scene = { ...grassyWorksite, opportunities: [birchScout] };
+    try {
+      await f.observe(133, scene);
+      reply.resolve();
+      const fresh = condition === "moved stance" ? { ...scene, stance: 2 } :
+        condition === "lost lane" ? { ...grassyWorksite, travelHint: undefined } :
+        condition === "new landmark" ? { ...scene, travelHint: { ...scene.travelHint, target: "m-4" },
+          opportunities: [{ ...birchScout, anchor: { ...birchScout.anchor, target: "m-4" } }] } :
+        { ...grassyWorksite, safety: { clear: false, revision: 3 }, travelHint: undefined, opportunities: [] };
+      await f.observe(138, fresh);
+      await f.actor.poll();
+      expect(f.actor.status().issued).toBe(0);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+const surfaceOpening = { block: "minecraft:grass_block", target: "m-5", tool: "minecraft:wooden_pickaxe", maxToolLoss: 0 } as const;
+const surfaceAnchor = { subject: "block:minecraft:grass_block", target: "m-5" } as const;
+const surfacePolicy = {
+  target: { kind: "stock", item: "minecraft:cobblestone", count: 3 },
+  allowedEffects: ["break:minecraft:dirt", "break:minecraft:grass_block", "break:minecraft:stone"],
+  costCaps: [], reserves: [{ item: "minecraft:wooden_pickaxe", count: 1 }],
+  maxBreaks: 12, maxCrafts: 0, maxPlacements: 0,
+} as const;
+
+test("A constrained scout cannot bypass an already protected inventory floor", async () => {
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return workReply(request, requests.length === 1 ? { kind: "work", policy: surfacePolicy }
+      : { kind: "opportunity", opportunityId: birchScout.id });
+  }, "Find stone and retain the wooden pickaxe.", 2);
+  try {
+    await f.observe(133, { ...grassyWorksite, surfaceOpening });
+    await f.actor.poll();
+    const previous = await f.order();
+    await f.receipt(previous.id, 136, "accepted");
+    await f.receipt(previous.id, 149, "interrupted");
+    await f.observe(220, { ...grassyWorksite, inventory: {}, opportunities: [birchScout] });
+    await f.actor.poll();
+    expect(requests[1]?.work?.protectedReserves).toEqual(surfacePolicy.reserves);
+    expect(requests[1]?.observation.opportunities).toEqual([]);
+    expect(f.actor.status().issued).toBe(0);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test("The JzX8Kz stone gap wakes promptly on the first physical cap, not a rekeyed birch cue", async () => {
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return workReply(request, requests.length === 1
+      ? { kind: "gap", capability: "Safe discovery of a stone source or cave frontier from the current stance" }
+      : { kind: "work", policy: surfacePolicy });
+  }, "Obtain a diamond in Survival.", 3);
+  try {
+    await f.observe(133, grassyWorksite);
+    await f.actor.poll();
+    await f.observe(138, { ...grassyWorksite, opportunities: grassyWorksite.opportunities.map(offer => ({ ...offer, id: `new-${offer.id}` })) });
+    expect(requests.map(request => request.observation.tick)).toEqual([133]);
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await f.observe(143, { ...grassyWorksite, surfaceOpening });
+    await f.actor.poll();
+    expect(requests.map(request => request.observation.tick)).toEqual([133, 143]);
+    expect(requests[1]?.observation).toMatchObject({ surfaceOpening });
+    expect(await f.order()).toMatchObject({ target: surfacePolicy.target, surfaceAnchor, basisTick: 143 });
+    expect((await f.order()).travelAnchor).toBeUndefined();
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test("An unchanged surface cap does not wake another decision when it comes back into view", async () => {
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return workReply(request, { kind: "abstain" });
+  }, "Obtain a diamond in Survival.", 3);
+  try {
+    await f.observe(133, { ...grassyWorksite, surfaceOpening });
+    await f.actor.poll();
+    await f.observe(230, grassyWorksite);
+    await f.observe(330, { ...grassyWorksite, surfaceOpening });
+    expect(requests.map(request => request.observation.tick)).toEqual([133]);
+    await f.observe(335, { ...grassyWorksite, surfaceOpening: { ...surfaceOpening, target: "m-6" } });
+    expect(requests.map(request => request.observation.tick)).toEqual([133, 335]);
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each(["first scene", "cave alternative", "surface instead of cave", "empty hand", "priced loss", "coal", "raw iron",
+  "wrong cover", "wrong stock source", "unrelated effect", "one break", "not enough breaks for stock",
+  "no tool", "cap tool missing", "insufficient harvest tier", "unpriced loss", "floor would break", "changed cap", "changed stance",
+  "protected tile", "label only"] as const)("An ordinary early-stock quote at grassy footing admits only a supported start (%s)",
+  async condition => {
+    const reply = Promise.withResolvers<void>();
+    const newQuote = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length > 1) {
+        await newQuote.promise;
+        return workReply(request, { kind: "work", policy: surfacePolicy });
+      }
+      await reply.promise;
+      const target = condition === "coal" ? { ...surfacePolicy.target, item: "minecraft:coal" } :
+        condition === "raw iron" || condition === "wrong stock source" || condition === "insufficient harvest tier"
+          ? { ...surfacePolicy.target, item: "minecraft:raw_iron" } : surfacePolicy.target;
+      const allowedEffects = condition === "wrong cover" ? ["break:minecraft:dirt", "break:minecraft:stone"] :
+        condition === "cave alternative" ? ["break:minecraft:stone"] :
+        condition === "raw iron" || condition === "insufficient harvest tier" ? ["break:minecraft:grass_block", "break:minecraft:iron_ore"] :
+        condition === "coal" ? ["break:minecraft:grass_block", "break:minecraft:coal_ore"] :
+        condition === "wrong stock source" || condition === "unrelated effect"
+          ? [...surfacePolicy.allowedEffects, "break:minecraft:birch_log"] : surfacePolicy.allowedEffects;
+      return workReply(request, { kind: "work", policy: {
+        ...surfacePolicy, target, allowedEffects,
+        maxBreaks: condition === "one break" ? 1 : condition === "not enough breaks for stock" ? 3 : surfacePolicy.maxBreaks,
+        reserves: condition === "unpriced loss" ? [] : surfacePolicy.reserves,
+        costCaps: condition === "floor would break" || condition === "priced loss" ? [{ item: surfaceOpening.tool, count: 1 }] : [],
+      } });
+    }, "Obtain a diamond in Survival.", condition === "changed cap" ? 2 : 1);
+    const clue = condition === "label only" ? undefined :
+      condition === "no tool" || condition === "empty hand" ? { ...surfaceOpening, tool: "minecraft:air" } :
+      condition === "cap tool missing" ? { ...surfaceOpening, tool: "minecraft:wooden_shovel" } :
+      condition === "unpriced loss" || condition === "floor would break" || condition === "priced loss"
+        ? { ...surfaceOpening, maxToolLoss: 1 as const } : surfaceOpening;
+    const scene = { ...grassyWorksite, surfaceOpening: clue,
+      ...(condition === "no tool" ? { inventory: { "minecraft:oak_log": 6 } } : {}),
+      ...(condition === "unpriced loss" || condition === "priced loss"
+        ? { inventory: { ...grassyWorksite.inventory, "minecraft:wooden_pickaxe": 2 } } : {}),
+      ...(condition === "floor would break" || condition === "raw iron"
+        ? { inventory: { ...grassyWorksite.inventory, "minecraft:stone_pickaxe": 1 } } : {}),
+      ...(condition === "first scene" ? { opportunities: [], travelHint: undefined } : {}),
+      ...(condition === "cave alternative" || condition === "surface instead of cave" ? {
+        travelHint: { ...grassyWorksite.travelHint, subject: "block:minecraft:stone", target: "m-7", kind: "cave_frontier" as const },
+      } : {}),
+      ...(condition === "label only" ? { opportunities: [...grassyWorksite.opportunities,
+        { ...caveSurvey, summary: "Cut one witnessed adjacent grass cap" }] } : {}),
+    };
+    try {
+      await f.observe(133, scene);
+      expect(requests).toHaveLength(1);
+      if (condition === "changed cap") await f.observe(138, { ...scene, surfaceOpening: { ...surfaceOpening, target: "m-6" } });
+      if (condition === "changed stance") await f.observe(138, { ...scene, stance: 2 });
+      if (condition === "protected tile") await f.observe(138, { ...scene, surfaceOpening: undefined });
+      reply.resolve();
+      await f.actor.poll();
+      if (["first scene", "surface instead of cave", "empty hand", "priced loss", "coal", "raw iron"].includes(condition))
+        expect(await f.order()).toMatchObject({ surfaceAnchor });
+      else if (condition === "cave alternative") {
+        const order = await f.order();
+        expect(order).toMatchObject({ travelAnchor: { subject: "block:minecraft:stone", target: "m-7" } });
+        expect(order.surfaceAnchor).toBeUndefined();
+      } else await expect(access(f.file("work.json"))).rejects.toThrow();
+      if (condition === "changed cap" || condition === "changed stance" || condition === "protected tile") {
+        const history = (await readFile(f.file("history.jsonl"), "utf8")).trimEnd().split("\n").map(line => JSON.parse(line));
+        const original = history.find(event => event.event === "request" && event.request.observation.tick === 133);
+        expect(original?.request.observation.surfaceOpening).toEqual(surfaceOpening);
+        expect(history).toContainEqual(expect.objectContaining({ event: "stale", requestId: original.requestId,
+          reason: condition === "changed stance" ? "physical_work_scope_or_ttl_changed" : "surface_opening_no_longer_witnessed_or_priced" }));
+        expect(history.some(event => event.event === "work_order_prepared" && event.requestId === original.requestId)).toBe(false);
+        expect(f.actor.status().issuedWorkOrders).toBe(0);
+        if (condition === "changed cap") {
+          expect(requests.map(request => request.observation.tick)).toEqual([133, 138]);
+          const followup = history.find(event => event.event === "request" && event.request.observation.tick === 138);
+          expect(followup?.requestId).not.toBe(original.requestId);
+          expect(followup?.request.observation.surfaceOpening.target).toBe("m-6");
+          newQuote.resolve();
+          await f.actor.poll();
+          expect(await f.order()).toMatchObject({ basisTick: 138, surfaceAnchor: { ...surfaceAnchor, target: "m-6" } });
+        } else expect(requests.map(request => request.observation.tick)).toEqual([133]);
+      }
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      reply.resolve();
+      newQuote.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  });
+
+test.each(["fresh cap", "receipt alone", "unrelated trunk", "unlicensed cap"] as const)(
+  "A paid camera check can bind an early-stock job only after a fresh, matching physical cap (%s)", async condition => {
+    const quote = Promise.withResolvers<void>();
+    const view = condition === "unrelated trunk" ? grassyWorksite.opportunities[1] : caveSurvey;
+    const f = await durableFixture(async request => {
+      await quote.promise;
+      const policy = condition === "unrelated trunk"
+        ? { ...surfacePolicy, allowedEffects: [...surfacePolicy.allowedEffects, "break:minecraft:birch_log"] } : surfacePolicy;
+      return workReply(request, { kind: "work", policy, openingViewId: view.id });
+    }, "Obtain a diamond in Survival.", 1);
+    try {
+      await f.observe(133, { ...grassyWorksite, opportunities: [view] });
+      quote.resolve();
+      await f.actor.poll();
+      if (condition === "unrelated trunk") {
+        await expect(access(f.file("intent.json"))).rejects.toThrow();
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        return;
+      }
+      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      await f.receipt(intent.id, 136, "accepted");
+      await f.receipt(intent.id, 140, "completed", "The ground-facing camera view rendered.");
+      await f.observe(140, { ...grassyWorksite, surfaceOpening });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      await f.observe(145, { ...grassyWorksite, surfaceOpening: condition === "receipt alone" ? undefined :
+        condition === "unlicensed cap" ? { ...surfaceOpening, block: "minecraft:andesite" } : surfaceOpening });
+      if (condition === "fresh cap") expect(await f.order()).toMatchObject({ surfaceAnchor, basisTick: 145 });
+      else await expect(access(f.file("work.json"))).rejects.toThrow();
+    } finally {
+      quote.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
 
 test.each(["matching later witness", "camera receipt only"] as const)(
   "An inherited ceiling first view opens only the paid outlook and waits for %s", async condition => {

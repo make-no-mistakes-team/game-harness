@@ -38,8 +38,10 @@ final class AgentStallGuard {
     private static final int DRY_FOOTING_TICKS = 110;
     private static final int PROBE_TICKS = 46;
     private static final int RETRY_TICKS = 145;
+    private static final int HANDBACK_TICKS = 230;
+    private static final int ORDINARY_SETUP_TICKS = 75;
     private static final int ANGLE_WINDOW = 64;
-    private static final int SPIN_TICKS = 45;
+    private static final int SPIN_TICKS = 96;
     private static final float RECOVERY_TURN_LIMIT = 250;
     private static final int HISTORY = 64;
     private static final int FLAT_RETURN_AGE = 200;
@@ -49,6 +51,12 @@ final class AgentStallGuard {
     private static final int BLOCKED_RECHECK_TICKS = 43; // Stagger the rendered sampler's four interleaved phases.
     private static final int CHANGED_SUPPORT_TICKS = 3;
     private static final int ALTERNATIVE_TICKS = 210;
+    private static final int DEPARTURE_LENGTH = 3;
+    private static final int DEPARTURE_LOOK_TICKS = 40;
+    private static final int DEPARTURE_DRIVE_TICKS = 62;
+    private static final int DEPARTURE_VIEWS = 2;
+    private static final float DEPARTURE_PITCH = 33;
+    private static final Predicate<BlockState> DRY_DANGER = AgentBody::dryCaveDanger;
     private static final double STEP_CENTER = 0.14;
     private static final double STEP_CLEARANCE = 3.08; // 1.25-block jump plus 1.8-block standing height and margin.
     private static final Predicate<ItemStack> TORCH = s -> s.isOf(Items.TORCH);
@@ -56,7 +64,7 @@ final class AgentStallGuard {
         || s.isOf(Items.DIRT);
 
     private enum Phase { WATCH, PENDING, WATER, SCOUT, BACKTRACK, WALK, LIGHT, CUT, STEP, SETTLE, RETRY,
-                         ASSESS, ALTERNATIVE, BLOCKED }
+                         ASSESS, DEPART, ALTERNATIVE, BLOCKED }
     private enum StepStage { CENTER, HEADROOM, SUPPORT, TORCH_BYPASS, JUMP, LAND }
     enum Alternative { WORKING, ADVANCED, ADVANCED_BUT_HELD, REPLAN, REFUSED }
 
@@ -65,6 +73,66 @@ final class AgentStallGuard {
 
     // A vanilla-foot-contact receipt on the exact level segment, not a terrain lookup at a remembered coordinate.
     private record FlatCrossing(BlockPos previous, BlockPos next, Vec3d previousFoot, Vec3d crossing, int tick) {}
+
+    /** Keep recently spent exits across handbacks; a changed camera angle is not a changed lane. */
+    static final class Departures {
+        private record Lane(BlockPos from, BlockPos to) {}
+        private final Lane[] refused = new Lane[HISTORY];
+        private final BlockPos[] stood = new BlockPos[HISTORY];
+        private final BlockPos[] surveyed = new BlockPos[HISTORY];
+        private int refusals, contacts, surveys;
+
+        boolean canCross(BlockPos from, BlockPos to) {
+            for (Lane lane : refused) if (lane != null && lane.from().equals(from) && lane.to().equals(to)) return false;
+            return true;
+        }
+
+        void reject(BlockPos from, BlockPos to) {
+            if ((neighbor(from, to) || from.up().equals(to)) && canCross(from, to))
+                refused[refusals++ % refused.length] = new Lane(from.toImmutable(), to.toImmutable());
+        }
+
+        void changed(BlockPos block) {
+            for (int i = 0; i < refused.length; i++) {
+                Lane lane = refused[i];
+                if (lane != null && (inClearanceColumn(block, lane.from()) || inClearanceColumn(block, lane.to())))
+                    refused[i] = null;
+            }
+        }
+
+        private static boolean inClearanceColumn(BlockPos block, BlockPos foot) {
+            return block.getX() == foot.getX() && block.getZ() == foot.getZ()
+                && block.getY() >= foot.getY() - 1 && block.getY() <= foot.getY() + 2;
+        }
+
+        boolean newLanding(BlockPos foot) { return !contains(stood, foot); }
+
+        void stoodOn(BlockPos foot) {
+            if (newLanding(foot)) stood[contacts++ % stood.length] = foot.toImmutable();
+        }
+
+        boolean beginSurvey(BlockPos foot) {
+            if (contains(surveyed, foot)) return false;
+            surveyed[surveys++ % surveyed.length] = foot.toImmutable();
+            return true;
+        }
+
+        void revisit(BlockPos foot) {
+            for (int i = 0; i < surveyed.length; i++) if (foot.equals(surveyed[i])) surveyed[i] = null;
+        }
+
+        void resetSurveys() {
+            Arrays.fill(surveyed, null);
+            surveys = 0;
+        }
+
+        void clear() {
+            Arrays.fill(refused, null);
+            Arrays.fill(stood, null);
+            refusals = contacts = 0;
+            resetSurveys();
+        }
+    }
 
     private final MinecraftClient client;
     private final AgentBody body;
@@ -82,6 +150,9 @@ final class AgentStallGuard {
     private final BlockPos[] breakHistory = new BlockPos[24];
     private final BlockPos[] stairLights = new BlockPos[16];
     private final BlockPos[] route = new BlockPos[4];
+    private final Departures departures = new Departures();
+    private final BlockPos[] departurePath = new BlockPos[DEPARTURE_LENGTH];
+    private final BlockState[] departureSupports = new BlockState[DEPARTURE_LENGTH];
     private final Vec3d[] travelCredits = new Vec3d[16];
     private final float[] yawWindow = new float[ANGLE_WINDOW];
     private final byte[] reversalsWindow = new byte[ANGLE_WINDOW];
@@ -142,6 +213,11 @@ final class AgentStallGuard {
     private BlockPos observedQuietSupport;
     private int observedQuietAge, quietTicks;
     private Vec3d lastAssessedFeet;
+    private BlockPos departureFrom, surveyFoot;
+    private Direction departureBearing, surveyBearing;
+    private int departureLength, surveySector, surveySince, surveyViews, ordinarySetupUntil;
+    private long surveyFrame;
+    private boolean replanOnAssessment, safeIdle;
 
     AgentStallGuard(MinecraftClient client, AgentBody body, AgentHands hands, AgentTools tools,
                     Predicate<BlockPos> protectedBlock, Predicate<BlockHitResult> safeSupport,
@@ -163,13 +239,26 @@ final class AgentStallGuard {
             ? report.detail() : "stall recovery: " + report.detail();
     }
     boolean ownsRecovery() { return phase != Phase.WATCH && phase != Phase.RETRY; }
+    boolean retryingDistinctWork() { return phase == Phase.RETRY && blockedReason != null; }
     boolean waitingForEvidence() { return phase == Phase.BLOCKED || phase == Phase.ASSESS
         || phase == Phase.WATER && water.blocked(); }
-    boolean triedStallRoute(BlockPos cell) { return drivenStances.contains(cell); }
+    boolean triedStallRoute(BlockPos from, BlockPos cell) {
+        return drivenStances.contains(cell) || !departures.newLanding(cell) || !departures.canCross(from, cell);
+    }
+    boolean refusedCrossing(BlockPos from, BlockPos to) { return !departures.canCross(from, to); }
+    void refuseCrossing(BlockPos from, BlockPos to) {
+        if (from.equals(client.player.getBlockPos()) && safeDryContact()) departures.reject(from, to);
+    }
+
+    /** A newly witnessed approach or real equipment selection gets effort, not a progress receipt. */
+    void ordinarySetup() {
+        if (phase == Phase.WATCH && ordinarySetupUntil == 0)
+            ordinarySetupUntil = tick + ORDINARY_SETUP_TICKS;
+    }
 
     boolean caveSurveyStalled() {
         return phase == Phase.PENDING && !tookControl && !explicitRefusal
-            || phase == Phase.RETRY && tick - entered >= RETRY_TICKS;
+            || phase == Phase.RETRY && tick - entered >= retryTicks();
     }
 
     /** The miner physically returned to an old shaft and witnessed a different mineable branch. */
@@ -238,6 +327,13 @@ final class AgentStallGuard {
     /** Existing vanilla client player break receipt, not an attack request or an air-block guess. */
     void broken(BlockPos position, BlockState state) {
         water.broken(position, state);
+        departures.changed(position);
+        if ((phase == Phase.ASSESS || phase == Phase.BLOCKED) && surveyFoot != null
+                && position.getSquaredDistance(surveyFoot) <= 16) {
+            departures.revisit(surveyFoot);
+            surveyFoot = null;
+            alternativeCheckAt = tick;
+        }
         if (lastGround != null && inFootColumn(position, lastGround)) confirmedFoot = null;
         for (int i = 0; i < flatCrossings.length; i++) {
             FlatCrossing crossing = flatCrossings[i];
@@ -341,6 +437,8 @@ final class AgentStallGuard {
                     novelCells++;
                 }
             }
+            if ((phase == Phase.DEPART || phase == Phase.RETRY && blockedReason != null) && standingOn(cell))
+                departures.stoodOn(cell);
             if (Math.abs(feet.y - cell.getY()) < 0.04 && centerMargin(feet, cell) >= 0.24 && standingOn(cell)) {
                 confirmedFoot = feet;
                 confirmedFootAge = player.age;
@@ -407,9 +505,8 @@ final class AgentStallGuard {
         workBroke = resourceBroke = stairLit = surfaceStep = cooked = false;
         navigationTurn = navigationArrival = false;
         int idle = tick - lastUseful;
-        if (phase != Phase.WATCH || navigationLease || hands.busy() && idle < 300) return;
-        boolean spinning = idle >= SPIN_TICKS && distance <= 2.25 && yawTravel >= 275
-            && (Math.abs(yawNet) >= 170 || reversals >= 2);
+        if (phase != Phase.WATCH || navigationLease || tick < ordinarySetupUntil || hands.busy() && idle < 300) return;
+        boolean spinning = stalledByTurning(idle, distance, yawTravel, yawNet, reversals);
         if (!spinning && idle < IDLE_TICKS) return;
         if (verifiedMining(lastUseful) || verifiedFurnace()) return;
         String cause = spinning
@@ -417,6 +514,11 @@ final class AgentStallGuard {
                 + "deg net, " + reversals + " reversals in " + Math.min(sampledAngles, ANGLE_WINDOW) + " ticks"
             : "no settled progress for " + idle + " ticks";
         detect(cause + " while " + activity);
+    }
+
+    static boolean stalledByTurning(int idle, double distanceSquared, float travel, float net, int reversals) {
+        return idle >= SPIN_TICKS && distanceSquared <= 2.25 && travel >= 275
+            && (reversals >= 2 || travel >= 360 && Math.abs(net) >= 325);
     }
 
     /** Incidental immersion is not a failed dry stance and must not enter the dry-only assessment. */
@@ -517,8 +619,10 @@ final class AgentStallGuard {
         } else if (phase == Phase.PENDING) {
             explicitRefusal = true;
         } else if (phase == Phase.RETRY) {
-            if (blockedReason != null) assessAgain("ordinary replan refused: " + reason);
-            else if (mineHandedBack) fail("ordinary miner handback failed: " + reason);
+            if (blockedReason != null) {
+                replanOnAssessment = true;
+                assessAgain("ordinary replan refused: " + reason);
+            } else if (mineHandedBack) fail("ordinary miner handback failed: " + reason);
             else nextAttempt(reason);
         } else if (phase == Phase.ALTERNATIVE) assessAgain("alternative refused: " + reason);
     }
@@ -528,10 +632,16 @@ final class AgentStallGuard {
                      Runnable releaseAlternative, boolean navigationLease, BlockPos witnessedLowCeiling) {
         navigationLowCeiling = witnessedLowCeiling;
         if (phase == Phase.WATCH || client.player.isTouchingWater() || client.player.hasVehicle()) return false;
-        if (phase == Phase.ASSESS || phase == Phase.ALTERNATIVE || phase == Phase.BLOCKED)
+        if (phase == Phase.ASSESS || phase == Phase.DEPART || phase == Phase.ALTERNATIVE || phase == Phase.BLOCKED) {
+            if (replanOnAssessment) {
+                replanOnAssessment = false;
+                replan.run();
+            }
             return assessAlternative(chooseAlternative, workAlternative, releaseAlternative);
+        }
         if (phase == Phase.RETRY && blockedReason != null) {
-            if (tick - entered < RETRY_TICKS || navigationLease || verifiedMining(entered) || verifiedFurnace()) return false;
+            if (tick - entered < retryTicks() || navigationLease || verifiedMining(entered) || verifiedFurnace()) return false;
+            replan.run();
             assessAgain("ordinary replan did not produce settled progress");
             return true;
         }
@@ -579,8 +689,13 @@ final class AgentStallGuard {
     }
 
     private boolean assessAlternative(Supplier<String> choose, Supplier<Alternative> work, Runnable release) {
+        if (phase == Phase.DEPART) {
+            depart();
+            return true;
+        }
         if (phase == Phase.ALTERNATIVE) {
-            Alternative result = tick - entered >= ALTERNATIVE_TICKS ? Alternative.REFUSED : work.get();
+            Alternative result = !safeDryContact() || tick - entered >= ALTERNATIVE_TICKS
+                ? Alternative.REFUSED : work.get();
             if (result != Alternative.WORKING) release.run();
             if (result == Alternative.ADVANCED) {
                 recoveries++;
@@ -600,38 +715,167 @@ final class AgentStallGuard {
         }
         body.pauseWork();
         if (tick < alternativeCheckAt || tick == entered && phase == Phase.ASSESS) return true;
-        alternativeCheckAt = tick + BLOCKED_RECHECK_TICKS;
-        if (quietSupport() != null && body.hasRecentView()) {
-            String task = choose.get();
-            if (task != null) {
-                attempts++;
-                transition(Phase.ALTERNATIVE, task);
-                return true;
+        BlockPos support = quietSupport();
+        if (support == null || !body.hasRecentView()) {
+            idleAtAssessment(false, support == null ? "waiting for safe, settled dry contact" : "waiting for a rendered view");
+            return true;
+        }
+        BlockPos foot = client.player.getBlockPos();
+        if (!foot.equals(surveyFoot)) {
+            surveyFoot = foot.toImmutable();
+            departures.stoodOn(foot);
+            setSurveyBearing(client.player.getHorizontalFacing());
+            surveySector = departures.beginSurvey(foot) ? 0 : 4;
+            if (offerAlternative(choose)) return true;
+        }
+        if (surveySector >= 4) {
+            if (offerAlternative(choose) || offerDeparture(client.player.getHorizontalFacing())) return true;
+            idleAtAssessment(true, "no distinct witnessed work or safe departure");
+            return true;
+        }
+        if (phase != Phase.ASSESS) {
+            surveySince = tick;
+            transition(Phase.ASSESS, "reassessing alternatives from settled dry footing");
+        }
+        lookForDeparture(choose, support);
+        return true;
+    }
+
+    private boolean offerAlternative(Supplier<String> choose) {
+        String task = choose.get();
+        if (task == null) return false;
+        attempts++;
+        transition(Phase.ALTERNATIVE, task);
+        return true;
+    }
+
+    private void setSurveyBearing(Direction direction) {
+        surveyBearing = direction;
+        surveySince = tick;
+        surveyViews = 0;
+        surveyFrame = -1;
+    }
+
+    private void lookForDeparture(Supplier<String> choose, BlockPos support) {
+        var player = client.player;
+        Vec3d feet = player.getPos();
+        float yaw = surveyBearing.getPositiveHorizontalDegrees();
+        body.turn(yaw, DEPARTURE_PITCH);
+        if (body.renderedDirection(yaw, DEPARTURE_PITCH, 6) && body.renderedFrame() != surveyFrame) {
+            if (surveyViews == 0 && centerMargin(feet, surveyFoot) < 0.35 && support.equals(surveyFoot.down())
+                    && tick - surveySince < DEPARTURE_LOOK_TICKS - 12
+                    && body.centerOnGroundedSupport(surveyFoot, body.dryCaveContact(surveyFoot))) return;
+            surveyFrame = body.renderedFrame();
+            surveyViews++;
+            // Inspect the short level route before the wider resource scans spend the frame's shared rays.
+            int length = visibleDeparture(surveyBearing);
+            if (offerAlternative(choose)) return;
+            if (length != 0) {
+                beginDeparture(surveyBearing, length);
+                return;
             }
         }
-        if (phase == Phase.ASSESS) {
-            String detail = report.detail();
-            waitForEvidence(detail.equals(blockedReason) ? detail
-                : detail + "; original recovery exhausted: " + blockedReason);
+        if (surveyViews >= DEPARTURE_VIEWS || tick - surveySince >= DEPARTURE_LOOK_TICKS) {
+            surveySector++;
+            setSurveyBearing(surveyBearing.rotateYClockwise());
         }
+    }
+
+    private boolean offerDeparture(Direction direction) {
+        int length = visibleDeparture(direction);
+        if (length == 0) return false;
+        beginDeparture(direction, length);
         return true;
+    }
+
+    private int visibleDeparture(Direction direction) {
+        BlockPos prior = surveyFoot;
+        int length = 0;
+        for (int i = 0; i < departurePath.length; i++) {
+            BlockPos cell = prior.offset(direction);
+            if (!departures.canCross(prior, cell)) break;
+            BlockState top = body.overlandTop(cell.down(), direction, DRY_DANGER);
+            if (top == null) break;
+            Vec3d inside = Vec3d.ofBottomCenter(cell).add(direction.getOffsetX() * 0.24, 0, direction.getOffsetZ() * 0.24);
+            if (!body.overlandClear(inside.add(0, 0.32, 0), DRY_DANGER)
+                    || !body.overlandClear(inside.add(0, 1.34, 0), DRY_DANGER)) break;
+            departurePath[i] = cell;
+            departureSupports[i] = top;
+            prior = cell;
+            length++;
+        }
+        for (; length > 0; length--) {
+            if (departures.newLanding(departurePath[length - 1])
+                    && body.overlandLane(surveyFoot, departurePath, departureSupports, length, direction, DRY_DANGER))
+                return length;
+        }
+        return 0;
+    }
+
+    private void beginDeparture(Direction direction, int length) {
+        departureFrom = surveyFoot;
+        departureBearing = direction;
+        departureLength = length;
+        attempts++;
+        transition(Phase.DEPART, "leaving the refused maneuver along witnessed level ground to "
+            + departurePath[length - 1].toShortString());
+    }
+
+    private void depart() {
+        var player = client.player;
+        BlockPos foot = player.getBlockPos();
+        BlockPos ending = departurePath[departureLength - 1];
+        boolean safe = safeDryContact();
+        if (safe && body.hasRecentView() && foot.equals(ending) && standingOn(ending)
+                && player.getVelocity().horizontalLengthSquared() <= 0.0025
+                && centerMargin(player.getPos(), ending) >= 0.27) {
+            body.pauseWork();
+            reached.accept(ending);
+            retry("settled on different witnessed footing at " + ending.toShortString() + "; returning to ordinary play");
+            return;
+        }
+        if (safe && tick - entered < DEPARTURE_DRIVE_TICKS
+                && (!body.hasRecentView() || body.overlandLane(departureFrom, departurePath, departureSupports,
+                    departureLength, departureBearing, DRY_DANGER))) {
+            if (body.hasRecentView()) body.driveDryRoute(departureFrom, ending, departureBearing);
+            return;
+        }
+        // Preserve the last exact attempted edge, not a blanket veto around the player.
+        if (safe && body.hasRecentView()) {
+            BlockPos prior = departureFrom;
+            for (int i = 0; i < departureLength; i++) {
+                BlockPos next = departurePath[i];
+                if (prior.equals(foot)) {
+                    departures.reject(prior, next);
+                    break;
+                }
+                prior = next;
+            }
+        }
+        assessAgain("level departure no longer has a safe stopping lane");
     }
 
     private void assessAgain(String reason) {
         body.pauseWork();
         alternativeCheckAt = tick;
+        surveySince = tick;
         transition(Phase.ASSESS, reason);
     }
 
-    private void waitForEvidence(String reason) {
-        body.pauseWork();
-        alternativeCheckAt = tick + BLOCKED_RECHECK_TICKS;
-        transition(Phase.BLOCKED, "blocked/waiting for changed evidence: " + reason);
+    private void idleAtAssessment(boolean safe, String reason) {
+        alternativeCheckAt = tick + (safe ? BLOCKED_RECHECK_TICKS : CHANGED_SUPPORT_TICKS);
+        String detail = (safe ? "safe idle: " : "recovery inputs held: ") + reason + "; " + blockedReason;
+        if (phase != Phase.BLOCKED || safeIdle != safe || !report.detail().equals(detail))
+            transition(Phase.BLOCKED, detail);
+        safeIdle = safe;
     }
 
     private void resetWorld() {
         world = client.world;
         water.clearEpisode();
+        departures.clear();
+        surveyFoot = null;
+        replanOnAssessment = false;
         Arrays.fill(walked, null);
         Arrays.fill(flatCrossings, null);
         Arrays.fill(footprints, null);
@@ -656,6 +900,7 @@ final class AgentStallGuard {
 
     private void markUseful(Vec3d feet) {
         lastUseful = tick;
+        ordinarySetupUntil = 0;
         anchor = feet;
         novelCells = movedCells = 0;
         clearAngles();
@@ -749,6 +994,10 @@ final class AgentStallGuard {
         triedCuts.clear();
         drivenStances.clear();
         assessedSupports.clear();
+        departures.resetSurveys();
+        departures.stoodOn(incidentFrom);
+        surveyFoot = null;
+        replanOnAssessment = false;
         triedStances.add(incidentFrom);
         rejectedStances.add(incidentFrom);
         cutCount = 0;
@@ -830,7 +1079,7 @@ final class AgentStallGuard {
                 case 2 -> -1;
                 default -> 0;
             });
-            if (triedStances.contains(cell)) continue;
+            if (triedStances.contains(cell) || !departures.canCross(from, cell)) continue;
             Vec3d point = Vec3d.ofBottomCenter(cell).add(0, -0.07, 0);
             BlockHitResult support = body.terrain(point, eye.distanceTo(point) + 0.05).orElse(null);
             if (support == null || support.getSide() != Direction.UP || !support.getBlockPos().equals(cell.down())
@@ -865,6 +1114,11 @@ final class AgentStallGuard {
     }
 
     private boolean checkStance() {
+        if (!departures.canCross(from, to)) {
+            rejectedStances.add(to);
+            probeSince = tick - PROBE_TICKS;
+            return false;
+        }
         Vec3d floor = Vec3d.ofBottomCenter(to);
         Vec3d eye = client.player.getEyePos();
         if (proof == 0) {
@@ -1112,6 +1366,7 @@ final class AgentStallGuard {
     }
 
     private void rejectWalk() {
+        if (driveSince != 0 && quietSupport() != null) departures.reject(from, to);
         rejectedStances.add(to);
         scanFromHere();
     }
@@ -1208,8 +1463,14 @@ final class AgentStallGuard {
     }
 
     private void startStep(String description) {
-        if (client.player.getBlockPos().equals(navigationLowCeiling)) {
+        BlockPos footing = client.player.getBlockPos();
+        if (footing.equals(navigationLowCeiling)) {
+            departures.reject(footing, footing.up());
             fail("witnessed low mine ceiling rules out a temporary pillar on this footing");
+            return;
+        }
+        if (!departures.canCross(footing, footing.up())) {
+            fail("the temporary step on this footing was already refused");
             return;
         }
         if (stepTried || !dryGround() || hands.count(STEP) == 0) {
@@ -1263,8 +1524,9 @@ final class AgentStallGuard {
                     && lowCeiling.getPos().y < overhead.y - 0.05
                     && client.world.getBlockState(lowCeiling.getBlockPos()).getFluidState().isEmpty()) {
                 String handback = mineHandback.apply(from);
-                if (handback == null) failStep("visible ceiling blocks the temporary step and no connected ordinary mine handback is safe");
+                if (handback == null) failStep("visible ceiling blocks the temporary step");
                 else {
+                    departures.reject(from, from.up());
                     attempts++;
                     mineHandedBack = true;
                     retry("visible ceiling blocks the temporary step; " + handback);
@@ -1430,8 +1692,14 @@ final class AgentStallGuard {
     }
 
     private BlockPos quietSupport() {
-        return dryGround() && client.player.getVelocity().horizontalLengthSquared() <= 0.0025
+        return safeDryContact() && client.player.getVelocity().horizontalLengthSquared() <= 0.0025
             ? client.player.supportingBlockPos.orElse(null) : null;
+    }
+
+    private boolean safeDryContact() {
+        if (!dryGround() || body.lavaEmergency() || client.player.isOnFire() || client.player.hurtTime > 0) return false;
+        BlockPos support = client.player.supportingBlockPos.orElse(null);
+        return support != null && !DRY_DANGER.test(client.world.getBlockState(support));
     }
 
     private BlockHitResult stepTop(BlockPos support, BlockHitResult selected) {
@@ -1442,8 +1710,11 @@ final class AgentStallGuard {
     }
 
     private void failStep(String reason) {
+        departures.reject(from, from.up());
         fail("temporary step at " + from.toShortString() + ": " + reason);
     }
+
+    private int retryTicks() { return blockedReason == null ? RETRY_TICKS : HANDBACK_TICKS; }
 
     private void retry(String reason) {
         anchor = client.player.getPos();
@@ -1451,6 +1722,7 @@ final class AgentStallGuard {
             BlockPos support = quietSupport();
             if (support != null) {
                 assessedSupports.add(support);
+                departures.stoodOn(client.player.getBlockPos());
                 lastAssessedFeet = anchor;
             }
         }
@@ -1468,6 +1740,7 @@ final class AgentStallGuard {
 
     private void fail(String reason) {
         failures++;
+        replanOnAssessment = phase == Phase.RETRY || !tookControl;
         if ((phase == Phase.STEP || phase == Phase.SETTLE) && quietSupport() == null)
             reason += "; last observed pose unstable (no settled dry support)";
         body.pauseWork();
@@ -1483,6 +1756,7 @@ final class AgentStallGuard {
 
     private void transition(Phase next, String detail) {
         phase = next;
+        if (next == Phase.WATCH) blockedReason = null;
         entered = tick;
         report = new Report(incidents, attempts, recoveries, failures, next.name().toLowerCase(java.util.Locale.ROOT),
             detail, ++eventSequence, incidentTick);

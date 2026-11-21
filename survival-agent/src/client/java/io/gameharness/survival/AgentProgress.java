@@ -228,6 +228,7 @@ final class AgentProgress {
     private boolean stallTorchTried;
     private final Predicate<BlockPos> protectedHeadroom = this::protectRecoveryBlock;
     private final Predicate<BlockHitResult> returnableOreFace = this::returnableOreReachable;
+    private final Predicate<BlockHitResult> ordinaryOreFace = face -> reachableResourceFace(face.getBlockPos());
     private final AgentCaves caves;
     private final AgentReturnableMine returnableMine;
     private final SurfaceApproach surfaceApproach = new SurfaceApproach();
@@ -1299,7 +1300,8 @@ final class AgentProgress {
             resource = stallOre(Resource.STONE);
             if (resource != null) return resource;
         }
-        if (!affordsWood(0, 3) || !has(WOOD_PICK, 1) && !has(STONE_PICK, 1) && !has(DEEP_PICK, 1)) {
+        if (!timberReady && needsTimberKit() && surfaceDeparture()
+                || !affordsWood(0, 3) || !has(WOOD_PICK, 1) && !has(STONE_PICK, 1) && !has(DEEP_PICK, 1)) {
             resource = stallTimber();
             if (resource != null) return resource;
         }
@@ -1324,9 +1326,9 @@ final class AgentProgress {
     private String stallTimber() {
         String pickup = stallPickup(LOG, "log");
         if (pickup != null) return pickup;
-        BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), REACH - 0.4, seen -> {
+        BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), c.player.getBlockInteractionRange(), seen -> {
             BlockPos block = seen.getBlockPos();
-            return !stallOreTried.contains(block) && !timberUnderfoot(block) && !supportsTrail(block)
+            return reachableTrunk.test(seen) && !stallOreTried.contains(block) && !supportsTrail(block)
                 && !body.hazardAhead(yaw(seen.getPos().subtract(c.player.getPos())), 1.5);
         }).orElse(null);
         if (log == null) return null;
@@ -1392,7 +1394,7 @@ final class AgentProgress {
             if (next < 0 || next >= trail.size()) continue;
             BlockPos step = trail.get(next);
             if (!adjacent(current, step) || current.getY() != step.getY()
-                    || stallRouteTried.contains(step) || stallGuard.triedStallRoute(step)) continue;
+                    || stallRouteTried.contains(step) || stallGuard.triedStallRoute(current, step)) continue;
             Vec3d landing = Vec3d.ofBottomCenter(step);
             BlockHitResult support = terrain(landing.add(0, -0.07, 0), 3.2);
             if (support == null || !support.getBlockPos().equals(step.down()) || support.getSide() != Direction.UP
@@ -2828,6 +2830,15 @@ final class AgentProgress {
             if (missingStone > 0 && pickUses(STONE_PICK) + pickUses(WOOD_PICK) >= missingStone
                 && prepareCharcoal()) return true;
         }
+        if (!has(BURNABLE_LOG, 1) && !has(FUEL, 1)) {
+            // Making charcoal needs a log, not another look for the same missing stove.
+            if (timberWitness != null || timberChop != null || timberExitFrom != null ||
+                    pickupItem == LOG || tick < timberDropUntil) {
+                seekExpeditionSupplies("light");
+                return true;
+            }
+            if (startReachableTimber(true)) return true;
+        }
         if (!departure && activeTrail() <= 1 && surveyLocalLight()) return true;
         seekExpeditionSupplies(canMakeTorch ? "light" : "wood and light");
         return true;
@@ -2842,7 +2853,10 @@ final class AgentProgress {
 
     private boolean surveyLocalLight() {
         BlockPos feet = c.player.getBlockPos();
-        if (!feet.equals(lightSurveyFoot)) {
+        // Crossing an adjacent tile while approaching a trunk isn't a new workshop search.
+        // Exposed coal in the current view is still checked on every ordinary gathering pass.
+        if (lightSurveyFoot == null || feet.getSquaredDistance(lightSurveyFoot) > 36
+                || Math.abs(feet.getY() - lightSurveyFoot.getY()) > 2) {
             lightSurveyFoot = feet;
             lightSurveyTurn = 0;
             lightSurveyYaw = c.player.getYaw();
@@ -3941,9 +3955,9 @@ final class AgentProgress {
             clearOreProbe();
             oreWorld = c.world;
         }
-        BlockHitResult hit = body.find(resource.block, range).orElse(null);
+        BlockHitResult hit = body.find(resource.block, range, ordinaryOreFace).orElse(null);
         if (hit == null || resource == Resource.STONE || !c.player.isOnGround()
-            || c.player.isTouchingWater() || !reachableResourceFace(hit.getBlockPos())) return hit;
+            || c.player.isTouchingWater()) return hit;
         BlockPos block = hit.getBlockPos();
         BlockPos stance = c.player.getBlockPos();
         // A failed memory detour does not veto a live ore face. It only stops the
@@ -5511,7 +5525,10 @@ final class AgentProgress {
                     timberAttackWitnessTick = tick;
                     attackTimber(false);
                 } else if (!ready) stopUnalignedTimber();
-                else if (!toolReady) body.awaitingContactEquipment();
+                else if (!toolReady) {
+                    stallGuard.ordinarySetup();
+                    body.awaitingContactEquipment();
+                }
                 return;
             }
         }
@@ -5572,7 +5589,8 @@ final class AgentProgress {
     }
 
     private boolean reachableResourceFace(BlockPos position) {
-        return !ignored(position) && !position.equals(c.player.getBlockPos().down());
+        return !ignored(position) && !position.equals(c.player.getBlockPos().down())
+            && (!stallGuard.retryingDistinctWork() || !stallOreTried.contains(position));
     }
 
     private void mineTarget(Resource resource) {
@@ -5626,6 +5644,7 @@ final class AgentProgress {
         }
         body.aimContact(hit, AgentBody.Contact.MINE);
         if (!readyForMine(material)) {
+            stallGuard.ordinarySetup();
             body.awaitingContactEquipment();
             return;
         }
@@ -7284,7 +7303,8 @@ final class AgentProgress {
     }
 
     private Walk driveKnownStep(BlockPos from, BlockPos to) {
-        if (!adjacent(from, to) || from.getX() == to.getX() && from.getZ() == to.getZ()) return Walk.BLOCKED;
+        if (!adjacent(from, to) || from.getX() == to.getX() && from.getZ() == to.getZ()
+                || stallGuard.refusedCrossing(from, to)) return Walk.BLOCKED;
         Vec3d feet = c.player.getPos();
         Vec3d start = Vec3d.ofBottomCenter(from);
         Vec3d landing = Vec3d.ofBottomCenter(to);
@@ -7318,13 +7338,17 @@ final class AgentProgress {
             }
             gaitStepProof = true;
         }
-        if (ascending && body.jumpBlocked(heading)) return Walk.BLOCKED;
+        if (ascending && body.jumpBlocked(heading)) {
+            stallGuard.refuseCrossing(from, to);
+            return Walk.BLOCKED;
+        }
         if (ascending) body.jump();
         walkDown(false);
         return Walk.MOVING;
     }
 
     private Walk walkMinedStep(BlockPos next) {
+        if (stallGuard.refusedCrossing(c.player.getBlockPos(), next)) return Walk.BLOCKED;
         Vec3d floor = Vec3d.ofBottomCenter(next);
         if (body.driveObservedStep(floor)) {
             rememberMotion();
@@ -7360,6 +7384,7 @@ final class AgentProgress {
 
     /** Check the jump envelope, then hold forward and jump through the rise without re-aiming at the floor. */
     private Walk climb(BlockPos from, BlockPos to) {
+        if (stallGuard.refusedCrossing(from, to)) return Walk.BLOCKED;
         if (!to.equals(climbTo)) {
             climbTo = to;
             climbCheck = 0;
@@ -7401,7 +7426,10 @@ final class AgentProgress {
         if (delta.horizontalLengthSquared() < 0.075 && feet.y > to.getY() - 0.20) return Walk.MOVING;
         body.turn(heading, -9);
         if (Math.abs(MathHelper.wrapDegrees(heading - c.player.getYaw())) > 10) return Walk.LOOKING;
-        if (body.jumpBlocked(heading) || ++climbDrive > 27) return Walk.BLOCKED;
+        if (body.jumpBlocked(heading) || ++climbDrive > 27) {
+            stallGuard.refuseCrossing(from, to);
+            return Walk.BLOCKED;
+        }
         body.jump();
         walk(false);
         return Walk.MOVING;
@@ -7463,7 +7491,8 @@ final class AgentProgress {
             default -> exitHeading.getOpposite();
         };
         BlockPos support = exitFrom.offset(direction);
-        if (recoveryVisited.contains(exitLevel ? support : support.up())) {
+        BlockPos landing = exitLevel ? support : support.up();
+        if (recoveryVisited.contains(landing) || stallGuard.refusedCrossing(exitFrom, landing)) {
             nextExitOption();
             return;
         }
@@ -7534,6 +7563,7 @@ final class AgentProgress {
     }
 
     private boolean recoverPillar() {
+        if (stallGuard.refusedCrossing(exitFrom, exitFrom.up())) return false;
         status = "raising a step on visible support";
         if (pillarStarted == 0) {
             pillarStarted = tick;
@@ -8165,6 +8195,7 @@ final class AgentProgress {
             // Use the ray's bearing, not the stored block center or an unseen adjacent stance.
             ordinaryApproach = new AgentBody.HorizonTravel(cue, new Vec3d(cue.point().x, feet.y, cue.point().z),
                 arrival, wade);
+            stallGuard.ordinarySetup();
         }
         ordinaryApproachTick = tick;
         return switch (body.driveHorizon(ordinaryApproach, false, false)) {

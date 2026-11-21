@@ -881,7 +881,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
       const valid = verb === "inspect" && risk === "read" || verb === "survey" && risk === "read"
         ? subject.startsWith("block:minecraft:")
         : verb === "approach" && risk === "low"
-          ? subject === "route:dry" || subject === "route:dry_landing" ||
+          ? subject === "route:dry" || independentGroundScout(subject) ||
             subject === woodlandAnchorSubject || subject.startsWith("block:minecraft:")
           : (verb === "survey" || verb === "follow") && risk === "guarded" && subject === "route:dry";
       if (!valid) invalid("rendered anchor subject/verb");
@@ -1063,7 +1063,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     if (scoutSeen || record.stance === undefined || !safety?.clear || working || pendingWork ||
         workOrder?.state === "working" || workOrder?.state === "needs_replan" || workOrder?.state === "parked")
       invalid("ground reconnaissance requires a current neutral dry stance");
-    if (offer.anchor.subject !== "route:dry_landing" && (travelHint?.footing !== "dry" ||
+    if (!independentGroundScout(offer.anchor.subject) && (travelHint?.footing !== "dry" ||
         travelHint.windowBlocks < MIN_GROUND_SCOUT_WINDOW || !sameTravelTarget(offer.anchor, travelHint)))
       invalid("ground reconnaissance requires a current dry landmark");
     scoutSeen = true;
@@ -1286,6 +1286,10 @@ export function matchesMaterial(offer: MacroOpportunity, selector: MacroDirectAc
 
 export function isGroundScout(offer: MacroOpportunity): offer is MacroOpportunity & { readonly anchor: MacroTravelAnchor } {
   return offer.verb === "approach" && offer.risk === "low" && !!offer.anchor && offer.anchor.subject !== "route:dry";
+}
+
+export function independentGroundScout(subject: string): boolean {
+  return subject === "route:dry_landing" || subject === "route:dry_vantage";
 }
 
 export function isOpeningView(offer: MacroOpportunity): boolean {

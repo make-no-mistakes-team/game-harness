@@ -520,12 +520,14 @@ const dryLandingScout = {
   anchor: { subject: "route:dry_landing", target: "m-47" },
 } as const;
 
-test("A newly witnessed dry landing wakes one paid choice after inspection, not from its receipt", async () => {
+test.each(["route:dry_landing", "route:dry_vantage"] as const)(
+  "A newly witnessed %s wakes one paid choice after inspection, not from its receipt", async subject => {
+  const affordance = { ...dryLandingScout, anchor: { ...dryLandingScout.anchor, subject } };
   const requests: MacroRequest[] = [];
   const f = await durableFixture(async request => {
     requests.push(request);
     if (requests.length === 1) return workReply(request, { kind: "opportunity", opportunityId: caveSurvey.id });
-    return workReply(request, { kind: "opportunity", opportunityId: dryLandingScout.id });
+    return workReply(request, { kind: "opportunity", opportunityId: affordance.id });
   }, "Find a safe view of the terrain below.", 5);
   const initial = { ...grassyWorksite, travelHint: undefined, opportunities: [caveSurvey] };
   try {
@@ -536,15 +538,15 @@ test("A newly witnessed dry landing wakes one paid choice after inspection, not 
     await f.receipt(survey.id, 3908, "completed", "The camera rendered the requested angle.");
     await f.observe(3910, initial);
     expect(requests).toHaveLength(1);
-    const landing = { ...initial, opportunities: [dryLandingScout] };
+    const landing = { ...initial, opportunities: [affordance] };
     await f.observe(3915, landing);
     await f.actor.poll();
     expect(requests.map(request => request.observation.tick)).toEqual([3900, 3915]);
     const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
-    expect(intent).toMatchObject({ opportunityId: dryLandingScout.id, skillHash: null });
+    expect(intent).toMatchObject({ opportunityId: affordance.id, skillHash: null });
     await f.receipt(intent.id, 3916, "accepted");
     await f.receipt(intent.id, 3925, "interrupted", "The witnessed landing became obscured.");
-    await f.observe(4010, { ...landing, opportunities: [{ ...dryLandingScout, id: "rekeyed-downhill" }] });
+    await f.observe(4010, { ...landing, opportunities: [{ ...affordance, id: "rekeyed-approach" }] });
     expect(requests).toHaveLength(2);
     await expect(access(f.file("intent.json"))).rejects.toThrow();
     await expect(access(f.file("work.json"))).rejects.toThrow();

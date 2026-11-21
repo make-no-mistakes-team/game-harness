@@ -93,6 +93,24 @@ final class OrdinaryRollingWorkTest {
     }
 
     @Test
+    void sameTopVantageNeedsNewPositionAndAStoppingEnvelopeThatDoesNotEnlargeAnOverhang() {
+        var support = new BlockPos(0, -1, 0);
+        var from = new Vec3d(0.84, 0, 0.61);
+        var cue = new Vec3d(0.40, -3, -2);
+        int sector = AgentGroundVantage.sector(support, cue);
+        Vec3d goal = AgentGroundVantage.goal(support, sector, 0.30);
+        assertNotNull(goal);
+        assertTrue(AgentGroundVantage.useful(from, goal, cue));
+        assertTrue(AgentGroundVantage.keepsContact(support, from, from, goal, new Vec3d(-0.025, 0, -0.01), 0.30));
+        assertFalse(AgentGroundVantage.keepsContact(support, from, from, goal, new Vec3d(0.025, 0, 0), 0.30));
+        assertFalse(AgentGroundVantage.keepsContact(support, from, new Vec3d(0.61, -0.1, 0.44), goal, Vec3d.ZERO, 0.30));
+        assertFalse(AgentGroundVantage.keepsContact(support, from, from, new Vec3d(0.05, 0, 0.5), Vec3d.ZERO, 0.30));
+        assertFalse(AgentGroundVantage.reached(from, goal, from));
+        assertFalse(AgentGroundVantage.useful(goal, goal, cue));
+        assertTrue(AgentGroundVantage.reached(from, goal, new Vec3d(0.56, 0, 0.41)));
+    }
+
+    @Test
     void paidDiamondCanStartAVisibleCaveLegOrAnApproachToActualOreWithoutASpine() {
         var paid = order("diamond", "\"prospect:minecraft:diamond\",\"break:minecraft:deepslate_diamond_ore\"",
             ",\"duringWaitFor\":\"9d0ad30c-b85c-4261-baff-f071c8e5ebc1\"");

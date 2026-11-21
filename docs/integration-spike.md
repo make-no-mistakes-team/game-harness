@@ -217,6 +217,10 @@ Another `approach` can name a visible dry landing one or two blocks below.
 It checks clearance from the player's actual position and rules out fall
 damage before moving. Landing there proves neither a return route nor
 the presence of a resource below.
+If the lip hides the next surface, Terra may instead shift on the top
+already supporting the player to get a better view. That move cannot
+take the player off the edge. A separate, fresh landing check is still
+needed to descend.
 
 On a dry approach the player can keep looking toward a tree while
 stepping to one side. It checks the ground under the movement it

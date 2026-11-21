@@ -229,12 +229,16 @@ test("Ground reconnaissance selects only an exact dry landmark and grants no sto
     { opportunities: [scout, { ...scout, id: "other-walk" }] },
   ]) expect(() => parseMacroObservation({ ...view, travelHint, opportunities: [scout], ...bad })).toThrow();
   const downhill = { ...scout, id: "step-down", anchor: { subject: "route:dry_landing", target: "m-5" } };
+  const vantage = { ...scout, id: "shift-for-view", anchor: { subject: "route:dry_vantage", target: "m-6" } };
   expect(parseMacroObservation({ ...view, opportunities: [downhill] }).opportunities).toEqual([downhill]);
+  expect(parseMacroObservation({ ...view, opportunities: [vantage] }).opportunities).toEqual([vantage]);
+  expect(() => parseMacroObservation({ ...view, opportunities: [vantage, downhill] })).toThrow("dry stance");
   for (const bad of [
     { ...downhill, verb: "follow" }, { ...downhill, risk: "guarded" },
     { ...downhill, material: { subject: anchor.subject, target: anchor.target, spends: {} } },
   ]) expect(() => parseMacroObservation({ ...view, opportunities: [bad] })).toThrow();
   expect(() => parseMacroObservation({ ...view, stance: undefined, opportunities: [downhill] })).toThrow("dry stance");
+  expect(() => parseMacroObservation({ ...view, safety: { clear: false, revision: 3 }, opportunities: [vantage] })).toThrow("dry stance");
 });
 
 test("A work approach names one target without pricing its material", () => {

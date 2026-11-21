@@ -1619,6 +1619,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         boolean continuous = travel.motion.observe(from, feet, travel.issued && !horizonAppliedPulse, player.horizontalCollision,
             player.hurtTime == 0 && !player.hasVehicle() && !player.isOnFire() && !player.isInLava());
         travel.wet |= player.isTouchingWater();
+        if (travel.groundScout) return; // A view-only trip is not a retained reversible route.
         if (!continuous || !travel.beenDriven || !horizonAppliedDry || !player.isOnGround() || player.isTouchingWater()) {
             travel.dryContacts = 0;
             travel.dryFrom = travel.dryTo = null;
@@ -2321,10 +2322,64 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     enum DryLandingEvidence { CONTROLS, SOURCE, NO_LIT_ADJACENT_TOP, FALL_BOUND, SWEEP, PICKUP, OFFERED }
     private DryLandingEvidence dryLandingEvidence;
-
     DryLandingEvidence dryLandingEvidence() { return dryLandingEvidence; }
 
+    private static final float[] GROUND_U = {0, -0.32f, 0.32f, -0.63f, 0.63f};
+    private static final float[] GROUND_V = {-0.72f, -0.38f, -0.05f};
+    private final BlockHitResult[] nearGroundTops = new BlockHitResult[GROUND_U.length * GROUND_V.length];
+    private final int[] nearGroundSectors = new int[3];
+    private long nearGroundFrame = -1;
+    private int nearGroundCount, nearGroundClipped, nearGroundOccluded, nearGroundDark, nearGroundMissed, nearGroundUnsafe;
+    private int landingProbeClipped, landingProbeOccluded;
+
+    /** Actual first hits through one bounded lower-frustum fan, never a scan behind a surface. */
+    int sampleNearGround() {
+        if (!hasView()) return 0;
+        if (nearGroundFrame == frameSequence) return nearGroundCount;
+        nearGroundFrame = frameSequence;
+        nearGroundCount = nearGroundClipped = nearGroundOccluded = nearGroundDark = nearGroundMissed = nearGroundUnsafe = 0;
+        landingProbeClipped = landingProbeOccluded = 0;
+        Arrays.fill(nearGroundSectors, 0);
+        int fromY = client.player.getBlockY();
+        for (float v : GROUND_V) for (float u : GROUND_U) {
+            if (raysLeft <= 0) return nearGroundCount;
+            inverseViewProjection.transform(clip.set(u, v, 0.9f, 1));
+            double x = clip.x / (double) clip.w, y = clip.y / (double) clip.w, z = clip.z / (double) clip.w;
+            double scale = Math.min(5, range(5)) / Math.sqrt(x * x + y * y + z * z);
+            --raysLeft;
+            BlockHitResult hit = raycast(eye.add(x * scale, y * scale, z * scale), Ray.TERRAIN);
+            if (hit.getType() != HitResult.Type.BLOCK) { ++nearGroundMissed; continue; }
+            if (!inView(hit.getPos())) { ++nearGroundClipped; continue; }
+            if (!litFace(hit)) { ++nearGroundDark; continue; }
+            BlockPos floor = hit.getBlockPos();
+            if (hit.isInsideBlock() || !matchesDryRouteTop(hit, floor)) { ++nearGroundOccluded; continue; }
+            int sector = u < -0.10 ? 0 : u > 0.10 ? 2 : 1;
+            nearGroundSectors[sector] |= 1 << AgentGroundVantage.clipHeight(floor.getY() + 1 - fromY);
+            BlockState seen = client.world.getBlockState(floor);
+            if (dryCaveDanger(seen) || !stableDryRouteTop(floor, seen)) { ++nearGroundUnsafe; continue; }
+            boolean duplicate = false;
+            for (int i = 0; i < nearGroundCount; ++i) if (nearGroundTops[i].getBlockPos().equals(floor)) {
+                duplicate = true;
+                break;
+            }
+            if (!duplicate) nearGroundTops[nearGroundCount++] = hit;
+        }
+        return nearGroundCount;
+    }
+
+    BlockHitResult nearGroundTop(int index) { return nearGroundTops[index]; }
+
+    record GroundSight(int dryTops, int clipped, int occluded, int dark, int missed, int unsafe,
+                       int leftHeights, int centerHeights, int rightHeights, int lipClipped, int lipOccluded) {}
+
+    GroundSight groundSight() {
+        return new GroundSight(nearGroundCount, nearGroundClipped, nearGroundOccluded, nearGroundDark, nearGroundMissed,
+            nearGroundUnsafe, nearGroundSectors[0], nearGroundSectors[1], nearGroundSectors[2],
+            landingProbeClipped, landingProbeOccluded);
+    }
+
     AgentDryLanding visibleDryLanding(Predicate<BlockPos> untried) {
+        landingProbeClipped = landingProbeOccluded = 0;
         dryLandingEvidence = DryLandingEvidence.CONTROLS;
         if (!dryLandingControls() || !client.player.isOnGround()) return null;
         var player = client.player;
@@ -2335,22 +2390,75 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         BlockState upper = dryCaveContact(source);
         if (upper == null || !normalDryTraction(upper)) return null;
         dryLandingEvidence = DryLandingEvidence.NO_LIT_ADJACENT_TOP;
-        var centered = horizonSightline(4.5);
-        var direct = dryLandingFromTop(source, upper, from, centered, untried);
-        if (direct != null) return direct;
+        int tops = sampleNearGround();
+        for (int i = 0; i < tops; ++i) {
+            var direct = dryLandingFromTop(source, upper, from, nearGroundTop(i), untried);
+            if (direct != null) return direct;
+        }
         Direction facing = Direction.fromHorizontalDegrees(player.getYaw());
         for (int i = 0; i < 3; ++i) {
             Direction direction = i == 0 ? facing : i == 1 ? facing.rotateYClockwise() : facing.rotateYCounterclockwise();
             for (int height = 1; height <= AgentDryLanding.MAX_DROP; ++height) {
                 BlockPos floor = source.offset(direction).down(height + 1);
                 if (!untried.test(floor)) continue;
-                BlockHitResult top = dryRouteFloor(Vec3d.ofBottomCenter(floor.up()).add(
-                    0.32 * direction.getOffsetX(), -0.025, 0.32 * direction.getOffsetZ()), floor);
+                BlockHitResult top = dryLandingTop(floor, direction);
                 var landing = dryLandingFromTop(source, upper, from, top, untried);
                 if (landing != null) return landing;
             }
         }
         return null;
+    }
+
+    private BlockHitResult dryLandingTop(BlockPos floor, Direction direction) {
+        Vec3d point = Vec3d.ofBottomCenter(floor.up()).add(
+            0.32 * direction.getOffsetX(), -0.025, 0.32 * direction.getOffsetZ());
+        if (!inView(point)) {
+            ++landingProbeClipped;
+            return null;
+        }
+        if (raysLeft <= 0) return null;
+        --raysLeft;
+        BlockHitResult hit = raycast(point, Ray.TERRAIN);
+        if (hit.getType() != HitResult.Type.BLOCK || !litFace(hit) || !inView(hit.getPos())) return null;
+        if (!matchesDryRouteTop(hit, floor)) {
+            ++landingProbeOccluded;
+            return null;
+        }
+        return hit;
+    }
+
+    boolean groundsVantage(AgentGroundVantage vantage) {
+        if (!hasView() || lavaEmergency || client.options.getAutoJump().getValue() || client.options.sneakKey.isUnbound()) return false;
+        var player = client.player;
+        BlockPos support = vantage.support();
+        Vec3d feet = player.getPos(), goal = vantage.goal();
+        if (!player.isOnGround() || !support.equals(player.supportingBlockPos.orElse(null))
+                || player.isTouchingWater() || player.isInLava() || player.isOnFire() || player.isSprinting()
+                || player.isUsingItem() || player.isClimbing() || player.hasVehicle() || player.getAbilities().flying
+                || player.hurtTime != 0 || !normalDryTraction(vantage.state())
+                || player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED) > 0.101
+                || client.world.getBlockState(support) != vantage.state() || dryCaveContact(support.up()) != vantage.state()
+                || !AgentGroundVantage.keepsContact(support, vantage.from(), feet, goal, player.getVelocity(), player.getWidth() * 0.5))
+            return false;
+        double dx = goal.x - feet.x, dz = goal.z - feet.z;
+        Box sweep = player.getBoundingBox().stretch(dx, 0, dz).expand(0.025, 0, 0.025);
+        return !hazardAhead(heading(dx, dz), Math.hypot(dx, dz) + 0.13)
+            && dryGradeVolume(sweep) && client.world.isSpaceEmpty(player, sweep) && macroNoVisiblePickup(goal);
+    }
+
+    void driveGroundVantage(AgentGroundVantage vantage) {
+        var player = client.player;
+        double dx = vantage.goal().x - player.getX(), dz = vantage.goal().z - player.getZ();
+        float yaw = heading(dx, dz);
+        sneak();
+        turnFixed(yaw, player.getPitch());
+        if (!player.isSneaking() || Math.abs(MathHelper.wrapDegrees(player.getYaw() - yaw)) > 2) return;
+        double angle = Math.toRadians(player.getYaw());
+        double acceleration = 0.102 * player.getAttributeValue(EntityAttributes.SNEAKING_SPEED) + 0.008;
+        Vec3d velocity = player.getVelocity().add(-acceleration * Math.sin(angle), 0, acceleration * Math.cos(angle));
+        if (!AgentGroundVantage.keepsContact(vantage.support(), vantage.from(), player.getPos(), vantage.goal(),
+                velocity, player.getWidth() * 0.5)) return;
+        macroFlatWalk(vantage.goal(), yaw, player.getPitch());
     }
 
     private AgentDryLanding dryLandingFromTop(BlockPos source, BlockState upper, Vec3d from, BlockHitResult top,

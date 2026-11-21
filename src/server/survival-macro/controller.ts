@@ -15,7 +15,7 @@ import {
   MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
   MacroDirectory, MacroObservationRotating, MacroValidationError,
-  foodWorkWitness, hasDirectAuthority, isFoodWork, isGroundScout, isIndependentPendingPolicy,
+  foodWorkWitness, hasDirectAuthority, independentGroundScout, isFoodWork, isGroundScout, isIndependentPendingPolicy,
   isOpeningView, isPendingWorkVerb, liveCorrectionEvidence, macroReplyRejectionDetail,
   harvestAnchorMatchesPolicy, hasSurfaceCoverEffect, matchesMaterial, openingViewMatchesPolicy,
   sameTravelTarget, surfaceAnchorMatchesPolicy, travelHintMatchesPolicy,
@@ -3759,7 +3759,7 @@ export class SurvivalMacroController {
     }
     const usableHandoff = (observation: MacroObservation) => {
       if (scout) return this.isCurrentHandoff(observation) && sameOpeningStance(witnessed, observation) &&
-        hasStock(observation, reserves) && (before.anchor.subject === "route:dry_landing" ||
+        hasStock(observation, reserves) && (independentGroundScout(before.anchor.subject) ||
           observation.travelHint?.footing === "dry" && sameTravelTarget(before.anchor, observation.travelHint));
       if (openingPolicy) return this.openingHandoff(witnessed, observation, openingPolicy) &&
         !openingWorkWitness(observation, openingPolicy, before);

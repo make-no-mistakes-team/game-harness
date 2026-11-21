@@ -231,6 +231,8 @@ interface IntentRecoveryScope {
 
 type IntentRecovery = IntentRecoveryScope & (
   | { readonly kind: "restored-survey"; gapSeen?: true }
+  | { readonly kind: "superseded-opening"; readonly source: MacroObservation;
+      readonly policy: MacroWorkPolicy; readonly wall: ProspectOpening; readonly proposalExpiresTick: number }
   | { readonly kind: "alternative"; readonly opening?: { readonly source: MacroObservation; readonly policy: MacroWorkPolicy } }
 );
 
@@ -1117,6 +1119,8 @@ export class SurvivalMacroController {
       const stale = this.busy.kind !== "trial" && (!current ||
         (this.busy.kind === "inference"
           ? work.context.correction ? (!!observed && !this.replyCorrectionApplies(work.context.correction, current)) :
+            work.context.reconsideration?.kind === "superseded-opening" ?
+              (!!observed && !this.supersededOpeningCurrent(work.context.reconsideration, current)) :
             work.context.lookahead ? lookaheadStale : work.context.workDemand ?
               !workScope(work.context.observation, current) || !this.pendingDecisionCurrent(work.context, current) :
             !sameGoalAndLife(work.context.observation, current) || !alive(current)
@@ -1440,6 +1444,20 @@ export class SurvivalMacroController {
       current.health === recovery.health && current.safety?.clear === true && evidence === recovery.evidence;
   }
 
+  private supersededOpeningWitnessCurrent(recovery: Extract<IntentRecovery, { kind: "superseded-opening" }>,
+    current: MacroObservation, evidence = this.workQueryEvidence(current)): boolean {
+    return current.tick < recovery.proposalExpiresTick && current.health === recovery.health &&
+      evidence === recovery.evidence &&
+      sameOpeningStance(recovery.source, current) && !offersAffordance(current, recovery.offer) &&
+      sameProspectOpening(recovery.wall, pricedProspectOpening(current, recovery.policy));
+  }
+
+  private supersededOpeningCurrent(recovery: Extract<IntentRecovery, { kind: "superseded-opening" }>,
+    current: MacroObservation, evidence?: string): boolean {
+    return this.openingHandoff(recovery.source, current, recovery.policy) &&
+      this.supersededOpeningWitnessCurrent(recovery, current, evidence);
+  }
+
   private alternativeRecovery(current: MacroObservation, evidence?: string): Extract<IntentRecovery, { kind: "alternative" }> | undefined {
     const recovery = this.intentRecovery;
     if (recovery?.kind !== "alternative" || current.tick - recovery.basis.tick < WORK_REPLAN_GAP_TICKS ||
@@ -1626,8 +1644,13 @@ export class SurvivalMacroController {
     const failedOpening = previous?.failedOpeningPolicy;
     const newTravelStart = !!asked && previous?.mayRecoverOnAffordance && travel && this.isCurrentHandoff(observation) &&
       !sameTravelHint(travel, asked.travelHint) && (!failedOpening || !!matchingTravelHint(observation, failedOpening));
+    const candidate = this.intentRecovery;
+    const superseded = candidate?.kind === "superseded-opening" && !job && !queue &&
+      observation.tick < candidate.expiresTick && performance.now() < candidate.until &&
+      this.supersededOpeningCurrent(candidate, observation, evidence) ? candidate : undefined;
+    if (candidate?.kind === "superseded-opening" && !superseded) this.intentRecovery = undefined;
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew" &&
-        !newTravelStart && !newObstruction && !reacquiredTravelOf) return;
+        !newTravelStart && !newObstruction && !reacquiredTravelOf && !superseded) return;
     const pendingCorrection = this.replyCorrection;
     const correction = pendingCorrection?.renewal
       ? demand === "renew" && pendingCorrection.renewal === job && observation.tick > pendingCorrection.observation.tick
@@ -1636,11 +1659,11 @@ export class SurvivalMacroController {
     const unchanged = previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence));
     const recovery = this.intentRecovery;
     const reconsideration = !job && !correction && !queue ? (
-      recovery?.kind === "restored-survey" && recovery.gapSeen && !observation.working &&
+      superseded ?? (recovery?.kind === "restored-survey" && recovery.gapSeen && !observation.working &&
         this.isCurrentHandoff(observation) && this.intentRecoveryCurrent(recovery, observation, evidence) &&
-        offersAffordance(observation, recovery.offer) ? recovery : this.alternativeRecovery(observation, evidence)
+        offersAffordance(observation, recovery.offer) ? recovery : this.alternativeRecovery(observation, evidence))
     ) : undefined;
-    if (obstructionQuery && this.workHandoffQueries.has(obstructionQuery) && !correction) return;
+    if (obstructionQuery && this.workHandoffQueries.has(obstructionQuery) && !correction && !superseded) return;
     // An idle abstention can recover on a genuinely new actionable witness or
     // neutral handoff, not when the same affordance is issued a different ID.
     if (unchanged && !correction && !reconsideration && !reacquiredTravelOf) {
@@ -2477,7 +2500,8 @@ export class SurvivalMacroController {
     const observation = view.observation;
     let disclosed = observation;
     if (workDemand && !lookahead) {
-      const lostOpening = reconsideration?.kind === "alternative" && reconsideration.opening ? reconsideration.offer : undefined;
+      const lostOpening = reconsideration?.kind === "superseded-opening" ||
+        (reconsideration?.kind === "alternative" && reconsideration.opening) ? reconsideration.offer : undefined;
       const opportunities = observation.opportunities.filter(offer =>
         (!lostOpening || !sameAffordance(lostOpening, offer)) &&
         (!isOpeningView(offer) || !this.effectKeys.has(primitiveEffectKey(observation, offer))));
@@ -2506,7 +2530,10 @@ export class SurvivalMacroController {
       maxResponseBytes: this.limits.maxResponseBytes, maxIntentTtlTicks: this.limits.maxIntentTtlTicks,
       maxPlanTtlTicks: this.limits.maxPlanTtlTicks,
       lastReceipt: this.lastReceipt?.life === observation.life ? this.lastReceipt : null,
-      feedback: reconsideration?.kind === "alternative" ? {
+      feedback: reconsideration?.kind === "superseded-opening" ? {
+        kind: "failed_intent",
+        detail: "The opening view disappeared before issuance. No camera read or work started. A fresh wall now fits the quoted prospecting policy. Decide from this observation whether to authorize ordinary work without an opening view, choose a supported alternative, or abstain.",
+      } : reconsideration?.kind === "alternative" ? {
         kind: "failed_intent",
         detail: reconsideration.opening
           ? "The opening view lost its witness before issuance. No camera read or work started. If the fresh physical clue already supports the job, use ordinary work without an opening view. Otherwise choose a distinct supported alternative or abstain."
@@ -2545,7 +2572,8 @@ export class SurvivalMacroController {
     if (reconsideration) this.recoveredIntents.add(reconsideration.key);
     // A newer decision supersedes a failed primitive. Only a restored survey
     // can carry its allowance through one subsequent model-reported gap.
-    if (reconsideration || this.intentRecovery?.kind === "alternative") this.intentRecovery = undefined;
+    if (reconsideration || this.intentRecovery?.kind === "alternative" || this.intentRecovery?.kind === "superseded-opening")
+      this.intentRecovery = undefined;
     this.busy = {
       kind: "inference",
       work: this.work({ requestId, observation, generation, testedSkills, selectedSkillHash,
@@ -2559,6 +2587,11 @@ export class SurvivalMacroController {
           sample = await this.capture(observation, observedAt, requestId, signal, !!workDemand, correction,
             reacquiredTravelOf ? observation.travelHint : undefined);
           signal.throwIfAborted();
+          if (reconsideration?.kind === "superseded-opening") {
+            const latest = await this.ipc!.read("observation.json", parseMacroObservation);
+            if (!latest || !this.supersededOpeningWitnessCurrent(reconsideration, latest))
+              throw new FrameRejected("stale", "The prospect wall no longer supersedes the unissued opening view.");
+          }
         } catch (error) {
           if (sample) await discardFrame(sample);
           if (error instanceof FrameRejected) throw error;
@@ -2674,6 +2707,7 @@ export class SurvivalMacroController {
     const result = busy.work.result!;
     const context = busy.work.context;
     const stale = runtimeExpired || !current || (context.correction && !this.replyCorrectionApplies(context.correction, current)) ||
+      (context.reconsideration?.kind === "superseded-opening" && !this.supersededOpeningCurrent(context.reconsideration, current)) ||
       (context.lookahead ? !lookaheadScope(context.lookahead, current) :
       context.workDemand ? !workScope(context.observation, current) || !this.pendingDecisionCurrent(context, current) :
         !samePlayableScope(context.observation, current)) ||
@@ -3492,7 +3526,7 @@ export class SurvivalMacroController {
 
   private rememberFailedIntent(plan: Plan, witnessed: MacroObservation, lost: MacroOpportunity, current: MacroObservation): void {
     const action = plan.proposal.action;
-    const opening = action.kind === "work" && action.openingViewId === lost.id && !!lost.anchor &&
+    const opening = action.kind === "work" && action.openingViewId === lost.id &&
       openingViewMatchesPolicy(lost, action.policy) ? { source: witnessed, policy: action.policy } : undefined;
     if (plan.reconsideration || (!opening && action.kind !== "opportunity") || plan.workDemand?.current !== null ||
         this.queuedWork || witnessed.working || current.working || !this.isCurrentHandoff(current) ||
@@ -3505,6 +3539,20 @@ export class SurvivalMacroController {
     } else if (current.opportunities.some(offer => offer.id === lost.id) || offersAffordance(current, lost)) return;
     const evidence = this.workQueryEvidence(current);
     const shared = { requestId: plan.requestId, basis: basis(witnessed), health: current.health, offer: lost, evidence };
+    if (opening && !lost.anchor) {
+      // A contextual camera check is not an alternative in itself. Only the
+      // first physical answer to its quoted job can supersede the unissued read.
+      if (lost.verb !== "survey" || offersAffordance(current, lost) ||
+          workEvidence(witnessed, this.lastWorkQueryReceipt) !== workEvidence(current, this.lastWorkQueryReceipt)) return;
+      const wall = pricedProspectOpening(current, opening.policy);
+      if (!wall || witnessed.prospectOpening?.target === wall.target) return;
+      const key = digest(["superseded-opening", current.epoch, evidence, wall]);
+      if (!this.recoveredIntents.has(key)) this.intentRecovery = { ...shared, kind: "superseded-opening",
+        ...opening, wall, key, proposalExpiresTick: plan.proposal.expiresTick,
+        expiresTick: Math.min(plan.proposal.expiresTick, current.tick + ALTERNATIVE_RECOVERY_TICKS),
+        until: performance.now() + ALTERNATIVE_RECOVERY_MS };
+      return;
+    }
     if ((opening || lost.risk !== "guarded" && meaningfulPrimitive(lost)) &&
         workEvidence(witnessed, this.lastWorkQueryReceipt) === workEvidence(current, this.lastWorkQueryReceipt)) {
       // Spend one recovery per unchanged work premise, independent of which
@@ -3541,7 +3589,8 @@ export class SurvivalMacroController {
       return false;
     }
     const recovery = plan.reconsideration;
-    if (recovery?.kind === "alternative" && recovery.opening && sameAffordance(recovery.offer, before)) {
+    if ((recovery?.kind === "superseded-opening" || (recovery?.kind === "alternative" && recovery.opening)) &&
+        sameAffordance(recovery.offer, before)) {
       await this.disposition("proposal_refused", { requestId: plan.requestId, reason: "The refused opening view is not a distinct recovery action." });
       return false;
     }

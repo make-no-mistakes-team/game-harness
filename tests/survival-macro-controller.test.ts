@@ -872,7 +872,7 @@ test.each(["regained", "second stale", "paid stale", "different target", "unsafe
       await expect(access(f.file("work.json"))).rejects.toThrow();
 
       if (result === "unsafe") {
-        await f.observe(30, { ...visible, epoch: 4, safety: { clear: false, revision: 3 } });
+        await f.observe(30, { ...still, epoch: 4, safety: { clear: false, revision: 3 } });
       } else if (result === "different target") {
         await f.observe(30, { ...still, travelHint: { ...travelHint, target: "m-2" } });
         await f.observe(40, visible);
@@ -959,7 +959,7 @@ test.each(["same target", "different target", "never returned", "unsafe"] as con
           await f.observe(822, { ...still, travelHint: { ...travelHint, target: "m-11" } });
           await f.observe(827, visible);
         } else if (result === "unsafe") {
-          await f.observe(822, { ...visible, epoch: 6, safety: { clear: false, revision: 3 } });
+          await f.observe(822, { ...still, epoch: 6, safety: { clear: false, revision: 3 } });
         } else {
           await f.observe(822, still);
           await f.observe(832, visible);
@@ -1011,6 +1011,116 @@ test("An iron leg can begin at an exact visible cave frontier without granting a
     await f.clean();
   }
 });
+
+test.each(["priced wall", "fresh work", "wall lost again", "unknown", "unrelated wall", "unpriced wall", "rekeyed survey", "changed stance", "unsafe", "budget"] as const)(
+  "An unissued tick-3 contextual outlook yields only to a fresh priced prospect wall (%s)",
+  async result => {
+    const outlook = { id: "o-4", verb: "survey", risk: "read", summary: "Frame the outlook ahead",
+      evidence: "The current first-person view points almost straight up at nearby lit cover. Look forward from the same stance; no movement or contact is authorized." } as const;
+    const resumed: Partial<MacroObservation> = { goal: "nether_portal", epoch: 3, stance: 1, food: 18,
+      safety: { clear: true, revision: 2 },
+      inventory: { "minecraft:wooden_pickaxe": 1, "minecraft:tuff": 5, "minecraft:torch": 3, "minecraft:iron_pickaxe": 1,
+        "minecraft:granite": 65, "minecraft:cobblestone": 585, "minecraft:andesite": 69, "minecraft:raw_copper": 41,
+        "minecraft:clay_ball": 124, "minecraft:dirt": 23, "minecraft:raw_iron": 5, "minecraft:moss_block": 10,
+        "minecraft:gravel": 6, "minecraft:diorite": 18, "minecraft:raw_copper_block": 1, "minecraft:coal": 4,
+        "minecraft:cobbled_deepslate": 55 } };
+    const wall = { target: "fresh-wall", block: "minecraft:deepslate", tool: "minecraft:iron_pickaxe", maxToolLoss: 0 } as const;
+    const policy = {
+      target: { kind: "stock", item: "minecraft:diamond", count: 1 },
+      allowedEffects: ["break:minecraft:andesite", "break:minecraft:deepslate", "break:minecraft:deepslate_diamond_ore",
+        "break:minecraft:diamond_ore", "break:minecraft:diorite", "break:minecraft:granite", "break:minecraft:stone",
+        "break:minecraft:tuff", "place:minecraft:cobblestone", "place:minecraft:torch", MACRO_DIAMOND_PROSPECT],
+      costCaps: [{ item: "minecraft:cobblestone", count: 4 }, { item: "minecraft:iron_pickaxe", count: 1 },
+        { item: "minecraft:torch", count: 3 }],
+      reserves: [], maxBreaks: 48, maxCrafts: 0, maxPlacements: 7,
+    } as const;
+    const quote = Promise.withResolvers<void>();
+    const fresh = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) {
+        await quote.promise;
+        return workReply(request, { kind: "work",
+          policy: result === "unpriced wall" ? { ...policy, costCaps: policy.costCaps.filter(cap => cap.item !== wall.tool) } :
+            result === "unrelated wall" ? { ...policy, allowedEffects: policy.allowedEffects.filter(effect => effect !== "break:minecraft:tuff") } :
+            policy,
+          openingViewId: outlook.id }, 1200);
+      }
+      await fresh.promise;
+      return workReply(request, result === "wall lost again" || result === "fresh work"
+        ? { kind: "work", policy } : { kind: "abstain" });
+    }, "Find and mine a diamond before heading for the Nether. Use the iron pickaxe and supplies actually carried, and light the excavation where needed.",
+    result === "budget" ? 1 : 28);
+    try {
+      const witnessed: Partial<MacroObservation> = {
+        ...resumed,
+        ...(result === "changed stance" ? { stance: 2 } :
+          result === "unsafe" ? { epoch: 4, safety: { clear: false, revision: 3 } } : {}),
+        // Native withholds physical opening clues whenever safety is not clear.
+        prospectOpening: result === "unknown" || result === "rekeyed survey" || result === "unsafe" ? undefined :
+          result === "unrelated wall" ? { ...wall, block: "minecraft:tuff" } :
+          result === "unpriced wall" ? { ...wall, maxToolLoss: 1 } : wall,
+        opportunities: result === "rekeyed survey" ? [{ ...outlook, id: "new-id" }] : [],
+      };
+      await f.observe(3, { ...resumed, opportunities: [outlook] });
+      await f.observe(9, witnessed);
+      await f.observe(14, witnessed);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ observation: { tick: 3, opportunities: [outlook] }, work: { openingViewIds: [outlook.id] } });
+      quote.resolve();
+      await f.observe(189, witnessed);
+      await f.actor.poll();
+      const recovered = result === "priced wall" || result === "wall lost again" || result === "fresh work";
+      // A new stance can independently warrant an ordinary changed-evidence query after the normal gap.
+      const ordinaryReplan = result === "changed stance";
+      const requestedAgain = recovered || ordinaryReplan;
+      expect(requests.map(request => request.observation.tick)).toEqual(requestedAgain ? [3, 189] : [3]);
+      if (recovered) {
+        expect(requests[1]).toMatchObject({ observation: { tick: 189, prospectOpening: wall, opportunities: [] }, lastReceipt: null,
+          feedback: { kind: "failed_intent", detail: expect.stringContaining("No camera read or work started") } });
+      } else if (ordinaryReplan) {
+        expect(requests[1]?.feedback).toBeUndefined();
+        expect(requests[1]?.work?.demand).toBe("changed");
+      }
+      if (requestedAgain) {
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        fresh.resolve();
+        if (result === "wall lost again") await f.observe(190, resumed);
+        else await f.actor.poll();
+        if (result !== "fresh work") {
+          await f.observe(265, witnessed);
+          await f.observe(350, witnessed);
+        }
+      }
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      if (result === "fresh work") expect(await f.order()).toMatchObject({ ...policy, origin: "model", basisTick: 189 });
+      else await expect(access(f.file("work.json"))).rejects.toThrow();
+      expect(await readFile(f.file("receipts.jsonl"), "utf8")).toBe("");
+      expect(requests).toHaveLength(requestedAgain ? 2 : 1);
+      expect(f.actor.status().state).not.toBe("faulted");
+      expect(f.actor.status()).toMatchObject({ staleDecisions: result === "wall lost again" ? 2 : 1,
+        providerDispatches: requestedAgain ? 2 : 1, unreportedDispatches: 0, issued: 0,
+        terminalReceipts: 0, issuedWorkOrders: result === "fresh work" ? 1 : 0, completedModelWorkOrders: 0 });
+      if (requestedAgain) {
+        const history = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        const stale = history.find(event => event.event === "stale");
+        expect(stale).toMatchObject({ reason: "opportunity_no_longer_witnessed" });
+        const request = history.find(event => event.event === "request" && event.reconsiderationOf === stale!.requestId);
+        if (recovered) expect(request).toBeDefined();
+        else expect(request).toBeUndefined();
+        if (result === "fresh work") expect(history).toContainEqual(expect.objectContaining({
+          event: "work_order_issued", requestId: request!.requestId,
+        }));
+      }
+    } finally {
+      quote.resolve();
+      fresh.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
 
 test.each(["wall", "priced loss", "unknown", "wrong rock", "not allowed", "ore only", "short quota", "lost tool", "lost floor",
   "unpriced loss", "loss crosses floor", "different ore anchor", "changed stance"] as const)(

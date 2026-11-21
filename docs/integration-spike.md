@@ -224,6 +224,12 @@ a missed render does not reset its aim or extend its deadline. Completion
 requires a new frame at the requested angle, and the actor releases the
 camera before publishing the next rendered observation.
 
+Sometimes the player sees a workable wall before Terra's request to
+look ahead arrives. If that survey is no longer offered, the player
+does not turn. A newly witnessed wall that fits the quoted break and
+tool costs allows one fresh decision from the same safe stance. It
+does not authorize the old job.
+
 The camera receipt does not prove a route or count as physical progress. An unchanged stance
 does not gain a second bare survey from a new angle or ID; an exact new
 face or lane can still be inspected. A standalone first survey wakes

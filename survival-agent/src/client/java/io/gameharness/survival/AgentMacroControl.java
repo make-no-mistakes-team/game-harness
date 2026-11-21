@@ -203,7 +203,7 @@ final class AgentMacroControl {
     };
 
     private record GroundScout(AgentWorkOrder.TravelAnchor anchor, Face face, long stance, Vec3d from,
-                               float bearing, Vec3d goal) {}
+                               float bearing, Vec3d goal, AgentDryLanding landing) {}
     private record FoodClue(AgentFoodWork.Source source, Entity animal, Vec3d origin, int slot, Item hand) {}
 
     private record Offer(String id, Key key, String summary, String evidence, float yaw, float pitch,
@@ -1060,6 +1060,9 @@ final class AgentMacroControl {
     private long surveyReleaseFrame = -1;
     private final Set<String> scoutedLandmarks = new HashSet<>();
     private final Set<BlockPos> scoutDepartures = new HashSet<>();
+    private final Set<Key> attemptedDryLandings = new HashSet<>();
+    private AgentBody.DryLandingEvidence lastDryLandingEvidence;
+    private int lastDryLandingStance, dryLandingTransitions;
     private boolean firstOutlookPending, startupInputsClear;
     private boolean suspended, visited, owned, hazardClear, lastHazard, quiescent, urgent, blocked, deadlineMeasured;
     private boolean urgentInput;
@@ -1149,6 +1152,8 @@ final class AgentMacroControl {
             surveyReleaseFrame = -1;
             scoutedLandmarks.clear();
             scoutDepartures.clear();
+            attemptedDryLandings.clear();
+            lastDryLandingEvidence = null;
             reservedOffers = List.of();
             routeOffer = drySurveyOffer = null;
             dryOfferEvidence = null;
@@ -1391,7 +1396,8 @@ final class AgentMacroControl {
                 interrupt(timeoutDetail(), true);
             } else if (action.offer.route != null && (action.intent.epoch != epoch || !cursorClear())) {
                 interrupt("The dry route's dependency epoch or clean-cursor premise changed.", true);
-            } else if ((!grounded() && !progress.dryRouteInFlight(action.offer.route) && !pendingReturnInFlight())
+            } else if ((!grounded() && !progress.dryRouteInFlight(action.offer.route) && !pendingReturnInFlight()
+                    && !scoutDropInFlight())
                     || !hazardClear || !client.isWindowFocused() || client.getOverlay() != null) {
                 interrupt("Grounding, window focus, or local safety changed.", true);
             } else {
@@ -1441,8 +1447,14 @@ final class AgentMacroControl {
             : offer.scout == null ? validate(offer, progress) : null;
         AgentVisibleHorizon.Window scoutWindow = null;
         if (refusal == null && offer.scout != null) {
-            scoutWindow = currentGroundScout(offer.scout);
-            if (scoutWindow == null) refusal = "The exact landmark, neutral stance, protected stock, or dry stopping lane changed.";
+            var scout = offer.scout;
+            if (scout.landing == null) {
+                scoutWindow = currentGroundScout(scout);
+                if (scoutWindow == null) refusal = "The exact landmark, neutral stance, protected stock, or dry stopping lane changed.";
+            } else if (!groundScoutStance(scout) || !body.dryLandingSeen(scout.landing) || !body.dryLandingClear(scout.landing)
+                    || !body.macroNoVisiblePickup(scout.goal, scout.landing.to().getY(), scout.landing.source().getY())) {
+                refusal = "The exact lit landing, dry drop clearance, protected stock, or departure stance changed.";
+            }
         }
         if (refusal != null) {
             refuseUnseen(refusal);
@@ -1456,11 +1468,15 @@ final class AgentMacroControl {
         if (offer.route != null || offer.drySurvey != null) routeOwner = progress;
         action = new Action(intent, offer, client, tick, now, body.renderedFrame(),
             offer.item == null ? 0 : count(offer.item), NO_ANCHORS, Float.NaN);
-        if (scoutWindow != null) {
+        if (offer.scout != null) {
             var scout = offer.scout;
             scoutedLandmarks.add(scout.anchor.target());
-            scoutDepartures.add(BlockPos.ofFloored(scout.from));
-            action.horizonTravel = AgentBody.HorizonTravel.groundScout(scoutWindow.target(), scout.goal, GROUND_SCOUT_ARRIVAL);
+            if (scout.landing != null)
+                attemptedDryLandings.add(dryLandingKey(scout.landing.source(), scout.landing.top().getBlockPos()));
+            else {
+                scoutDepartures.add(BlockPos.ofFloored(scout.from));
+                action.horizonTravel = AgentBody.HorizonTravel.groundScout(scoutWindow.target(), scout.goal, GROUND_SCOUT_ARRIVAL);
+            }
         }
         if (offer.key.verb == Verb.COLLECT_PENDING) {
             action.pendingCollection = new PendingCollection(pendingEntry(), player.getInventory(), pendingRecheck);
@@ -7008,7 +7024,10 @@ final class AgentMacroControl {
                 else body.turnFine(action.camera.yaw, action.camera.pitch);
             }
             case APPROACH, COLLECT -> {
-                if (offer.scout != null) walkGroundScout(offer.scout);
+                if (offer.scout != null) {
+                    if (offer.scout.landing != null) walkDryLanding(offer.scout.landing);
+                    else walkGroundScout(offer.scout);
+                }
                 else {
                     trackDiamondRecoveryWalk();
                     walk(offer);
@@ -7411,22 +7430,19 @@ final class AgentMacroControl {
                 interrupt("Braking did not leave a settled stance inside the witnessed scout lane.", true);
                 return;
             }
-            var rendered = body.horizonView();
-            if (settled() && rendered != null && rendered.frame() > action.scoutStoppedFrame
-                    && rendered.displacement() <= 0.055 && body.horizonStance(rendered) != null) {
-                // One actual move can produce a distinct eye position without
-                // crossing the old 0.8-block camera-survey origin threshold.
-                body.pauseWork();
-                anchor = null;
-                surveyReleaseFrame = rendered.frame();
-                complete("Stopped after actual goalward movement on dry ground and rendered a new view. No harvest or collection authorized.");
-            }
+            completeGroundScout("Stopped after actual goalward movement on dry ground and rendered a new view. No harvest or collection authorized.");
             return;
         }
         if (!body.hasRecentView()) return;
         // Admission already rechecked the same face this tick.
         if (tick != action.started && groundScoutFace(scout.face) == null) {
-            interrupt("The exact scout landmark is no longer visible on the checked approach.", true);
+            if (action.horizonTravel.moved() && scoutReached(scout.from, scout.goal, feet)) {
+                // No more input. The endpoint may be valid even when the
+                // approach landmark itself falls out of the landing view.
+                body.stopHorizonTravel(action.horizonTravel);
+                body.pauseWork();
+                action.scoutStoppedFrame = body.renderedFrame();
+            } else interrupt("The exact scout landmark is no longer visible on the checked approach.", true);
             return;
         }
         if (action.horizonTravel.progressed()) continuityWork = AgentPauseEpisodes.Work.ROUTE;
@@ -7441,6 +7457,58 @@ final class AgentMacroControl {
                 }
             }
             case BLOCKED -> interrupt("Another step would exceed the visible dry stopping lane or cross a pickup.", true);
+        }
+    }
+
+    private boolean scoutDropInFlight() {
+        return action.offer.scout != null && action.offer.scout.landing != null && action.drove
+            && !player.isOnGround() && !player.isTouchingWater() && !player.isOnFire() && player.hurtTime == 0;
+    }
+
+    private void walkDryLanding(AgentDryLanding landing) {
+        Vec3d feet = player.getPos();
+        BlockPos to = landing.to();
+        if (!cursorClear() || !action.walkInventory.unchanged(player.getInventory()) || player.hurtTime != 0
+                || player.isTouchingWater() || feet.y > landing.source().getY() + 0.055 || feet.y < to.getY() - 0.055
+                || !action.walkMotion.observe(feet.x, feet.y, feet.z)) {
+            interrupt("The short dry descent lost contiguous motion, safety, or unchanged inventory.", true);
+            return;
+        }
+        if (!body.hasRecentView()) return;
+        if (!body.dryLandingClear(landing) || !body.macroNoVisiblePickup(landing.center(), to.getY(), landing.source().getY())) {
+            interrupt("The witnessed landing or its dry body clearance changed. No further movement authorized.", true);
+            return;
+        }
+        if (action.drove && horizontalSquared(landing.from(), feet) >= 0.16) {
+            continuityWork = AgentPauseEpisodes.Work.ROUTE;
+            if (!action.purposefulMotion) {
+                action.purposefulMotion = true;
+                purposeful("terra: " + action.offer.summary);
+            }
+        }
+        if (player.isOnGround() && feet.y < landing.source().getY() - 0.055) {
+            if (!player.getBlockPos().equals(to) || Math.abs(feet.y - to.getY()) > 0.055
+                    || !to.down().equals(player.supportingBlockPos.orElse(null)) || !action.walkMotion.traversed()) {
+                interrupt("Stopped outside the exact witnessed lower landing.", true);
+            } else if (settled()) {
+                if (action.scoutStoppedFrame < 0) action.scoutStoppedFrame = body.renderedFrame();
+                else completeGroundScout("Stepped down to the exact witnessed dry landing and rendered a fresh view. No return, harvest or collection authorized.");
+            }
+            return; // Coast on the landing; do not try to center or reverse.
+        }
+        if (player.isOnGround()) body.driveDryLanding(landing);
+    }
+
+    private void completeGroundScout(String detail) {
+        var rendered = body.horizonView();
+        if (settled() && rendered != null && rendered.frame() > action.scoutStoppedFrame
+                && rendered.displacement() <= 0.055 && body.horizonStance(rendered) != null) {
+            // Even a short scout can change the eye position by less than the
+            // normal camera-survey origin threshold.
+            body.pauseWork();
+            anchor = null;
+            surveyReleaseFrame = rendered.frame();
+            complete(detail);
         }
     }
 
@@ -8815,18 +8883,58 @@ final class AgentMacroControl {
     }
 
     private void addGroundScout(List<Offer> offers, TravelWitness travel) {
-        if (travel == null || travel.grade != null || !groundScoutReady()
-                || scoutedLandmarks.contains(travel.anchor.target()) || scoutDepartures.contains(player.getBlockPos())) return;
+        if (!groundScoutReady()) return;
+        if (addLandmarkScout(offers, travel)) return;
+        BlockPos source = player.getBlockPos();
+        var landing = body.visibleDryLanding(floor -> !attemptedDryLandings.contains(dryLandingKey(source, floor)));
+        noteDryLandingEvidence(body.dryLandingEvidence());
+        if (landing == null) return;
+        var floor = landing.top().getBlockPos();
+        var key = new Key(Verb.APPROACH, floor, surveyOrigin, "ground_scout_landing");
+        String identity = materialTarget(dryLandingKey(source, floor));
+        if (identity == null) return;
+        var anchor = new AgentWorkOrder.TravelAnchor("route:dry_landing", identity);
+        var scout = new GroundScout(anchor, null, surveyOrigin, landing.from(), landing.yaw(), landing.center(), landing);
+        offers.add(new Offer(offerId(key), key, "Step down to the visible dry landing",
+            "One adjacent lit full top, " + landing.height() + " block" + (landing.height() == 1 ? "" : "s")
+                + " lower, " + bearing(landing.center(), landing.from(), player.getYaw())
+                + " from the current view. Walk off the checked lip, coast and stop for a new view. No return, jumping, pickup or spending.",
+            0, 0, null, null, null, null, null, null, null, null, scout));
+    }
+
+    private static Key dryLandingKey(BlockPos source, BlockPos floor) {
+        Direction direction = AgentDryLanding.bearing(source, floor.up());
+        int drop = source.getY() - floor.getY();
+        return new Key(Verb.APPROACH, floor, drop, "ground_scout_landing", direction, null);
+    }
+
+    private void noteDryLandingEvidence(AgentBody.DryLandingEvidence evidence) {
+        if (dryLandingTransitions >= 32 || lastDryLandingStance == surveyOrigin && lastDryLandingEvidence == evidence) return;
+        lastDryLandingEvidence = evidence;
+        lastDryLandingStance = surveyOrigin;
+        ++dryLandingTransitions;
+        var value = header(run);
+        value.addProperty("life", life);
+        value.addProperty("tick", tick);
+        value.addProperty("stance", surveyOrigin);
+        value.addProperty("stage", evidence.name());
+        ipc.evidence("dry-landing-last.json", value.toString());
+    }
+
+    private boolean addLandmarkScout(List<Offer> offers, TravelWitness travel) {
+        if (travel == null || travel.grade != null || scoutedLandmarks.contains(travel.anchor.target())) return false;
         Vec3d from = player.getPos();
         Vec3d goal = scoutDestination(travel.window, from);
-        if (goal == null || scoutDepartures.contains(BlockPos.ofFloored(goal)) || !groundScoutLane(from, goal)) return;
+        if (goal == null || !BlockPos.ofFloored(goal).equals(player.getBlockPos()) && scoutDepartures.contains(BlockPos.ofFloored(goal))
+                || !groundScoutLane(from, goal)) return false;
         Face landmark = face(travel.window.target().hit());
-        var scout = new GroundScout(travel.anchor, landmark, surveyOrigin, from, travel.window.yaw(), goal);
+        var scout = new GroundScout(travel.anchor, landmark, surveyOrigin, from, travel.window.yaw(), goal, null);
         var key = new Key(Verb.APPROACH, landmark.hit.getBlockPos(), surveyOrigin, "ground_scout:" + travel.anchor.target());
         String name = travel.kind == WOODLAND_FRONTIER ? "woodland edge" : blockName(landmark);
         offers.add(new Offer(offerId(key), key, "Scout toward the visible " + name,
             "One level dry advance of at most 1.6 blocks along the current braking window. Stop for a new first-person view; no harvest, pickup or spending.",
             0, 0, null, null, null, null, null, null, null, null, scout));
+        return true;
     }
 
     private BlockHitResult groundScoutFace(Face face) {
@@ -8841,11 +8949,15 @@ final class AgentMacroControl {
             && body.macroNoVisiblePickup(goal);
     }
 
+    private boolean groundScoutStance(GroundScout scout) {
+        return groundScoutReady() && scout.stance == surveyOrigin && scout.from.squaredDistanceTo(player.getPos()) <= 0.0001
+            && !scoutedLandmarks.contains(scout.anchor.target());
+    }
+
     private AgentVisibleHorizon.Window currentGroundScout(GroundScout scout) {
         Vec3d from = player.getPos();
-        if (!groundScoutReady() || scout.stance != surveyOrigin || scout.from.squaredDistanceTo(from) > 0.0001
-                || scoutedLandmarks.contains(scout.anchor.target()) || scoutDepartures.contains(player.getBlockPos())
-                || scoutDepartures.contains(BlockPos.ofFloored(scout.goal))) return null;
+        BlockPos to = BlockPos.ofFloored(scout.goal);
+        if (!groundScoutStance(scout) || !to.equals(player.getBlockPos()) && scoutDepartures.contains(to)) return null;
         var horizon = body.visibleHorizon();
         var target = horizon.target(scout.face.hit);
         if (target == null || world.getBlockState(target.hit().getBlockPos()) != scout.face.state) return null;

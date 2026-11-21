@@ -3759,8 +3759,8 @@ export class SurvivalMacroController {
     }
     const usableHandoff = (observation: MacroObservation) => {
       if (scout) return this.isCurrentHandoff(observation) && sameOpeningStance(witnessed, observation) &&
-        hasStock(observation, reserves) && observation.travelHint?.footing === "dry" &&
-        sameTravelTarget(before.anchor, observation.travelHint);
+        hasStock(observation, reserves) && (before.anchor.subject === "route:dry_landing" ||
+          observation.travelHint?.footing === "dry" && sameTravelTarget(before.anchor, observation.travelHint));
       if (openingPolicy) return this.openingHandoff(witnessed, observation, openingPolicy) &&
         !openingWorkWitness(observation, openingPolicy, before);
       if (!pendingAction) return this.isCurrentHandoff(observation);

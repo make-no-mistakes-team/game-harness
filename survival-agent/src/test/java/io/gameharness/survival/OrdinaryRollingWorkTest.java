@@ -75,6 +75,24 @@ final class OrdinaryRollingWorkTest {
     }
 
     @Test
+    void directDryLandingKeepsAnOffsetSourceButRejectsDeepOrOvershootingSteps() {
+        BlockPos source = new BlockPos(0, 0, 0);
+        assertTrue(AgentDryLanding.shape(source, source.east().down(), Direction.EAST));
+        assertTrue(AgentDryLanding.shape(source, source.east().down(2), Direction.EAST));
+        assertFalse(AgentDryLanding.shape(source, source.east().down(3), Direction.EAST));
+        assertFalse(AgentDryLanding.shape(source, source.east(2).down(2), Direction.EAST));
+        assertFalse(AgentDryLanding.shape(source, source.east().south().down(2), Direction.EAST));
+        assertTrue(AgentDryLanding.stoppingFits(source, Direction.EAST, new Vec3d(0.743, 0, 0.248),
+            Vec3d.ZERO, 0.097, 0.032, 0.30));
+        assertTrue(AgentDryLanding.stoppingFits(source, Direction.EAST, new Vec3d(1.234, 0, 0.45),
+            Vec3d.ZERO, 0.097, 0.032, 0.30));
+        assertFalse(AgentDryLanding.stoppingFits(source, Direction.EAST, new Vec3d(1.168, 0, 0.39),
+            new Vec3d(0.097, 0, 0.032), 0.097, 0.032, 0.30));
+        assertFalse(AgentDryLanding.stoppingFits(source, Direction.EAST, new Vec3d(1.22, 0, 0.69),
+            new Vec3d(0.04, 0, 0.01), 0.097, 0.032, 0.30));
+    }
+
+    @Test
     void paidDiamondCanStartAVisibleCaveLegOrAnApproachToActualOreWithoutASpine() {
         var paid = order("diamond", "\"prospect:minecraft:diamond\",\"break:minecraft:deepslate_diamond_ore\"",
             ",\"duringWaitFor\":\"9d0ad30c-b85c-4261-baff-f071c8e5ebc1\"");

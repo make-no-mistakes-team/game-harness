@@ -209,7 +209,7 @@ test("Ground reconnaissance selects only an exact dry landmark and grants no sto
   const anchor = { subject: "block:minecraft:birch_log", target: "m-3" };
   const travelHint = { ...anchor, kind: "resource", footing: "dry", bearingDegrees: -40.1, windowBlocks: 0.8 };
   const scout = { id: "walk-observe", verb: "approach", risk: "low", summary: "Scout toward the visible birch",
-    evidence: "Stop on the witnessed dry ground for a new view; no harvest.", anchor };
+    evidence: "Stop on the witnessed dry ground for a new view; no harvest.", anchor } as const;
   const live = parseMacroObservation({ ...view, travelHint, opportunities: [scout] });
   const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
   const context = terraPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
@@ -228,6 +228,13 @@ test("Ground reconnaissance selects only an exact dry landmark and grants no sto
     { travelHint: { ...travelHint, windowBlocks: 0.4 } }, { stance: undefined },
     { opportunities: [scout, { ...scout, id: "other-walk" }] },
   ]) expect(() => parseMacroObservation({ ...view, travelHint, opportunities: [scout], ...bad })).toThrow();
+  const downhill = { ...scout, id: "step-down", anchor: { subject: "route:dry_landing", target: "m-5" } };
+  expect(parseMacroObservation({ ...view, opportunities: [downhill] }).opportunities).toEqual([downhill]);
+  for (const bad of [
+    { ...downhill, verb: "follow" }, { ...downhill, risk: "guarded" },
+    { ...downhill, material: { subject: anchor.subject, target: anchor.target, spends: {} } },
+  ]) expect(() => parseMacroObservation({ ...view, opportunities: [bad] })).toThrow();
+  expect(() => parseMacroObservation({ ...view, stance: undefined, opportunities: [downhill] })).toThrow("dry stance");
 });
 
 test("A work approach names one target without pricing its material", () => {

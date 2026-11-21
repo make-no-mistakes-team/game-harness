@@ -213,6 +213,10 @@ ordering a harvest. This short scouting move needs dry support and
 continues only while the same landmark and safe stopping lane hold.
 The player must actually move and settle before reporting the new view.
 Reaching a tree this way does not mean that stone or food was found.
+Another `approach` can name a visible dry landing one or two blocks below.
+It checks clearance from the player's actual position and rules out fall
+damage before moving. Landing there proves neither a return route nor
+the presence of a resource below.
 
 On a dry approach the player can keep looking toward a tree while
 stepping to one side. It checks the ground under the movement it

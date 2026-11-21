@@ -4,9 +4,8 @@ import {
   MACRO_MAX_WORK_STAGES, parseMacroWorkPolicy, parseMacroWorkStages, type MacroInference, type MacroObservation,
   type MacroStockFloor, type MacroWorkPolicy, type MacroWorkStage,
 } from "./protocol.ts";
-import {
-  preflightVanillaWork, VANILLA_HARVEST_SOURCES as harvestSources, VANILLA_TIMBER_RECIPES as timber, VANILLA_WORK_RECIPE_KEYS,
-} from "./vanilla-work.ts";
+import { VANILLA_HARVEST_SOURCES as harvestSources, VANILLA_TIMBER_RECIPES as timber } from "./vanilla-harvest.ts";
+import { preflightVanillaWork, VANILLA_WORK_RECIPE_KEYS } from "./vanilla-work.ts";
 
 export const PRE_SPAWN_GOAL_ONLY = "pre_spawn_goal_only";
 const TOOL = "propose_survival_first_plan";
@@ -72,7 +71,7 @@ function schema(properties: Record<string, unknown>) {
 const choice = (...values: string[]) => ({ type: "string", enum: values });
 const integer = { type: "integer" };
 const timberChoices = [WITNESSED_LOG, WITNESSED_TIMBER, ...timberItems];
-const harvestChoices = [...timberChoices, "minecraft:cobblestone", "minecraft:coal"];
+const harvestChoices = [...timberChoices, ...harvestSources.keys()];
 const stageEffects = [PLACE_TABLE, ...VANILLA_WORK_RECIPE_KEYS
   .filter(key => !key.endsWith("_planks")).map(key => `craft:${key}`)];
 const itemSchema = { anyOf: [{ type: "string" }, schema({ kind: choice(BOUND_SOURCE.kind, BOUND_PLANKS.kind) })] };

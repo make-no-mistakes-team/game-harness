@@ -150,7 +150,10 @@ needed to return, and the player's physical condition. The player checks
 each lit landing, dry clearance, and reverse climb before moving. Ordinary
 tool presets allow dry soil and common rock as cover. A custom work order
 needs an exact break permission for each cover type, charged against the
-same break budget. The player keeps at least one break for the source.
+same break budget. Terra's tool schema lists only the break effects the
+player supports. Gravel is not one of them. If a policy names an unsupported
+break, the host rejects the whole policy before issuing it. The player keeps
+at least one break for the source.
 Cover breaks, grounded travel, and stock pickups are confirmed separately.
 
 For ordinary travel the player needs visible support through its

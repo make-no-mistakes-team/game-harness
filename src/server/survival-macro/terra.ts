@@ -12,15 +12,17 @@ import {
 } from "./bootstrap.ts";
 import { episodeMatchesBasis } from "./episode-memory.ts";
 import {
-  MACRO_CAPABILITIES_VERSION, MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
+  MACRO_BREAK_EFFECTS, MACRO_CAPABILITIES_VERSION, MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS,
+  MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_STRATEGIC_EPISODES, MACRO_MAX_WORK_STAGES, MacroObservationRotating, MacroValidationError,
   hasDirectAuthority, isIndependentPendingPolicy, isPendingWorkVerb, openingViewMatchesPolicy, parseMacroProposal, validateMacroId,
-  MACRO_DIAMOND_PROSPECT, MACRO_FURNACE_PLACEMENT, MACRO_IRON_SMELT, MACRO_LIVE_EFFECT_PATTERN,
+  MACRO_DIAMOND_PROSPECT, MACRO_FURNACE_PLACEMENT, MACRO_IRON_SMELT, MACRO_LIVE_ONLY_EFFECTS,
   MACRO_PENDING_SIDE_MAX_EFFECTS, MACRO_PENDING_SIDE_MAX_TICKS,
-  MACRO_PROGRAM_EFFECT_PATTERN, MACRO_PROSPECT_SUPPORT, MACRO_PROSPECT_TORCH, MACRO_WATER_CLUE, MACRO_WATER_FILL, MACRO_WATER_SOURCE,
+  MACRO_PROSPECT_SUPPORT, MACRO_PROSPECT_TORCH, MACRO_WATER_CLUE, MACRO_WATER_FILL, MACRO_WATER_SOURCE, MACRO_WORK_TABLE_PLACEMENT,
   NATIVE_REVIEW_MAX_BYTES, NATIVE_REVIEW_MAX_FILE_BYTES, NATIVE_REVIEW_PATHS,
   type MacroBasis, type MacroFrame, type MacroInference, type MacroProposal, type MacroReplyRejection, type MacroRequest, type MacroStrategist,
 } from "./protocol.ts";
+import { VANILLA_WORK_RECIPE_KEYS } from "./vanilla-work.ts";
 
 const PROVIDER = "openai-codex";
 const API = "openai-codex-responses";
@@ -69,6 +71,7 @@ You may prequote duringWait:{policy,maxTicks} on the original multi-unit smelt o
 Use defer-pending only if deliberately parking without starting another job is useful, and only while deferOfferId is fresh. Neither deferral nor a location description grants travel. With parkedWorksite "view-unavailable", report the missing view or abstain. Smelting iron is not a bucket craft, diamond pickup, or Nether entry.`;
 
 const DIAMOND_PROMPT = `With a usable iron-tier or better harvesting tool, choose a single live work action targeting minecraft:diamond stock with ${MACRO_DIAMOND_PROSPECT}. A matching visible diamond ore or cave_frontier travelHint can start that same priced job on a short braking window without a proved full return. It grants no blind descent or break. Mining and deliberate excavation need their own safe footing. Deeper work can follow a witnessed lower shelf with a proved return or cut a cardinal staircase one tread at a time. Name exact permitted ore break effects (break:minecraft:diamond_ore and/or break:minecraft:deepslate_diamond_ore). This prospecting effect grants no cover breaks: if allowed, name each exact natural cover separately (such as minecraft:stone, minecraft:deepslate, minecraft:diorite, minecraft:andesite, minecraft:granite, or minecraft:tuff with the break: prefix). An ore-only job does not cut rock. New descending clearance can take four cover breaks per tread plus an obstructed anchor ceiling; keep at least one break for ore. If light is needed and allowed, include ${MACRO_PROSPECT_TORCH}, maxPlacements, exact carried torch cost, and the required torch floor. No light, block or tool stock is spent implicitly. Mining can wear a pickaxe even when no item-count loss is allowed; preserve usable tools and slots for genuine drops.
+Use only exact break effects from the tool schema. Gravel is unsupported; find a witnessed alternative or stop rather than quoting a gravel break.
 prospectOpening names one witnessed dry natural wall cell reachable from stable footing. A blocked walking lane can be the very wall to cut: neither an exposed diamond nor an open passage is needed to begin that priced prospect job. Include break:<prospectOpening.block>, at least two breaks, and enough cost headroom for maxToolLoss of the named tool above the protected stock floors. The opaque target is not an opportunity ID. This clue gives no input and proves no landing, return beyond the present stance, or ore. A wall does not answer an exact check for a different ore or route.
 If the descent lanes fail, the same job can follow a witnessed dry level foothold or upper shelf, or open two exact, permitted foot/head cells toward a side wall. It can backtrack only over retained dry, revalidated edges. If permitted, ${MACRO_PROSPECT_SUPPORT} allows one use per exact adjacent support cell that the native camera proves empty, dry and attachable, with clear forward and reverse space. Add the exact minecraft:cobblestone cost cap and protect its reserve. Blocks and torches share maxPlacements. A screenshot of water or an opening does not prove an attachable dry cell; the player will not redirect water or step into an unverified gap. Read actual Y, reached treads, support placement/debit, separate landings, and the exact refusal in native progress. Use a substantial bounded horizon; a compatible renewal adds time without restoring spent caps. On a terminal productive leg, decide whether to grant a new finite leg, resupply, or change route. None of these movements counts as diamond stock. Do not use prospecting or its placements in work-program, preset work, a continuation or a generated skill.`;
 
@@ -97,28 +100,38 @@ const continuation = action("continuation", {
   }) },
   reserves: { type: "array", items: floor },
 });
-const workPolicy = (pattern: string) => strictObject({
+// The SDK drops string patterns in strict mode. An unconstrained craft branch
+// would then accept any string, including unsupported break effects.
+const localWorkEffect = { type: "string", enum: [
+  ...MACRO_BREAK_EFFECTS,
+  ...["planks", "boat", ...VANILLA_WORK_RECIPE_KEYS].map(key => `craft:${key}`),
+] };
+const localWorkEffectRef = { $ref: "#/$defs/localWorkEffect" };
+const workEffects = (extraEffects: readonly string[]) => ({
+  anyOf: [localWorkEffectRef, { type: "string", enum: extraEffects }],
+});
+const workPolicy = (effect: Record<string, unknown>) => strictObject({
   target: { anyOf: [
     action("stock", { item: string, count: integer }),
     action("preset", { goal: { type: "string", enum: SURVIVAL_AGENT_GOALS } }),
   ] },
-  allowedEffects: { type: "array", items: { type: "string", pattern } },
+  allowedEffects: { type: "array", items: effect },
   costCaps: { type: "array", items: floor },
   reserves: { type: "array", items: floor },
   maxBreaks: integer, maxCrafts: integer, maxPlacements: integer,
 });
-const singleWorkPolicy = workPolicy(MACRO_LIVE_EFFECT_PATTERN);
+const singleWorkPolicy = workPolicy(workEffects([MACRO_WORK_TABLE_PLACEMENT, ...MACRO_LIVE_ONLY_EFFECTS]));
 const independentWorkPolicy = strictObject({
   ...singleWorkPolicy.properties,
   target: action("stock", { item: string, count: integer }),
 });
 const pendingSidePolicy = strictObject({
   ...independentWorkPolicy.properties,
-  allowedEffects: { type: "array", items: { type: "string", pattern: "^(break:minecraft:[a-z0-9_]{1,96}|craft:[a-z0-9_]{1,96})$" } },
+  allowedEffects: { type: "array", items: localWorkEffectRef },
   maxPlacements: { type: "integer", enum: [0] },
 });
 const workStages = { type: "array", minItems: 2, maxItems: MACRO_MAX_WORK_STAGES,
-  items: strictObject({ policy: workPolicy(MACRO_PROGRAM_EFFECT_PATTERN), requires: { type: "array", items: floor } }),
+  items: strictObject({ policy: workPolicy(workEffects([MACRO_WORK_TABLE_PLACEMENT])), requires: { type: "array", items: floor } }),
 };
 function smeltSuccessorId(work?: MacroRequest["work"]): string | undefined {
   if (work?.demand === "successor" && work.current?.origin === "model" && work.current.accepted &&
@@ -163,7 +176,7 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
     name: TOOL_NAME,
     description: "Return one bounded plan proposal. This tool records data; it does not act in the game.",
     strict: true,
-    parameters: strictObject({
+    parameters: { ...strictObject({
       subgoal: string, reason: string, successCondition: string, contingency: string, alternative: string,
       expiresTick: integer,
       action: { anyOf: noParkedView ? [action("gap", { capability: string }), action("abstain")] : [
@@ -181,7 +194,7 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
         ...otherActions,
         action("abstain"),
       ] },
-    }),
+    }), ...(work && !noParkedView ? { $defs: { localWorkEffect } } : {}) },
   };
 };
 const proposalTools = [
@@ -287,7 +300,7 @@ function verifiedImage(frame: MacroFrame): { image: ImageContent; sha256: string
   };
 }
 
-function contextFor(request: MacroRequest, basis: MacroBasis, image?: ImageContent): Context | undefined {
+export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image?: ImageContent): Context | undefined {
   const { observation, objective, feedback, lastReceipt, strategicEpisodes, trigger, capabilitiesVersion,
     skillGeneration, skillVerbs, selectedSkillHash, testedSkills, maxSkillEffects,
     maxIntentTtlTicks, maxPlanTtlTicks, frame, nativeReview, lookahead, work } = request;
@@ -626,7 +639,7 @@ async function infer(
   if (request.frame && !session.model.input.includes("image")) return finish("provider_unavailable");
   const frame = request.frame ? verifiedImage(request.frame) : undefined;
   if (request.frame && !frame) return finish("invalid");
-  const context = contextFor(request, basis, frame?.image);
+  const context = terraPlanContext(request, basis, frame?.image);
   if (!context) return finish("invalid");
   const result = await exchange<MacroProposal>(session, options, context, scope, started, raw => proposalFor(raw, request, basis),
     () => options.assertDispatch?.(basis, request.lookahead ? request.observation : undefined,

@@ -2,10 +2,28 @@ import { expect, spyOn, test } from "bun:test";
 import { link, mkdtemp, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { convertOpenAICodexResponsesTools } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
+import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
   MACRO_CAPABILITIES_VERSION, MacroDirectory, MacroObservationRotating, hasDirectAuthority,
-  parseMacroObservation, parseMacroProposal, parseMacroWorkOrder,
+  parseMacroObservation, parseMacroProposal, parseMacroWorkOrder, type MacroWorkDemand,
 } from "../src/server/survival-macro/protocol.ts";
+import { terraPlanContext } from "../src/server/survival-macro/terra.ts";
+
+function liveWorkSchema(duringWaitFor?: string) {
+  const observation = { v: 1, run: "run", life: 1, epoch: 3, tick: 117, goal: "diamond",
+    health: 20, food: 20, inventory: {}, opportunities: [], recent: [], quiescent: true } as const;
+  const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [],
+    current: null, lastOutcome: null, ...(duringWaitFor ? { duringWaitFor } : {}) };
+  const context = terraPlanContext({ observation, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+    lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200, maxPlanTtlTicks: 7_200 }, observation);
+  const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses")!;
+  const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
+  const [wire] = convertOpenAICodexResponsesTools(context!.tools!, model);
+  if (wire?.type !== "function" || wire.strict !== true) throw new Error("Missing strict Terra work tool");
+  return wire.parameters;
+}
 
 test("A prospect opening is a bounded dry wall clue, never a material opportunity", () => {
   const observation = {
@@ -298,6 +316,89 @@ test("Deep diamond work is explicit, standalone, and does not imply cover or tor
       policy: { ...policy, target: { kind: "stock", item: "minecraft:torch", count: 4 }, allowedEffects: [] }, requires: [],
     }],
   }))).toThrow("single live work policy");
+});
+
+test("The rejected descending diamond prospect cannot quote a gravel break", () => {
+  // Replay the policy the host issued and the native actor refused in an ordinary Terra run.
+  const policy = {
+    target: { kind: "stock", item: "minecraft:diamond", count: 1 },
+    allowedEffects: [
+      "break:minecraft:andesite", "break:minecraft:deepslate", "break:minecraft:deepslate_diamond_ore",
+      "break:minecraft:diamond_ore", "break:minecraft:diorite", "break:minecraft:dirt", "break:minecraft:granite",
+      "break:minecraft:gravel", "break:minecraft:stone", "break:minecraft:tuff",
+      "place:minecraft:cobblestone", "place:minecraft:torch", "prospect:minecraft:diamond",
+    ],
+    costCaps: [{ item: "minecraft:cobblestone", count: 4 }, { item: "minecraft:torch", count: 6 }],
+    reserves: [{ item: "minecraft:bucket", count: 1 }, { item: "minecraft:iron_pickaxe", count: 1 }],
+    maxBreaks: 48, maxCrafts: 0, maxPlacements: 8,
+  };
+  const proposal = {
+    subgoal: "Prospect a reversible descending passage for diamond", reason: "A stone cave frontier has a witnessed step",
+    successCondition: "Diamond, bucket and iron pickaxe held", contingency: "Stop if the return cannot be verified",
+    alternative: "Reassess a dry shelf", expiresTick: 1317, action: { kind: "work", policy },
+  };
+  const envelope = { v: 1, id: "diamond-leg", run: "run", life: 1, epoch: 3, basisTick: 297,
+    expiresTick: 1317, safetyRevision: 2, origin: "model", travelAnchor: { subject: "block:minecraft:stone", target: "m-1" } };
+  const schema = liveWorkSchema();
+  expect(validateJsonSchemaValue(schema, proposal).success).toBe(false);
+  expect(() => parseMacroProposal(proposal)).toThrow("unsupported break effect break:minecraft:gravel");
+  expect(() => parseMacroWorkOrder({ ...envelope, ...policy })).toThrow("unsupported break effect break:minecraft:gravel");
+
+  const revised = { ...policy, allowedEffects: policy.allowedEffects.filter(effect => effect !== "break:minecraft:gravel") };
+  const correction = { ...proposal, action: { kind: "work", policy: revised } };
+  expect(validateJsonSchemaValue(schema, correction).success).toBe(true);
+  expect(parseMacroProposal(correction).action).toMatchObject({ policy: revised });
+  expect(parseMacroWorkOrder({ ...envelope, ...revised })).toMatchObject(revised);
+});
+
+test("Programs and both pending-work forms keep exact breaks without changing craft syntax", () => {
+  const base = { costCaps: [], reserves: [], maxBreaks: 2, maxCrafts: 0, maxPlacements: 0 };
+  const cutting = {
+    ...base, target: { kind: "stock", item: "minecraft:pale_oak_log", count: 1 },
+    allowedEffects: ["break:minecraft:pale_oak_leaves", "break:minecraft:pale_oak_log"],
+  };
+  const craft = {
+    ...base, target: { kind: "stock", item: "minecraft:pale_oak_planks", count: 4 },
+    allowedEffects: ["craft:pale_oak_planks", "craft:planks"],
+    costCaps: [{ item: "minecraft:pale_oak_log", count: 1 }], maxBreaks: 0, maxCrafts: 1,
+  };
+  const smelt = {
+    ...base, target: { kind: "stock", item: "minecraft:iron_ingot", count: 2 },
+    allowedEffects: ["smelt:minecraft:iron_ingot"], maxBreaks: 0, maxCrafts: 2,
+    costCaps: [{ item: "minecraft:coal", count: 1 }, { item: "minecraft:raw_iron", count: 2 }],
+  };
+  const ticket = "cooking-iron";
+  const standard = liveWorkSchema();
+  const pending = liveWorkSchema(ticket);
+  const proposal = (action: unknown) => ({
+    subgoal: "Gather timber", reason: "Wood is needed", successCondition: "Hold the requested stock",
+    contingency: "Stop if access is blocked", alternative: "Wait at the furnace", expiresTick: 600, action,
+  });
+  const program = (policy: typeof cutting) => ({ kind: "work-program", stages: [
+    { policy, requires: [] }, { policy: craft, requires: [{ item: "minecraft:pale_oak_log", count: 1 }] },
+  ] });
+  const prequote = (policy: typeof cutting) => ({ kind: "work", policy: smelt, duringWait: { policy, maxTicks: 200 } });
+  const independent = (policy: typeof cutting) => ({ kind: "work", policy, duringWaitFor: ticket });
+  for (const [schema, action] of [[standard, program], [standard, prequote], [pending, independent]] as const) {
+    const valid = proposal(action(cutting));
+    expect(validateJsonSchemaValue(schema, valid).success).toBe(true);
+    expect(parseMacroProposal(valid).action).toMatchObject(action(cutting));
+    for (const effect of ["break:minecraft:gravel", "break:minecraft:invented_ore", "break:minecraft:nether_gold_ore"]) {
+      const invalid = proposal(action({ ...cutting, allowedEffects: [...cutting.allowedEffects, effect] }));
+      expect(validateJsonSchemaValue(schema, invalid).success).toBe(false);
+      expect(() => parseMacroProposal(invalid)).toThrow(`unsupported break effect ${effect}`);
+    }
+  }
+  const open = { ...cutting, allowedEffects: [
+    "break:minecraft:crimson_stem", "break:minecraft:stripped_warped_hyphae", "break:minecraft:stripped_pale_oak_wood",
+    "break:minecraft:bamboo", "break:minecraft:stripped_bamboo_block", "break:minecraft:flowering_azalea_leaves",
+    "break:minecraft:grass_block", "break:minecraft:clay", "break:minecraft:nether_quartz_ore",
+    "break:minecraft:deepslate_copper_ore",
+  ] };
+  expect(validateJsonSchemaValue(standard, proposal(program(open))).success).toBe(true);
+  expect(parseMacroProposal(proposal(program(open))).action).toMatchObject({
+    stages: [{ policy: { allowedEffects: [...open.allowedEffects].sort() } }, { policy: craft }],
+  });
 });
 
 test("Only a single exact live order can fill a water bucket", () => {

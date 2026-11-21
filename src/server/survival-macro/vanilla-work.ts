@@ -3,6 +3,7 @@ import {
   MACRO_WATER_CLUE, MACRO_WATER_FILL, MACRO_WATER_SOURCE,
   type MacroObservation, type MacroStockFloor, type MacroWorkPolicy, type MacroWorkStage,
 } from "./protocol.ts";
+import { VANILLA_HARVEST, VANILLA_TIMBER_RECIPES } from "./vanilla-harvest.ts";
 
 const vanilla = (name: string) => `minecraft:${name}`;
 const TABLE = vanilla("crafting_table");
@@ -14,21 +15,6 @@ const IRON_INGOT = vanilla("iron_ingot");
 const BUCKET = vanilla("bucket");
 const WATER_BUCKET = vanilla("water_bucket");
 const IRON_COOK_TICKS = 200;
-
-// Public vanilla 1.21.4 facts, shared with opening binding. These say nothing about the player's world.
-export const VANILLA_TIMBER_RECIPES: ReadonlyMap<string, string> = new Map(
-  ([
-    ["oak", ["log", "wood"]], ["spruce", ["log", "wood"]], ["birch", ["log", "wood"]],
-    ["jungle", ["log", "wood"]], ["acacia", ["log", "wood"]], ["dark_oak", ["log", "wood"]],
-    ["mangrove", ["log", "wood"]], ["cherry", ["log", "wood"]], ["pale_oak", ["log", "wood"]],
-    ["crimson", ["stem", "hyphae"]], ["warped", ["stem", "hyphae"]], ["bamboo", ["block"]],
-  ] as const).flatMap(([species, forms]) =>
-    forms.flatMap(form => ["", "stripped_"].map(prefix => [vanilla(`${prefix}${species}_${form}`), `${species}_planks`] as const))),
-);
-export const VANILLA_HARVEST_SOURCES: ReadonlyMap<string, readonly string[]> = new Map([
-  [vanilla("cobblestone"), ["stone", "cobblestone"].map(vanilla)],
-  [vanilla("coal"), ["coal_ore", "deepslate_coal_ore"].map(vanilla)],
-]);
 
 interface Ingredient {
   readonly items: readonly string[];
@@ -86,24 +72,6 @@ const RECIPES = new Map<string, Recipe>([
 ]);
 export const VANILLA_WORK_RECIPE_KEYS: readonly string[] = Object.freeze([...RECIPES.keys()]);
 
-// Maximum counted material per authorized break, not a promise of a drop or a suitable tool.
-const HARVEST = new Map<string, { item: string; yield: number }>();
-function harvest(item: string, blocks: readonly string[], maxYield: number) {
-  for (const block of blocks) HARVEST.set(block, { item, yield: maxYield });
-}
-for (const [item, blocks] of VANILLA_HARVEST_SOURCES) harvest(item, blocks, item === vanilla("coal") ? 4 : 1);
-for (const item of [...VANILLA_TIMBER_RECIPES.keys(), ...["sand", "red_sand", "tuff", "granite", "diorite", "andesite"].map(vanilla)])
-  harvest(item, [item], 1);
-harvest(vanilla("bamboo"), [vanilla("bamboo")], 64); // Breaking a stalk can drop its upper segments.
-harvest(vanilla("cobbled_deepslate"), ["deepslate", "cobbled_deepslate"].map(vanilla), 1);
-harvest(vanilla("dirt"), ["dirt", "grass_block"].map(vanilla), 1);
-harvest(vanilla("clay_ball"), [vanilla("clay")], 4);
-for (const [ore, item, max] of [
-  ["iron", "raw_iron", 4], ["copper", "raw_copper", 20], ["gold", "raw_gold", 4], ["diamond", "diamond", 4],
-  ["redstone", "redstone", 8], ["lapis", "lapis_lazuli", 36], ["emerald", "emerald", 4],
-] as const) harvest(vanilla(item), [`${ore}_ore`, `deepslate_${ore}_ore`].map(vanilla), max);
-harvest(vanilla("quartz"), [vanilla("nether_quartz_ore")], 4);
-
 export interface VanillaWorkDiagnostic {
   readonly stageIndex: number;
   readonly detail: string;
@@ -156,7 +124,7 @@ class StageArithmetic {
     let unknownBreak = false, unknownRecipe = false;
     for (const effect of this.allowed) {
       if (effect.startsWith("break:") && policy.maxBreaks > 0) {
-        const source = HARVEST.get(effect.slice(6));
+        const source = VANILLA_HARVEST.get(effect.slice(6));
         if (source) this.harvests.set(source.item, Math.max(get(this.harvests, source.item), source.yield));
         else unknownBreak = true;
       } else if (effect.startsWith("craft:") && policy.maxCrafts > 0) {

@@ -4,6 +4,7 @@ import { link, open, rename, unlink, type FileHandle } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import actorManifest from "../../../survival-agent/src/main/resources/fabric.mod.json";
 import { SURVIVAL_AGENT_GOALS, type SurvivalAgentGoal } from "../../shared/survival-agent-ui.ts";
+import { VANILLA_HARVEST, VANILLA_TIMBER_LEAVES } from "./vanilla-harvest.ts";
 
 export const MACRO_CAPABILITIES_VERSION = `survival-macro/v${actorManifest.custom["gameharness:terra_work_wire"]}`;
 export const MACRO_MAX_INTENT_TTL_TICKS = 1_200;
@@ -34,10 +35,16 @@ export const MACRO_PROSPECT_SUPPORT = "place:minecraft:cobblestone";
 export const MACRO_WATER_FILL = "fill:minecraft:water";
 export const MACRO_WATER_CLUE = "fill_water";
 export const MACRO_WATER_SOURCE = "fluid:minecraft:water_source";
-const workEffects = "break:minecraft:[a-z0-9_]{1,96}|craft:[a-z0-9_]{1,96}|place:minecraft:crafting_table";
-export const MACRO_PROGRAM_EFFECT_PATTERN = `^(${workEffects})$`;
-export const MACRO_LIVE_EFFECT_PATTERN = `^(${workEffects}|${MACRO_IRON_SMELT}|${MACRO_FURNACE_PLACEMENT}|${MACRO_DIAMOND_PROSPECT}|${MACRO_PROSPECT_TORCH}|${MACRO_PROSPECT_SUPPORT}|${MACRO_WATER_FILL})$`;
-const liveEffect = new RegExp(MACRO_LIVE_EFFECT_PATTERN);
+export const MACRO_WORK_TABLE_PLACEMENT = "place:minecraft:crafting_table";
+export const MACRO_LIVE_ONLY_EFFECTS = [
+  MACRO_IRON_SMELT, MACRO_FURNACE_PLACEMENT, MACRO_DIAMOND_PROSPECT,
+  MACRO_PROSPECT_TORCH, MACRO_PROSPECT_SUPPORT, MACRO_WATER_FILL,
+] as const;
+export const MACRO_BREAK_EFFECTS: readonly string[] = Object.freeze(
+  [...VANILLA_HARVEST.keys(), ...VANILLA_TIMBER_LEAVES].map(id => `break:${id}`),
+);
+const liveEffects = new Set([...MACRO_BREAK_EFFECTS, MACRO_WORK_TABLE_PLACEMENT, ...MACRO_LIVE_ONLY_EFFECTS]);
+const craftEffect = /^craft:[a-z0-9_]{1,96}$/;
 
 // Vanilla 1.21.4 durations for the exact fuels the bounded iron work supports.
 // Neither these durations nor a readable station count as observed furnace heat.
@@ -88,7 +95,6 @@ export interface MacroOpportunity {
 
 const prospectRock = ["minecraft:stone", "minecraft:deepslate", "minecraft:andesite",
   "minecraft:diorite", "minecraft:granite", "minecraft:tuff"] as const;
-const timberObstructionLeaf = /^minecraft:(?:oak|spruce|birch|jungle|acacia|dark_oak|mangrove|cherry|pale_oak|azalea|flowering_azalea)_leaves$/;
 
 export interface MacroTravelAnchor {
   readonly subject: string;
@@ -566,7 +572,14 @@ function workPolicy(raw: Record<string, unknown>): MacroWorkPolicy {
       count: whole(target.count, "target count", 1, 2_304) }
     : { kind, goal: choice(shape(target, "preset target", ["kind", "goal"]).goal, "preset goal", SURVIVAL_AGENT_GOALS) };
   const effects = bounds(raw.allowedEffects, "work effects", 64).map(effect => {
-    if (typeof effect !== "string" || effect.trim() !== effect || !liveEffect.test(effect)) invalid("work effect");
+    if (typeof effect !== "string" || effect.trim() !== effect) invalid("work effect");
+    if (!liveEffects.has(effect) && !craftEffect.test(effect)) {
+      if (effect.startsWith("break:")) {
+        const named = /^break:minecraft:[a-z0-9_]{1,96}$/.test(effect) ? ` ${effect}` : "";
+        invalid(`allowedEffects (unsupported break effect${named}; choose an exact break from the tool schema)`);
+      }
+      invalid("work effect");
+    }
     return effect;
   });
   if (new Set(effects).size !== effects.length) invalid("duplicate work effects");
@@ -941,7 +954,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     const timber = vanillaItem(raw.timber, "timber obstruction stock");
     const target = validateMacroId(raw.target, "timber obstruction target");
     const toward = parseStartAnchor(shape(raw.toward, "timber direction", ["subject", "target"]), "timber direction");
-    if (!timberObstructionLeaf.test(block) || !woodlandStock.test(timber) || target === toward.target ||
+    if (!VANILLA_TIMBER_LEAVES.has(block) || !woodlandStock.test(timber) || target === toward.target ||
         (toward.subject !== woodlandAnchorSubject && toward.subject !== `block:${timber}`))
       invalid("timber obstruction association");
     timberObstruction = Object.freeze({ block, target, toward, timber });

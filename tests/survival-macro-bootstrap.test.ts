@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { access, appendFile, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import { reviewPauseJournal } from "../survival-agent/pause-evidence.ts";
 import {
   bindFirstPlan, firstPlanContext, parseFirstPlanToolArguments, PRE_SPAWN_GOAL_ONLY, type FirstPlanInference,
@@ -69,6 +70,24 @@ test("only exact bounded advisory and defer schemas are admitted", () => {
       requires: [{ item: "minecraft:coal", count: 1 }, { item: "minecraft:coal", count: 2 }] }] },
     { kind: "defer", reason: "Pretend I saw a tree" },
   ]) expect(parseFirstPlanToolArguments(JSON.stringify({ advice: raw }))).toBeNull();
+});
+
+test("Goal-only startup quotes exact opening stock, not arbitrary block breaks", () => {
+  const schema = firstPlanContext(request)!.tools![0]!.parameters;
+  const opening = (resource: string) => ({ advice: { kind: "first_policy" as const, reserves: [], branches: [{
+    policy: { kind: "harvest_stock" as const, resource, count: 1, maxBreaks: 1 }, requires: [],
+  }] } });
+  for (const stock of ["minecraft:stripped_warped_hyphae", "minecraft:pale_oak_log", "minecraft:bamboo_block",
+    "minecraft:cobblestone", "minecraft:coal"]) {
+    const reply = opening(stock);
+    expect(validateJsonSchemaValue(schema, reply).success).toBe(true);
+    expect(parseFirstPlanToolArguments(JSON.stringify(reply))).toEqual(reply.advice);
+  }
+  for (const stock of ["minecraft:gravel", "minecraft:invented_ore", "break:minecraft:stone", "minecraft:quartz"]) {
+    const reply = opening(stock);
+    expect(validateJsonSchemaValue(schema, reply).success).toBe(false);
+    expect(parseFirstPlanToolArguments(JSON.stringify(reply))).toBeNull();
+  }
 });
 
 test("witnessed timber binds exact live species and spend; absent, mismatched or ambiguous evidence does not", () => {

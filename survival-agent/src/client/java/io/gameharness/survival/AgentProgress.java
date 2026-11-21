@@ -828,12 +828,15 @@ final class AgentProgress {
             status = defense.status();
             return;
         }
-        if (!macroEngaged && defense.meleeActive()) {
+        if (defense.meleeActive()) {
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             interruptHands();
+            if (macroEngaged) macro.urgent("responding to nearby melee danger");
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
-            defense.meleeStep(tick, AgentProgress::dangerous);
+            defense.meleeStep(tick, AgentBody::dryCaveDanger, safetySpend);
+            if (macroEngaged && defense.confirmedMeleeRetreat())
+                macro.safetyEffect("confirmed voluntary retreat on a witnessed dry lane");
             stallGuard.priorityAim();
             status = defense.status();
             return;
@@ -6946,14 +6949,15 @@ final class AgentProgress {
             body.walk(true);
             return true;
         }
-        LivingEntity threat = body.threat(8).orElse(null);
+        LivingEntity threat = body.threat(8, defense.meleeAttacker(tick),
+            !c.player.isOnFire() && (hurt || defense.recentMeleeImpact(tick))).orElse(null);
         boolean creeper = threat instanceof CreeperEntity;
         // Defer to the actual fall controller before issuing a ranged brace. Avoid the
         // generic damage turn/backtrack when a ranged shot is the corroborating cue.
         if (!creeper && defense.observeRanged(ears, threat, hurt)) return false;
-        if (!macroEngaged && !creeper && tick >= retreatUntil
+        if (!creeper
                 && defense.observeMelee(ears, threat, hurt,
-                    c.player.getHealth() <= 10 && wantsHealingMeal(), tick)) return false;
+                    c.player.getHealth() <= 10 && wantsHealingMeal(), tick, safetySpend)) return false;
         if (hurt && c.currentScreen instanceof HandledScreen<?>) {
             defense.forgetContact();
             interruptHands();

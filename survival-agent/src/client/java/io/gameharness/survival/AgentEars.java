@@ -66,7 +66,7 @@ final class AgentEars implements SoundInstanceListener {
             default -> null; // In particular, zombie steps share the generic Footsteps subtitle.
         };
         boolean melee = escapeTicks == 0 && (cue != null || id.equals("entity.husk.ambient")
-            || id.equals("entity.husk.hurt"));
+            || id.equals("entity.husk.hurt") || id.equals("entity.spider.ambient"));
         if (!fuse && !explosion && !shot && !melee) return;
         var ear = client.getSoundManager().getListenerTransform().position();
         double dx = ear.x - sound.getX(), dy = ear.y - sound.getY(), dz = ear.z - sound.getZ();
@@ -172,7 +172,7 @@ final class AgentEars implements SoundInstanceListener {
             ? (float) Math.toDegrees(Math.atan2(-dx, dz)) : Float.NaN;
         boolean lava = body.lavaEmergency();
         var action = fuseEscape.step(feet, body.fuseViewYaw(), body.fuseViewPitch(),
-            player.isOnGround() && !lava, body.appliedFuseForward() && player.hurtTime == 0 && !lava,
+            player.isOnGround() && !lava, body.appliedEmergencyForward() && player.hurtTime == 0 && !lava,
             explosionCue != null && explosionCue.monotonicNs() >= lastFuseNs, body, walkedBearing);
         if (lava) return; // The separate lava egress remains the final motor owner.
         switch (action) {

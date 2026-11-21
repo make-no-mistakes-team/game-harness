@@ -101,10 +101,10 @@ final class AgentDefense {
     private int rangedCoverUntil, rangedCoverSlot, rangedCoverCount;
     private final MeleeRecovery melee = new MeleeRecovery();
     private Vec3d meleeStart, meleeSurveyFrom;
-    private LivingEntity meleeVisible;
+    private LivingEntity meleeVisible, meleeAttacker;
     private float meleeAway = Float.NaN;
     private float meleeLane = Float.NaN;
-    private int meleeTurn, meleeTurnSince, meleeSamples;
+    private int meleeTurn, meleeTurnSince, meleeSamples, meleeAttackerTick;
     private long meleeSound;
     private boolean meleeFreshHit, meleeDirectionalEvidence;
     private float meleeLookPitch;
@@ -112,27 +112,43 @@ final class AgentDefense {
     private Vec3d meleeDriveFrom;
     private int meleeDriveTick;
     private float meleeDriveYaw;
-    private boolean meleeDriveConfirmed;
+    private boolean meleeDriveConfirmed, meleeDrove;
     private double meleeMotionBefore;
 
     /** Holds the safety lane across missing frames, but not indefinitely without new evidence. */
     static final class MeleeRecovery {
         private static final int QUIET_AFTER_HIT = 32;
         private static final int EVIDENCE_LIMIT = 64;
+        private static final int PINNED_LIMIT = 100;
+        enum Evidence { NONE, AMBIENT, CONTACT, IMPACT }
+
         private int lastEvidence = -EVIDENCE_LIMIT;
         private int lastHit = -QUIET_AFTER_HIT;
-        private boolean active;
+        private boolean active, pinned;
 
         static boolean canSprint(double seen, double speed, int hunger, boolean sprinting) {
             return hunger > 6 && seen >= Math.max(sprinting ? 2.1 : 2.5, 1.4 + 3.2 * speed);
         }
 
-        boolean observe(int tick, boolean hurt, boolean close, boolean separated) {
-            if (hurt) lastHit = tick;
+        boolean observe(int tick, Evidence evidence, boolean critical, boolean separated) {
+            boolean hurt = evidence == Evidence.IMPACT, close = evidence == Evidence.CONTACT;
+            if (!active || !critical || separated) pinned = false;
+            if (hurt) {
+                pinned |= critical && !separated && active && tick - lastHit < QUIET_AFTER_HIT;
+                lastHit = tick;
+            }
             if (hurt || close) lastEvidence = tick;
-            active = hurt || close || active && tick - lastEvidence < EVIDENCE_LIMIT
+            active = hurt || close || active && tick - lastEvidence < (pinned ? PINNED_LIMIT : EVIDENCE_LIMIT)
                 && (!separated || tick - lastHit < QUIET_AFTER_HIT);
             return active;
+        }
+
+        boolean recentImpact(int tick) { return active && tick - lastHit <= 3; }
+
+        static boolean checkedStride(boolean applied, boolean grounded, boolean hurt,
+                                     double horizontal, double rise, double previousMotion) {
+            return applied && grounded && !hurt && Math.abs(rise) < 0.055
+                && horizontal > Math.max(0, previousMotion) + 0.035;
         }
     }
 
@@ -155,67 +171,74 @@ final class AgentDefense {
 
     void stopZombieLook() { zombieLook = null; }
 
-    boolean observeMelee(AgentEars ears, LivingEntity visible, boolean hurt, boolean healingMeal, int tick) {
+    boolean observeMelee(AgentEars ears, LivingEntity visible, boolean hurt, boolean healingMeal, int tick,
+                        Predicate<ItemStack> spend) {
         var player = client.player;
-        meleeVisible = visible;
         if (player.hasVehicle() || player.isTouchingWater()) {
             melee.active = false;
+            meleeAttacker = meleeVisible = null;
             return false;
         }
         Vec3d feet = player.getPos();
         double distance = visible == null ? Double.POSITIVE_INFINITY : player.squaredDistanceTo(visible);
         boolean closeMelee = distance <= 5.0 * 5.0
             && (visible instanceof ZombieEntity || !(visible instanceof RangedAttackMob) && distance <= 3.4 * 3.4);
-        boolean weakKit = (hurt || closeMelee) && meleeOutmatched();
         boolean wounded = criticallyHurt(player) || healingMeal;
-        boolean equippedDuel = closeMelee && !weakKit && !wounded;
+        meleeVisible = closeMelee ? visible : null;
         var cue = ears.recentMeleeCue();
         boolean newSound = cue != null && cue.heardAt() != meleeSound;
-        boolean hearClose = newSound && cue.near() && client.currentScreen == null
-            && System.nanoTime() - cue.heardAt() <= 550_000_000L && (melee.active || wounded || meleeOutmatched());
+        boolean hearClose = cue != null && cue.near() && System.nanoTime() - cue.heardAt() <= 550_000_000L;
         if (newSound) meleeSound = cue.heardAt();
-        boolean hit = hurt && !equippedDuel;
+        // Damage without an identified source warrants defense, not permission to attack.
+        // Burning and hunger loss alone must not suppress their own recovery.
+        boolean hit = hurt && !player.isOnFire()
+            && (player.getHungerManager().getFoodLevel() > 0 || closeMelee || hearClose && player.hurtTime > 0);
         meleeFreshHit = hit;
-        boolean close = closeMelee && (weakKit || wounded) || hearClose;
-        boolean separated = meleeStart != null && feet.squaredDistanceTo(meleeStart) >= 5 * 5
-            && distance >= 6 * 6 && body.hasRecentView();
+        boolean close = closeMelee && (wounded || meleeOutmatched(spend));
+        double movedX = meleeStart == null ? 0 : feet.x - meleeStart.x;
+        double movedZ = meleeStart == null ? 0 : feet.z - meleeStart.z;
+        boolean separated = meleeDrove && movedX * movedX + movedZ * movedZ >= 5 * 5
+            && distance >= 6 * 6 && body.hasRecentView() && player.isOnGround() && player.hurtTime == 0;
         boolean started = !melee.active;
-        if (!melee.observe(tick, hit, close, separated)) return false;
+        var evidence = hit ? MeleeRecovery.Evidence.IMPACT : close ? MeleeRecovery.Evidence.CONTACT
+            : newSound ? MeleeRecovery.Evidence.AMBIENT : MeleeRecovery.Evidence.NONE;
+        if (!melee.observe(tick, evidence, player.getHealth() <= 4, separated)) {
+            meleeAttacker = null;
+            return false;
+        }
         if (started) {
             meleeStart = feet;
             meleeAway = Float.NaN;
             meleeDirectionalEvidence = false;
             meleeDriveFrom = null;
-            meleeDriveConfirmed = false;
+            meleeDriveConfirmed = meleeDrove = false;
             resetMeleeSurvey(feet, tick);
+        }
+        if (closeMelee && (hit || melee.recentImpact(tick)) && body.visiblyCorroboratesMeleeImpact(visible)) {
+            meleeAttacker = visible;
+            meleeAttackerTick = tick;
         }
         float away = Float.NaN;
         if (closeMelee) {
             away = yaw(feet.subtract(visible.getPos()));
-        } else if (hit) {
+        } else if (hit || melee.recentImpact(tick)) {
             Vec3d impulse = player.getVelocity();
-            if (impulse.horizontalLengthSquared() >= 0.0144) away = yaw(impulse);
-            else if (cue != null) away = cue.yaw() + 180;
-        } else if (hearClose && !Float.isFinite(meleeAway)) {
-            away = cue.yaw() + 180;
+            if (player.hurtTime > 0 && impulse.y > 0.06 && impulse.horizontalLengthSquared() >= 0.0064)
+                away = yaw(impulse);
+            else if (hearClose) away = cue.yaw() + 180;
         }
-        if (Float.isFinite(away) && (!meleeDirectionalEvidence
-                || hit && !Float.isFinite(meleeLane) && meleeSamples == 0 && meleeTurn == 0
-                    && turnDifference(away, meleeAway) >= 100)) {
+        if (Float.isFinite(away) && (!meleeDirectionalEvidence || hit && turnDifference(away, meleeAway) >= 100)) {
             meleeAway = away;
             meleeDirectionalEvidence = true;
             resetMeleeSurvey(feet, tick);
         }
-        if (!Float.isFinite(meleeAway)) {
-            Vec3d walked = body.recentEmergencyFooting();
-            meleeAway = walked == null ? player.getYaw() : yaw(walked.subtract(feet));
-        }
         return true;
     }
 
-    private boolean meleeOutmatched() {
-        return meleeOutmatched(null);
+    LivingEntity meleeAttacker(int tick) {
+        return melee.active && tick - meleeAttackerTick < MeleeRecovery.QUIET_AFTER_HIT ? meleeAttacker : null;
     }
+    boolean recentMeleeImpact(int tick) { return melee.recentImpact(tick); }
 
     boolean retreatFromEnderman(LivingEntity threat, Predicate<ItemStack> spend) {
         return threat instanceof EndermanEntity && (body.threatPoint() == null || meleeOutmatched(spend));
@@ -235,20 +258,27 @@ final class AgentDefense {
 
     boolean meleeActive() { return melee.active; }
 
-    void meleeStep(int tick, Predicate<BlockState> dangerous) {
+    void meleeStep(int tick, Predicate<BlockState> dangerous, Predicate<ItemStack> spend) {
         markDanger(tick);
         forgetContact();
         body.prioritizeMovement();
         var player = client.player;
+        meleeDriveConfirmed = false;
         meleeStatus("holding after damage or close contact");
         if (player.isTouchingWater() || player.hasVehicle() || client.currentScreen != null) return;
         Vec3d feet = player.getPos();
-        if (meleeDriveFrom != null && tick == meleeDriveTick + 1 && client.options.forwardKey.isPressed()
-                && !client.options.forwardKey.isUnbound() && !meleeFreshHit && player.isOnGround()
-                && player.hurtTime == 0
-                && feet.subtract(meleeDriveFrom).dotProduct(Vec3d.fromPolar(0, meleeDriveYaw))
-                    > Math.max(0, meleeMotionBefore) + 0.035) {
-            meleeDriveConfirmed = true;
+        if (meleeDriveFrom != null && tick == meleeDriveTick + 1) {
+            Vec3d change = feet.subtract(meleeDriveFrom);
+            meleeDriveConfirmed = MeleeRecovery.checkedStride(body.appliedEmergencyForward(), player.isOnGround(),
+                meleeFreshHit || player.hurtTime != 0, change.dotProduct(Vec3d.fromPolar(0, meleeDriveYaw)),
+                change.y, meleeMotionBefore);
+            meleeDrove |= meleeDriveConfirmed;
+        }
+        if (player.isOnGround() && defendWithHeldMeleeKit(spend)) return;
+        if (!meleeDirectionalEvidence) {
+            braceMelee();
+            meleeStatus("bracing; attack bearing not proved");
+            return;
         }
         if (player.isOnGround() && feet.squaredDistanceTo(meleeSurveyFrom) >= 1.4 * 1.4) {
             meleeSurveyFrom = feet;
@@ -289,10 +319,6 @@ final class AgentDefense {
                     return;
                 }
                 if (++meleeSamples >= 2) nextMeleeView(tick);
-                if (openHandSpaceStrike()) {
-                    meleeStatus("lining up a close defensive punch; " + meleeRefusal);
-                    return;
-                }
                 meleeStatus("checking dry retreat footing; " + meleeRefusal);
             } else {
                 if (tick - meleeTurnSince >= 30 && body.hasRecentView()) nextMeleeView(tick);
@@ -301,26 +327,12 @@ final class AgentDefense {
             return;
         }
         // No path was witnessed. Do not run blindly, back over an edge, or open inventory.
-        body.sneak();
+        braceMelee();
         LivingEntity threat = meleeVisible;
         if (threat != null && body.hasRecentView() && body.threatPoint() != null) {
             body.aimUrgent(body.threatPoint());
-            ItemStack main = player.getMainHandStack();
-            if (SHIELD.test(main) || SHIELD.test(player.getOffHandStack()) && AgentBody.shieldSafeMainHand(main)) {
-                body.blockAgainst(threat);
-            } else if ((main.isEmpty() || main.isIn(ItemTags.SWORDS) || main.isIn(ItemTags.AXES))
-                    && body.strikeTarget(threat) && player.getAttackCooldownProgress(0.5f) >= 0.9f) {
-                body.strike(threat);
-                meleeStatus("lining up a close defensive strike from a stationary stance");
-                return;
-            } else {
-                int weapon = bestWeapon(PlayerInventory.HOTBAR_SIZE, true);
-                if (weapon >= 0) selectRangedSlot(weapon, tick);
-            }
-        } else {
-            float toward = meleeAway + 180;
-            body.turnUrgent(toward, 17);
-            body.guardRangedBearing(toward);
+            int weapon = bestWeapon(PlayerInventory.HOTBAR_SIZE, true, spend);
+            if (weapon >= 0) selectRangedSlot(weapon, tick);
         }
         meleeStatus("bracing; no safe dry retreat witnessed"
             + (meleeRefusal == null ? "" : "; " + meleeRefusal));
@@ -330,12 +342,32 @@ final class AgentDefense {
         status = (meleeFreshHit ? "melee emergency (fresh damage): " : "melee emergency: ") + action;
     }
 
-    private boolean openHandSpaceStrike() {
+    boolean confirmedMeleeRetreat() { return meleeDriveConfirmed; }
+
+    private void braceMelee() {
+        body.pauseWork();
+        if (client.player.isOnGround()) body.sneak();
+    }
+
+    private boolean defendWithHeldMeleeKit(Predicate<ItemStack> spend) {
+        if (meleeVisible == null || !body.hasRecentView() || body.threatPoint() == null) return false;
         var player = client.player;
-        if (meleeVisible == null || !player.getMainHandStack().isEmpty()
-                || SHIELD.test(player.getOffHandStack()) || !body.strikeTarget(meleeVisible)
+        ItemStack main = player.getMainHandStack(), offhand = player.getOffHandStack();
+        if (SHIELD.test(main) && canWear(main, spend) || SHIELD.test(offhand) && canWear(offhand, spend)
+                && AgentBody.shieldSafeMainHand(main)
+                && !(main.isIn(ItemTags.AXES) && body.shieldStartWouldUseBlock())) {
+            body.sneak();
+            body.aimUrgent(body.threatPoint());
+            body.blockAgainst(meleeVisible);
+            meleeStatus("guarding against a visible melee threat");
+            return true;
+        }
+        if (player.isUsingItem() || !(main.isEmpty() || main.isIn(ItemTags.SWORDS) || main.isIn(ItemTags.AXES))
+                || !canWear(main, spend) || !body.renderedMeleeStrike(meleeVisible)
                 || player.getAttackCooldownProgress(0.5f) < 0.9f) return false;
+        body.aimUrgent(body.threatPoint());
         body.strike(meleeVisible);
+        meleeStatus("lining up a charged defensive strike on a visible melee threat");
         return true;
     }
 

@@ -354,6 +354,12 @@ stops retrying it. A side step needs visible dry support and a clear
 path for the player's body. Blast knockback does not count as a
 successful retreat.
 
+Close melee danger also preempts Terra. A hit can justify taking cover
+or retreating without identifying the attacker; it does not justify
+striking an unseen mob. Ambient sound alone does not start or extend
+the emergency. Shields and tools remain subject to the job's stock
+protections.
+
 For the rhythm of the whole run, inspect `outcome.json` → `pauseEvidence`.
 It flags long stops and clusters of shorter ones and gives their times in
 the recording. The provider overlap is reported separately: a pending

@@ -26,8 +26,11 @@ import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.effect.StatusEffects;
+import net.minecraft.entity.mob.Angerable;
 import net.minecraft.entity.mob.EndermanEntity;
 import net.minecraft.entity.mob.Monster;
+import net.minecraft.entity.mob.PiglinEntity;
+import net.minecraft.entity.mob.SpiderEntity;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.BoatItem;
@@ -174,7 +177,7 @@ final class AgentBody implements AgentFuseEscape.Terrain {
     private int previousDryFootingTick;
     private boolean lavaEmergency;
     private boolean fuseWalking;
-    private int fuseDriveTick = -1;
+    private int emergencyDriveTick = -1;
     private Predicate<ItemStack> safetySpend;
     private int stableDryTicks;
     private Vec3d escapeLanding;
@@ -333,7 +336,7 @@ final class AgentBody implements AgentFuseEscape.Terrain {
             hazards.clear();
             headroom.reset();
             stepSupport = null;
-            fuseDriveTick = -1;
+            emergencyDriveTick = -1;
             dryFooting = previousDryFooting = null;
             lavaEmergency = false;
             horizonApplied = null;
@@ -765,7 +768,7 @@ final class AgentBody implements AgentFuseEscape.Terrain {
         }
         if (jump && stepJump) lastStepJump = tick;
         ownsKeys = true;
-        if (advance && fuseWalking && !options.forwardKey.isUnbound()) fuseDriveTick = tick;
+        if (advance && emergencyWalk && !options.forwardKey.isUnbound()) emergencyDriveTick = tick;
         options.forwardKey.setPressed(advance);
         options.backKey.setPressed(retreat);
         if (pickupWalk) visibleHorizon.reportPickup(pickupTarget,
@@ -2055,6 +2058,11 @@ final class AgentBody implements AgentFuseEscape.Terrain {
         return hasView() && strikeContact(target, currentCrosshair());
     }
 
+    boolean renderedMeleeStrike(Entity target) {
+        return hasView() && renderedCrosshair instanceof EntityHitResult seen && seen.getEntity() == target
+            && strikeContact(target, currentCrosshair());
+    }
+
     private boolean strikeContact(Entity target, HitResult actual) {
         return actual instanceof EntityHitResult hit && hit.getEntity() == target
             && (!(target instanceof EndermanEntity enderman) || hasView()
@@ -2468,7 +2476,7 @@ final class AgentBody implements AgentFuseEscape.Terrain {
     }
 
     Vec3d continuityLanding() {
-        if (fuseWalking || !client.options.forwardKey.isPressed()) return null;
+        if (emergencyWalk || !client.options.forwardKey.isPressed()) return null;
         return dryLanding != null ? dryLanding : stepDriveTick == tick && stepSupport != null ? stepLanding : null;
     }
 
@@ -3126,8 +3134,8 @@ final class AgentBody implements AgentFuseEscape.Terrain {
         return tick - previousDryFootingTick <= 35 ? previousDryFooting : null;
     }
 
-    boolean appliedFuseForward() {
-        return fuseDriveTick == tick - 1 && client.options.forwardKey.isPressed();
+    boolean appliedEmergencyForward() {
+        return emergencyDriveTick == tick - 1 && client.options.forwardKey.isPressed();
     }
 
     float fuseViewYaw() { return hasView() ? observedYaw : Float.NaN; }
@@ -4182,7 +4190,7 @@ final class AgentBody implements AgentFuseEscape.Terrain {
         return hit != null && hit.getBlockPos().equals(pos);
     }
 
-    Optional<LivingEntity> threat(double distance) {
+    Optional<LivingEntity> threat(double distance, LivingEntity lastAttacker, boolean impact) {
         if (!hasView()) return Optional.empty();
         double max = range(distance);
         threats.begin(max * max);
@@ -4196,10 +4204,26 @@ final class AgentBody implements AgentFuseEscape.Terrain {
                 if (d <= max * max) observeEnderman(enderman, center, d);
             } else if (threats.couldSelect(d)) {
                 Vec3d visible = visibleEntityPoint(candidate, center);
-                if (visible != null) threats.observeHostile(candidate, visible, d);
+                if (visible == null) continue;
+                if ((candidate instanceof SpiderEntity || candidate instanceof PiglinEntity || candidate instanceof Angerable)
+                        && candidate != lastAttacker && !(impact && visiblyCorroboratesMeleeImpact(candidate))) continue;
+                threats.observeHostile(candidate, visible, d);
             }
         }
         return Optional.ofNullable(threats.target());
+    }
+
+    /** Admit a potentially neutral mob only on visible close contact consistent with this hit. */
+    boolean visiblyCorroboratesMeleeImpact(LivingEntity candidate) {
+        var player = client.player;
+        Vec3d velocity = player.getVelocity();
+        if (player.hurtTime == 0 || velocity.y <= 0.06 || velocity.horizontalLengthSquared() < 0.0064) return false;
+        double dx = player.getX() - candidate.getX(), dz = player.getZ() - candidate.getZ();
+        double separation = dx * dx + dz * dz;
+        double reach = (player.getWidth() + candidate.getWidth()) * 0.5 + 0.65;
+        double away = dx * velocity.x + dz * velocity.z;
+        return Math.abs(player.getY() - candidate.getY()) <= 1 && separation <= reach * reach
+            && away > 0 && away * away >= 0.75 * separation * velocity.horizontalLengthSquared();
     }
 
     private void observeEnderman(EndermanEntity enderman, Vec3d center, double distanceSquared) {

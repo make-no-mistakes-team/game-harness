@@ -280,6 +280,7 @@ interface Decision {
   readonly correction?: ReplyCorrection;
   readonly reconsideration?: IntentRecovery;
   readonly reacquiredTravelOf?: string;
+  readonly firstLiveReadOf?: string;
 }
 
 class FrameRejected extends Error {
@@ -508,6 +509,15 @@ function offersAffordance(observation: MacroObservation, offer: Omit<MacroOpport
 
 function workAffordance(offer: MacroOpportunity): boolean {
   return offer.risk !== "read" || offer.material !== undefined || !!offer.anchor && isOpeningView(offer);
+}
+
+function emptyFirstWorkView(view: MacroObservation): boolean {
+  return !view.quiescent && !view.working && !view.workOrder && !view.pendingWork && !view.opportunities.length &&
+    !view.travelHint && !view.timberObstruction && !view.prospectOpening && !view.surfaceOpening;
+}
+
+function firstWorkRead(offer: MacroOpportunity): boolean {
+  return offer.risk === "read" && isOpeningView(offer) && !isGroundScout(offer);
 }
 
 function meaningfulPrimitive(offer: MacroOpportunity): boolean {
@@ -897,10 +907,12 @@ export class SurvivalMacroController {
   private newestJob?: WorkJob;
   private lastAcceptedJob?: WorkJob;
   private lastJobOutcome?: WorkJob;
+  private firstLiveWorkView?: { readonly tick: number; readonly observedAt: number };
   private workQuery?: {
     readonly key: string; tick: number; readonly evidence: string; mayRecoverOnAffordance?: true;
     failedOpeningPolicy?: MacroWorkPolicy;
     reacquireTravel?: TravelReacquisition;
+    emptyStartAbstention?: { readonly source: MacroObservation; readonly requestId: string };
   };
   private parkedWorkQueries?: {
     readonly id: string; readonly life: number; readonly tick: number; readonly since: number;
@@ -1644,6 +1656,13 @@ export class SurvivalMacroController {
     if (!job && complete?.finalOrder.target.kind === "preset" &&
         complete.basis.life === observation.life && complete.goal === observation.goal) return;
     if (this.previousJob) return; // A published candidate has not settled; the incumbent remains authoritative.
+    if (!previous && !job && !queue && !this.config.preparedStockReady && emptyFirstWorkView(observation)) {
+      // The first ordinary dispatch can land between native idle publications,
+      // including after a pre-spawn refusal. Let the camera settle, without holding the game.
+      const first = this.firstLiveWorkView ??= { tick: observation.tick, observedAt: this.observedAt };
+      if (observation.tick - first.tick < FIRST_ACTIONABLE_VIEW_TICKS &&
+          performance.now() - first.observedAt < FIRST_ACTIONABLE_VIEW_MS) return;
+    }
     const nativeState = job && observation.workOrder?.id === job.order.id ? observation.workOrder : null;
     let overlap: WorkOverlap | undefined;
     if (job?.policy.allowedEffects.includes(MACRO_IRON_SMELT)) {
@@ -1701,6 +1720,17 @@ export class SurvivalMacroController {
     const outcome = this.lastJobOutcome && sameGoalAndLife(this.lastJobOutcome.source, observation) ? this.lastJobOutcome : undefined;
     const outcomeState = outcome && outcome.order.id === observation.workOrder?.id ? observation.workOrder : null;
     const evidence = recoveryEvidence ?? this.workQueryEvidence(observation);
+    const protectedReserves = this.floorScope?.life === observation.life ? this.floorScope.reserves : [];
+    const emptyStart = previous?.emptyStartAbstention;
+    let firstLiveReadOf: string | undefined;
+    if (previous && emptyStart) {
+      const { source, requestId } = emptyStart;
+      if (job || queue || observation.workOrder || previous.evidence !== evidence || !sameOpeningStance(source, observation) ||
+          !hasStock(observation, protectedReserves)) previous.emptyStartAbstention = undefined;
+      else if (observation.tick > source.tick && this.isCurrentHandoff(observation) &&
+          observation.opportunities.some(offer => firstWorkRead(offer) &&
+            !this.effectKeys.has(primitiveEffectKey(observation, offer)))) firstLiveReadOf = requestId;
+    }
 
     let demand: MacroWorkDemand["demand"];
     let key: string;
@@ -1752,7 +1782,7 @@ export class SurvivalMacroController {
       this.supersededOpeningCurrent(candidate, observation, evidence) ? candidate : undefined;
     if (candidate?.kind === "superseded-opening" && !superseded) this.intentRecovery = undefined;
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew" &&
-        !newTravelStart && !newObstruction && !newSurfaceStart && !newScout && !reacquiredTravelOf && !superseded) return;
+        !newTravelStart && !newObstruction && !newSurfaceStart && !newScout && !reacquiredTravelOf && !superseded && !firstLiveReadOf) return;
     const pendingCorrection = this.replyCorrection;
     const correction = pendingCorrection?.renewal
       ? demand === "renew" && pendingCorrection.renewal === job && observation.tick > pendingCorrection.observation.tick
@@ -1768,7 +1798,8 @@ export class SurvivalMacroController {
     if (obstructionQuery && this.workHandoffQueries.has(obstructionQuery) && !correction && !superseded) return;
     // An idle abstention can recover on a genuinely new actionable witness or
     // neutral handoff, not when the same affordance is issued a different ID.
-    if (unchanged && !correction && !reconsideration && !reacquiredTravelOf) {
+    const ordinaryUnchanged = unchanged && !correction && !reconsideration && !reacquiredTravelOf && !firstLiveReadOf;
+    if (ordinaryUnchanged) {
       if (!newSurfaceStart && !newScout && (job || !previous.mayRecoverOnAffordance || !asked ||
           (!(observation.quiescent && !asked.quiescent) &&
             !(observation.prospectOpening && !sameOpeningCut(observation.prospectOpening, asked.prospectOpening)) &&
@@ -1780,13 +1811,13 @@ export class SurvivalMacroController {
     const handoffQuery = !job && (observation.quiescent || observation.prospectOpening || surface || observation.travelHint || obstruction ||
       observation.opportunities.some(workAffordance))
       ? digest([evidence, liveCorrectionEvidence({ ...observation, opportunities: observation.opportunities.filter(workAffordance) })]) : null;
-    if (unchanged && !correction && !reconsideration && !reacquiredTravelOf &&
-        (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
+    if (ordinaryUnchanged && (!handoffQuery || this.workHandoffQueries.has(handoffQuery))) return;
     if (handoffQuery) this.workHandoffQueries.add(handoffQuery);
     if (obstructionQuery) this.workHandoffQueries.add(obstructionQuery);
     if (surfaceQuery) this.workHandoffQueries.add(surfaceQuery);
     if (scoutQuery) this.workHandoffQueries.add(scoutQuery);
     if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
+    this.firstLiveWorkView = undefined;
     if (overlap?.smeltBurnTick !== undefined) overlap.incumbent.smeltLookedAhead = true;
     else if (overlap && owner) this.workOverlapRequests.add(owner);
     const purpose = ticket && this.jobs.get(ticket.id)?.pendingPurpose;
@@ -1795,7 +1826,7 @@ export class SurvivalMacroController {
       job?.order.duringWaitFor && this.parkedOrdinaryWindow(job.order.duringWaitFor, observation) ? job.order.duringWaitFor : undefined;
     const workDemand: MacroWorkDemand = {
       mode: this.workMode!, demand,
-      protectedReserves: this.floorScope?.life === observation.life ? this.floorScope.reserves : [],
+      protectedReserves,
       current: job ? { id: job.order.id, origin: job.order.origin, policy: job.policy,
         expiresTick: job.order.expiresTick, accepted: job.accepted ?? null, nativeState } : null,
       ...(demand === "renew" && job ? { renewal: { workOrderId: job.order.id } } : {}),
@@ -1805,7 +1836,7 @@ export class SurvivalMacroController {
       lastOutcome: outcome?.terminal ? { id: outcome.order.id, policy: outcome.policy,
         receipt: outcome.terminal, nativeState: outcomeState } : null,
     };
-    await this.begin(view, { workDemand, workOverlap: overlap, correction, reconsideration, reacquiredTravelOf });
+    await this.begin(view, { workDemand, workOverlap: overlap, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf });
   }
 
   private async scheduleParkedWork(view: View, ticket: NonNullable<MacroObservation["pendingWork"]>): Promise<void> {
@@ -2627,8 +2658,8 @@ export class SurvivalMacroController {
   }
 
   private async begin(
-    view: View, { lookahead, workDemand, workOverlap, correction, reconsideration, reacquiredTravelOf }:
-      Pick<Decision, "lookahead" | "workDemand" | "workOverlap" | "correction" | "reconsideration" | "reacquiredTravelOf">,
+    view: View, { lookahead, workDemand, workOverlap, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf }:
+      Pick<Decision, "lookahead" | "workDemand" | "workOverlap" | "correction" | "reconsideration" | "reacquiredTravelOf" | "firstLiveReadOf">,
   ): Promise<void> {
     const trigger = this.trigger(view);
     const observation = view.observation;
@@ -2686,7 +2717,8 @@ export class SurvivalMacroController {
     await this.record("request", { requestId, evidenceKey: view.evidence, request,
       ...(correction ? { correctionOf: correction.requestId } : {}),
       ...(reconsideration ? { reconsiderationOf: reconsideration.requestId, reconsideration: reconsideration.kind } : {}),
-      ...(reacquiredTravelOf ? { reacquiredTravelOf } : {}) });
+      ...(reacquiredTravelOf ? { reacquiredTravelOf } : {}),
+      ...(firstLiveReadOf ? { firstLiveReadOf } : {}) });
     if (this.closing || performance.now() - this.startedAt! >= this.limits.maxRuntimeMs) {
       await this.disposition("request_not_dispatched", { requestId, reason: this.closing ? "stop" : "runtime_wall_limit" });
       return;
@@ -2712,7 +2744,8 @@ export class SurvivalMacroController {
     this.busy = {
       kind: "inference",
       work: this.work({ requestId, observation, generation, testedSkills, selectedSkillHash,
-        lookahead, workDemand, workOverlap, replyKey, correction, reconsideration, reacquiredTravelOf }, this.limits.requestTimeoutMs, async signal => {
+        lookahead, workDemand, workOverlap, replyKey, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf },
+      this.limits.requestTimeoutMs, async signal => {
         if (lookahead) return this.config.strategist!(request, signal);
         if (workDemand?.parkedWorksite === "view-unavailable" ||
             workDemand?.current && (workDemand.current.id !== workDemand.duringWaitFor || !this.config.frame)) return this.config.strategist!({ ...request,
@@ -2726,6 +2759,15 @@ export class SurvivalMacroController {
             const latest = await this.ipc!.read("observation.json", parseMacroObservation);
             if (!latest || !this.supersededOpeningWitnessCurrent(reconsideration, latest))
               throw new FrameRejected("stale", "The fresh physical start no longer supersedes the unissued opening view.");
+          }
+          if (firstLiveReadOf) {
+            const latest = await this.ipc!.read("observation.json", parseMacroObservation);
+            if (!latest || latest.tick < observation.tick || !sameOpeningStance(observation, latest) ||
+                latest.workOrder || !hasStock(latest, workDemand!.protectedReserves) ||
+                !disclosed.opportunities.some(offer => firstWorkRead(offer) &&
+                  latest.opportunities.some(fresh => sameOffer(offer, fresh))))
+              throw new FrameRejected("stale", "The first usable read is no longer offered on the same safe stance.");
+            signal.throwIfAborted();
           }
         } catch (error) {
           if (sample) await discardFrame(sample);
@@ -3011,6 +3053,7 @@ export class SurvivalMacroController {
       ...(filtered ? { filteredAction: proposal?.action.kind } : {}),
       ...(correction ? { correctionOf: correction.requestId } : {}),
       ...(context.reacquiredTravelOf ? { reacquiredTravelOf: context.reacquiredTravelOf } : {}),
+      ...(context.firstLiveReadOf ? { firstLiveReadOf: context.firstLiveReadOf } : {}),
       ...(context.lookahead ? { conditionalOn: context.lookahead.origin.intent.id } : {}),
       ...(context.workDemand ? {
         workDemand: context.workDemand.demand,
@@ -3053,7 +3096,14 @@ export class SurvivalMacroController {
     // instead advances on the native park/return transitions, not this flag.
     if (proposal.action.kind === "abstain" && !context.reconsideration && context.workDemand?.current === null &&
         !context.workDemand.parkedWorksite && this.workQuery &&
-        model && basisMatches && ttlValid && !runtimeExpired && !late) this.workQuery.mayRecoverOnAffordance = true;
+        model && basisMatches && ttlValid && !runtimeExpired && !late) {
+      this.workQuery.mayRecoverOnAffordance = true;
+      if (inference?.dispatched === true && !this.config.preparedStockReady && context.workDemand.demand === "first" &&
+          !this.lastReceipt && !current.workOrder && emptyFirstWorkView(original) && sameOpeningStance(original, current) &&
+          hasStock(current, context.workDemand.protectedReserves)) {
+        this.workQuery.emptyStartAbstention = { source: original, requestId: context.requestId };
+      }
+    }
     if (disposition !== "proposed") {
       // The provider chose a pure function, not a durable live command. A
       // stale movement premise may still yield bounded independent testing,

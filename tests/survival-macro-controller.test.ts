@@ -897,6 +897,81 @@ test.each(["matching later witness", "camera receipt only"] as const)(
   },
 );
 
+const emptySpawn = { goal: "diamond", stance: 1, epoch: 3, safety: { clear: true, revision: 2 } } as const;
+const spawnGround = { id: "o-1", verb: "survey", risk: "read", summary: "Survey the nearby ground",
+  evidence: "A fixed downward camera angle from the current stance." } as const;
+const spawnSide = { id: "o-2", verb: "survey", risk: "read", summary: "Survey left from this stance",
+  evidence: "A bounded first-person turn over nearby terrain." } as const;
+
+test("the empty iLRnpk opening waits briefly for its first actual read before paying for live planning", async () => {
+  const requests: MacroRequest[] = [];
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    return workReply(request, { kind: "abstain" });
+  }, "Collect timber toward diamond.", 3);
+  try {
+    await f.observe(21, emptySpawn);
+    await f.observe(26, emptySpawn);
+    expect(requests).toHaveLength(0);
+    await expect(access(f.file("planning.json"))).rejects.toThrow();
+    await expect(access(f.file("intent.json"))).rejects.toThrow();
+    await f.observe(31, { ...emptySpawn, opportunities: [spawnGround, spawnSide] });
+    expect(requests.map(request => request.observation.tick)).toEqual([31]);
+    expect(requests[0]).toMatchObject({ observation: { opportunities: [spawnGround, spawnSide] },
+      work: { demand: "first", openingViewIds: [spawnGround.id, spawnSide.id] } });
+  } finally {
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
+test.each(["same scope", "new stance", "new epoch", "new life", "new safety", "unsafe", "new stock", "request budget", "not abstained"] as const)(
+  "an already paid empty first decision wakes once on a new usable read only in the original scope (%s)", async condition => {
+    const requests: MacroRequest[] = [];
+    const reply = Promise.withResolvers<void>();
+    const woke = Promise.withResolvers<void>();
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) {
+        await reply.promise;
+        if (condition === "not abstained") return { ...workReply(request, { kind: "abstain" }), outcome: "refused", proposal: null };
+      } else woke.resolve();
+      return workReply(request, { kind: "abstain" });
+    }, "Collect timber toward diamond.", condition === "request budget" ? 1 : 4);
+    try {
+      await f.observe(21, emptySpawn);
+      await f.observe(31, emptySpawn);
+      expect(requests.map(request => request.observation.tick)).toEqual([31]);
+      reply.resolve();
+      await f.actor.poll();
+      const next = { ...emptySpawn, ...(condition === "new stance" ? { stance: 2 } :
+        condition === "new epoch" ? { epoch: 4 } : condition === "new life" ? { life: 2, epoch: 4 } :
+        condition === "new safety" ? { safety: { clear: true, revision: 3 } } :
+        condition === "unsafe" ? { safety: { clear: false, revision: 3 } } :
+        condition === "new stock" ? { inventory: { "minecraft:oak_log": 1 } } : {}) };
+      await f.observe(36, { ...next, opportunities: [spawnGround, spawnSide] });
+      if (condition === "same scope") {
+        await woke.promise;
+        expect(requests.map(request => request.observation.tick)).toEqual([31, 36]);
+        expect(requests[1]!.work?.openingViewIds).toEqual([spawnGround.id, spawnSide.id]);
+        const history = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        const dispatched = history.filter(row => row.event === "request");
+        expect(dispatched[1]).toMatchObject({ firstLiveReadOf: dispatched[0].requestId });
+      } else expect(f.actor.status().requests).toBe(1); // No special fast wake across a changed scope.
+      if (condition === "same scope") {
+        await f.observe(130, next);
+        await f.observe(220, { ...next, opportunities: [{ ...spawnGround, id: "rekeyed-ground" }, spawnSide] });
+        expect(requests).toHaveLength(2);
+      }
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test("A first standalone fixed survey wakes constrained planning only for newly visible physical work", async () => {
   const requests: MacroRequest[] = [];
   const quote = Promise.withResolvers<void>();

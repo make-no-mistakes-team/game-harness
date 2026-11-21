@@ -63,6 +63,11 @@ advice grants no action. A rejected plan or a failed
 startup can still use that request. Pass `--startup off` before the goal
 to wait for the first observation before making a paid call.
 
+An empty first view gets a brief settling window. If Terra has already
+abstained because there were no actions, the first usable read at that
+same safe stance can prompt one fresh decision. Reissuing the same read
+does not keep the player or the model in a survey loop.
+
 For a single-world campaign, pass `--skill-trials off` before the goal
 and `--continue-from RUN_BASENAME` after the time limit. Terra still
 plans and plays in that save; the runner does not create side worlds

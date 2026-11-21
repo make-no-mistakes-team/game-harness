@@ -6,6 +6,7 @@ import java.util.Optional;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.minecraft.block.Block;
@@ -232,6 +233,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private boolean wetEscapeWalk;
     private static final int HORIZON_WAIT_TICKS = 8;
     private HorizonTravel horizonIntent, horizonApplied;
+    private BooleanSupplier reconInputGrant;
     private Vec3d horizonAppliedFrom;
     private boolean horizonAppliedDry, horizonAppliedPulse;
     private AgentShallowTransit horizonCrossing;
@@ -394,6 +396,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         dryRouteWalk = false;
         wetEscapeWalk = false;
         horizonIntent = null;
+        reconInputGrant = null;
         horizonKeyWindow = null;
         horizonForward = horizonSneak = horizonWade = false;
         horizonSide = 0;
@@ -705,6 +708,10 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             horizonSide = 0;
             if (pickupWalk) retreat = false;
             pickupSide = 0;
+        }
+        if (reconInputGrant != null && !reconInputGrant.getAsBoolean()) {
+            advance = retreat = jump = sprintRequested = attack = use = false;
+            horizonSide = 0;
         }
         boolean centerKeys = centerLanding != null && controlledBoat == null
             && player.isOnGround() && !player.isTouchingWater() && player.getVehicle() == null;
@@ -1780,6 +1787,52 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         }
     }
 
+    /** Retain ordinary rolling-key hazard gates without invoking its camera motor or special travel. */
+    boolean driveVisualRecon(HorizonTravel travel, AgentVisibleHorizon.Window window, int side, double reach) {
+        if (!visualReconStance() || !visualReconSideBound(side) || window.frame() != renderedFrame()
+                || window.medium() != AgentVisibleHorizon.Medium.DRY || window.contactOnly()
+                || Math.abs(MathHelper.wrapDegrees(window.yaw() - client.player.getYaw() - 45 * side)) > 0.01
+                || window.knownDistance() <= reach) return false;
+        if (travel.motion == null) travel.motion = new HorizonMotion(client.player.getPos(), travel.goal, true);
+        prioritizeMovement();
+        horizonIntent = travel;
+        horizonHeading = window.yaw();
+        horizonReach = reach;
+        horizonSide = side;
+        horizonForward = true;
+        horizonKeyWindow = window;
+        return true;
+    }
+
+    boolean visualReconStance() {
+        return visualReconPosture() && client.player.isOnGround() && !client.player.horizontalCollision;
+    }
+
+    boolean visualReconPosture() {
+        return dryLandingControls() && client.player.getVehicle() == null && client.player.getAir() >= 230
+            && client.getCameraEntity() == client.player && client.options.getPerspective().isFirstPerson();
+    }
+
+    boolean visualReconSideBound(int side) {
+        return !client.options.forwardKey.isUnbound()
+            && (side >= 0 || !client.options.leftKey.isUnbound())
+            && (side <= 0 || !client.options.rightKey.isUnbound());
+    }
+
+    boolean visualReconInput(boolean advance, int side, boolean jump) {
+        var keys = client.options;
+        return keys.forwardKey.isPressed() == advance && keys.leftKey.isPressed() == (advance && side < 0)
+            && keys.rightKey.isPressed() == (advance && side > 0)
+            && !keys.backKey.isPressed() && keys.jumpKey.isPressed() == jump && !keys.sprintKey.isPressed()
+            && !keys.sneakKey.isPressed() && !keys.attackKey.isPressed() && !keys.useKey.isPressed();
+    }
+
+    boolean visualReconIssued(HorizonTravel travel) {
+        return travel != null && horizonApplied == travel && horizonAppliedTick == tick && travel.issued;
+    }
+
+    void guardVisualReconKeys(BooleanSupplier grant) { reconInputGrant = grant; }
+
     private static int horizonSide(float turn) {
         return turn < -23 ? -1 : turn > 23 ? 1 : 0;
     }
@@ -2075,6 +2128,22 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     boolean hasRecentView() { return hasView(); }
+
+    private AgentVisual visual;
+
+    AgentVisual visual() { return visual; }
+    void bindVisual(AgentVisual visual) { this.visual = visual; }
+
+    // Read-only bridge from the actual START callback. Never recompute FOV from player settings.
+    boolean copyVisualProjection(AgentVisualProjection view) {
+        if (!hasView()) return false;
+        view.eye = eye;
+        view.yaw = observedYaw;
+        view.pitch = observedPitch;
+        view.matrix.set(viewProjection);
+        view.inverse.set(inverseViewProjection);
+        return true;
+    }
 
     long renderedFrame() { return frameSequence; }
 
@@ -2607,14 +2676,21 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     /** Leave the proved lip on foot, then coast: never manufacture a mid-air step or reversal. */
     boolean driveDryLanding(AgentDryLanding landing) {
+        return driveDryLanding(landing, false);
+    }
+
+    boolean driveDryLanding(AgentDryLanding landing, boolean keepView) {
         var player = client.player;
         if (!player.isOnGround() || player.getY() < landing.source().getY() - 0.055) return false;
         double dx = landing.center().x - player.getX(), dz = landing.center().z - player.getZ();
-        float pitch = (float) Math.toDegrees(Math.atan2(player.getEyeY() - landing.top().getPos().y,
-            Math.hypot(landing.top().getPos().x - player.getX(), landing.top().getPos().z - player.getZ())));
-        turnFixed(landing.yaw(), Math.min(77, pitch));
+        if (!keepView) {
+            float pitch = (float) Math.toDegrees(Math.atan2(player.getEyeY() - landing.top().getPos().y,
+                Math.hypot(landing.top().getPos().x - player.getX(), landing.top().getPos().z - player.getZ())));
+            turnFixed(landing.yaw(), Math.min(77, pitch));
+        }
         float yaw = player.getYaw();
-        if (!dryLandingSeen(landing) || Math.abs(MathHelper.wrapDegrees(yaw - landing.yaw())) > 2.0) return false;
+        if (!dryLandingSeen(landing) || Math.abs(MathHelper.wrapDegrees(yaw - landing.yaw())) > (keepView ? 0.7 : 2.0))
+            return false;
         var feet = player.getPos();
         var velocity = player.getVelocity();
         double angle = Math.toRadians(yaw), speed = 0.102, radius = player.getWidth() * 0.5;
@@ -3269,15 +3345,25 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     /** Keep W through a level waypoint only when the straight successor has already passed its guards. */
     void driveDryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry) {
+        driveDryRoute(from, to, bearing, carry, false, true);
+    }
+
+    boolean driveVisualRise(OrdinaryGrade grade, boolean allowJump) {
+        driveDryRoute(grade.from(), grade.to(), grade.bearing(), false, true, allowJump);
+        return forward;
+    }
+
+    private void driveDryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry, boolean keepView,
+                               boolean allowJump) {
         var player = client.player;
         Vec3d landing = Vec3d.ofBottomCenter(to);
         double dx = landing.x - player.getX(), dz = landing.z - player.getZ();
-        boolean jump = to.getY() > from.getY() && player.isOnGround() && !player.isTouchingWater()
+        boolean jump = allowJump && to.getY() > from.getY() && player.isOnGround() && !player.isTouchingWater()
             && !player.isInLava() && player.getBlockPos().equals(from);
         float yaw = heading(bearing.getOffsetX(), bearing.getOffsetZ());
         boolean level = to.getY() == from.getY();
-        turnFixed(yaw, level ? LEVEL_ROUTE_PITCH : jump ? 4 : 39);
-        if (!hasView() || Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > 6) return;
+        if (!keepView) turnFixed(yaw, level ? LEVEL_ROUTE_PITCH : jump ? 4 : 39);
+        if (!hasView() || Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > (keepView ? 0.7 : 6.0)) return;
         double remaining = dx * bearing.getOffsetX() + dz * bearing.getOffsetZ();
         Vec3d velocity = player.getVelocity();
         double forwardSpeed = Math.max(0, velocity.x * bearing.getOffsetX() + velocity.z * bearing.getOffsetZ());
@@ -3338,18 +3424,19 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return pickupSweepClear(landing, minimumFeetY, maximumFeetY, 0, 0, null, AgentPickup.Scope.EXACT_ENTITY, null);
     }
 
+    /** Negative-only collision veto: no item witness or target is created even if a drop is visible. */
+    boolean visualReconPickupClear(Vec3d landing, double minimumFeetY, double maximumFeetY) {
+        if (!hasView()) return false;
+        Box sweep = pickupSweep(landing, minimumFeetY, maximumFeetY, 0, 0);
+        return client.world.getEntitiesByClass(ItemEntity.class, sweep, Entity::isAlive).isEmpty();
+    }
+
     private boolean pickupSweepClear(Vec3d landing, double minimumFeetY, double maximumFeetY,
                                      double driftX, double driftZ, ItemEntity target, AgentPickup.Scope scope,
                                      Predicate<ItemEntity> stockFooting) {
         if (!hasView() || raysLeft <= 0) return false;
         var player = client.player;
-        // The vanilla on-foot pickup envelope is 1 / 0.5 / 1 around the body.
-        // Reserve an extra quarter-block for braking or a drifting drop.
-        Box sweep = player.getBoundingBox().stretch(landing.x - player.getX(), 0, landing.z - player.getZ())
-            .stretch(driftX, 0, driftZ)
-            .stretch(0, Math.min(0, minimumFeetY - player.getY()), 0)
-            .stretch(0, Math.max(0, maximumFeetY - player.getY()), 0)
-            .expand(1.25, 0.5, 1.25);
+        Box sweep = pickupSweep(landing, minimumFeetY, maximumFeetY, driftX, driftZ);
         ItemStack selected = target == null ? ItemStack.EMPTY : target.getStack();
         for (ItemEntity item : client.world.getEntitiesByClass(ItemEntity.class, sweep,
                 candidate -> candidate != target && candidate.isAlive() && !candidate.isInvisibleTo(player))) {
@@ -3360,6 +3447,17 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                     || stockFooting == null || !stockFooting.test(item))) return false;
         }
         return raysLeft > 0;
+    }
+
+    private Box pickupSweep(Vec3d landing, double minimumFeetY, double maximumFeetY, double driftX, double driftZ) {
+        var player = client.player;
+        // The vanilla on-foot pickup envelope is 1 / 0.5 / 1 around the body.
+        // Reserve an extra quarter-block for braking or a drifting drop.
+        return player.getBoundingBox().stretch(landing.x - player.getX(), 0, landing.z - player.getZ())
+            .stretch(driftX, 0, driftZ)
+            .stretch(0, Math.min(0, minimumFeetY - player.getY()), 0)
+            .stretch(0, Math.max(0, maximumFeetY - player.getY()), 0)
+            .expand(1.25, 0.5, 1.25);
     }
 
     enum PickupResult { WAITING, MOVING, BLOCKED }

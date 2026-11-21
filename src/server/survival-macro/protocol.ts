@@ -22,6 +22,11 @@ export const MACRO_PENDING_SIDE_MAX_TICKS = 600;
 export const MACRO_PENDING_SIDE_MAX_EFFECTS = 4;
 export const MACRO_COLLECT_PENDING = "collect_pending";
 export const MACRO_DEFER_PENDING = "defer_pending";
+export const MACRO_RECON = "recon";
+export const MACRO_RECON_ANCHOR = "route:visual_region";
+export const MACRO_RECON_MAX_TICKS = 100;
+export const MACRO_VISUAL_PROBE_MAX_TICKS = 80;
+export const MACRO_VISUAL_WITNESS_MAX_TICKS = 600;
 
 export function isPendingWorkVerb(verb: string): boolean {
   return verb === MACRO_COLLECT_PENDING || verb === MACRO_DEFER_PENDING;
@@ -77,10 +82,15 @@ const FILE_BYTES = {
   "work.json": 16 * 1024,
   "receipt.json": 4 * 1024,
   "revoked.json": 1024,
+  "visual-probe.json": 2 * 1024,
+  "visual-probe-result.json": 2 * 1024,
 } as const;
 const idPattern = /^[A-Za-z0-9._:-]{1,128}$/;
 const hashPattern = /^[a-f0-9]{64}$/;
 const itemPattern = /^[a-z0-9_.:/-]{1,128}$/;
+const visualCandidatePattern = /^vr-[a-f0-9]{32}$/;
+const visualCapturePattern = /^vc-[a-f0-9]{32}$/;
+const visualUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const utf8 = new TextDecoder("utf-8", { fatal: true });
 
 export interface MacroBasis {
@@ -126,6 +136,8 @@ export type MacroTravelHint = MacroTravelAnchor & {
 );
 
 export interface MacroObservation extends MacroBasis {
+  /** Native can capture a settled first-person view. This flag grants no input. */
+  readonly visualReady?: true;
   readonly v: 1;
   readonly goal: string;
   readonly health: number;
@@ -177,6 +189,7 @@ export interface MacroIntent {
   readonly expiresTick: number;
   readonly opportunityId: string;
   readonly skillHash: string | null;
+  readonly recon?: MacroReconBounds;
 }
 
 export type MacroHandoff = Pick<MacroIntent, "v" | "run" | "life" | "epoch" | "basisTick" | "expiresTick">;
@@ -377,6 +390,53 @@ export interface MacroDirectAction {
   readonly reserves: readonly MacroStockFloor[];
 }
 
+export interface MacroReconBounds {
+  readonly maxLegs: number;
+  readonly maxBlocks: number;
+}
+
+export interface MacroVisualRegion {
+  readonly x: number;
+  readonly y: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface MacroVisualBinding {
+  readonly captureId: string;
+  readonly renderFrame: number;
+}
+
+interface MacroVisualProbeScope {
+  readonly v: 1;
+  readonly run: string;
+  readonly life: number;
+  readonly epoch: number;
+  readonly id: string;
+  readonly requestId: string;
+  readonly captureId: string;
+  readonly imageSha256: string;
+}
+
+export interface MacroVisualProbe extends MacroVisualProbeScope {
+  readonly basisTick: number;
+  readonly expiresTick: number;
+  readonly region: MacroVisualRegion;
+}
+
+const visualMissStatuses = ["miss", "occluded", "dark", "out_of_range", "basis_changed", "budget_exhausted"] as const;
+type MacroVisualOutcome =
+  | { readonly status: "witnessed"; readonly candidateId: string; readonly subject: string; readonly distanceBlocks: number }
+  | { readonly status: typeof visualMissStatuses[number] };
+
+export type MacroVisualProbeResult = MacroVisualProbeScope & { readonly tick: number } & MacroVisualOutcome;
+
+export interface MacroVisualContext {
+  readonly mayNominate: boolean;
+  readonly read?: MacroVisualOutcome & { readonly tick: number; readonly region: MacroVisualRegion };
+  readonly reconOpportunityId?: string;
+}
+
 export interface MacroProposal {
   readonly subgoal: string;
   readonly reason: string;
@@ -386,6 +446,8 @@ export interface MacroProposal {
   readonly expiresTick: number;
   readonly action:
     | { readonly kind: "opportunity"; readonly opportunityId: string }
+    | { readonly kind: "nominate-visible"; readonly captureId: string; readonly imageSha256: string; readonly region: MacroVisualRegion }
+    | ({ readonly kind: "recon"; readonly opportunityId: string } & MacroReconBounds)
     | MacroDirectAction
     | MacroSuccessor
     | { readonly kind: "work"; readonly policy: MacroWorkPolicy; readonly openingViewId?: string;
@@ -412,10 +474,15 @@ export interface MacroFrame {
   readonly width: number;
   readonly height: number;
   readonly data: Uint8Array;
+  readonly visualBinding?: MacroVisualBinding;
+  readonly captureSource?: "native" | "x11";
+  readonly nativeOmission?: string;
+  readonly nativeCaptureMs?: number;
   /** Private supervisor custody. Removed before the frame is sent to a strategist. */
   readonly artifact?: {
     readonly relativePath: string;
     readonly sha256: string;
+    readonly verify?: () => Promise<boolean>;
     readonly discard?: () => Promise<void>;
   };
 }
@@ -470,6 +537,9 @@ export interface MacroRequest {
   readonly maxIntentTtlTicks: number;
   readonly maxPlanTtlTicks: number;
   readonly frame?: MacroFrame;
+  readonly visual?: MacroVisualContext;
+  /** Private archive and current-scope check, immediately before dispatch. */
+  readonly verifyFrameDispatch?: () => Promise<boolean>;
 }
 
 export interface MacroUsage {
@@ -494,6 +564,8 @@ const replyRejections = {
   wrong_preset_goal: "A preset work target must equal the live invocation goal.",
   active_work: "An active job admits work policies, a scoped revoke, a genuine gap, or abstention; not a primitive or skill.",
   missing_opportunity: "Select an exact opportunityId offered in the current observation.",
+  visual_nomination: "Nominate only a region of the exact native-bound image supplied for this request.",
+  visual_recon: "Recon needs a separate bounded choice of the exact offered recon opportunity after its confirmed read.",
   opening_view: "Use an offered openingViewId only for a camera check relevant to the quoted physical job; otherwise use ordinary work without it.",
   guarded_opportunity: "Constrained work mode does not admit guarded primitives. Use a bounded work policy with explicit costs and reserves for supported effects.",
   continuation: "A continuation needs direct authority and currently witnessed material selectors. Constrained mode does not admit continuations.",
@@ -522,6 +594,7 @@ export interface MacroInference {
   readonly outcome: "completed" | "refused" | "invalid" | "cancelled" | "provider_error" | "provider_unavailable" | "stale";
   readonly latencyMs?: number;
   readonly frameSha256?: string;
+  readonly frameVisualBinding?: MacroVisualBinding;
   readonly dispatched?: boolean;
   readonly providerStartedAtMs?: number;
   /** Host validation only, and set only for a transport-completed invalid reply. */
@@ -833,6 +906,65 @@ function basis(record: Record<string, unknown>): MacroBasis {
   };
 }
 
+function visualRegion(value: unknown): MacroVisualRegion {
+  const raw = shape(value, "visual region", ["x", "y", "width", "height"]);
+  const x = finite(raw.x, "visual x", 1), y = finite(raw.y, "visual y", 1);
+  const width = finite(raw.width, "visual width", 0.35), height = finite(raw.height, "visual height", 0.35);
+  if (width <= 0 || height <= 0 || x + width > 1 || y + height > 1) invalid("visual region bounds");
+  return Object.freeze({ x, y, width, height });
+}
+
+function imageSha256(value: unknown): string {
+  if (typeof value !== "string" || !hashPattern.test(value)) invalid("visual image sha256");
+  return value;
+}
+
+export function validateMacroCaptureId(value: unknown): string {
+  if (typeof value !== "string" || !visualCapturePattern.test(value)) invalid("capture id");
+  return value;
+}
+
+function visualUuid(value: unknown, field: string): string {
+  if (typeof value !== "string" || !visualUuidPattern.test(value)) invalid(field);
+  return value;
+}
+
+function reconBounds(raw: Record<string, unknown>): MacroReconBounds {
+  return Object.freeze({ maxLegs: whole(raw.maxLegs, "recon maxLegs", 1, 3),
+    maxBlocks: whole(raw.maxBlocks, "recon maxBlocks", 1, 6) });
+}
+
+const VISUAL_PROBE_SCOPE = ["v", "run", "life", "epoch", "id", "requestId", "captureId", "imageSha256"] as const;
+
+function visualProbeScope(raw: Record<string, unknown>): MacroVisualProbeScope {
+  return { v: version(raw.v), run: validateMacroId(raw.run, "run"), life: whole(raw.life, "life", 1, 2_147_483_647),
+    epoch: whole(raw.epoch, "epoch", 1), id: visualUuid(raw.id, "probe id"),
+    requestId: visualUuid(raw.requestId, "visual request id"), captureId: validateMacroCaptureId(raw.captureId),
+    imageSha256: imageSha256(raw.imageSha256) };
+}
+
+export function parseMacroVisualProbe(value: unknown): MacroVisualProbe {
+  const raw = shape(value, "visual probe", [...VISUAL_PROBE_SCOPE, "basisTick", "expiresTick", "region"]);
+  const basisTick = whole(raw.basisTick, "probe basisTick", 1, Number.MAX_SAFE_INTEGER - MACRO_VISUAL_PROBE_MAX_TICKS);
+  return Object.freeze({ ...visualProbeScope(raw), basisTick,
+    expiresTick: whole(raw.expiresTick, "probe expiresTick", basisTick + 1, basisTick + MACRO_VISUAL_PROBE_MAX_TICKS),
+    region: visualRegion(raw.region) });
+}
+
+export function parseMacroVisualProbeResult(value: unknown): MacroVisualProbeResult {
+  const status = choice(object(value, "visual probe result").status, "visual probe status", ["witnessed", ...visualMissStatuses] as const);
+  const raw = shape(value, "visual probe result", [...VISUAL_PROBE_SCOPE, "tick", "status",
+    ...(status === "witnessed" ? ["candidateId", "subject", "distanceBlocks"] : [])]);
+  const scope = { ...visualProbeScope(raw), tick: whole(raw.tick, "probe result tick", 1) };
+  if (status !== "witnessed") return Object.freeze({ ...scope, status });
+  const { candidateId, subject } = raw;
+  if (typeof candidateId !== "string" || !visualCandidatePattern.test(candidateId)) invalid("visual candidate id");
+  if (typeof subject !== "string" || subject.length > 128 || !/^block:[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(subject))
+    invalid("visual candidate subject");
+  return Object.freeze({ ...scope, status, candidateId, subject,
+    distanceBlocks: finite(raw.distanceBlocks, "visual candidate distance", 12) });
+}
+
 function directMaterialPrefix(verb: string): string | undefined {
   switch (verb) {
     case "break": return "block:";
@@ -855,7 +987,8 @@ function parseStartAnchor(record: Record<string, unknown>, field: string): Macro
 export function parseMacroObservation(value: unknown): MacroObservation {
   const record = shape(value, "observation", [
     "v", "run", "life", "tick", "epoch", "goal", "health", "food", "inventory", "opportunities", "recent", "quiescent",
-  ], ["safety", "working", "workOrder", "pendingWork", "stance", "prospectOpening", "surfaceOpening", "timberObstruction", "travelHint"]);
+  ], ["safety", "working", "workOrder", "pendingWork", "stance", "prospectOpening", "surfaceOpening", "timberObstruction", "travelHint",
+    "visualReady"]);
   const inventory = Object.create(null) as Record<string, number>;
   const entries = Object.entries(object(record.inventory, "inventory"));
   if (entries.length > 128) invalid("inventory");
@@ -883,10 +1016,13 @@ export function parseMacroObservation(value: unknown): MacroObservation {
         : verb === "approach" && risk === "low"
           ? subject === "route:dry" || independentGroundScout(subject) ||
             subject === woodlandAnchorSubject || subject.startsWith("block:minecraft:")
-          : (verb === "survey" || verb === "follow") && risk === "guarded" && subject === "route:dry";
+          : verb === MACRO_RECON
+            ? risk === "low" && subject === MACRO_RECON_ANCHOR && typeof raw.target === "string" && visualCandidatePattern.test(raw.target)
+            : (verb === "survey" || verb === "follow") && risk === "guarded" && subject === "route:dry";
       if (!valid) invalid("rendered anchor subject/verb");
       anchor = Object.freeze({ subject, target: validateMacroId(raw.target, "rendered anchor target") });
     }
+    if (verb === MACRO_RECON && !anchor) invalid("recon anchor");
     let material: MacroOpportunity["material"];
     if (Object.hasOwn(offer, "material")) {
       const prefix = directMaterialPrefix(verb);
@@ -1072,6 +1208,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
   if (food.length && (record.stance === undefined || !safety?.clear || working || pendingWork || workOrder?.state === "working" ||
       food.length > 2 || new Set(food.map(offer => offer.material!.subject)).size !== food.length))
     invalid("food clue scope");
+  if (Object.hasOwn(record, "visualReady") && record.visualReady !== true) invalid("visualReady");
   return Object.freeze({
     v: version(record.v), ...basis(record), goal: text(record.goal, "goal", 256),
     health: finite(record.health, "health", 1_024), food: whole(record.food, "food", 0, 20),
@@ -1082,6 +1219,7 @@ export function parseMacroObservation(value: unknown): MacroObservation {
     ...(surfaceOpening ? { surfaceOpening } : {}),
     ...(timberObstruction ? { timberObstruction } : {}),
     ...(workOrder ? { workOrder } : {}), ...(pendingWork ? { pendingWork } : {}),
+    ...(record.visualReady === true ? { visualReady: true as const } : {}),
     ...(Object.hasOwn(record, "stance") ? { stance: whole(record.stance, "stance", 1) } : {}),
   });
 }
@@ -1089,14 +1227,17 @@ export function parseMacroObservation(value: unknown): MacroObservation {
 export function parseMacroIntent(value: unknown): MacroIntent {
   const record = shape(value, "intent", [
     "v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "opportunityId", "skillHash",
-  ]);
+  ], ["recon"]);
   const basisTick = whole(record.basisTick, "basisTick", 1, Number.MAX_SAFE_INTEGER - MACRO_MAX_INTENT_TTL_TICKS);
   if (record.skillHash !== null && (typeof record.skillHash !== "string" || !hashPattern.test(record.skillHash))) invalid("skillHash");
+  const recon = Object.hasOwn(record, "recon") ? reconBounds(shape(record.recon, "recon bounds", ["maxLegs", "maxBlocks"])) : undefined;
+  if (recon && record.skillHash !== null) invalid("recon intent skillHash");
   return Object.freeze({
     v: version(record.v), id: validateMacroId(record.id, "intent id"), run: validateMacroId(record.run, "run"),
     life: whole(record.life, "life", 1, 2_147_483_647), epoch: whole(record.epoch, "epoch", 1), basisTick,
-    expiresTick: whole(record.expiresTick, "expiresTick", basisTick + 1, basisTick + MACRO_MAX_INTENT_TTL_TICKS),
+    expiresTick: whole(record.expiresTick, "expiresTick", basisTick + 1, basisTick + (recon ? MACRO_RECON_MAX_TICKS : MACRO_MAX_INTENT_TTL_TICKS)),
     opportunityId: validateMacroId(record.opportunityId, "opportunity id"), skillHash: record.skillHash,
+    ...(recon ? { recon } : {}),
   });
 }
 
@@ -1172,7 +1313,7 @@ export function parseMacroProposal(value: unknown): MacroProposal {
   const rawAction = object(record.action, "action");
   const kind = choice(rawAction.kind, "action kind",
     ["opportunity", "continuation", "successor", "work", "work-program", "renew-work", "revoke-work", "collect-pending", "defer-pending",
-      "skill", "tested-skill", "selected-skill", "gap", "abstain"] as const);
+      "skill", "tested-skill", "selected-skill", "gap", "abstain", "nominate-visible", "recon"] as const);
   let action: MacroProposal["action"];
   switch (kind) {
     case "work": {
@@ -1210,6 +1351,15 @@ export function parseMacroProposal(value: unknown): MacroProposal {
     case "opportunity":
       shape(rawAction, "opportunity action", ["kind", "opportunityId"]);
       action = { kind, opportunityId: validateMacroId(rawAction.opportunityId, "opportunity id") };
+      break;
+    case "nominate-visible":
+      shape(rawAction, "nominate-visible action", ["kind", "captureId", "imageSha256", "region"]);
+      action = { kind, captureId: validateMacroCaptureId(rawAction.captureId), imageSha256: imageSha256(rawAction.imageSha256),
+        region: visualRegion(rawAction.region) };
+      break;
+    case "recon":
+      shape(rawAction, "recon action", ["kind", "opportunityId", "maxLegs", "maxBlocks"]);
+      action = { kind, opportunityId: validateMacroId(rawAction.opportunityId, "opportunity id"), ...reconBounds(rawAction) };
       break;
     case "continuation": {
       shape(rawAction, "continuation action", ["kind", "opportunityId", "steps", "reserves"]);
@@ -1466,9 +1616,10 @@ export class MacroDirectory {
       }
       try {
         const info = await file.stat();
-        if (!info.isFile() || info.uid !== process.getuid!() || (info.mode & 0o022) !== 0 ||
+        const privateVisual = name === "visual-probe.json" || name === "visual-probe-result.json";
+        if (!info.isFile() || info.uid !== process.getuid!() || (privateVisual ? (info.mode & 0o7777) !== 0o600 : (info.mode & 0o022) !== 0) ||
             info.size < 1 || info.size > FILE_BYTES[name]) throw new Error(`Invalid macro IPC file: ${name}.`);
-        if (name === "observation.json" && info.nlink === 0) {
+        if ((name === "observation.json" || name === "visual-probe-result.json") && info.nlink === 0) {
           // Native publishes by atomic replacement. A displaced, otherwise
           // admissible snapshot is not evidence; reopen the pinned path once.
           if (retry !== 0) throw new MacroObservationRotating();
@@ -1490,7 +1641,7 @@ export class MacroDirectory {
     }
   }
 
-  async write(name: "active.json" | "intent.json" | "handoff.json" | "planning.json" | "work.json", value: unknown,
+  async write(name: "active.json" | "intent.json" | "handoff.json" | "planning.json" | "work.json" | "visual-probe.json", value: unknown,
     replace?: "work-only"): Promise<void> {
     if (replace && name !== "work.json") throw new Error("Only a durable work order may be replaced atomically.");
     const content = JSON.stringify(value) + "\n";
@@ -1508,7 +1659,7 @@ export class MacroDirectory {
     }
   }
 
-  async remove(name: "active.json" | "intent.json" | "handoff.json" | "planning.json" | "work.json" | `.tmp-${string}`): Promise<void> {
+  async remove(name: "active.json" | "intent.json" | "handoff.json" | "planning.json" | "work.json" | "visual-probe.json" | `.tmp-${string}`): Promise<void> {
     try { await unlink(this.entry(name)); } catch (error) { if (!missing(error)) throw error; }
   }
 

@@ -70,6 +70,7 @@ public final class AgentClient implements ClientModInitializer {
     private AgentProgress progress;
     private AgentEars ears;
     private AgentMacroControl macro;
+    private AgentVisual visual;
     private AgentPendingFurnaceMemory pendingFurnaceMemory;
     private AgentPauseEpisodes pauses;
     private ClientPlayerEntity continuityPlayer;
@@ -347,6 +348,16 @@ public final class AgentClient implements ClientModInitializer {
         finally { movement = contacts = looks = null; }
     }
 
+    public static void beginVisualRender() {
+        var actor = active;
+        if (actor != null && actor.visual != null && !actor.ended) actor.visual.begin(actor.body);
+    }
+
+    public static void finishVisualRender() {
+        var actor = active;
+        if (actor != null && actor.visual != null && !actor.ended) actor.visual.renderTail(actor.body, actor.tick);
+    }
+
     public static void steerFrame() {
         if (active != null && active.progress != null && !active.ended) {
             MinecraftClient client = MinecraftClient.getInstance();
@@ -411,6 +422,10 @@ public final class AgentClient implements ClientModInitializer {
         pendingFurnaceMemory = new AgentPendingFurnaceMemory(directory);
         if (ownedSinglePlayer) pendingFurnaceMemory.bind(client.player.getUuid(), 1, tick, 0);
         macro = AgentMacroControl.create(directory, goal, pendingFurnaceMemory);
+        // The runner keeps every prepared/diagnostic actor in its separate trusted evidence root.
+        if (macro != null && macro.visualTransportEnabled()
+                && !directory.getParent().endsWith("diagnostic-runs"))
+            visual = new AgentVisual(directory.resolve("macro"), directory.getFileName().toString(), client, macro);
         bindPolicy(client);
         if (macro == null || !macro.trial()) pauses = new AgentPauseEpisodes(directory, tick);
         return true;
@@ -418,6 +433,7 @@ public final class AgentClient implements ClientModInitializer {
 
     private void bindPolicy(MinecraftClient client) {
         body = new AgentBody(client, this::recordContact, this::recordLook, lookSeed + respawns);
+        if (visual != null) body.bindVisual(visual);
         hands = new AgentHands(client);
         progress = new AgentProgress(client, body, hands, goal, new AgentMemory(directory));
         craftSequence = stallSequence = 0;
@@ -438,6 +454,7 @@ public final class AgentClient implements ClientModInitializer {
     }
 
     private void releaseLifeInputs(MinecraftClient client) {
+        if (visual != null) visual.invalidate();
         body.finishWorldLook();
         body.release();
         hands.discardLifeInputs();
@@ -447,6 +464,10 @@ public final class AgentClient implements ClientModInitializer {
 
     private void stopMacro(String cause, String reason) {
         if (pauses != null) pauses.close(cause);
+        if (visual != null) {
+            visual.close();
+            visual = null;
+        }
         if (macro == null) return;
         macro.suspend(tick, reason);
         macro.close(cause);
@@ -609,6 +630,7 @@ public final class AgentClient implements ClientModInitializer {
         if (!playing(client) || client.interactionManager == null) {
             // World changes sometimes clear the actor while the original connection stays open.
             observeContinuityIdle();
+            if (visual != null) visual.invalidate();
             pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
             if (macro != null) macro.suspend(tick, "The player left the current Survival view.");
             body.release();
@@ -625,6 +647,7 @@ public final class AgentClient implements ClientModInitializer {
         if (client.player.isSprinting()) ++sprintTicks;
         progress.observeMemoryFooting(tick);
         body.begin();
+        if (visual != null) visual.beginTick(tick);
         if (macro != null) macro.begin(client, body, hands, renderedScreen, tick, 1 + respawns);
         long fuseCheckNs = System.nanoTime();
         var fuse = ears.takeFuseCue();
@@ -707,6 +730,7 @@ public final class AgentClient implements ClientModInitializer {
                 fuseCursorItem = null;
             }
         }
+        if (visual != null) visual.tick(body);
         if (macro != null) macro.end(progress, fleeing ? "A primed creeper owns emergency movement." :
             "The local safety or completion controller owns this tick.");
         observeContinuity(client, fleeing && ears.advancedOnFuse(), macro == null ? null : macro.continuityWork());

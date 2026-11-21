@@ -11,6 +11,7 @@ import { filterPreparedStockProposal } from "./prepared-stock.ts";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_COLLECT_PENDING, MACRO_DEFER_PENDING, MACRO_DIAMOND_PROSPECT, MACRO_FOOD_CLUE,
   MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
+  MACRO_RECON, MACRO_RECON_ANCHOR, MACRO_RECON_MAX_TICKS, MACRO_VISUAL_WITNESS_MAX_TICKS,
   MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
   MACRO_MAX_HANDOFF_TTL_TICKS, MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS, MACRO_MAX_PLANNING_IDLE_MS, MACRO_LOOKAHEAD_MAX_AGE_TICKS, MACRO_LOOKAHEAD_MAX_CRACK,
@@ -20,12 +21,14 @@ import {
   harvestAnchorMatchesPolicy, hasSurfaceCoverEffect, matchesMaterial, openingViewMatchesPolicy,
   sameTravelTarget, surfaceAnchorMatchesPolicy, travelHintMatchesPolicy,
   parseMacroHandoff, parseMacroIntent, parseMacroObservation, parseMacroPlanning,
-  parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroWorkOrder, sameLiveCorrectionScope, validateMacroId,
+  parseMacroProposal, parseMacroReceipt, parseMacroRevocation, parseMacroVisualProbe, parseMacroVisualProbeResult,
+  parseMacroWorkOrder, sameLiveCorrectionScope, validateMacroCaptureId, validateMacroId,
   type MacroBasis, type MacroDirectAction, type MacroFeedback, type MacroFrame, type MacroHandoff, type MacroInference, type MacroIntent,
   type MacroLookahead, type MacroObservation, type MacroOpportunity, type MacroParkedReceipt, type MacroPendingWork, type MacroPlanning,
   type MacroProposal, type MacroReceipt, type MacroReplyRejection, type MacroRequest, type MacroSkillReceipt, type MacroStockFloor,
   type MacroStrategist, type MacroSuccessor,
-  type MacroTravelHint, type MacroTrigger, type MacroWorkDemand, type MacroWorkMode, type MacroWorkOrder,
+  type MacroTravelHint, type MacroTrigger, type MacroVisualBinding, type MacroVisualProbe, type MacroVisualProbeResult,
+  type MacroWorkDemand, type MacroWorkMode, type MacroWorkOrder,
   type MacroWorkPolicy, type MacroWorkStage,
   type NativeReceiptCursor,
 } from "./protocol.ts";
@@ -34,6 +37,7 @@ import type { NativeGapReview } from "./gap-review.ts";
 import type { MacroSkillProposal, SurvivalMacroSkills } from "./skills.ts";
 import { VANILLA_HARVEST } from "./vanilla-harvest.ts";
 import { preflightVanillaWork, type VanillaWorkDiagnostic } from "./vanilla-work.ts";
+import { sameNativeFrameScope } from "./visual-capture.ts";
 
 export interface MacroLimits {
   readonly maxRequests: number;
@@ -86,6 +90,8 @@ const ALTERNATIVE_RECOVERY_MS = 5_000;
 // publications and a short wall-clock bound for a fresh physical handoff.
 const FIRST_ACTIONABLE_VIEW_TICKS = 10;
 const FIRST_ACTIONABLE_VIEW_MS = 600;
+const VISUAL_PROBE_TICKS = 40;
+const VISUAL_WITNESS_MS = 30_000;
 
 type TrialResult =
   | { readonly status: "passed"; readonly detail: string; readonly verb: string }
@@ -101,9 +107,13 @@ export type UnavailableFrame = {
   readonly cause: "unavailable";
   readonly failure: DisplayCaptureFailure;
   readonly adapter?: "scrot" | "ffmpeg";
+  readonly captureSource?: MacroFrame["captureSource"];
+  readonly nativeOmission?: string;
+  readonly nativeCaptureMs?: number;
 };
 
-type FrameCapture = MacroFrame | UnavailableFrame | { readonly cause: "basis_changed" };
+type FrameCapture = MacroFrame | UnavailableFrame | { readonly cause: "basis_changed";
+  readonly captureSource?: MacroFrame["captureSource"]; readonly nativeOmission?: string; readonly nativeCaptureMs?: number };
 
 export interface SurvivalMacroConfig {
   readonly runDir: string;
@@ -281,6 +291,23 @@ interface Decision {
   readonly reconsideration?: IntentRecovery;
   readonly reacquiredTravelOf?: string;
   readonly firstLiveReadOf?: string;
+  readonly visual?: MacroRequest["visual"];
+  readonly visualFollowup?: true;
+  deliveredVisual?: MacroVisualBinding & { readonly imageSha256: string; readonly verify: () => Promise<boolean> };
+}
+
+interface VisualProbe {
+  readonly wire: MacroVisualProbe;
+  readonly source: MacroObservation;
+  readonly startedAt: number;
+  readonly until: number;
+}
+
+interface VisualFinding {
+  readonly probe: VisualProbe;
+  readonly result: MacroVisualProbeResult;
+  readonly receivedAt: number;
+  followedUp?: true;
 }
 
 class FrameRejected extends Error {
@@ -339,6 +366,7 @@ interface Issued {
   readonly openingWorkView?: true;
   readonly reserves?: readonly MacroStockFloor[];
   readonly priorTargets?: ReadonlySet<string>;
+  readonly reconUntil?: number;
   withdrawn?: true;
   lookedAhead?: true;
   accepted?: MacroReceipt;
@@ -508,7 +536,7 @@ function offersAffordance(observation: MacroObservation, offer: Omit<MacroOpport
 }
 
 function workAffordance(offer: MacroOpportunity): boolean {
-  return offer.risk !== "read" || offer.material !== undefined || !!offer.anchor && isOpeningView(offer);
+  return offer.verb !== MACRO_RECON && (offer.risk !== "read" || offer.material !== undefined || !!offer.anchor && isOpeningView(offer));
 }
 
 function emptyFirstWorkView(view: MacroObservation): boolean {
@@ -600,7 +628,8 @@ function evidenceKey(observation: MacroObservation): string {
   return digest([
     observation.life, observation.epoch, observation.goal, guardBand(observation.health), guardBand(observation.food),
     Object.entries(observation.inventory).sort(([a], [b]) => a.localeCompare(b)),
-    orderedOpportunities(observation), observation.quiescent, observation.prospectOpening, observation.surfaceOpening, observation.timberObstruction,
+    orderedOpportunities(observation).filter(offer => offer.verb !== MACRO_RECON),
+    observation.quiescent, observation.prospectOpening, observation.surfaceOpening, observation.timberObstruction,
     [...new Set(observation.recent)].sort(),
   ]);
 }
@@ -897,6 +926,9 @@ export class SurvivalMacroController {
   private readonly testedCandidates = new Map<string, ProvenCandidate>();
   private handoffAfterTick = -1;
   private pending?: Issued;
+  private visualProbe?: VisualProbe;
+  private visualFinding?: VisualFinding;
+  private readonly visualBases = new Set<string>();
   private readonly jobs = new Map<string, WorkJob>();
   private job?: WorkJob;
   /** Until candidate acceptance, native still owns this exact older lease. */
@@ -1069,6 +1101,137 @@ export class SurvivalMacroController {
       now - this.startedAt! < this.limits.maxRuntimeMs;
   }
 
+  private isVisualHandoff(observation: MacroObservation): boolean {
+    return !!this.workMode && this.capabilitiesVersion === MACRO_CAPABILITIES_VERSION &&
+      !this.firstPlanning && !this.config.preparedStockReady &&
+      !this.queuedWork && !this.pendingSuccessor && !this.direct && !this.segment && !this.conditional && !this.lease &&
+      this.isCurrentHandoff(observation) && observation.visualReady === true &&
+      observation.stance !== undefined && observation.safety?.clear === true && !observation.pendingWork && !observation.working;
+  }
+
+  private visualBasis(observation: MacroObservation): string {
+    // Ticks, opaque render IDs and animated pixels alone are not a new physical premise.
+    return digest([observation.run, observation.life, observation.epoch, observation.goal, observation.stance, observation.safety?.revision]);
+  }
+
+  private currentVisualFinding(observation: MacroObservation): VisualFinding | undefined {
+    const finding = this.visualFinding;
+    if (finding && sameOpeningStance(finding.probe.source, observation) && observation.tick >= finding.result.tick &&
+        observation.tick < finding.result.tick + MACRO_VISUAL_WITNESS_MAX_TICKS &&
+        performance.now() - finding.probe.startedAt < VISUAL_WITNESS_MS) return finding;
+  }
+
+  private reconOffer(observation: MacroObservation, finding = this.currentVisualFinding(observation)): MacroOpportunity | undefined {
+    const result = finding?.result;
+    const reserves = this.floorScope?.life === observation.life ? this.floorScope.reserves : [];
+    if (result?.status !== "witnessed" || !this.isVisualHandoff(observation) || !hasStock(observation, reserves)) return;
+    return observation.opportunities.find(offer => offer.verb === MACRO_RECON && offer.risk === "low" &&
+      offer.anchor?.subject === MACRO_RECON_ANCHOR && offer.anchor.target === result.candidateId &&
+      !this.effectKeys.has(digest([MACRO_RECON, observation.life, observation.epoch, result.candidateId])));
+  }
+
+  private visualContext(observation: MacroObservation): MacroRequest["visual"] {
+    if (!this.isVisualHandoff(observation)) return;
+    const finding = this.currentVisualFinding(observation);
+    const mayNominate = !!this.config.frame && !this.visualBases.has(this.visualBasis(observation));
+    if (!finding) return mayNominate ? { mayNominate } : undefined;
+    const { result, probe } = finding;
+    const { tick } = result;
+    const read = result.status === "witnessed"
+      ? { tick, region: probe.wire.region, status: result.status,
+        candidateId: result.candidateId, subject: result.subject, distanceBlocks: result.distanceBlocks }
+      : { tick, region: probe.wire.region, status: result.status };
+    const offer = this.reconOffer(observation, finding);
+    return { mayNominate, read, ...(offer ? { reconOpportunityId: offer.id } : {}) };
+  }
+
+  private visualWake(observation: MacroObservation): VisualFinding | undefined {
+    if (!this.isVisualHandoff(observation)) return;
+    const finding = this.currentVisualFinding(observation);
+    if (!finding || finding.followedUp) return;
+    // A witnessed result and its optional motor offer may arrive in either order.
+    if (finding.result.status === "witnessed" && !this.reconOffer(observation, finding) &&
+        observation.tick - finding.result.tick < FIRST_ACTIONABLE_VIEW_TICKS &&
+        performance.now() - finding.receivedAt < FIRST_ACTIONABLE_VIEW_MS) return;
+    return finding;
+  }
+
+  private async finishVisualProbe(reason: string, result?: MacroVisualProbeResult): Promise<void> {
+    const probe = this.visualProbe;
+    if (!probe) return;
+    await this.ipc!.remove("visual-probe.json");
+    this.visualProbe = undefined;
+    await this.record("visual_probe_outcome", { requestId: probe.wire.requestId, id: probe.wire.id, reason, ...(result ? { result } : {}) });
+    if (result) this.visualFinding = { probe, result, receivedAt: performance.now() };
+  }
+
+  private async advanceVisualProbe(current: MacroObservation | undefined, runtimeExpired: boolean): Promise<void> {
+    const probe = this.visualProbe;
+    if (!probe) return;
+    const wire = probe.wire;
+    if (runtimeExpired || !current || !sameOpeningStance(probe.source, current) ||
+        current.tick >= wire.expiresTick || performance.now() >= probe.until) {
+      await this.finishVisualProbe(runtimeExpired ? "runtime_wall_limit" :
+        !current || !sameOpeningStance(probe.source, current) ? "visual_scope_changed" : "visual_probe_expired");
+      return;
+    }
+    let result: MacroVisualProbeResult | null;
+    try { result = await this.ipc!.read("visual-probe-result.json", parseMacroVisualProbeResult); }
+    catch (error) {
+      if (error instanceof MacroObservationRotating) return;
+      throw error;
+    }
+    if (!result || result.id !== wire.id) return;
+    if (result.run !== wire.run || result.life !== wire.life || result.epoch !== wire.epoch ||
+        result.requestId !== wire.requestId || result.captureId !== wire.captureId || result.imageSha256 !== wire.imageSha256 ||
+        result.tick < wire.basisTick || result.tick > wire.expiresTick) {
+      await this.finishVisualProbe("visual_result_binding_mismatch");
+      return;
+    }
+    if (result.tick > current.tick) return;
+    await this.finishVisualProbe("native_result", result);
+  }
+
+  private async nominateVisual(plan: Plan, action: Extract<MacroProposal["action"], { kind: "nominate-visible" }>): Promise<void> {
+    const delivered = plan.deliveredVisual;
+    const reason = "Visual nomination requires the exact native render and bytes actually dispatched for this request.";
+    if (!plan.visual?.mayNominate || !delivered || delivered.captureId !== action.captureId ||
+        delivered.imageSha256 !== action.imageSha256 || !await delivered.verify()) {
+      await this.record("visual_nomination_refused", { requestId: plan.requestId, reason });
+      return;
+    }
+    const current = await this.refresh();
+    const source = plan.observation;
+    if (!current || !this.isVisualHandoff(current) || !sameOpeningStance(source, current) ||
+        current.tick >= Math.min(plan.proposal.expiresTick, source.tick + MACRO_VISUAL_WITNESS_MAX_TICKS)) {
+      await this.record("visual_nomination_refused", { requestId: plan.requestId, reason: "The live camera or probe expiry changed." });
+      return;
+    }
+    const key = this.visualBasis(source);
+    if (this.visualBases.has(key)) {
+      await this.record("visual_nomination_refused", { requestId: plan.requestId, reason: "This unchanged visual stance was already nominated." });
+      return;
+    }
+    const expiresTick = Math.min(plan.proposal.expiresTick, current.tick + VISUAL_PROBE_TICKS,
+      source.tick + MACRO_VISUAL_WITNESS_MAX_TICKS);
+    const wire = parseMacroVisualProbe({ v: 1, run: current.run, life: current.life, epoch: current.epoch, basisTick: current.tick,
+      id: randomUUID(), requestId: plan.requestId, captureId: action.captureId, imageSha256: action.imageSha256, expiresTick,
+      region: action.region });
+    await this.record("visual_probe_prepared", { requestId: plan.requestId, probe: wire, imageBasis: basis(source) });
+    if (this.closing) return;
+    const fresh = await this.refresh();
+    if (!fresh || !this.isVisualHandoff(fresh) || !sameOpeningStance(current, fresh) || fresh.tick >= expiresTick) {
+      await this.record("visual_nomination_refused", { requestId: plan.requestId, reason: "The live camera changed before publication." });
+      return;
+    }
+    this.visualBases.add(key);
+    this.visualFinding = undefined;
+    const startedAt = performance.now();
+    this.visualProbe = { wire, source, startedAt, until: startedAt + VISUAL_PROBE_TICKS * 50 };
+    await this.ipc!.write("visual-probe.json", wire);
+    await this.record("visual_probe_issued", { requestId: plan.requestId, id: wire.id });
+  }
+
   private schedule(): void {
     if (this.closing || this.faulted || !this.markerLive) return;
     this.timer = setTimeout(() => {
@@ -1098,9 +1261,10 @@ export class SurvivalMacroController {
     const observed = await this.refresh();
     await this.readReceipts();
     if (this.closing) return;
-    const [mailbox, barrier, planning, order] = await Promise.all([
+    const [mailbox, barrier, planning, order, probe] = await Promise.all([
       ipc.read("intent.json", parseMacroIntent), ipc.read("handoff.json", parseMacroHandoff), ipc.read("planning.json", parseMacroPlanning),
       this.workMode ? ipc.read("work.json", parseMacroWorkOrder) : null,
+      ipc.read("visual-probe.json", parseMacroVisualProbe),
     ]);
     if (mailbox ? !this.pending || digest(mailbox) !== digest(this.pending.intent) : !!this.pending) {
       throw new Error("Survival macro intent mailbox changed outside its owner.");
@@ -1114,10 +1278,18 @@ export class SurvivalMacroController {
     if (order ? !this.job || digest(order) !== digest(this.job.order) : !!this.job) {
       throw new Error("Survival macro work mailbox changed outside its owner.");
     }
+    if (probe ? !this.visualProbe || digest(probe) !== digest(this.visualProbe.wire) : !!this.visualProbe) {
+      throw new Error("Survival macro visual mailbox changed outside its owner.");
+    }
     const now = performance.now();
     const view = this.view;
     const current = view && now - this.observedAt <= this.limits.maxObservationAgeMs ? view.observation : undefined;
     const runtimeExpired = now - this.startedAt! >= this.limits.maxRuntimeMs;
+    if (this.visualProbe) {
+      if (!observed && current && !runtimeExpired) return;
+      await this.advanceVisualProbe(current, runtimeExpired);
+      if (this.visualProbe || this.closing) return;
+    }
     if (this.intentRecovery && (runtimeExpired || !current || this.pending || this.job || this.queuedWork ||
         !this.intentRecoveryCurrent(this.intentRecovery, current))) this.intentRecovery = undefined;
     if (this.firstPlanning) {
@@ -1165,6 +1337,9 @@ export class SurvivalMacroController {
     }
     if (this.pending && (runtimeExpired || !current || !scope(this.pending.scope, current) || !alive(current) ||
       (isPendingWorkVerb(this.pending.offer.verb) && !workScope(this.pending.scope, current)) ||
+      (this.pending.intent.recon && (!workScope(this.pending.scope, current) || !hasStock(current, this.pending.reserves ?? []) ||
+        now >= this.pending.reconUntil! || !this.pending.accepted &&
+        (!sameOpeningStance(this.pending.scope, current) || current.tick - this.pending.intent.basisTick >= WORK_ADMISSION_TICKS))) ||
       current.tick > this.pending.intent.expiresTick)) {
       await this.withdraw(runtimeExpired ? "runtime_wall_limit" : "native_scope_or_ttl_changed");
     }
@@ -1294,11 +1469,11 @@ export class SurvivalMacroController {
     if (!this.job && current.tick <= this.handoffAfterTick && !(this.workMode && current.pendingWork?.parked)) return;
     if (this.workMode) {
       if (this.requests === 0 && this.config.preparedStockReady && !this.config.preparedStockReady(current)) return;
-      await this.scheduleWork(this.view!);
+      await this.scheduleWork(this.view!, undefined, this.visualWake(current));
       return;
     }
     if (!this.config.strategist || !alive(current) || current.safety?.clear === false ||
-        (!current.quiescent && !current.opportunities.length)) return;
+        (!current.quiescent && !current.opportunities.some(offer => offer.verb !== MACRO_RECON))) return;
     const latest = this.view!;
     const correction = this.replyCorrection;
     if (!correction && this.queryKeys.has(latest.query)) {
@@ -1628,7 +1803,7 @@ export class SurvivalMacroController {
       (!order.duringWaitFor || this.parkedOrdinaryWindow(order.duringWaitFor, observation, job));
   }
 
-  private async scheduleWork(view: View, queue?: QueuedWork): Promise<void> {
+  private async scheduleWork(view: View, queue?: QueuedWork, visualWake?: VisualFinding): Promise<void> {
     const { observation } = view;
     const job = this.job;
     const ticket = observation.pendingWork;
@@ -1755,6 +1930,9 @@ export class SurvivalMacroController {
       key = evidence;
     }
     const asked = this.lastAsked?.observation;
+    const visualStart = !job && !queue && asked?.visualReady !== true && this.visualContext(observation)?.mayNominate
+      ? digest(["first visual handoff", this.visualBasis(observation)]) : undefined;
+    const newVisualStart = !!asked && !!visualStart && !this.workHandoffQueries.has(visualStart);
     const scout = !job && !queue && this.isCurrentHandoff(observation) && hasStock(observation,
       this.floorScope?.life === observation.life ? this.floorScope.reserves : [])
       ? observation.opportunities.find(offer => isGroundScout(offer) && !this.effectKeys.has(primitiveEffectKey(observation, offer)))
@@ -1782,7 +1960,8 @@ export class SurvivalMacroController {
       this.supersededOpeningCurrent(candidate, observation, evidence) ? candidate : undefined;
     if (candidate?.kind === "superseded-opening" && !superseded) this.intentRecovery = undefined;
     if (previous && observation.tick - previous.tick < WORK_REPLAN_GAP_TICKS && demand !== "renew" &&
-        !newTravelStart && !newObstruction && !newSurfaceStart && !newScout && !reacquiredTravelOf && !superseded && !firstLiveReadOf) return;
+        !newTravelStart && !newObstruction && !newSurfaceStart && !newScout && !reacquiredTravelOf && !superseded && !firstLiveReadOf &&
+        !visualWake && !newVisualStart) return;
     const pendingCorrection = this.replyCorrection;
     const correction = pendingCorrection?.renewal
       ? demand === "renew" && pendingCorrection.renewal === job && observation.tick > pendingCorrection.observation.tick
@@ -1790,15 +1969,16 @@ export class SurvivalMacroController {
       : !job ? pendingCorrection : undefined;
     const unchanged = previous && (key === previous.key || (!job && demand === "changed" && previous.evidence === evidence));
     const recovery = this.intentRecovery;
-    const reconsideration = !job && !correction && !queue ? (
+    const reconsideration = !job && !correction && !queue && !visualWake ? (
       superseded ?? (recovery?.kind === "restored-survey" && recovery.gapSeen && !observation.working &&
         this.isCurrentHandoff(observation) && this.intentRecoveryCurrent(recovery, observation, evidence) &&
         offersAffordance(observation, recovery.offer) ? recovery : this.alternativeRecovery(observation, evidence))
     ) : undefined;
-    if (obstructionQuery && this.workHandoffQueries.has(obstructionQuery) && !correction && !superseded) return;
+    if (obstructionQuery && this.workHandoffQueries.has(obstructionQuery) && !correction && !superseded && !visualWake) return;
     // An idle abstention can recover on a genuinely new actionable witness or
     // neutral handoff, not when the same affordance is issued a different ID.
-    const ordinaryUnchanged = unchanged && !correction && !reconsideration && !reacquiredTravelOf && !firstLiveReadOf;
+    const ordinaryUnchanged = unchanged && !correction && !reconsideration && !reacquiredTravelOf && !firstLiveReadOf && !visualWake &&
+      !newVisualStart;
     if (ordinaryUnchanged) {
       if (!newSurfaceStart && !newScout && (job || !previous.mayRecoverOnAffordance || !asked ||
           (!(observation.quiescent && !asked.quiescent) &&
@@ -1816,7 +1996,8 @@ export class SurvivalMacroController {
     if (obstructionQuery) this.workHandoffQueries.add(obstructionQuery);
     if (surfaceQuery) this.workHandoffQueries.add(surfaceQuery);
     if (scoutQuery) this.workHandoffQueries.add(scoutQuery);
-    if (!correction) this.workQuery = { key, tick: observation.tick, evidence };
+    if (visualStart) this.workHandoffQueries.add(visualStart);
+    if (!correction && !visualWake) this.workQuery = { key, tick: observation.tick, evidence };
     this.firstLiveWorkView = undefined;
     if (overlap?.smeltBurnTick !== undefined) overlap.incumbent.smeltLookedAhead = true;
     else if (overlap && owner) this.workOverlapRequests.add(owner);
@@ -1836,7 +2017,7 @@ export class SurvivalMacroController {
       lastOutcome: outcome?.terminal ? { id: outcome.order.id, policy: outcome.policy,
         receipt: outcome.terminal, nativeState: outcomeState } : null,
     };
-    await this.begin(view, { workDemand, workOverlap: overlap, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf });
+    await this.begin(view, { workDemand, workOverlap: overlap, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf }, visualWake);
   }
 
   private async scheduleParkedWork(view: View, ticket: NonNullable<MacroObservation["pendingWork"]>): Promise<void> {
@@ -2487,13 +2668,18 @@ export class SurvivalMacroController {
       if (digest(prior) !== digest(receipt)) throw new Error("Conflicting native survival macro receipt.");
       return;
     }
-    if (record.terminal || (record.accepted && receipt.tick < record.accepted.tick)) {
+    if (record.terminal || (record.accepted && receipt.tick < record.accepted.tick) ||
+        (record.intent.recon && receipt.status === "completed" && !record.accepted)) {
       throw new Error("Native survival macro receipt order is invalid.");
     }
     const staleLife = (this.view?.observation.life ?? receipt.life) > receipt.life;
-    const eligible = !record.withdrawn && !staleLife;
+    const current = this.view?.observation;
+    const reconScopeLost = !!record.intent.recon && !!current &&
+      (!scope(record.scope, current) || !workScope(record.scope, current) || !hasStock(current, record.reserves ?? []));
+    const eligible = !record.withdrawn && !staleLife && !reconScopeLost;
     await this.append(this.receipts, { requestId: record.requestId, intent: record.intent, receipt, eligible,
-      ...(record.withdrawn ? { afterWithdrawal: true } : {}), ...(staleLife ? { priorLife: true } : {}) });
+      ...(record.withdrawn ? { afterWithdrawal: true } : {}), ...(staleLife ? { priorLife: true } : {}),
+      ...(reconScopeLost ? { reconScopeLost: true } : {}) });
     if (receipt.status === "accepted") {
       record.accepted = receipt;
       return;
@@ -2518,7 +2704,9 @@ export class SurvivalMacroController {
         reason: "The fixed camera view completed. A changed physical affordance, not this receipt, can wake work planning." });
     }
     const scout = isGroundScout(record.offer);
-    if (eligible && !record.openingWorkView && !standaloneSurvey && !scout &&
+    const recon = !!record.intent.recon;
+    if (recon && eligible && record.accepted && this.workQuery) this.workQuery.mayRecoverOnAffordance = true;
+    if (eligible && !record.openingWorkView && !standaloneSurvey && !scout && !recon &&
         (!this.lastWorkQueryReceipt || this.lastWorkQueryReceipt.tick <= receipt.tick))
       this.lastWorkQueryReceipt = receipt;
     if (this.pending === record) {
@@ -2544,7 +2732,7 @@ export class SurvivalMacroController {
           receipt.status === "completed" ? "missing_native_acceptance" : `native_${receipt.status}`);
       }
     }
-    this.handoffAfterTick = Math.max(this.handoffAfterTick, standaloneSurvey || scout ? receipt.tick : receipt.tick - 1);
+    this.handoffAfterTick = Math.max(this.handoffAfterTick, standaloneSurvey || scout || recon ? receipt.tick : receipt.tick - 1);
     if (this.view) this.view = { ...this.view, query: this.queryKey(this.view.observation, this.view.evidence) };
   }
 
@@ -2660,6 +2848,7 @@ export class SurvivalMacroController {
   private async begin(
     view: View, { lookahead, workDemand, workOverlap, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf }:
       Pick<Decision, "lookahead" | "workDemand" | "workOverlap" | "correction" | "reconsideration" | "reacquiredTravelOf" | "firstLiveReadOf">,
+    visualWake?: VisualFinding,
   ): Promise<void> {
     const trigger = this.trigger(view);
     const observation = view.observation;
@@ -2691,6 +2880,12 @@ export class SurvivalMacroController {
       skills?.status(selection.hash) === "active" ? selection.hash : undefined;
     const testedSkills = this.availableCandidates(selection?.generation);
     const generation = selection && (selectedSkillHash || skillVerbs?.length || testedSkills.length) ? selection.generation : null;
+    const visual = !lookahead && !workDemand?.current && !workDemand?.parkedWorksite && !reconsideration ?
+      this.visualContext(observation) : undefined;
+    const resultingRead = visual?.read && (visualWake ?? this.currentVisualFinding(observation));
+    // Candidate IDs outside this request's independently confirmed read are not planner or skill affordances.
+    const opportunities = disclosed.opportunities.filter(offer => offer.verb !== MACRO_RECON || offer.id === visual?.reconOpportunityId);
+    if (opportunities.length !== disclosed.opportunities.length) disclosed = { ...disclosed, opportunities };
     const request: MacroRequest = {
       observation: disclosed, objective: this.objective, trigger, capabilitiesVersion: this.capabilitiesVersion,
       skillGeneration: generation, skillVerbs, selectedSkillHash, testedSkills,
@@ -2707,6 +2902,7 @@ export class SurvivalMacroController {
       } : correction?.feedback ?? this.currentFeedback(observation),
       ...(lookahead ? { lookahead: lookahead.evidence } : {}),
       ...(workDemand ? { work: workDemand } : {}),
+      ...(visual ? { visual } : {}),
     };
     if (!lookahead) {
       this.queryKeys.add(view.query);
@@ -2718,7 +2914,8 @@ export class SurvivalMacroController {
       ...(correction ? { correctionOf: correction.requestId } : {}),
       ...(reconsideration ? { reconsiderationOf: reconsideration.requestId, reconsideration: reconsideration.kind } : {}),
       ...(reacquiredTravelOf ? { reacquiredTravelOf } : {}),
-      ...(firstLiveReadOf ? { firstLiveReadOf } : {}) });
+      ...(firstLiveReadOf ? { firstLiveReadOf } : {}),
+      ...(resultingRead ? { visualFollowupOf: resultingRead.probe.wire.requestId } : {}) });
     if (this.closing || performance.now() - this.startedAt! >= this.limits.maxRuntimeMs) {
       await this.disposition("request_not_dispatched", { requestId, reason: this.closing ? "stop" : "runtime_wall_limit" });
       return;
@@ -2735,17 +2932,19 @@ export class SurvivalMacroController {
     }
     this.requests++;
     this.unreportedDispatches++;
+    if (resultingRead) resultingRead.followedUp = true;
     if (correction) this.replyCorrection = undefined;
     if (reconsideration) this.recoveredIntents.add(reconsideration.key);
     // A newer decision supersedes a failed primitive. Only a restored survey
     // can carry its allowance through one subsequent model-reported gap.
     if (reconsideration || this.intentRecovery?.kind === "alternative" || this.intentRecovery?.kind === "superseded-opening")
       this.intentRecovery = undefined;
+    const context: Decision = { requestId, observation, generation, testedSkills, selectedSkillHash,
+      lookahead, workDemand, workOverlap, replyKey, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf, visual,
+      ...(visualWake ? { visualFollowup: true } : {}) };
     this.busy = {
       kind: "inference",
-      work: this.work({ requestId, observation, generation, testedSkills, selectedSkillHash,
-        lookahead, workDemand, workOverlap, replyKey, correction, reconsideration, reacquiredTravelOf, firstLiveReadOf },
-      this.limits.requestTimeoutMs, async signal => {
+      work: this.work(context, this.limits.requestTimeoutMs, async signal => {
         if (lookahead) return this.config.strategist!(request, signal);
         if (workDemand?.parkedWorksite === "view-unavailable" ||
             workDemand?.current && (workDemand.current.id !== workDemand.duringWaitFor || !this.config.frame)) return this.config.strategist!({ ...request,
@@ -2781,11 +2980,31 @@ export class SurvivalMacroController {
           strategicEpisodes: this.episodeMemory.forObservation(observation),
         };
         if (!sample) return this.config.strategist!(input, signal);
-        const { artifact, ...frame } = sample;
+        const { artifact, visualBinding, ...ordinaryFrame } = sample;
+        const verify = artifact?.verify;
+        // Only an owned, immutable archive can carry native visual authority.
+        const binding = visual?.mayNominate && verify ? visualBinding : undefined;
+        const frame: MacroFrame = binding ? { ...ordinaryFrame, visualBinding: binding } : ordinaryFrame;
         let sent = false;
         try {
-          const result = await this.config.strategist!({ ...input, frame }, signal);
+          if (verify && !await verify()) {
+            await this.record("request_frame_omitted", { requestId, basis: basis(observation), cause: "unavailable",
+              reason: "The archived image was replaced before dispatch." });
+            return this.config.strategist!(input, signal);
+          }
+          signal.throwIfAborted();
+          let dispatchVerified = false;
+          const verifyFrameDispatch = binding && verify ? async () => {
+            const latest = await this.ipc!.read("observation.json", parseMacroObservation);
+            dispatchVerified = sameNativeFrameScope(observation, latest) && await verify();
+            return dispatchVerified;
+          } : verify;
+          const result = await this.config.strategist!({ ...input, frame, verifyFrameDispatch }, signal);
           sent = result.dispatched === true && result.frameSha256 === artifact?.sha256;
+          if (sent && dispatchVerified && binding && verify && artifact &&
+              result.frameVisualBinding?.captureId === binding.captureId && result.frameVisualBinding.renderFrame === binding.renderFrame) {
+            context.deliveredVisual = { ...binding, imageSha256: artifact.sha256, verify };
+          }
           return result;
         } finally {
           if (!sent) await discardFrame(sample);
@@ -2848,12 +3067,24 @@ export class SurvivalMacroController {
       if (artifact && (relativePath !== `macro-frames/${requestId}.${extension}` || artifact.sha256 !== sha256)) {
         throw new FrameRejected("invalid", "The display capture archive did not match its request or bytes.");
       }
+      if (sample.visualBinding) {
+        const binding = sample.visualBinding;
+        validateMacroCaptureId(binding.captureId);
+        if (!artifact?.verify || sample.mimeType !== "image/jpeg" || sample.captureSource === "x11" ||
+            !Number.isSafeInteger(binding.renderFrame) || binding.renderFrame < 1) {
+          throw new FrameRejected("invalid", "The native visual binding did not have an owned image and render identity.");
+        }
+      }
       if (!sameBasis(sample, observation)) throw new FrameRejected("stale", "The display capture used a stale observation basis.");
       await this.record("request_frame", { requestId, basis: basis(observation), sha256, relativePath,
-        bytes: sample.data.length, width: sample.width, height: sample.height, mimeType: sample.mimeType });
+        bytes: sample.data.length, width: sample.width, height: sample.height, mimeType: sample.mimeType,
+        ...(sample.captureSource || sample.visualBinding ? { captureSource: sample.captureSource ?? "native" } : {}),
+        ...(sample.nativeOmission ? { nativeOmission: sample.nativeOmission } : {}),
+        ...(sample.nativeCaptureMs !== undefined ? { nativeCaptureMs: sample.nativeCaptureMs } : {}),
+        ...(sample.visualBinding ? { visualBinding: sample.visualBinding } : {}) });
       const latest = await checkScope();
       signal.throwIfAborted();
-      if (sameBasis(latest, observation)) return sample;
+      if (sameBasis(latest, observation) || sample.visualBinding && sameNativeFrameScope(observation, latest)) return sample;
     } catch (error) {
       await discardFrame(sample);
       throw error;
@@ -3019,7 +3250,7 @@ export class SurvivalMacroController {
         this.correctedContexts.add(correction.key);
         if (this.workQuery) this.workQuery.tick = original.tick;
       }
-    } else if (!this.config.preparedStockReady && disposition === "invalid" && reason && rejection &&
+    } else if (!this.config.preparedStockReady && !context.visualFollowup && disposition === "invalid" && reason && rejection &&
         inference?.dispatched === true && current) {
       this.offerReplyCorrection(context, current,
         { kind: "invalid_reply", detail: `The previous tool reply was invalid. No effect was authorized. ${reason}` });
@@ -3049,6 +3280,7 @@ export class SurvivalMacroController {
       providerOutcome: inference?.outcome ?? null, dispatched: inference?.dispatched ?? (preflight ? false : null),
       latencyMs: Math.round(result.settledAt - startedAt), providerLatencyMs: positiveFinite(inference?.latencyMs),
       frameSha256: inference?.frameSha256 && /^[a-f0-9]{64}$/.test(inference.frameSha256) ? inference.frameSha256 : null,
+      ...(context.deliveredVisual ? { captureId: context.deliveredVisual.captureId, renderFrame: context.deliveredVisual.renderFrame } : {}),
       disposition, reason, proposal: recordedProposal,
       ...(filtered ? { filteredAction: proposal?.action.kind } : {}),
       ...(correction ? { correctionOf: correction.requestId } : {}),
@@ -3287,6 +3519,14 @@ export class SurvivalMacroController {
       await this.rejectStale(context, "primitive_premise_changed");
       return;
     }
+    if (action.kind === "nominate-visible") {
+      await this.nominateVisual({ ...context, proposal }, action);
+      return;
+    }
+    if (action.kind === "recon" && (inference?.dispatched !== true || context.visual?.reconOpportunityId !== action.opportunityId)) {
+      await this.record("visual_recon_refused", { requestId: context.requestId, reason: "A separate dispatched choice must name the confirmed recon offer." });
+      return;
+    }
     if (proposal.action.kind !== "abstain") {
       this.episodeMemory.chosen(context.requestId, original, proposal.subgoal, proposal.successCondition);
     }
@@ -3317,6 +3557,7 @@ export class SurvivalMacroController {
         return;
       }
       case "opportunity":
+      case "recon":
         this.ready = { kind: "plan", plan: { ...context, proposal } };
         return;
       case "continuation": {
@@ -3419,7 +3660,7 @@ export class SurvivalMacroController {
       }
       return;
     }
-    if (plan.proposal.action.kind === "opportunity") {
+    if (plan.proposal.action.kind === "opportunity" || plan.proposal.action.kind === "recon") {
       this.ready = undefined;
       await this.issue(plan, plan.observation, plan.proposal.action.opportunityId);
       return;
@@ -3793,6 +4034,14 @@ export class SurvivalMacroController {
       return false;
     }
     const action = plan.proposal.action;
+    const recon = action.kind === "recon" ? action : undefined;
+    const reconFinding = recon ? this.currentVisualFinding(current) : undefined;
+    if ((before.verb === MACRO_RECON) !== !!recon || (recon && (authority ||
+        plan.visual?.reconOpportunityId !== opportunityId || !reconFinding || !sameOffer(before, this.reconOffer(current, reconFinding))))) {
+      await this.disposition("proposal_refused", { requestId: plan.requestId,
+        reason: "Visual reconnaissance needs a separate bounded model choice of the exact current confirmed candidate." });
+      return false;
+    }
     const pendingAction = action.kind === "collect-pending" || action.kind === "defer-pending" ? action : undefined;
     const openingPolicy = action.kind === "work" && action.openingViewId === opportunityId ? action.policy : undefined;
     const scout = isGroundScout(before);
@@ -3808,6 +4057,8 @@ export class SurvivalMacroController {
       return false;
     }
     const usableHandoff = (observation: MacroObservation) => {
+      if (recon) return reconFinding === this.currentVisualFinding(observation) && sameOpeningStance(witnessed, observation) &&
+        hasStock(observation, reserves) && sameOffer(before, this.reconOffer(observation, reconFinding));
       if (scout) return this.isCurrentHandoff(observation) && sameOpeningStance(witnessed, observation) &&
         hasStock(observation, reserves) && (independentGroundScout(before.anchor.subject) ||
           observation.travelHint?.footing === "dry" && sameTravelTarget(before.anchor, observation.travelHint));
@@ -3836,12 +4087,13 @@ export class SurvivalMacroController {
         !after || !sameOffer(before, after) || (selection && after.risk === "guarded") ||
         (direct && (!directScope(direct, current) || !directConditions(direct, current) || !protectsStock(direct.action.reserves, current, after))) ||
         (conditional && (current.working || !successorScope(conditional, current) || !successorStock(conditional, current, after)))) {
-      if (!authority) this.rememberFailedIntent(plan, witnessed, before, current);
+      if (!authority && !recon) this.rememberFailedIntent(plan, witnessed, before, current);
       await this.rejectStale(plan, "opportunity_no_longer_witnessed");
       return false;
     }
     const key = pendingAction
       ? digest([current.life, pendingAction.kind, pendingAction.pendingWorkId, after?.evidence])
+      : recon ? digest([MACRO_RECON, current.life, current.epoch, before.anchor!.target])
       : primitiveEffectKey(current, after);
     const segmentKey = digest(after);
     if (this.effectKeys.has(key) || selection?.continuation?.seen.has(segmentKey)) {
@@ -3852,12 +4104,16 @@ export class SurvivalMacroController {
     const intent = parseMacroIntent({
       v: 1, id: randomUUID(), run: current.run, life: current.life, epoch: current.epoch, basisTick: current.tick,
       expiresTick: Math.min(plan.proposal.expiresTick, current.tick + this.limits.maxIntentTtlTicks,
-        direct ? current.tick + Math.max(1, Math.floor((direct.until - performance.now()) / 50)) : Infinity),
+        direct ? current.tick + Math.max(1, Math.floor((direct.until - performance.now()) / 50)) : Infinity,
+        reconFinding ? Math.min(current.tick + MACRO_RECON_MAX_TICKS, reconFinding.result.tick + MACRO_VISUAL_WITNESS_MAX_TICKS) : Infinity),
       opportunityId,
       skillHash: selection?.hash ?? null,
+      ...(recon ? { recon: { maxLegs: recon.maxLegs, maxBlocks: recon.maxBlocks } } : {}),
     });
     await this.record("intent_prepared", { requestId: plan.requestId, intent, witnessed: before,
       ...(openingPolicy ? { authority: "opening-view" } : {}),
+      ...(reconFinding ? { authority: "visual-recon", readRequestId: reconFinding.probe.wire.requestId,
+        candidateId: before.anchor!.target, reserves } : {}),
       ...(direct ? { authority: "direct-continuation", stage: direct.stage + 1,
         selector: direct.action.steps[direct.stage]!.selector, reserves: direct.action.reserves } : {}),
       ...(conditional ? { authority: "conditional-successor", predecessorId: conditional.action.afterIntentId,
@@ -3871,12 +4127,14 @@ export class SurvivalMacroController {
         (conditional && (refreshed.working || !successorScope(conditional, refreshed) || !successorStock(conditional, refreshed, after!))) ||
         (selection && (!selection.offer || !this.isSelectedSkill(selection.hash, selection.generation) ||
           !this.config.skills!.matchesSelection(selection.offer, refreshed, selection.continuation?.receipts)))) {
-      if (!authority && refreshed) this.rememberFailedIntent(plan, witnessed, before, refreshed);
+      if (!authority && !recon && refreshed) this.rememberFailedIntent(plan, witnessed, before, refreshed);
       await this.rejectStale(plan, "intent_basis_changed_at_publication");
       return false;
     }
     const macro: Issued = { requestId: plan.requestId, intent, scope: refreshed, offer: after!,
       ...(openingPolicy ? { openingWorkView: true } : {}),
+      ...(reconFinding ? { reserves, reconUntil: Math.min(performance.now() + MACRO_RECON_MAX_TICKS * 50,
+        reconFinding.probe.startedAt + VISUAL_WITNESS_MS) } : {}),
       ...(direct ? { reserves: direct.action.reserves, priorTargets: direct.usedTargets } : {}),
       ...(conditional ? { lookedAhead: true } : {}),
     };
@@ -3999,6 +4257,8 @@ export class SurvivalMacroController {
     try { await this.withdrawWork("authority_revoked"); await ipc.remove("work.json"); } catch (error) { errors.push(error); }
     try { await ipc.remove("intent.json"); } catch (error) { errors.push(error); }
     try { await ipc.remove("handoff.json"); this.lease = undefined; } catch (error) { errors.push(error); }
+    try { await this.finishVisualProbe("authority_revoked"); await ipc.remove("visual-probe.json"); }
+    catch (error) { errors.push(error); }
     try { await this.endPlanning("revoked"); } catch (error) { errors.push(error); }
     if (this.pendingSuccessor) await this.advancePendingSuccessor(undefined, true);
     if (this.queuedWork) await this.advanceQueuedWork(undefined, true);

@@ -17,10 +17,11 @@ import {
   MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
   MACRO_MAX_STRATEGIC_EPISODES, MACRO_MAX_WORK_STAGES, MacroObservationRotating, MacroValidationError,
   foodWorkWitness, hasDirectAuthority, isFoodWork, isIndependentPendingPolicy, isPendingWorkVerb,
-  openingViewMatchesPolicy, parseMacroProposal, validateMacroId,
+  openingViewMatchesPolicy, parseMacroProposal, validateMacroCaptureId, validateMacroId,
   MACRO_DIAMOND_PROSPECT, MACRO_FURNACE_PLACEMENT, MACRO_IRON_SMELT, MACRO_LIVE_ONLY_EFFECTS,
   MACRO_PENDING_SIDE_MAX_EFFECTS, MACRO_PENDING_SIDE_MAX_TICKS,
   MACRO_FOOD_CLUE, MACRO_PROSPECT_SUPPORT, MACRO_PROSPECT_TORCH,
+  MACRO_RECON, MACRO_RECON_ANCHOR, MACRO_VISUAL_WITNESS_MAX_TICKS,
   MACRO_WATER_CLUE, MACRO_WATER_FILL, MACRO_WATER_SOURCE, MACRO_WORK_TABLE_PLACEMENT,
   NATIVE_REVIEW_MAX_BYTES, NATIVE_REVIEW_MAX_FILE_BYTES, NATIVE_REVIEW_PATHS,
   type MacroBasis, type MacroFrame, type MacroInference, type MacroProposal, type MacroReplyRejection, type MacroRequest, type MacroStrategist,
@@ -83,6 +84,9 @@ If the descent lanes fail, the same job can follow a witnessed dry level foothol
 
 const WATER_PROMPT = `When a read-only ${MACRO_WATER_CLUE} clue names ${MACRO_WATER_SOURCE} and an empty bucket can be spent above its floor, choose a single live "work" action for {kind:"stock",item:"minecraft:water_bucket",count:1}. Set allowedEffects to ["${MACRO_WATER_FILL}"], costCaps to [{item:"minecraft:bucket",count:1}], and all three effect counters to zero. Preserve every reserve. The clue is not an opportunity to select: the native player stays on the same dry footing and uses only the exact rechecked source. Flowing water or a waterfall without a source clue is not enough. Await a completed native receipt and the bucket swap; do not renew a pending fill. This job does not grant movement, pouring, lava pickup, or portal casting.`;
 
+const VISUAL_PROMPT = `If the listed opportunities do not support the goal and the tool offers nominate-visible, you can ask about a specific useful region of this exact first-person image. Copy frame.captureId and frame.imageSha256. Use normalized top-left x/y and positive width/height up to 0.35, entirely inside the image. This only asks for a current visual check. It does not move, aim, act on an old pixel, or find hidden blocks.
+visualRead reports the new check, not whether the surface is reachable. If the tool separately offers recon, use it only for useful forward exploration toward that exact checked target. Quote maxLegs (1–3) and maxBlocks (1–6 cumulative), using the smallest useful bounds. Each leg needs fresh footing, clearance and stopping evidence. Recon does not authorize breaking, placing, using, spending, pickup, or blind jumps. An absent recon offer means no movement was authorized by the read; choose a separate supported action or abstain. Do not repeat an unchanged nomination.`;
+
 const string = { type: "string" };
 const integer = { type: "integer" };
 function strictObject(properties: Record<string, unknown>) {
@@ -144,10 +148,13 @@ function smeltSuccessorId(work?: MacroRequest["work"]): string | undefined {
       work.current.nativeState?.progress?.smeltBurn)
     return work.current.id;
 }
-const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroRequest["work"], observation?: MacroRequest["observation"]): Tool => {
+type VisualTool = { readonly nomination?: { readonly captureId: string; readonly imageSha256: string }; readonly reconId?: string };
+
+const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroRequest["work"],
+  observation?: MacroRequest["observation"], visual?: VisualTool): Tool => {
   const pending = observation?.pendingWork;
   const selectable = work?.current ? undefined : observation?.opportunities.filter(offer =>
-    !isPendingWorkVerb(offer.verb) && offer.verb !== MACRO_WATER_CLUE && offer.verb !== MACRO_FOOD_CLUE &&
+    !isPendingWorkVerb(offer.verb) && offer.verb !== MACRO_WATER_CLUE && offer.verb !== MACRO_FOOD_CLUE && offer.verb !== MACRO_RECON &&
     (work?.mode !== "constrained" || offer.risk !== "guarded")).map(offer => offer.id);
   const smeltId = smeltSuccessorId(work);
   const predecessorIds = [...new Set([work?.current?.accepted ? work.current.id : undefined,
@@ -157,11 +164,20 @@ const proposalTool = (nativeReview: boolean, direct: boolean, work?: MacroReques
   const renewal = work?.demand === "renew" ? work.renewal : undefined;
   const noParkedView = work?.parkedWorksite === "view-unavailable";
   const openingViewIds = work?.openingViewIds;
+  const unit = { type: "number", minimum: 0, maximum: 1 };
+  const extent = { type: "number", exclusiveMinimum: 0, maximum: 0.35 };
   const otherActions = smeltId ? [] : [
     ...(work && !work.duringWaitFor ? [action("work", { policy: singleWorkPolicy }), action("work-program", { stages: workStages })] : []),
     ...(openingViewIds?.length ? [action("work", { policy: singleWorkPolicy,
       openingViewId: { type: "string", enum: openingViewIds } })] : []),
     ...(work?.current ? [action("revoke-work", { workOrderId: ticketId(work.current.id) })] : [
+      ...(visual?.nomination ? [action("nominate-visible", {
+        captureId: ticketId(visual.nomination.captureId), imageSha256: ticketId(visual.nomination.imageSha256),
+        region: strictObject({ x: unit, y: unit, width: extent, height: extent }),
+      })] : []),
+      ...(visual?.reconId ? [action("recon", { opportunityId: ticketId(visual.reconId),
+        maxLegs: { type: "integer", enum: [1, 2, 3] }, maxBlocks: { type: "integer", enum: [1, 2, 3, 4, 5, 6] },
+      })] : []),
       ...(selectable?.length === 0 ? [] :
         [action("opportunity", { opportunityId: selectable ? { type: "string", enum: selectable } : string })]),
       ...(direct ? [continuation] : []),
@@ -335,8 +351,33 @@ function verifiedImage(frame: MacroFrame): { image: ImageContent; sha256: string
   };
 }
 
+function visualTool(request: MacroRequest, basis: MacroBasis, image?: ImageContent,
+    checked?: ReturnType<typeof verifiedImage>): VisualTool | undefined {
+  const { frame, lookahead, observation, visual, work } = request;
+  if (request.capabilitiesVersion !== MACRO_CAPABILITIES_VERSION || !work || !visual || lookahead || work.current ||
+      work.duringWaitFor || work.parkedWorksite || observation.pendingWork || observation.working) return;
+  const read = visual.read;
+  const reconId = read?.status === "witnessed" && read.tick <= basis.tick && basis.tick - read.tick < MACRO_VISUAL_WITNESS_MAX_TICKS
+    ? observation.opportunities.find(offer =>
+      offer.id === visual.reconOpportunityId && offer.verb === MACRO_RECON && offer.risk === "low" &&
+      offer.anchor?.subject === MACRO_RECON_ANCHOR && offer.anchor.target === read.candidateId)?.id : undefined;
+  const binding = frame?.visualBinding;
+  if (!visual.mayNominate || !binding || !frame || !image || !sameBasis(frame, basis) || frame.mimeType !== "image/jpeg" ||
+      frame.captureSource === "x11" || !Number.isSafeInteger(binding.renderFrame) || binding.renderFrame < 1 ||
+      observation.visualReady !== true) return { reconId };
+  const exact = checked ?? verifiedImage(frame);
+  if (!exact || image.mimeType !== exact.image.mimeType || image.data !== exact.image.data) return { reconId };
+  try { validateMacroCaptureId(binding.captureId); } catch { return { reconId }; }
+  return { nomination: { captureId: binding.captureId, imageSha256: exact.sha256 }, reconId };
+}
+
 export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image?: ImageContent,
     preparedStock?: PreparedStockFooting): Context | undefined {
+  return buildPlanContext(request, basis, image, preparedStock, preparedStock ? undefined : visualTool(request, basis, image));
+}
+
+function buildPlanContext(request: MacroRequest, basis: MacroBasis, image?: ImageContent,
+    preparedStock?: PreparedStockFooting, visual?: VisualTool): Context | undefined {
   const { observation, objective, feedback, lastReceipt, strategicEpisodes, trigger, capabilitiesVersion,
     skillGeneration, skillVerbs, selectedSkillHash, testedSkills, maxSkillEffects,
     maxIntentTtlTicks, maxPlanTtlTicks, frame, nativeReview, lookahead, work } = request;
@@ -349,6 +390,8 @@ export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image
     .slice(0, MACRO_MAX_STRATEGIC_EPISODES);
   const direct = work?.mode !== "constrained" && capabilitiesVersion === MACRO_CAPABILITIES_VERSION && observation.safety?.clear === true &&
     observation.opportunities.some(offer => offer.risk === "guarded" && offer.material);
+  const visualRead = visual && request.visual?.read;
+  const visualActive = !!(visual?.nomination || visual?.reconId || visualRead);
   const text = JSON.stringify({
     basis, trigger, capabilitiesVersion, skillGeneration, skillVerbs, selectedSkillHash,
     testedSkills: testedSkills?.map(({ hash, verb }) => ({ hash, verb })), maxSkillEffects,
@@ -364,19 +407,24 @@ export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image
     surfaceOpening: work && !work.current && !lookahead && !preparedStock ? observation.surfaceOpening : undefined,
     timberObstruction: work && !work.current && !lookahead ? observation.timberObstruction : undefined,
     travelHint: work && !work.current && !lookahead ? observation.travelHint : undefined,
-    opportunities: observation.opportunities.map(({ id, verb, summary, risk, evidence, material, anchor }) =>
+    ...(visualRead ? { visualRead } : {}),
+    opportunities: observation.opportunities.filter(offer => offer.verb !== MACRO_RECON || offer.id === visual?.reconId)
+      .map(({ id, verb, summary, risk, evidence, material, anchor }) =>
       ({ id, verb, summary, risk, evidence, material, anchor })),
-    ...(image && frame ? { frame: { tick: frame.tick, width: frame.width, height: frame.height } } : {}),
+    ...(image && frame ? { frame: { tick: frame.tick, width: frame.width, height: frame.height, ...visual?.nomination } } : {}),
   });
   if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) return;
   return {
-    systemPrompt: preparedStock ? [PREPARED_STOCK_PROMPT] :
-      work && !lookahead ? [PROMPT, FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT] : [PROMPT],
+    systemPrompt: preparedStock ? [PREPARED_STOCK_PROMPT] : [
+      PROMPT, ...(work && !lookahead ? [FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT] : []),
+      ...(visualActive ? [VISUAL_PROMPT] : []),
+    ],
     messages: [{
       role: "user", timestamp: Date.now(),
       content: image ? [{ type: "text", text }, image] : text,
     }],
-    tools: [preparedStock ? preparedStockTool(observation) : lookahead ? lookaheadTool : work ? proposalTool(!!nativeReview, direct, work, observation) :
+    tools: [preparedStock ? preparedStockTool(observation) : lookahead ? lookaheadTool : work || visualActive ||
+      observation.opportunities.some(offer => offer.verb === MACRO_RECON) ? proposalTool(!!nativeReview, direct, work, observation, visual) :
       proposalTools[nativeReview ? 1 : 0]![direct ? 1 : 0]!],
   };
 }
@@ -468,7 +516,7 @@ function usageFor(message: AssistantMessage, reported?: { input: number; output:
     ? { input, output, cacheRead, cacheWrite, totalTokens } : null;
 }
 
-function proposalFor(raw: string | undefined, request: MacroRequest, basis: MacroBasis): MacroProposal | MacroReplyRejection {
+function proposalFor(raw: string | undefined, request: MacroRequest, basis: MacroBasis, visual?: VisualTool): MacroProposal | MacroReplyRejection {
   if (!raw) return "missing_arguments";
   if (Buffer.byteLength(raw) > request.maxResponseBytes) return "argument_bytes";
   // The SDK can repair partial tool JSON for display. Only exact terminal
@@ -490,6 +538,10 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
       request.lookahead.candidates.some(offer => offer.id === action.opportunityId)) ? proposal : "successor";
   }
   if (action.kind === "successor") return "successor";
+  if (action.kind === "nominate-visible")
+    return visual?.nomination?.captureId === action.captureId && visual.nomination.imageSha256 === action.imageSha256 ?
+      proposal : "visual_nomination";
+  if (action.kind === "recon") return visual?.reconId === action.opportunityId ? proposal : "visual_recon";
   if (request.work?.parkedWorksite === "view-unavailable" && action.kind !== "gap" && action.kind !== "abstain")
     return "missing_opportunity";
   if (action.kind === "renew-work") {
@@ -534,7 +586,7 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
   if (request.work?.current && action.kind !== "gap" && action.kind !== "abstain") return "active_work";
   if (action.kind === "opportunity") {
     const offer = request.observation.opportunities.find(offer => offer.id === action.opportunityId);
-    if (!offer || isPendingWorkVerb(offer.verb) || offer.verb === MACRO_FOOD_CLUE) return "missing_opportunity";
+    if (!offer || isPendingWorkVerb(offer.verb) || offer.verb === MACRO_FOOD_CLUE || offer.verb === MACRO_RECON) return "missing_opportunity";
     if (request.work?.mode === "constrained" && offer.risk === "guarded") return "guarded_opportunity";
   }
   if (action.kind === "continuation" && (request.work?.mode === "constrained" ||
@@ -557,12 +609,14 @@ async function exchange<T extends object>(
   session: SelectedAccountInferenceSession, options: TerraOptions, context: Context, scope: AbortSignal, started: number,
   decode: (raw: string | undefined) => T | MacroReplyRejection | null, checkDispatch?: () => boolean | void | Promise<boolean | void>,
   onDispatch?: (startedAtMs: number) => void, markTerminal?: () => void,
+  exactImage?: ImageContent,
 ): Promise<Exchange<T>> {
   const toolName = context.tools![0]!.name;
   let dispatched = false;
   let providerStartedAtMs: number | undefined;
   let preflightStale = false;
   let observationRotating = false;
+  let payloadHasExactImage = false;
   let usage: MacroInference["usage"] = null;
   const finish = (outcome: MacroInference["outcome"], proposal: T | null = null, invalidReply?: MacroReplyRejection): Exchange<T> => ({
     proposal, model: TERRA_MODEL_ID, usage, costUsd: null, outcome, dispatched,
@@ -584,6 +638,7 @@ async function exchange<T extends object>(
       fetch: async (input, init) => {
         signal.throwIfAborted();
         if (preflightStale) throw new Error("The Terra request is no longer eligible to dispatch.");
+        if (exactImage && !payloadHasExactImage) throw new Error("The request did not retain its exact native-bound image.");
         let eligible;
         try {
           eligible = await checkDispatch?.();
@@ -624,6 +679,23 @@ async function exchange<T extends object>(
         if (body?.model !== TERRA_MODEL_ID || body.tool_choice !== "required" ||
             tool?.name !== toolName || tool.strict !== true)
           throw new Error("The admitted Terra request must retain its exact model and strict proposal tool.");
+        if (exactImage) {
+          let imageCount = 0;
+          const expected = `data:${exactImage.mimeType};base64,${exactImage.data}`;
+          if (Array.isArray(body.input)) for (const item of body.input) {
+            const message = record(item);
+            if (!Array.isArray(message?.content)) continue;
+            for (const part of message.content) {
+              const image = record(part);
+              if (image?.type !== "input_image") continue;
+              if (message.role !== "user" || image.image_url !== expected)
+                throw new Error("The request changed its native-bound image.");
+              imageCount++;
+            }
+          }
+          payloadHasExactImage = imageCount === 1;
+          if (!payloadHasExactImage) throw new Error("The request did not retain its exact native-bound image.");
+        }
       },
       onSseEvent: evidence.observe,
     });
@@ -682,13 +754,20 @@ async function infer(
   if (request.frame && !session.model.input.includes("image")) return finish("provider_unavailable");
   const frame = request.frame ? verifiedImage(request.frame) : undefined;
   if (request.frame && !frame) return finish("invalid");
-  const context = terraPlanContext(request, basis, frame?.image, options.preparedStock);
+  const visual = options.preparedStock ? undefined : visualTool(request, basis, frame?.image, frame);
+  const context = buildPlanContext(request, basis, frame?.image, options.preparedStock, visual);
   if (!context) return finish("invalid");
-  const result = await exchange<MacroProposal>(session, options, context, scope, started, raw => proposalFor(raw, request, basis),
-    () => options.assertDispatch?.(basis, request.lookahead ? request.observation : undefined,
-      request.work ? request.observation : undefined, request.feedback?.kind === "invalid_reply" ? request.observation : undefined),
-    options.onProviderDispatch && (() => options.onProviderDispatch!({ ...providerMoment(), basis: { ...basis } })), markTerminal);
-  return { ...result, basis, ...(result.dispatched && frame ? { frameSha256: frame.sha256 } : {}) };
+  const result = await exchange<MacroProposal>(session, options, context, scope, started, raw => proposalFor(raw, request, basis, visual),
+    async () => {
+      if (await options.assertDispatch?.(basis, request.lookahead ? request.observation : undefined,
+        request.work ? request.observation : undefined, request.feedback?.kind === "invalid_reply" ? request.observation : undefined) === false)
+        return false;
+      return request.verifyFrameDispatch?.();
+    },
+    options.onProviderDispatch && (() => options.onProviderDispatch!({ ...providerMoment(), basis: { ...basis } })), markTerminal,
+    visual?.nomination ? frame?.image : undefined);
+  return { ...result, basis, ...(result.dispatched && frame ? { frameSha256: frame.sha256 } : {}),
+    ...(result.dispatched && visual?.nomination && request.frame?.visualBinding ? { frameVisualBinding: request.frame.visualBinding } : {}) };
 }
 
 function ownStrategist(auth: AuthManager, options: TerraOptions): TerraStrategist {

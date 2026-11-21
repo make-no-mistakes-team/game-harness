@@ -230,6 +230,19 @@ An explicitly offered one-block climb is different: it requires room
 for the jump from the actual stance and an exact, visible landing.
 Seeing a higher treetop in the distance is not enough.
 
+Terra can nominate a region of a first-person image when the client
+captured the image and its camera geometry together. A nomination asks
+what visible surface is there. It does not turn the camera, move the
+player, break anything, or prove a route. An ordinary desktop image
+without that binding cannot supply a target.
+
+After the client confirms a surface, Terra can authorize a separate
+scouting move toward it: up to three checked legs and six blocks of
+total travel. The player rechecks the surface, footing and stopping
+distance as it moves. A changed view, unsafe gap, or unexpected item
+need not be crossed to finish a leg. Gathering a resource still needs
+its own work order and an actual inventory gain.
+
 On a dry approach the player can keep looking toward a tree while
 stepping to one side. It checks the ground under the movement it
 actually makes, not just the direction the camera faces. It can move

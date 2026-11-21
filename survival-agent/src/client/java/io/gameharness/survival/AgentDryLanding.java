@@ -12,6 +12,7 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
     static final int MAX_DROP = 2;
     private static final double EARLY_LIP_MARGIN = 0.035;
     private static final double STOP_MARGIN = 0.11;
+    static final double STOPPING_END = 1.5 - STOP_MARGIN;
     private static final double GROUND_DRAG = 0.55;
     private static final double AIR_DRAG = 0.91;
     private static final int AIR_TICKS = 10;
@@ -44,7 +45,7 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
             z += vz;
             double along = dx * x + dz * z;
             double across = Math.abs(dz * x - dx * z);
-            if (along < -0.42 || along > 1.5 - STOP_MARGIN || across > 0.46) return false;
+            if (along < -0.42 || along > STOPPING_END || across > 0.46) return false;
             if (along >= 0.5 + radius - EARLY_LIP_MARGIN || air > 0) {
                 if (across + radius > 0.49) return false;
                 ++air;

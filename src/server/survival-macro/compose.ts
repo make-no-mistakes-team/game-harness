@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { lstat, mkdir, open, rename, stat, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { createMacroTrials, MACRO_TRIAL_ADAPTER_VERSION, MACRO_TRIAL_VERBS } from "../../../survival-agent/macro-trial.ts";
@@ -8,7 +8,7 @@ import type { ProviderPendingSpan } from "../../../survival-agent/pause-evidence
 import { hasConfirmedTerraEffect, TERRA_MODEL_ID, type SurvivalAgentGoal } from "../../shared/survival-agent-ui.ts";
 import { PRE_SPAWN_GOAL_ONLY } from "./bootstrap.ts";
 import {
-  SurvivalMacroController, type DisplayCaptureFailure, type SurvivalMacroConfig, type UnavailableFrame,
+  SurvivalMacroController, type DisplayCaptureFailure, type UnavailableFrame,
 } from "./controller.ts";
 import { createNativeGapReview } from "./gap-review.ts";
 import { preparedStockReady, samePreparedStockView } from "./prepared-stock.ts";
@@ -18,11 +18,11 @@ import {
   type MacroBasis, type MacroInference, type MacroObservation,
 } from "./protocol.ts";
 import { MACRO_AUTOMATIC_SKILL_VERBS, SurvivalMacroSkills } from "./skills.ts";
-import { frameDimensions, openTerraStrategist, type TerraStrategist } from "./terra.ts";
+import { openTerraStrategist, type TerraStrategist } from "./terra.ts";
+import { createTrustedFrameCapture, FRAME_BYTES, FRAME_TIMEOUT_MS, initializeFrameArchive } from "./visual-capture.ts";
 
-const FRAME_BYTES = 2 * 1024 * 1024;
-const FRAME_TIMEOUT_MS = 1_000;
-const FRAME_DIRECTORY = "macro-frames";
+export { createTrustedFrameCapture };
+
 const FRAME_PATH = "/usr/bin:/bin";
 const inspect = promisify(execFile);
 const REQUEST_TIMEOUT_MS = 35_000;
@@ -79,9 +79,8 @@ interface TerraAttemptOptions {
 }
 
 type CaptureOptions = Pick<TerraAttemptOptions, "dir" | "display" | "width" | "height" | "ffmpeg" | "signal">;
-type ArchiveOptions = Pick<CaptureOptions, "dir" | "width" | "height" | "signal"> & { assertDisplay: () => void };
 type CaptureCommand = { readonly adapter: "scrot" | "ffmpeg"; readonly file: string; readonly args: string[] };
-type CapturedJpeg = { readonly bytes: Buffer; readonly staged?: true; readonly adapter?: CaptureCommand["adapter"] };
+type CapturedJpeg = { readonly bytes: Buffer; readonly adapter?: CaptureCommand["adapter"] };
 
 function unavailable(failure: DisplayCaptureFailure, adapter?: CaptureCommand["adapter"]): UnavailableFrame {
   return { cause: "unavailable", failure, ...(adapter ? { adapter } : {}) };
@@ -112,7 +111,6 @@ async function jpegCommand({ display, width, height, ffmpeg, signal }: CaptureOp
 function captureProcess(
   { dir, display }: CaptureOptions, command: CaptureCommand, signal: AbortSignal, outputFd?: number,
 ) {
-  const deadline = AbortSignal.any([signal, AbortSignal.timeout(FRAME_TIMEOUT_MS)]);
   return new Promise<Buffer | DisplayCaptureFailure | undefined>((resolve, reject) => {
     if (signal.aborted) { reject(signal.reason); return; }
     const child = spawn(command.file, command.args, {
@@ -127,7 +125,7 @@ function captureProcess(
       child.kill("SIGKILL");
     };
     const onAbort = () => kill("timeout");
-    deadline.addEventListener("abort", onAbort, { once: true });
+    signal.addEventListener("abort", onAbort, { once: true });
     child.on("error", () => { failure ??= "spawn_failed"; });
     child.stdout?.on("error", () => kill("io_error"));
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -137,7 +135,7 @@ function captureProcess(
       else chunks.push(chunk);
     });
     child.once("close", code => {
-      deadline.removeEventListener("abort", onAbort);
+      signal.removeEventListener("abort", onAbort);
       if (signal.aborted) reject(signal.reason);
       else if (failure) resolve(failure);
       else if (code !== 0) resolve("process_failed");
@@ -145,7 +143,7 @@ function captureProcess(
       else if (bytes === 0) resolve("empty_output");
       else resolve(chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, bytes));
     });
-    if (deadline.aborted) onAbort();
+    if (signal.aborted) onAbort();
   });
 }
 
@@ -157,12 +155,15 @@ async function oneJpeg(
     const result = await captureProcess(options, command, signal);
     return Buffer.isBuffer(result) ? { bytes: result, adapter } : unavailable(result ?? "empty_output", adapter);
   }
-  // scrot reopens /dev/stdout; a Bun child-process "pipe" is a socket
-  // and cannot be reopened. Give scrot the already-owned pending archive fd.
-  const file = await open(temporary, "wx+", 0o600).catch(() => undefined);
+  // scrot reopens /dev/stdout. Give it a private anonymous scratch fd, not a Bun
+  // pipe (a socket) or the model frame archive.
+  const file = await open(temporary, constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
+    .catch(() => undefined);
   if (!file) return unavailable("io_error", adapter);
-  let staged = false;
+  let detached = false;
   try {
+    await unlink(temporary);
+    detached = true;
     const result = await captureProcess(options, command, signal, file.fd);
     if (typeof result === "string") return unavailable(result, adapter);
     const { size } = await file.stat();
@@ -171,90 +172,28 @@ async function oneJpeg(
     const bytes = Buffer.allocUnsafe(size);
     const { bytesRead } = await file.read(bytes, 0, size, 0);
     if (bytesRead !== size) return unavailable("io_error", adapter);
-    await file.close();
-    staged = true;
-    return { bytes, staged: true, adapter };
+    return { bytes, adapter };
   } catch {
     signal.throwIfAborted();
     return unavailable("io_error", adapter);
   } finally {
-    if (!staged) {
-      try { await file.close(); }
-      finally { await unlink(temporary); }
-    }
+    try { await file.close(); }
+    finally { if (!detached) await unlink(temporary); }
   }
 }
 
-/** One request-scoped image bracketed by the same native publication and display owner. */
-export function createTrustedFrameCapture({
-  dir, width, height, signal, assertDisplay, readJpeg,
-}: ArchiveOptions & {
-  readJpeg: (signal: AbortSignal, temporary: string) => Promise<CapturedJpeg | UnavailableFrame>;
-}): NonNullable<SurvivalMacroConfig["frame"]> {
-  const macroDir = path.join(dir, "macro");
-  async function samePublishedBasis(observation: MacroObservation) {
-    const fresh = await readMacroObservation(macroDir);
-    assertDisplay();
-    return fresh?.run === observation.run && fresh.life === observation.life &&
-      fresh.epoch === observation.epoch && fresh.tick === observation.tick && fresh.goal === observation.goal && fresh.health > 0;
-  }
-  return async (observation, workSignal, requestId) => {
-    assertDisplay();
-    const captureSignal = AbortSignal.any([signal, workSignal]);
-    if (!await samePublishedBasis(observation)) return { cause: "basis_changed" };
-    captureSignal.throwIfAborted();
-    const relativePath = `${FRAME_DIRECTORY}/${requestId}.jpg`;
-    const file = path.join(dir, relativePath);
-    const temporary = `${file}.pending`;
-    let discard: string | undefined;
-    try {
-      const result = await readJpeg(captureSignal, temporary);
-      if ("staged" in result && result.staged) discard = temporary;
-      assertDisplay();
-      captureSignal.throwIfAborted();
-      if ("cause" in result) return result;
-      const { bytes, adapter } = result;
-      if (!await samePublishedBasis(observation)) return { cause: "basis_changed" };
-      captureSignal.throwIfAborted();
-      const size = frameDimensions(bytes, "image/jpeg");
-      if (!size) return unavailable("invalid_image", adapter);
-      if (size[0] !== width || size[1] !== height) return unavailable("unexpected_dimensions", adapter);
-      const sha256 = createHash("sha256").update(bytes).digest("hex");
-      try {
-        if (!discard) {
-          const pending = await open(temporary, "wx", 0o600);
-          discard = temporary;
-          try { await pending.writeFile(bytes, { signal: captureSignal }); }
-          finally { await pending.close(); }
-        }
-        captureSignal.throwIfAborted();
-        await rename(temporary, file);
-        discard = file;
-      } catch {
-        captureSignal.throwIfAborted();
-        return unavailable("io_error", adapter);
-      }
-      assertDisplay();
-      captureSignal.throwIfAborted();
-      const { run, life, epoch, tick } = observation;
-      discard = undefined;
-      return {
-        source: "verified-game-display", run, life, epoch, tick, mimeType: "image/jpeg", width, height, data: bytes,
-        artifact: { relativePath, sha256, discard: () => unlink(file) },
-      };
-    } finally {
-      if (discard) await unlink(discard);
-    }
-  };
-}
-
-export async function openTrustedFrameCapture(options: CaptureOptions & ArchiveOptions) {
-  const [command] = await Promise.all([
-    jpegCommand(options), mkdir(path.join(options.dir, FRAME_DIRECTORY), { mode: 0o700 }),
-  ]);
+export async function openTrustedFrameCapture(options: CaptureOptions & { assertDisplay: () => void; native?: boolean }) {
+  await initializeFrameArchive(options.dir);
   options.assertDisplay();
+  let command: CaptureCommand | undefined;
   return createTrustedFrameCapture({
-    ...options, readJpeg: (signal, temporary) => oneJpeg(options, command, signal, temporary),
+    ...options,
+    // Startup goal-only inference and successful native capture never initialize X11 capture.
+    readJpeg: async (signal, temporary) => {
+      const selected = command ??= await jpegCommand({ ...options, signal });
+      signal.throwIfAborted();
+      return oneJpeg(options, selected, signal, temporary);
+    },
   });
 }
 
@@ -391,7 +330,7 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
       throw new Error(`The existing GameHarness authorization could not admit ${TERRA_MODEL_ID}.`);
     }
     assertDisplay();
-    const capture = await openTrustedFrameCapture({ ...options, assertDisplay });
+    const capture = await openTrustedFrameCapture({ ...options, assertDisplay, native: !declaration.preparedDiagnostic });
     const authoring = declaration.preparedDiagnostic ? null : declaration.authoring;
     if (authoring) {
       const directory = path.join(dir, "macro-skills");

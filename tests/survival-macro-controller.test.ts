@@ -9,7 +9,7 @@ import { SurvivalMacroController, type SurvivalMacroConfig } from "../src/server
 import { preparedStockReady } from "../src/server/survival-macro/prepared-stock.ts";
 import { hasConfirmedTerraEffect } from "../src/shared/survival-agent-ui.ts";
 import {
-  MACRO_DIAMOND_PROSPECT, MacroDirectory, MacroObservationRotating, parseMacroIntent, parseMacroPlanning,
+  MACRO_DIAMOND_PROSPECT, MacroDirectory, MacroObservationRotating, parseMacroIntent, parseMacroPlanning, parseMacroVisualProbe,
   type MacroBasis, type MacroInference, type MacroIntent, type MacroObservation, type MacroOpportunity,
   type MacroProposal, type MacroRequest, type MacroStrategist,
 } from "../src/server/survival-macro/protocol.ts";
@@ -144,6 +144,133 @@ test.each(["same source", "different source", "missing source", "reserve lost"] 
 
 const captureJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAAf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AH//Z", "base64");
 const captureHash = createHash("sha256").update(captureJpeg).digest("hex");
+const visualBinding = { captureId: `vc-${"a".repeat(32)}`, renderFrame: 12 };
+const visualNomination = { kind: "nominate-visible", captureId: visualBinding.captureId, imageSha256: captureHash,
+  region: { x: 0.25, y: 0.5, width: 0.2, height: 0.2 } } as const;
+const visualScene = { stance: 1, visualReady: true } as const;
+const reconOffer = { id: "recon-offer", verb: "recon", risk: "low", summary: "Scout toward the checked surface",
+  evidence: "A current first leg passed the dry clearance and braking check.",
+  anchor: { target: `vr-${"c".repeat(32)}`, subject: "route:visual_region" },
+} as const;
+
+const visualFrameFor = (bound: boolean, onArchive?: (file: string) => void) => (dir: string): SurvivalMacroConfig["frame"] =>
+  async ({ run, life, epoch, tick }, _signal, requestId) => {
+    const relativePath = `macro-frames/${requestId}.jpg`;
+    const archive = path.join(dir, relativePath);
+    await mkdir(path.dirname(archive), { recursive: true, mode: 0o700 });
+    await writeFile(archive, captureJpeg, { mode: 0o600, flag: "wx" });
+    onArchive?.(archive);
+    return { source: "verified-game-display", mimeType: "image/jpeg", width: 1, height: 1, data: captureJpeg,
+      run, life, epoch, tick, ...(bound ? { visualBinding } : {}),
+      artifact: { relativePath, sha256: captureHash,
+        verify: async () => (await readFile(archive)).equals(captureJpeg),
+        discard: () => rm(archive, { force: true }),
+      },
+    };
+  };
+
+async function pollVisual(f: Awaited<ReturnType<typeof durableFixture>>) {
+  for (let attempt = 0; attempt < 6; attempt++) await f.actor.poll();
+}
+
+test.each(["unbound X11", "wrong image hash", "wrong capture", "not dispatched", "unverified dispatch", "replaced archive",
+  "stale dispatch"] as const)(
+  "A %s frame never grants a read-only visual probe", async condition => {
+    let archive: string | undefined;
+    let f: Awaited<ReturnType<typeof durableFixture>>;
+    f = await durableFixture(async request => {
+      if (condition === "stale dispatch") await f.publishObservation(request.observation.tick + 45, visualScene);
+      const qualified = condition === "unverified dispatch" || await request.verifyFrameDispatch?.();
+      if (condition === "replaced archive") await writeFile(archive!, "replaced");
+      return {
+        ...workReply(request, condition === "wrong capture" ? { ...visualNomination, captureId: `vc-${"b".repeat(32)}` } : visualNomination),
+        dispatched: condition !== "not dispatched" && !!qualified,
+        frameSha256: condition === "wrong image hash" ? "0".repeat(64) : captureHash,
+        frameVisualBinding: request.frame?.visualBinding,
+      };
+    }, "Explore before committing to a route.", 1, visualFrameFor(condition !== "unbound X11", file => { archive = file; }));
+    try {
+      await f.observe(10, visualScene);
+      await f.observe(20, visualScene);
+      await pollVisual(f);
+      expect(f.actor.status().requests).toBe(1);
+      for (const name of ["visual-probe.json", "intent.json", "work.json"]) await expect(access(f.file(name))).rejects.toThrow();
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each(["bounded", "ordinary ID", "wrong ID", "wrong candidate", "wrong run", "wrong life", "wrong epoch", "wrong request",
+  "expired", "miss", "invalid limits", "unchanged repeat"] as const)(
+  "A checked visual region permits only separate exact bounded recon (%s)", async condition => {
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1 || condition === "unchanged repeat") {
+        expect(await request.verifyFrameDispatch?.()).toBe(true);
+        return { ...workReply(request, visualNomination), frameSha256: captureHash,
+          frameVisualBinding: request.frame?.visualBinding };
+      }
+      if (condition === "ordinary ID") return workReply(request, { kind: "opportunity", opportunityId: reconOffer.id });
+      return workReply(request, { kind: "recon", opportunityId: condition === "wrong ID" ? "old-offer" : reconOffer.id,
+        maxLegs: 2, maxBlocks: condition === "invalid limits" ? 7 : 4 });
+    }, "Explore the first-person terrain without spending or collecting.", 3, visualFrameFor(true));
+    try {
+      await f.observe(10, visualScene);
+      await f.observe(20, visualScene);
+      await pollVisual(f);
+      const probe = parseMacroVisualProbe(JSON.parse(await readFile(f.file("visual-probe.json"), "utf8")));
+      expect(probe).toMatchObject({ captureId: visualBinding.captureId, imageSha256: captureHash,
+        basisTick: 20, expiresTick: 60, region: visualNomination.region });
+      expect(f.actor.status().issued).toBe(0);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      const { v, id, run, life, epoch, requestId, captureId, imageSha256 } = probe;
+      await writeFile(f.file("visual-probe-result.json"), JSON.stringify({
+        v, id, run: condition === "wrong run" ? "foreign-run" : run, life: condition === "wrong life" ? life + 1 : life,
+        epoch: condition === "wrong epoch" ? epoch + 1 : epoch, captureId, imageSha256, tick: 23,
+        requestId: condition === "wrong request" ? "01010101-0101-4101-8101-010101010101" : requestId,
+        ...(condition === "miss" ? { status: "miss" } : {
+          status: "witnessed", candidateId: reconOffer.anchor.target, subject: "block:minecraft:grass_block", distanceBlocks: 4,
+        }),
+      }), { mode: 0o600 });
+      const offer = condition === "wrong candidate" ? { ...reconOffer, anchor: { ...reconOffer.anchor, target: `vr-${"d".repeat(32)}` } } : reconOffer;
+      await f.observe(condition === "expired" ? probe.expiresTick : 25, { ...visualScene, opportunities: [offer] });
+      if (condition === "wrong candidate") await f.observe(35, { ...visualScene, opportunities: [offer] });
+      await pollVisual(f);
+      const unconfirmed = condition === "wrong run" || condition === "wrong life" ||
+        condition === "wrong epoch" || condition === "wrong request" || condition === "expired";
+      expect(requests[1]?.visual?.read?.status).toBe(condition === "miss" ? "miss" :
+        unconfirmed ? undefined : "witnessed");
+      if (condition === "bounded") {
+        expect(requests[1]?.visual).toMatchObject({ mayNominate: false, reconOpportunityId: reconOffer.id,
+          read: { candidateId: reconOffer.anchor.target, subject: "block:minecraft:grass_block", distanceBlocks: 4 } });
+        const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+        expect(intent).toMatchObject({ basisTick: 25, expiresTick: 125, skillHash: null, opportunityId: reconOffer.id,
+          recon: { maxLegs: 2, maxBlocks: 4 } });
+        expect(f.actor.status()).toMatchObject({ requests: 2, issued: 1, completedReceipts: 0, completedWorkOrders: 0 });
+        await f.receipt(intent.id, 26, "accepted");
+        await f.receipt(intent.id, 30, "completed", "Completed one checked leg, 1.4 blocks cumulative, with a settled new first-person view.");
+        await f.observe(35, { ...visualScene, stance: 2 });
+        expect(f.actor.status()).toMatchObject({ issued: 1, completedReceipts: 1, completedWorkOrders: 0 });
+      } else {
+        await expect(access(f.file("intent.json"))).rejects.toThrow();
+        await f.observe(115, { ...visualScene, opportunities: [offer] });
+        await pollVisual(f);
+        expect(requests.length).toBe(unconfirmed ? 1 : 2);
+      }
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      await expect(access(f.file("visual-probe.json"))).rejects.toThrow();
+      const history = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(history).toContainEqual(expect.objectContaining({ event: "visual_probe_outcome", requestId,
+        reason: condition === "expired" ? "visual_probe_expired" : unconfirmed ? "visual_result_binding_mismatch" : "native_result" }));
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
 
 test.each(["stock", "abstain", "read", "overgrant", "unpaid stale"] as const)(
   "Prepared stock starts from stable native evidence and distinguishes a terminal %s reply",

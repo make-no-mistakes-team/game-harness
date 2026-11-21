@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { link, mkdtemp, open, rename, rm, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,9 +8,103 @@ import { validateJsonSchemaValue } from "@oh-my-pi/pi-ai/utils/schema";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import {
   MACRO_CAPABILITIES_VERSION, MacroDirectory, MacroObservationRotating, foodWorkWitness, hasDirectAuthority,
-  parseMacroObservation, parseMacroProposal, parseMacroWorkOrder, parseMacroWorkPolicy, type MacroWorkDemand,
+  parseMacroIntent, parseMacroObservation, parseMacroProposal, parseMacroVisualProbeResult, parseMacroWorkOrder,
+  parseMacroWorkPolicy, type MacroRequest, type MacroWorkDemand,
 } from "../src/server/survival-macro/protocol.ts";
 import { terraPlanContext } from "../src/server/survival-macro/terra.ts";
+
+const visualProposal = {
+  subgoal: "See beyond a ridge", reason: "The slope obscures my view", successCondition: "A checked first-person clue",
+  contingency: "Do not cross unverified ground", alternative: "Observe the existing view", expiresTick: 150,
+};
+
+test("A visual proposal accepts a top-left rectangle, not coordinates or an unbounded motor grant", () => {
+  const region = { x: 0.7, y: 0.3, width: 0.25, height: 0.1 };
+  const nominate = { kind: "nominate-visible", captureId: `vc-${"a".repeat(32)}`, imageSha256: "a".repeat(64), region } as const;
+  expect(parseMacroProposal({ ...visualProposal, action: nominate }).action).toEqual(nominate);
+  for (const change of [{ x: -0.01 }, { x: Infinity }, { width: 0 }, { height: 0.36 }, { x: 0.9 }, { y: NaN }, { z: 1 }])
+    expect(() => parseMacroProposal({ ...visualProposal, action: { ...nominate, region: { ...region, ...change } } })).toThrow();
+  const recon = { kind: "recon", opportunityId: "o-recon", maxLegs: 3, maxBlocks: 6 } as const;
+  expect(parseMacroProposal({ ...visualProposal, action: recon }).action).toEqual(recon);
+  for (const change of [{ maxLegs: 0 }, { maxLegs: 4 }, { maxBlocks: 1.5 }, { maxBlocks: 7 }])
+    expect(() => parseMacroProposal({ ...visualProposal, action: { ...recon, ...change } })).toThrow();
+  const intent = { v: 1, run: "run", life: 1, epoch: 1, id: "intent", opportunityId: "o-recon",
+    basisTick: 50, expiresTick: 150, skillHash: null, recon: { maxLegs: 3, maxBlocks: 6 } };
+  expect(parseMacroIntent(intent).recon).toEqual({ maxLegs: 3, maxBlocks: 6 });
+  expect(() => parseMacroIntent({ ...intent, expiresTick: 151 })).toThrow();
+  expect(() => parseMacroIntent({ ...intent, skillHash: "a".repeat(64) })).toThrow();
+});
+
+test("Only a witnessed visual result carries a general observed surface, never a route", () => {
+  const terminal = { v: 1, run: "run", life: 1, epoch: 2,
+    id: "01010101-0101-4101-8101-010101010101", requestId: "02020202-0202-4202-8202-020202020202",
+    captureId: `vc-${"a".repeat(32)}`, imageSha256: "a".repeat(64), tick: 12 };
+  const surface = { candidateId: `vr-${"b".repeat(32)}`, subject: "block:minecraft:grass_block", distanceBlocks: 4.3 };
+  expect(parseMacroVisualProbeResult({ ...terminal, status: "witnessed", ...surface }))
+    .toMatchObject({ status: "witnessed", ...surface });
+  expect(parseMacroVisualProbeResult({ ...terminal, status: "occluded" })).toMatchObject({ status: "occluded" });
+  expect(() => parseMacroVisualProbeResult({ ...terminal, status: "miss", ...surface })).toThrow();
+  expect(() => parseMacroVisualProbeResult({ ...terminal, status: "witnessed" })).toThrow();
+  expect(() => parseMacroVisualProbeResult({ ...terminal, status: "witnessed", ...surface, distanceBlocks: 13 })).toThrow();
+});
+
+test("Terra exposes region nomination only for the exact native-bound image included in its message", () => {
+  const observation = { v: 1, run: "run", life: 1, epoch: 3, tick: 117, goal: "diamond", visualReady: true,
+    health: 20, food: 20, inventory: {}, opportunities: [], recent: [], quiescent: false,
+    stance: 2, safety: { clear: true, revision: 1 },
+  } as const;
+  const jpeg = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAAf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AH//Z";
+  const bytes = Buffer.from(jpeg, "base64");
+  const binding = { captureId: `vc-${"a".repeat(32)}`, renderFrame: 1 };
+  const frame = { source: "verified-game-display", run: observation.run, life: 1, epoch: 3, tick: 117,
+    width: 1, height: 1, mimeType: "image/jpeg", data: bytes, visualBinding: binding } as const;
+  const image = { type: "image", mimeType: "image/jpeg", data: jpeg } as const;
+  const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
+  const request: MacroRequest = { observation, work, frame, visual: { mayNominate: true }, capabilitiesVersion: MACRO_CAPABILITIES_VERSION,
+    trigger: "first", lastReceipt: null, skillGeneration: null, maxResponseBytes: 4096, maxIntentTtlTicks: 1200, maxPlanTtlTicks: 7200 };
+  const context = terraPlanContext(request, observation, image)!;
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  expect(JSON.stringify(context.tools)).toContain('"nominate-visible"');
+  expect(JSON.stringify(context.tools)).toContain(binding.captureId);
+  expect(JSON.stringify(context.messages)).toContain(sha256);
+  for (const candidate of [
+    terraPlanContext(request, observation),
+    terraPlanContext({ ...request, work: undefined }, observation, image),
+    terraPlanContext({ ...request, frame: { ...frame, visualBinding: undefined } }, observation, image),
+    terraPlanContext({ ...request, frame: { ...frame, tick: 116 } }, observation, image),
+    terraPlanContext(request, observation, { ...image, data: `${jpeg}AAAA` }),
+  ]) {
+    expect(JSON.stringify(candidate?.tools)).not.toContain('"nominate-visible"');
+    expect(JSON.stringify(candidate?.messages)).not.toContain(binding.captureId);
+  }
+});
+
+test("A confirmed surface can be selected only as a separate strictly bounded recon action", () => {
+  const candidateId = `vr-${"e".repeat(32)}`;
+  const offer = { id: "exact-recon", verb: "recon", risk: "low", summary: "Scout toward the checked wall",
+    evidence: "Current footing and stopping window", anchor: { subject: "route:visual_region", target: candidateId },
+  } as const;
+  const observation = { v: 1, run: "run", life: 1, epoch: 3, tick: 117, goal: "diamond", visualReady: true,
+    health: 20, food: 20, inventory: {}, opportunities: [offer], recent: [], quiescent: false, stance: 2,
+    safety: { clear: true, revision: 1 },
+  } as const;
+  const request: MacroRequest = { observation, capabilitiesVersion: MACRO_CAPABILITIES_VERSION,
+    work: { mode: "constrained", demand: "changed", protectedReserves: [], current: null, lastOutcome: null },
+    trigger: "progress", lastReceipt: null, skillGeneration: null, maxResponseBytes: 4096, maxIntentTtlTicks: 1200, maxPlanTtlTicks: 7200,
+    visual: { mayNominate: false, reconOpportunityId: offer.id,
+      read: { status: "witnessed", tick: 113, candidateId, subject: "block:minecraft:grass_block",
+        distanceBlocks: 4, region: { x: 0.2, y: 0.2, width: 0.3, height: 0.2 } },
+    },
+  };
+  const { tools } = terraPlanContext(request, observation)!;
+  const schema = JSON.stringify(tools);
+  expect(schema).toContain('"exact-recon"');
+  expect(schema).toContain('"maxLegs"');
+  expect(schema).toContain('"maxBlocks"');
+  expect(schema).not.toContain('["opportunity"]');
+  expect(schema).not.toContain('"nominate-visible"');
+  expect(JSON.stringify(terraPlanContext({ ...request, visual: undefined }, observation)?.tools)).not.toContain('"exact-recon"');
+});
 
 function liveWorkSchema(duringWaitFor?: string) {
   const observation = { v: 1, run: "run", life: 1, epoch: 3, tick: 117, goal: "diamond",

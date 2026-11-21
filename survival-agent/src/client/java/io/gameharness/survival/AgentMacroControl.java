@@ -34,6 +34,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.IntPredicate;
@@ -141,6 +142,7 @@ final class AgentMacroControl {
         SURVEY("survey", "read", 30), DRY_SURVEY("survey", "guarded", 56),
         STATION_REACQUIRE("survey", "read", 40),
         INSPECT("inspect", "read", 30), APPROACH("approach", "low", 65),
+        RECON("recon", "low", AgentVisualRecon.MAX_TICKS),
         INTERACT("interact", "guarded", 40), COLLECT("collect", "guarded", 38), BREAK("break", "guarded", 120),
         CONTINUE("continue", "guarded", 320), FOLLOW("follow", "guarded", 640),
         WORK_WALK("work_walk", "guarded", 160), WORK_EQUIP("work_equip", "guarded", 120),
@@ -212,11 +214,28 @@ final class AgentMacroControl {
         }
     }
     private record FoodClue(AgentFoodWork.Source source, Entity animal, Vec3d origin, int slot, Item hand) {}
+    private record ReconOffer(Vec3d feet, float yaw, float pitch) {
+        boolean matches(ClientPlayerEntity player) {
+            return feet.equals(player.getPos()) && yaw == player.getYaw() && pitch == player.getPitch();
+        }
+    }
+    private record ReconPlan(AgentVisualRecon.Leg motion, BlockHitResult top, AgentBody.OrdinaryGrade rise,
+                             AgentDryLanding descent) {
+        BlockPos source() { return rise != null ? rise.from() : descent.source(); }
+        BlockPos destination() { return rise != null ? rise.to() : descent.to(); }
+        BlockState destinationState() { return rise != null ? rise.surface() : descent.lower(); }
+    }
 
     private record Offer(String id, Key key, String summary, String evidence, float yaw, float pitch,
                          Floor floor, Face face, ItemEntity drop, Item item, Recipe recipe,
                          AgentDryCaveRoute.Offer route, Floor farther, AgentDryCaveRoute.Survey drySurvey,
-                         GroundScout scout, FoodClue food) {
+                         GroundScout scout, FoodClue food, ReconOffer recon) {
+        Offer(String id, Key key, String summary, String evidence, float yaw, float pitch,
+              Floor floor, Face face, ItemEntity drop, Item item, Recipe recipe,
+              AgentDryCaveRoute.Offer route, Floor farther, AgentDryCaveRoute.Survey drySurvey, GroundScout scout,
+              FoodClue food) {
+            this(id, key, summary, evidence, yaw, pitch, floor, face, drop, item, recipe, route, farther, drySurvey, scout, food, null);
+        }
         Offer(String id, Key key, String summary, String evidence, float yaw, float pitch,
               Floor floor, Face face, ItemEntity drop, Item item, Recipe recipe,
               AgentDryCaveRoute.Offer route, Floor farther, AgentDryCaveRoute.Survey drySurvey, GroundScout scout) {
@@ -245,7 +264,8 @@ final class AgentMacroControl {
                             TimberObstruction timberObstruction, SurfaceOpening surfaceOpening) {}
     private record SurfaceOpening(AgentWorkOrder.SurfaceAnchor anchor, BlockPos foot, BlockState support,
                                   Face face, Item tool, int loss) {}
-    private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity, String skillHash) {}
+    private record Intent(String id, int life, long epoch, long basis, long expires, String opportunity,
+                          String skillHash, AgentVisualRecon.Bounds recon) {}
     private record Handoff(int life, long epoch, long basis, long expires) {}
     private record Planning(int life, long epoch, long basis, String id, long noticedAt) {}
     private record WorkMailbox(boolean present, AgentWorkOrder order) {}
@@ -288,6 +308,30 @@ final class AgentMacroControl {
         }
     }
 
+    private static final class ReconStock {
+        private final ItemStack[] slots;
+        private final int selected;
+        private final float health;
+
+        ReconStock(ClientPlayerEntity player) {
+            var inventory = player.getInventory();
+            selected = inventory.selectedSlot;
+            slots = new ItemStack[inventory.size()];
+            for (int i = 0; i < slots.length; ++i) slots[i] = inventory.getStack(i).copy();
+            health = player.getHealth();
+        }
+
+        boolean unchanged(ClientPlayerEntity player) {
+            var inventory = player.getInventory();
+            if (inventory.selectedSlot != selected || inventory.size() != slots.length) return false;
+            for (int i = 0; i < slots.length; ++i)
+                if (!ItemStack.areEqual(slots[i], inventory.getStack(i))) return false;
+            return true;
+        }
+
+        boolean damaged(ClientPlayerEntity player) { return player.hurtTime != 0 || player.getHealth() < health; }
+    }
+
     private static final class Action {
         final Intent intent;
         final Offer offer;
@@ -312,6 +356,13 @@ final class AgentMacroControl {
         Vec3d destination, walkFrom;
         AgentBody.HorizonTravel horizonTravel;
         long scoutStoppedFrame = -1;
+        AgentVisualRecon recon;
+        ReconStock reconStock;
+        WorkMailbox reconWork;
+        ReconPlan reconPlan;
+        float reconYaw;
+        long reconStoppedAtFrame = -1;
+        boolean reconProposed, reconAligning, reconJumped, reconJumpKey;
         AgentWorkOrder.TravelKind horizonKind;
         AgentBody.OrdinaryGrade ordinaryGrade;
         long gradeLookUntil;
@@ -1010,6 +1061,7 @@ final class AgentMacroControl {
     private ProspectLandmark prospectLandmark;
     private FurnaceFact furnaceFact;
     private final Predicate<ItemStack> safetySpend = this::canSpendSafetyStock;
+    private final BooleanSupplier reconInputGrant = this::reconInputCurrent;
     private final Predicate<ItemEntity> stockPickupFooting = drop -> !dropInProspectOpening(drop) && roomFor(drop.getStack());
     private List<Offer> reservedOffers = List.of();
     private static final Offer[] NO_ANCHORS = {};
@@ -1070,6 +1122,8 @@ final class AgentMacroControl {
     private final Set<Key> attemptedDryLandings = new HashSet<>();
     private final Map<BlockPos, Integer> inspectedVantageSectors = new HashMap<>();
     private String lastDryLandingEvidence;
+    private String usedReconCandidate;
+    private boolean visualResultChanged;
     private AgentBody.GroundSight lastGroundSight;
     private int lastDryLandingStance;
     private boolean firstOutlookPending, startupInputsClear;
@@ -1164,6 +1218,8 @@ final class AgentMacroControl {
             attemptedDryLandings.clear();
             inspectedVantageSectors.clear();
             lastDryLandingEvidence = null;
+            usedReconCandidate = null;
+            visualResultChanged = false;
             reservedOffers = List.of();
             routeOffer = drySurveyOffer = null;
             dryOfferEvidence = null;
@@ -1186,6 +1242,14 @@ final class AgentMacroControl {
     }
 
     boolean engaged() { return input != null && (trial || activated); }
+    int visualLife() { return life; }
+    long visualEpoch() { return epoch; }
+    long visualBasisTick() { return lastObservation; }
+    boolean visualTransportEnabled() { return !trial && ipc.workMode != null; }
+    boolean visualReadAllowed() {
+        return visualTransportEnabled() && input != null && input.active && ipc.inbox.active && idlePublicationPremise();
+    }
+    void visualResultChanged() { visualResultChanged = true; }
     boolean hasAction() { return action != null; }
     boolean hasActiveWorkOrder() { return work != null && work.active(); }
     boolean invocationFinishAllowed() {
@@ -1373,6 +1437,12 @@ final class AgentMacroControl {
         }
         sampleClock();
         witnessStationPlacement();
+        if (action != null && action.recon != null) {
+            claim("terra");
+            state("terra_in_progress", action.offer.summary);
+            advanceVisualRecon(progress);
+            return;
+        }
         if (pendingEntry() != null && !AgentClient.ownsSinglePlayerFurnaceWorld(client, player))
             invalidatePending("Actor-only furnace access no longer holds.");
         // An accepted direct intent owns the input path even when its tick is
@@ -1455,7 +1525,17 @@ final class AgentMacroControl {
                 ? "Only a direct Terra intent may survey or follow this dry route."
             : !trial && intent.skillHash != null && offer.key.verb == Verb.APPROACH
                 ? "Reusable skills cannot approach while incidental pickup remains possible."
-            : offer.scout == null ? validate(offer, progress) : null;
+            : offer.scout == null && offer.recon == null ? validate(offer, progress) : null;
+        ReconPlan reconPlan = null;
+        AgentVisual.Surface reconSurface = null;
+        if (refusal == null && offer.recon != null) {
+            if (visualReconReady() && offer.recon.matches(player))
+                reconSurface = AgentVisual.recheck(body, offer.key.activity);
+            if (reconSurface != null && intent.expires - tick > 16)
+                reconPlan = visualReconPlan(reconSurface.hit(), intent.recon.maxBlocks(), intent.expires - tick > 34);
+            if (reconPlan == null)
+                refusal = "No exact current surface and unchanged stance with a proved dry level, rise or descent leg inside the grant.";
+        }
         AgentVisibleHorizon.Window scoutWindow = null;
         if (refusal == null && offer.scout != null) {
             var scout = offer.scout;
@@ -1485,6 +1565,15 @@ final class AgentMacroControl {
         if (offer.route != null || offer.drySurvey != null) routeOwner = progress;
         action = new Action(intent, offer, client, tick, now, body.renderedFrame(),
             offer.item == null ? 0 : count(offer.item), NO_ANCHORS, Float.NaN);
+        if (reconPlan != null) {
+            usedReconCandidate = offer.key.activity;
+            action.recon = new AgentVisualRecon(intent.recon, player.getPos(), reconSurface.hit().getPos(), tick, now,
+                Math.min(intent.expires, reconSurface.expiresTick()));
+            action.reconStock = new ReconStock(player);
+            action.reconWork = input.work;
+            action.horizonTravel = AgentBody.HorizonTravel.groundScout(null, action.recon.target, 0);
+            startVisualReconLeg(reconPlan);
+        }
         if (offer.scout != null) {
             var scout = offer.scout;
             scoutedLandmarks.add(scout.anchor.target());
@@ -1579,8 +1668,14 @@ final class AgentMacroControl {
         if (intent.life != life || intent.epoch != epoch) return "The opportunity's life or dependency epoch changed.";
         if (intent.basis > tick || tick - intent.basis > MAX_AGE || tick > intent.expires) return "The intent expired.";
         var snapshot = snapshots.get(intent.basis);
-        return snapshot != null && snapshot.epoch == epoch && snapshot.offers.containsKey(intent.opportunity)
-            ? null : "Opportunity not offered in that observation.";
+        Offer offer = snapshot != null && snapshot.epoch == epoch ? snapshot.offers.get(intent.opportunity) : null;
+        if (offer == null) return "Opportunity not offered in that observation.";
+        if (offer.key.verb == Verb.RECON) {
+            if (!AgentVisualRecon.grants(intent.recon, offer.key.activity, usedReconCandidate,
+                    intent.skillHash == null && !trial && ipc.workMode != null))
+                return "The witnessed candidate requires one unused, explicitly bounded Terra recon grant.";
+        } else if (intent.recon != null) return "Recon bounds do not authorize a different opportunity.";
+        return null;
     }
 
     private boolean handoffCurrent(Handoff request) {
@@ -6986,6 +7081,7 @@ final class AgentMacroControl {
             case INSPECT -> retiredViews.contains(offer.key) || !visible(offer.face, INSPECT_REACH)
                 || player.getRotationVec(1).dotProduct(offer.face.hit.getPos().subtract(player.getEyePos()).normalize()) > 0.996
                 ? "The feature is already centered, inspected, or no longer visible." : null;
+            case RECON -> "Only one explicitly bounded visual reconnaissance grant can move toward this candidate.";
             case APPROACH -> repeatedSourceFooting(offer.floor.pos) || offer.farther != null && repeatedSourceFooting(offer.farther.pos)
                 ? "That footing was already checked without finding a new source."
                 : !floorCurrent(offer.floor) ? "The adjacent footing is no longer visible and clear." :
@@ -7033,6 +7129,7 @@ final class AgentMacroControl {
             }
         }
         switch (offer.key.verb) {
+            case RECON -> advanceVisualRecon(progress);
             case DRY_SURVEY -> surveyDryRoute(offer, progress);
             case STATION_REACQUIRE -> advanceStationRecall();
             case SURVEY -> fixedSurvey();
@@ -7443,6 +7540,362 @@ final class AgentMacroControl {
         }
     }
 
+    private boolean visualReconReady() {
+        return ipc.workMode != null && neutralWorkView() && body.visualReconStance()
+            && reconStopped() && (work == null || missingWorkFloor() == null);
+    }
+
+    private boolean reconStopped() {
+        double speed = AgentVisualRecon.SETTLED_SPEED;
+        return player.getVelocity().horizontalLengthSquared() <= speed * speed;
+    }
+
+    private ReconPlan visualReconPlan(BlockHitResult hit, double remaining, boolean timeForGrade) {
+        var view = body.horizonView();
+        if (view == null || view.ageTicks() > 1 || view.displacement() > 0.055 || !reconStopped()
+                || !body.visualReconStance()) return null;
+        var horizon = body.visibleHorizon();
+        var target = horizon.target(hit);
+        if (target == null) return null;
+        Vec3d feet = player.getPos(), aim = hit.getPos();
+        float yaw = player.getYaw(), pitch = player.getPitch();
+        float turn = MathHelper.wrapDegrees(heading(aim.x - feet.x, aim.z - feet.z) - yaw);
+        int shoulder = turn < 0 ? -1 : 1;
+        for (int i = 0; i < 3; ++i) {
+            int side = i == 2 ? -shoulder : (i == 0) == (Math.abs(turn) < 23) ? 0 : shoulder;
+            if (!body.visualReconSideBound(side) || Math.abs(turn - 45 * side) >= 45) continue;
+            float chosen = yaw + 45 * side;
+            double angle = Math.toRadians(chosen), dx = -Math.sin(angle), dz = Math.cos(angle);
+            var window = horizon.visualReconWindow(target, chosen);
+            if (window == null) continue;
+            double cap = Math.min(Math.min(AgentVisualRecon.MAX_LEG, remaining), window.knownDistance() - 0.06);
+            double limit = Math.min(cap, AgentVisualRecon.towardRoom(feet, aim, dx, dz));
+            // The stop target is a prefix of the checked same-height ribbon, not a
+            // prediction that the target block is traversable or a later leg exists.
+            if (limit < 0.57) continue;
+            Vec3d end = feet.add(dx * limit, 0, dz * limit);
+            if (body.macroRetainsView(aim, end, yaw, pitch) && body.visualReconPickupClear(end, feet.y, feet.y))
+                return new ReconPlan(new AgentVisualRecon.Leg(side, chosen, dx, dz, limit), null, null, null);
+        }
+        return timeForGrade ? visualReconGrade(aim, remaining) : null;
+    }
+
+    private ReconPlan visualReconGrade(Vec3d aim, double remaining) {
+        if (remaining < 2) return null;
+        Vec3d feet = player.getPos();
+        BlockPos source = player.getBlockPos();
+        Direction toward = Direction.fromHorizontalDegrees(heading(aim.x - feet.x, aim.z - feet.z));
+        var landing = body.visibleDryLanding(floor -> {
+            var direction = AgentDryLanding.bearing(source, floor.up());
+            return direction != null && reconGradeLeg(feet, aim, source, floor.up(), direction, remaining) != null;
+        });
+        if (landing != null) {
+            var leg = reconGradeLeg(feet, aim, source, landing.to(), landing.bearing(), remaining);
+            if (leg != null && reconGradeView(aim, feet, landing.center(), landing.top(), landing.yaw(), -landing.height())
+                    && reconGradePickupClear(source, landing.to(), feet, leg, leg.dx(), leg.dz())) {
+                double radians = Math.toRadians(landing.yaw());
+                return new ReconPlan(new AgentVisualRecon.Leg(0, landing.yaw(), -Math.sin(radians), Math.cos(radians),
+                    leg.limit(), leg.height(), leg.verticalReserve()), landing.top(), null, landing);
+            }
+        }
+        for (Direction bearing : CARDINAL) {
+            if (bearing != toward && bearing != toward.rotateYClockwise() && bearing != toward.rotateYCounterclockwise()) continue;
+            BlockPos to = source.offset(bearing).up();
+            var leg = reconGradeLeg(feet, aim, source, to, bearing, remaining);
+            if (leg == null) continue;
+            var rise = body.scoutRise(to.down(), bearing);
+            if (rise.grade() != null && reconGradeView(aim, feet, Vec3d.ofBottomCenter(to), rise.top(), leg.yaw(), 1)
+                    && reconGradePickupClear(source, to, feet, leg, leg.dx(), leg.dz()))
+                return new ReconPlan(leg, rise.top(), rise.grade(), null);
+        }
+        return null;
+    }
+
+    private AgentVisualRecon.Leg reconGradeLeg(Vec3d feet, Vec3d aim, BlockPos source, BlockPos to,
+                                               Direction direction, double remaining) {
+        int height = to.getY() - source.getY();
+        if (height < -AgentDryLanding.MAX_DROP || height == 0 || height > 1) return null;
+        Vec3d center = Vec3d.ofBottomCenter(to);
+        double before = Math.sqrt(horizontalSquared(feet, aim));
+        if (before - Math.sqrt(horizontalSquared(center, aim)) < 0.48) return null;
+        double dx = direction.getOffsetX(), dz = direction.getOffsetZ();
+        float yaw = heading(dx, dz);
+        // Reserve even the interrupted trajectory: a jump may coast back down to
+        // its source, and the descent may use the whole checked lip/receiver.
+        double vertical = height > 0 ? 2.72 : -height + 0.12;
+        double horizontal = reconGradeRoom(source, feet, dx, dz, height);
+        double limit = vertical + horizontal + 0.10;
+        return limit > remaining || horizontal < 0.64 ? null
+            : new AgentVisualRecon.Leg(0, yaw, dx, dz, limit, height, vertical);
+    }
+
+    private static double reconGradeRoom(BlockPos source, Vec3d feet, double dx, double dz, int height) {
+        // The independent ascent sweep extends through the receiver's center
+        // with a 0.055 clearance margin. The descent proof clears its widened lip.
+        return (height > 0 ? 1.05 : AgentDryLanding.STOPPING_END) - alongGrade(source, feet, dx, dz);
+    }
+
+    private static double alongGrade(BlockPos source, Vec3d feet, double dx, double dz) {
+        return dx * (feet.x - source.getX() - 0.5) + dz * (feet.z - source.getZ() - 0.5);
+    }
+
+    private boolean reconGradePickupClear(BlockPos source, BlockPos to, Vec3d feet, AgentVisualRecon.Leg leg,
+                                           double dx, double dz) {
+        double room = Math.max(0, reconGradeRoom(source, feet, dx, dz, leg.height()));
+        var end = feet.add(dx * room, 0, dz * room);
+        double low = Math.min(source.getY(), to.getY());
+        double high = Math.max(source.getY(), to.getY()) + (leg.height() > 0 ? 0.34 : 0);
+        return body.visualReconPickupClear(end, low, high);
+    }
+
+    private boolean reconGradeView(Vec3d aim, Vec3d from, Vec3d center, BlockHitResult top, float yaw, int height) {
+        float pitch = player.getPitch();
+        Vec3d apex = height > 0 ? center.add(0, 0.30, 0) : center;
+        return body.macroRetainsView(aim, from, yaw, pitch)
+            && body.macroRetainsView(top.getPos(), from, yaw, pitch)
+            && body.macroRetainsView(aim, apex, yaw, pitch);
+    }
+
+    private void startVisualReconLeg(ReconPlan plan) {
+        action.recon.start(plan.motion);
+        action.reconPlan = plan;
+        action.reconYaw = player.getYaw();
+        action.reconAligning = plan.motion.grade();
+        action.reconJumped = action.reconJumpKey = false;
+        action.reconStoppedAtFrame = -1;
+    }
+
+    private boolean reconMotionCurrent() {
+        return client.player == player && client.world == world && action.intent.life == life
+            && action.intent.epoch == epoch;
+    }
+
+    private boolean reconInputCurrent() {
+        return action != null && action.recon != null && reconMotionCurrent()
+            && currentReconGrant() && action.recon.timeForKey(tick, System.nanoTime());
+    }
+
+    private boolean currentReconGrant() {
+        var latest = ipc.inbox;
+        return latest.active && action.intent.equals(latest.intent) && action.reconWork.equals(latest.work);
+    }
+
+    private void sampleVisualRecon() {
+        if (action == null || action.recon == null) return;
+        boolean same = reconMotionCurrent();
+        action.recon.sample(tick, same ? player.getPos() : action.position,
+            same, same && action.reconStock.damaged(player));
+    }
+
+    private void advanceVisualRecon(AgentProgress progress) {
+        var recon = action.recon;
+        var plan = action.reconPlan;
+        var leg = plan.motion;
+        status = action.offer.summary;
+        double before = recon.travel();
+        sampleVisualRecon();
+        if (recon.travel() - before > 0.02) {
+            continuityWork = AgentPauseEpisodes.Work.ROUTE;
+            if (!action.purposefulMotion && recon.travel() >= AgentVisualRecon.MIN_PROGRESS) {
+                action.purposefulMotion = true;
+                purposeful("terra: " + action.offer.summary);
+            }
+        }
+        boolean posture = reconMotionCurrent() && (leg.grade()
+            ? body.visualReconPosture() && (grounded() || recon.droveLeg() && !player.isOnGround())
+            : grounded() && body.visualReconStance());
+        boolean camera = player.getPitch() == action.pitch && (action.reconAligning
+            ? angle(player.getYaw(), action.pitch, leg.yaw(), action.pitch)
+                <= angle(action.reconYaw, action.pitch, leg.yaw(), action.pitch) + 0.08
+            : player.getYaw() == action.reconYaw);
+        boolean controls = posture && hazardClear && camera
+            && !hands.busy() && !hands.holdsWorkInventory() && cursorClear()
+            && player.currentScreenHandler == player.playerScreenHandler
+            && !client.interactionManager.isBreakingBlock() && client.currentScreen == null
+            && client.isWindowFocused() && client.getOverlay() == null && !client.isPaused()
+            && body.visualReconInput(recon.priorKey(tick), leg.side(), action.reconJumpKey);
+        if (!recon.live(tick, now)) {
+            recon.cancel("The bounded reconnaissance expired before further input or a settled receipt.");
+            finish("interrupted", recon.interruption());
+            return;
+        }
+        boolean grant = currentReconGrant();
+        var view = controls ? body.horizonView() : null;
+        var surface = !grant || view == null || view.ageTicks() > 1 ? null
+            : AgentVisual.recheck(body, action.offer.key.activity);
+        recon.observePremises(grant, controls, reconMotionCurrent() && action.reconStock.unchanged(player), surface != null);
+        if (recon.interruption() != null) {
+            if (!recon.drove()) {
+                finish("interrupted", recon.interruption());
+                return;
+            }
+            brakeVisualRecon();
+        }
+        if (recon.braking()) {
+            if (view == null || !grounded() || !reconStopped() || view.displacement() > 0.055 || body.horizonStance(view) == null) {
+                action.reconStoppedAtFrame = -1;
+                return;
+            }
+            if (action.reconStoppedAtFrame < 0) {
+                action.reconStoppedAtFrame = view.frame();
+                return;
+            }
+            if (view.frame() <= action.reconStoppedAtFrame
+                    || !recon.settle(view.frame(), !leg.grade() || reconGradeLanded(plan))) return;
+            anchor = null;
+            if (recon.interruption() != null) {
+                finish("interrupted", recon.interruption());
+                return;
+            }
+            if (!recon.canStartLeg() || recon.remaining() < 0.57
+                    || horizontalSquared(player.getPos(), recon.target) <= 1.28 * 1.28) {
+                complete("Stopped at the authorized leg, travel or nominated-surface limit.");
+                return;
+            }
+            if (reconNewMaterial(progress, recon)) {
+                complete("The relocated view newly made an independently safe resource face reachable; stopped without harvesting.");
+                return;
+            }
+            var next = visualReconPlan(surface.hit(), recon.remaining(), recon.timeForGrade(tick, now));
+            if (next == null) {
+                finish("interrupted", "The relocated view did not prove another goalward dry level, rise or descent leg within the remaining grant.");
+                return;
+            }
+            startVisualReconLeg(next);
+            return; // Observe again before the first key of the next leg.
+        }
+        if (!recon.timeForKey(tick, now)) {
+            recon.cancel("Reserved the remaining grant for neutral braking and a settled view.");
+            brakeVisualRecon();
+            return;
+        }
+        if (leg.grade()) {
+            advanceVisualReconGrade(plan);
+            return;
+        }
+        var horizon = body.visibleHorizon();
+        var target = horizon.target(surface.hit());
+        var window = horizon.visualReconWindow(target, leg.yaw());
+        if (window == null) {
+            recon.cancel("The leg lost its currently witnessed dry support or stopping envelope.");
+            brakeVisualRecon();
+            return;
+        }
+        Vec3d velocity = player.getVelocity();
+        if (!recon.admitsKey(velocity, window.knownDistance())) {
+            brakeVisualRecon();
+            return;
+        }
+        double reach = AgentVisualRecon.keyEnvelope(velocity);
+        double drift = AgentVisualRecon.neutralSideDrift(velocity, leg);
+        Vec3d end = player.getPos().add(leg.dx() * reach - leg.dz() * drift, 0,
+            leg.dz() * reach + leg.dx() * drift);
+        if (body.horizonSweep(leg.dx(), leg.dz(), drift, reach, reach, AgentVisibleHorizon.Medium.DRY) != null
+                || !body.visualReconPickupClear(end, end.y, end.y)
+                || !body.macroRetainsView(recon.target, end, action.reconYaw, action.pitch)
+                || !body.driveVisualRecon(action.horizonTravel, window, leg.side(), reach)) {
+            recon.cancel("The next key would lose safe clearance, visibility, or the no-pickup lane.");
+            brakeVisualRecon();
+            return;
+        }
+        action.reconProposed = true;
+        body.guardVisualReconKeys(reconInputGrant);
+    }
+
+    private boolean reconGradeLanded(ReconPlan plan) {
+        return grounded() && Math.abs(player.getY() - plan.destination().getY()) <= 0.055
+            && plan.destination().down().equals(player.supportingBlockPos.orElse(null))
+            && world.getBlockState(plan.destination().down()) == plan.destinationState();
+    }
+
+    private void advanceVisualReconGrade(ReconPlan plan) {
+        var recon = action.recon;
+        var leg = plan.motion;
+        Vec3d feet = player.getPos(), end = Vec3d.ofBottomCenter(plan.destination());
+        boolean landed = reconGradeLanded(plan);
+        if (action.reconAligning) {
+            action.reconYaw = player.getYaw();
+            if (!recon.timeForGrade(tick, now) || !reconGradeView(recon.target, feet, end, plan.top, leg.yaw(), leg.height())) {
+                recon.cancel("The exact grade could not keep its nominated surface and support in view inside the remaining grant.");
+                brakeVisualRecon();
+                return;
+            }
+            if (Math.abs(MathHelper.wrapDegrees(player.getYaw() - leg.yaw())) <= 0.65
+                    && body.renderedDirection(leg.yaw(), action.pitch, 0.72f)) action.reconAligning = false;
+            else body.turnFixed(leg.yaw(), action.pitch);
+            return;
+        }
+        if (landed) {
+            brakeVisualRecon();
+            return;
+        }
+        if (grounded() && (!player.getBlockPos().equals(plan.source())
+                || !plan.source().down().equals(player.supportingBlockPos.orElse(null)))) {
+            recon.cancel("The grade did not remain on its exact departure or receiving footing.");
+            brakeVisualRecon();
+            return;
+        }
+        if (grounded() && plan.rise != null && action.reconJumped) {
+            recon.cancel("The authorized rise did not land on its exact witnessed dry top; no second jump was attempted.");
+            brakeVisualRecon();
+            return;
+        }
+        if (!recon.droveLeg() && !recon.timeForGrade(tick, now)) {
+            recon.cancel("Insufficient grant remains for the grade and its conservative neutral settling window.");
+            brakeVisualRecon();
+            return;
+        }
+        Direction travel = plan.rise != null ? plan.rise.bearing() : plan.descent.bearing();
+        double dx = travel.getOffsetX(), dz = travel.getOffsetZ();
+        boolean path = plan.rise != null
+            ? body.scoutRisePhysics() && body.ordinaryGradeSweep(plan.rise.from(), plan.rise.to())
+                && world.getBlockState(plan.rise.from().down()) == plan.rise.source()
+                && world.getBlockState(plan.rise.floor()) == plan.rise.surface()
+            : body.dryLandingClear(plan.descent);
+        if (!path || !reconGradePickupClear(plan.source(), plan.destination(), feet, leg, dx, dz)) {
+            recon.cancel("The exact grade lost dry headroom, landing or no-pickup clearance.");
+            brakeVisualRecon();
+            return;
+        }
+        // Descent releases every key as soon as the dry lip is left. The only
+        // airborne forward input is an already authorized and rechecked rise.
+        if (!grounded() && plan.rise == null) return;
+        if (body.horizonRecheck(plan.top) == null) {
+            recon.cancel("The exact dry top is no longer visible for the next grade input.");
+            brakeVisualRecon();
+            return;
+        }
+        double toLip = 0.5 + player.getWidth() * 0.5 - 0.035 - alongGrade(plan.source(), feet, dx, dz);
+        double reach = plan.rise != null ? AgentVisualRecon.gradeKeyEnvelope(player.getVelocity(), grounded())
+            : AgentVisualRecon.descentKeyEnvelope(player.getVelocity(), toLip);
+        if (!recon.admitsGradeKey(reach, reconGradeRoom(plan.source(), feet, dx, dz, leg.height()))) {
+            recon.cancel("Another grade key and its neutral coast would exceed the grant or the proved receiving footprint.");
+            brakeVisualRecon();
+            return;
+        }
+        action.reconProposed = plan.rise != null ? body.driveVisualRise(plan.rise, !action.reconJumped)
+            : body.driveDryLanding(plan.descent, true);
+        if (action.reconProposed) body.guardVisualReconKeys(reconInputGrant);
+        else if (grounded() && reconStopped()) {
+            recon.cancel("The ordinary grade motor did not admit movement into the proved landing envelope.");
+            brakeVisualRecon();
+        }
+    }
+
+    private void brakeVisualRecon() {
+        action.recon.brake(body.renderedFrame());
+        body.stopHorizonTravel(action.horizonTravel);
+        body.pauseWork();
+    }
+
+    private boolean reconNewMaterial(AgentProgress progress, AgentVisualRecon recon) {
+        var oldEye = recon.origin.add(0, player.getEyeY() - player.getY(), 0);
+        double reach = reach(), oldReach = (reach + 0.25) * (reach + 0.25);
+        return body.find(AgentMacroControl::resource, reach, hit -> hit.getPos().squaredDistanceTo(oldEye) > oldReach
+            && canBreak(hit.getBlockPos(), world.getBlockState(hit.getBlockPos()), progress)
+            && body.macroMineWitness(hit, reach) != null).isPresent();
+    }
+
     private void walkGroundScout(GroundScout scout) {
         Vec3d feet = player.getPos();
         if (!cursorClear() || player.isUsingItem() || player.isTouchingWater() || player.isClimbing() || player.hurtTime != 0
@@ -7837,6 +8290,23 @@ final class AgentMacroControl {
             action.fired |= client.options.attackKey.isPressed();
         if (action != null && action.offer.scout != null && action.offer.scout.rise != null)
             action.fired |= client.options.jumpKey.isPressed() && client.options.forwardKey.isPressed();
+        if (action != null && action.recon != null) {
+            action.reconJumpKey = false;
+            if (action.reconProposed) {
+                action.reconProposed = false;
+                boolean grade = action.reconPlan.motion.grade();
+                boolean forward = grade ? client.options.forwardKey.isPressed()
+                    : body.visualReconIssued(action.horizonTravel);
+                if (grade && client.options.jumpKey.isPressed()) {
+                    action.reconJumped = action.reconJumpKey = true;
+                }
+                if (forward || action.reconJumpKey) action.recon.issued(tick);
+                if (!forward || grade && action.reconPlan.rise != null && !action.reconJumped) {
+                    action.recon.cancel("The ordinary key gates vetoed the next checked movement pulse.");
+                    brakeVisualRecon();
+                }
+            }
+        }
         float crack = advancingCrack();
         if (crack > 0) continuityWork = AgentPauseEpisodes.Work.CRACK;
         long handsEvidence = hands.workEvidence();
@@ -7861,7 +8331,7 @@ final class AgentMacroControl {
                     && visited && hazardClear && !urgent && grounded() && stationaryWorldControls())) return;
             surveyReleaseFrame = -1;
         }
-        boolean forced = releasedSurvey || lastObservation == 0 || epoch != lastPublishedEpoch || hazardClear != lastHazard
+        boolean forced = visualResultChanged || releasedSurvey || lastObservation == 0 || epoch != lastPublishedEpoch || hazardClear != lastHazard
             || personalCraft != null && work.completedTick == tick
             || timberReplan != null && timberReplanAt == tick
             || action != null && action.furnace != null && action.furnace.releaseTick == tick
@@ -8770,6 +9240,23 @@ final class AgentMacroControl {
                 0, 0, null, face, null, null, null);
     }
 
+    private void addVisualSurface(List<Offer> offers) {
+        if (!visualTransportEnabled() || !neutralWorkView()) return;
+        var surface = AgentVisual.current(body);
+        if (surface == null) return;
+        var face = new Face(surface.hit(), surface.state());
+        if (offers.size() < MAX_OFFERS && visible(face, INSPECT_REACH)) inspect(offers, face);
+        if (!surface.id().equals(usedReconCandidate) && visualReconReady()
+                && visualReconPlan(face.hit, 6, true) != null) {
+            var key = faceKey(Verb.RECON, face, surface.id());
+            var stance = new ReconOffer(player.getPos(), player.getYaw(), player.getPitch());
+            offers.add(new Offer(offerId(key), key, "Scout toward the confirmed " + blockName(face),
+                "The exact nominated lit surface is visible and an initial goalward dry stopping lane is checked. "
+                    + "Requires separate leg and travel bounds; no harvest, pickup or spending.",
+                0, 0, null, face, null, null, null, null, null, null, null, null, stance));
+        }
+    }
+
     private void craftOffer(List<Offer> offers, Recipe recipe, Face face) {
         if (ingredients(recipe) && (recipe.result == null || count(recipe.result) == 0 || recipe == STICKS)) {
             offer(offers, face == null ? new Key(Verb.CONTINUE, null, 0, recipe.id) : faceKey(Verb.CONTINUE, face, recipe.id),
@@ -8808,6 +9295,10 @@ final class AgentMacroControl {
     private JsonObject renderedAnchor(Offer offer) {
         String subject, target;
         switch (offer.key.verb) {
+            case RECON -> {
+                subject = "route:visual_region";
+                target = offer.key.activity;
+            }
             case INSPECT -> {
                 subject = "block:" + blockName(offer.face);
                 target = materialTarget(new Key(Verb.BREAK, offer.key.pos, 0, null));
@@ -9305,6 +9796,7 @@ final class AgentMacroControl {
     }
 
     private void publish(AgentProgress progress, float crack, boolean releasedSurvey) {
+        visualResultChanged = false;
         lastObservation = tick;
         lastPublishedEpoch = epoch;
         JsonObject value = header(run);
@@ -9348,6 +9840,8 @@ final class AgentMacroControl {
         var ticket = pendingEntry();
         boolean idleView = idlePublicationPremise();
         String viewBlocker = progress == null ? null : worldViewBlocker();
+        if (progress != null && viewBlocker == null && visualReadAllowed() && AgentVisual.publishable(body, tick))
+            value.addProperty("visualReady", true);
         // Safety and control have already run. Keep this idle scout's existing
         // fan allotment out of optional material scans until offers begin.
         int scoutRays = progress != null && viewBlocker == null && idleView && groundScoutReady()
@@ -9458,6 +9952,9 @@ final class AgentMacroControl {
             }
             value.add("pendingWork", pending);
         }
+        // Append the visual option after the ordinary menu: nomination must not evict
+        // existing work or wait for its own path before those offers can publish.
+        if (idleView && progress != null && viewBlocker == null) addVisualSurface(visible);
         // An unvisited idle publication can itself explain why a survey disappeared.
         boolean trackSurvey = progress != null && !trial && surveyEvidence.enabled()
             && action == null && !hasActiveWorkOrder() && !rawWorking && !hands.busy() && !hands.holdsWorkInventory()
@@ -9752,6 +10249,12 @@ final class AgentMacroControl {
     }
 
     private void finish(String result, String detail) {
+        if (action.recon != null) {
+            sampleVisualRecon();
+            if (!owner.equals("safety")) body.pauseWork();
+            detail = action.recon.receipt(detail);
+            visualResultChanged();
+        }
         if (action.horizonTravel != null) body.stopHorizonTravel(action.horizonTravel);
         if (action.offer.scout != null && !owner.equals("safety")) body.pauseWork();
         if (action.offer.drop != null && !owner.equals("safety")) body.pauseWork();
@@ -9907,6 +10410,7 @@ final class AgentMacroControl {
     private String timeoutDetail() {
         return switch (action.offer.key.verb) {
             case BREAK -> "The resource did not produce a matching vanilla break event before expiry.";
+            case RECON -> "Visual reconnaissance expired before it could settle.";
             case APPROACH -> action.offer.scout == null ? "The short walk did not settle on the witnessed tile before expiry."
                 : "Ground reconnaissance expired before a settled, displaced stance could render a new view.";
             case COLLECT -> "The drop did not produce a matching inventory gain before expiry.";
@@ -9992,6 +10496,8 @@ final class AgentMacroControl {
         private static final String LEGACY = "";
         private static final Set<String> INTENT_FIELDS =
             Set.of("v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "opportunityId", "skillHash");
+        private static final Set<String> RECON_INTENT_FIELDS =
+            Set.of("v", "id", "run", "life", "epoch", "basisTick", "expiresTick", "opportunityId", "skillHash", "recon");
         private static final Set<String> HANDOFF_FIELDS = Set.of("v", "run", "life", "epoch", "basisTick", "expiresTick");
         private static final Set<String> PLANNING_FIELDS = Set.of("v", "run", "life", "epoch", "basisTick", "id");
         private static final WorkMailbox NO_WORK = new WorkMailbox(false, null);
@@ -10153,7 +10659,9 @@ final class AgentMacroControl {
 
         private Intent readIntent() {
             JsonObject value = read(directory.resolve("intent.json"), 2048);
-            if (value == null || !value.keySet().equals(INTENT_FIELDS)) return null;
+            if (value == null) return null;
+            boolean bounded = value.has("recon");
+            if (!value.keySet().equals(bounded ? RECON_INTENT_FIELDS : INTENT_FIELDS)) return null;
             try {
                 if (number(value, "v") != 1 || !run.equals(text(value, "run"))) return null;
                 String id = text(value, "id"), opportunity = text(value, "opportunityId");
@@ -10164,7 +10672,12 @@ final class AgentMacroControl {
                 long expires = number(value, "expiresTick");
                 if (life < 1 || life > Integer.MAX_VALUE || epoch < 1 || basis < 1 || expires <= basis
                         || expires - basis > MAX_AGE) return null;
-                return new Intent(id, (int) life, epoch, basis, expires, opportunity, skillHash);
+                AgentVisualRecon.Bounds recon = null;
+                if (bounded) {
+                    if (skillHash != null || expires - basis > AgentVisualRecon.MAX_TICKS) return null;
+                    recon = AgentVisualRecon.Bounds.read(value.getAsJsonObject("recon"));
+                }
+                return new Intent(id, (int) life, epoch, basis, expires, opportunity, skillHash, recon);
             } catch (RuntimeException e) {
                 return null;
             }

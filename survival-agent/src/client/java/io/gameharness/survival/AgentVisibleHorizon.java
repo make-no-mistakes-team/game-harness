@@ -197,6 +197,17 @@ final class AgentVisibleHorizon {
         checkedWindow(target, yaw, false, true);
     private final BearingCheck<Target, Window> checkedContact = (target, yaw, dry) -> checkedContactWindow(target, yaw);
     private final PatchCache patches = new PatchCache();
+    private final Support reconPatches = new Support() {
+        @Override public Patch at(int x, int z) {
+            Patch patch = patches.at(x, z);
+            return patch.medium == Medium.DRY && (patch.state == null || !AgentBody.normalDryTraction(patch.state))
+                ? Refusal.UNSUITABLE_TOP.unavailable : patch;
+        }
+
+        @Override public Refusal vetoDry(double dx, double dz, double drift, double braking) {
+            return patches.vetoDry(dx, dz, drift, braking);
+        }
+    };
     private final DryStrideSupport dryStride = new DryStrideSupport();
     private final PickupSupport pickupSupport = new PickupSupport();
     private final PickupGround pickupGround = new PickupGround();
@@ -435,6 +446,18 @@ final class AgentVisibleHorizon {
 
     Window dryWindow(Target target, float yaw) {
         return prepare(target) ? checkedWindow(target, yaw, false) : null;
+    }
+
+    /** Recon reserves a normal-traction stopping envelope and never inherits a wade or contact pulse. */
+    Window visualReconWindow(Target target, float yaw) {
+        if (!prepare(target) || !body.horizonBearingInView(memoView, yaw) || memoStance.wet) return null;
+        double heading = Math.toRadians(yaw);
+        double dx = -Math.sin(heading), dz = Math.cos(heading);
+        Track track = trace(reconPatches, memoStance, dx, dz);
+        return track.medium == Medium.DRY && track.known > track.braking
+            ? new Window(target, yaw, track.known, track.braking, Medium.DRY, memoView.frame(),
+                memoView.ageTicks(), memoView.displacement(), null, false)
+            : null;
     }
 
     Window dryKeyWindow(AgentBody.HorizonTravel travel, float yaw, float goal, float yawStep, float blocked,

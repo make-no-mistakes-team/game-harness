@@ -78,7 +78,7 @@ const SURVEY_RECOVERY_MS = 30_000;
 const ALTERNATIVE_RECOVERY_TICKS = WORK_REPLAN_GAP_TICKS + 20;
 const ALTERNATIVE_RECOVERY_MS = 5_000;
 // Native views are published every 5 ticks. Permit at most two follow-up
-// publications and a short wall-clock bound for the first rendered offer.
+// publications and a short wall-clock bound for a fresh physical handoff.
 const FIRST_ACTIONABLE_VIEW_TICKS = 10;
 const FIRST_ACTIONABLE_VIEW_MS = 600;
 
@@ -350,6 +350,7 @@ interface QueuedWork {
   readonly next: number;
   readonly bootstrap?: { readonly branchIndex: number; readonly declaredStages: number; readonly stageOffset: number };
   readonly smeltSuccessor?: true;
+  readonly travelWait?: { readonly tick: number; readonly until: number };
   readonly pendingPurpose?: WorkJob["pendingPurpose"];
   readonly preparedSide?: WorkJob["preparedSide"];
 }
@@ -1788,6 +1789,7 @@ export class SurvivalMacroController {
     if (runtimeExpired || this.closing || !current || !workScope(plan.observation, current, bootstrap ? after?.health : undefined) ||
         current.tick >= plan.proposal.expiresTick || after?.withdrawn) reason = "scope_or_ttl_changed";
     else if (!after) {
+      if (queued.travelWait?.tick === current.tick && performance.now() < queued.travelWait.until) return;
       await this.startWorkStage(queued);
       return;
     } else if (queued.smeltSuccessor && next === 0 && !terminal && current.workOrder?.id === after.order.id &&
@@ -1820,6 +1822,7 @@ export class SurvivalMacroController {
       } else await this.startWorkStage(queued);
       return;
     }
+    if (queued.travelWait && !this.closing) await this.rejectStale(plan, "physical_work_scope_or_ttl_changed");
     await this.discardQueuedWork(queued, reason);
   }
 
@@ -1841,13 +1844,33 @@ export class SurvivalMacroController {
         reason: "The witnessed timber obstruction requires its exact leaf break plus enough breaks for the remaining timber stock." });
       return;
     }
-    const currentWall = wall ? (fresh: MacroObservation) =>
-      this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
-      sameProspectOpening(wall, pricedProspectOpening(fresh, policy)) : undefined;
+    const wait = queued.travelWait;
+    let failedStart: { observation: MacroObservation; reason: string } | undefined;
+    const withoutStart = (observation: MacroObservation, reason: string) => {
+      failedStart = { observation, reason };
+      return false;
+    };
     let travelRefusal: { observation: MacroObservation; reason: string } | undefined;
-    const currentTravel = travel ? (fresh: MacroObservation) => {
+    const physical = travel ?? wall ?? timber;
+    const currentStart = physical ? (fresh: MacroObservation) => {
       if (!this.isCurrentHandoff(fresh) || !sameOpeningStance(plan.observation, fresh) ||
-          !sameTravelHint(travel, fresh.travelHint) || fresh.tick >= plan.proposal.expiresTick) return false;
+          fresh.tick >= plan.proposal.expiresTick) return withoutStart(fresh, "physical_work_scope_or_ttl_changed");
+      if (!("footing" in physical)) return "timber" in physical
+        ? sameTimberObstruction(physical, pricedTimberObstruction(fresh, policy)) ||
+          withoutStart(fresh, "timber_obstruction_no_longer_witnessed_or_priced")
+        : sameProspectOpening(physical, pricedProspectOpening(fresh, policy)) ||
+          withoutStart(fresh, "prospect_opening_no_longer_witnessed_or_priced");
+      if (wait) {
+        if (fresh.tick - wait.tick > FIRST_ACTIONABLE_VIEW_TICKS || performance.now() >= wait.until)
+          return withoutStart(fresh, "travel_hint_did_not_return_in_time");
+        if (!this.openingHandoff(plan.observation, fresh, policy, queued) || !hasStock(fresh, requires))
+          return withoutStart(fresh, "deferred_travel_grant_no_longer_current");
+      }
+      const current = fresh.travelHint;
+      if (!current) return withoutStart(fresh, "travel_hint_missing");
+      if (!sameTravelHint(physical, current) || (wait && physical.footing !== current.footing))
+        return withoutStart(fresh, "travel_hint_changed");
+      if (wait) return true; // The deferred handoff gate already rechecked the live floors.
       const missing = policy.reserves.find(({ item, count }) => stock(fresh, item) < count);
       if (!missing) return true;
       const { item, count } = missing;
@@ -1855,10 +1878,6 @@ export class SurvivalMacroController {
         reason: `The witnessed approach requires ${count} ${item} reserved at entry, but only ${stock(fresh, item)} are carried.` };
       return false;
     } : undefined;
-    const currentTimber = timber ? (fresh: MacroObservation) =>
-      this.isCurrentHandoff(fresh) && sameOpeningStance(plan.observation, fresh) &&
-      sameTimberObstruction(timber, pricedTimberObstruction(fresh, policy)) : undefined;
-    const currentStart = currentWall ?? currentTravel ?? currentTimber;
     let rejection = "fresh_work_admission_rejected";
     const job = await this.publishWork(plan.observation, policy, "model", plan.requestId, plan.proposal.expiresTick,
       requires, after?.policy, afterSmelt ? fresh => !this.job && fresh.tick >= afterSmelt.terminal!.tick &&
@@ -1910,11 +1929,29 @@ export class SurvivalMacroController {
         }
         return true;
       }, duringWaitFor, undefined, currentStart ? (before, latest) =>
-        latest.tick - before.tick < WORK_ADMISSION_TICKS && currentStart(latest) : undefined,
+        latest.tick - before.tick >= WORK_ADMISSION_TICKS ? withoutStart(latest, "physical_work_admission_basis_aged") :
+          currentStart(latest) : undefined,
       travel ? () => ({ travelAnchor: { subject: travel.subject, target: travel.target } }) :
         timber ? () => ({ travelAnchor: timber.toward }) : undefined);
     if (job === null) return; // A rotating observation is not a denied program stage.
     if (!job && (bootstrap || afterSmelt || duringWaitFor)) return this.discardQueuedWork(queued, rejection);
+    if (!job && failedStart) {
+      const { observation, reason } = failedStart;
+      if (reason === "travel_hint_missing" && travel &&
+          this.openingHandoff(plan.observation, observation, policy, queued) && hasStock(observation, requires) &&
+          (!plan.correction || this.sameReplyContext(plan.correction, observation))) {
+        // Hold the same grant, not a promise that the last visible route still works.
+        if (!wait) {
+          this.queuedWork = { ...queued, travelWait: { tick: observation.tick, until: performance.now() + FIRST_ACTIONABLE_VIEW_MS } };
+          await this.disposition("work_start_deferred", { requestId: plan.requestId, basis: basis(observation), reason,
+            travelAnchor: { subject: travel.subject, target: travel.target } });
+        }
+        return;
+      }
+      this.queuedWork = undefined;
+      await this.rejectStale(plan, reason);
+      return;
+    }
     this.queuedWork = undefined;
     if (!job && travelRefusal) {
       const { observation, reason } = travelRefusal;
@@ -1931,7 +1968,7 @@ export class SurvivalMacroController {
     }
     if (job && (stages.length > 1 || (job.order.origin === "model" && policy.target.kind === "preset"))) {
       if (bootstrap) job.bootstrap = index + stageOffset + 1;
-      this.queuedWork = { ...queued, after: job, next: index + 1 };
+      this.queuedWork = { ...queued, after: job, next: index + 1, travelWait: undefined };
       await this.record("work_program_stage", { requestId: plan.requestId, id: job.order.id, stage: index + stageOffset + 1,
         stages: bootstrap?.declaredStages ?? stages.length, ...(bootstrap ? { programSource: PRE_SPAWN_GOAL_ONLY } : {}) });
     }
@@ -2000,7 +2037,8 @@ export class SurvivalMacroController {
     await this.record("work_order_prepared", { requestId, order, previousId: previous?.order.id ?? null, equivalent });
     if (recheck) {
       const latest = await this.refresh();
-      if (!latest || !recheck(fresh, latest)) return;
+      if (!latest) return null;
+      if (!recheck(fresh, latest)) return;
     }
     if (this.closing || this.config.signal?.aborted) return;
     await this.ipc!.write("work.json", order, previous ? "work-only" : undefined);
@@ -3247,9 +3285,9 @@ export class SurvivalMacroController {
       issued: direct.issued, completed: direct.completed, maxEffects: direct.maxEffects });
   }
 
-  private openingHandoff(source: MacroObservation, fresh: MacroObservation, policy: MacroWorkPolicy): boolean {
+  private openingHandoff(source: MacroObservation, fresh: MacroObservation, policy: MacroWorkPolicy, queued?: QueuedWork): boolean {
     const inherited = this.floorScope?.life === fresh.life ? this.floorScope.reserves : [];
-    return this.isCurrentHandoff(fresh) && sameOpeningStance(source, fresh) && !this.queuedWork && !this.pendingSuccessor &&
+    return this.isCurrentHandoff(fresh) && sameOpeningStance(source, fresh) && this.queuedWork === queued && !this.pendingSuccessor &&
       !this.direct && !this.segment && !this.conditional && !this.lease && hasStock(fresh, policy.reserves) &&
       !confirmsWorkStock(fresh, policy) &&
       inherited.every(floor => policy.reserves.some(kept => kept.item === floor.item && kept.count >= floor.count));

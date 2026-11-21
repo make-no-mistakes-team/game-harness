@@ -76,6 +76,11 @@ be the starting reserve. The host explains that refusal to Terra
 and allows one corrected proposal on the same evidence. It never
 lowers the reserve on the model's behalf.
 
+If a travel job arrives just as its target drops out of view, the host
+can hold the unissued job for up to 10 ticks or 600 ms, whichever comes
+first. The same target and footing must reappear from the same stance.
+A different tree cannot take the old one's place.
+
 If a requested survey disappears before the player turns, Terra can report
 the missing view. Its return under the same safe conditions permits one
 fresh decision. The player never executes the old turn on a stale view.

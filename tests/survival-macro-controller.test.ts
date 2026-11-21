@@ -389,6 +389,94 @@ const wallPolicy = { ...cavePolicy, allowedEffects: [...cavePolicy.allowedEffect
   reserves: [...cavePolicy.reserves, { item: "minecraft:raw_iron", count: 2 }] } as const;
 const wallState = { ...caveState, inventory: { ...caveState.inventory, "minecraft:raw_iron": 2 } } as const;
 
+test.each(["matching later witness", "camera receipt only"] as const)(
+  "An inherited ceiling first view opens only the paid outlook and waits for %s", async condition => {
+    const outlook = { id: "o-startup", verb: "survey", risk: "read", summary: "Frame the outlook ahead",
+      evidence: "The current first-person view points almost straight up at nearby lit cover. Look forward from the same stance; no movement or contact is authorized." } as const;
+    const resumed = { ...wallState, goal: "nether_portal" };
+    const requests: MacroRequest[] = [];
+    const quote = Promise.withResolvers<void>();
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      await quote.promise;
+      return workReply(request, { kind: "work", policy: wallPolicy, openingViewId: outlook.id });
+    }, "Find a diamond with the carried iron pickaxe and protect the existing raw iron.", 3);
+    try {
+      // Native has entered play but has no first usable render to publish yet.
+      await f.actor.poll();
+      expect(requests).toHaveLength(0);
+      await f.observe(6, { ...resumed, opportunities: [outlook] });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ trigger: "first", observation: { tick: 6, opportunities: [outlook] },
+        work: { demand: "first", openingViewIds: [outlook.id] } });
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+
+      quote.resolve();
+      await f.actor.poll();
+      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      expect(intent).toMatchObject({ basisTick: 6, opportunityId: outlook.id, skillHash: null });
+      await f.receipt(intent.id, 10, "accepted");
+      await f.observe(16, resumed);
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+
+      await f.receipt(intent.id, 22, "completed", "The first-person camera rendered the outlook ahead.");
+      await f.observe(22, { ...resumed, prospectOpening: wall });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      if (condition === "matching later witness") {
+        await f.observe(27, { ...resumed, prospectOpening: wall });
+        const order = await f.order();
+        expect(order).toMatchObject({ basisTick: 27, origin: "model", reserves: wallPolicy.reserves });
+        expect(new Set(order.allowedEffects)).toEqual(new Set(wallPolicy.allowedEffects));
+      } else {
+        await f.observe(27, resumed);
+        await f.observe(182, { ...resumed, opportunities: [caveSurvey] });
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+      }
+      expect(requests).toHaveLength(1);
+      expect(f.actor.status()).toMatchObject({ issued: 1, completedReceipts: 0, completedModelWorkOrders: 0 });
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      quote.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test("A first standalone fixed survey wakes constrained planning only for newly visible physical work", async () => {
+  const requests: MacroRequest[] = [];
+  const quote = Promise.withResolvers<void>();
+  const f = await durableFixture(async request => {
+    requests.push(request);
+    await quote.promise;
+    return workReply(request, requests.length === 1 ? { kind: "opportunity", opportunityId: caveSurvey.id } : { kind: "abstain" });
+  }, "Look for a dry entrance to quarry for diamond.", 3);
+  try {
+    await f.observe(6, { ...wallState, opportunities: [caveSurvey] });
+    expect(requests).toHaveLength(1);
+    quote.resolve();
+    await f.actor.poll();
+    const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+    await f.receipt(intent.id, 10, "accepted");
+    await f.receipt(intent.id, 22, "completed", "The first-person camera rendered the requested survey angle.");
+    await f.observe(91, { ...wallState, opportunities: [{ ...caveSurvey, id: "right", summary: "Survey right" }] });
+    expect(requests).toHaveLength(1);
+    expect(await readFile(f.file("history.jsonl"), "utf8")).toContain('"event":"survey_awaiting_witness"');
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    const station = { id: "furnace", verb: "interact", risk: "guarded", summary: "Open the visible furnace",
+      evidence: "A lit station face is inside vanilla use reach." } as const;
+    await f.observe(96, { ...wallState, opportunities: [station] });
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({ observation: { tick: 96, opportunities: [station] },
+      lastReceipt: { id: intent.id, status: "completed" } });
+  } finally {
+    quote.resolve();
+    await f.actor.stop();
+    await f.clean();
+  }
+});
+
 const visibleTimber = { kind: "resource", subject: "block:minecraft:oak_log", target: "log-a",
   footing: "dry", bearingDegrees: -12, windowBlocks: 0.9 } as const;
 const timberRiser = { kind: "resource", subject: visibleTimber.subject, target: visibleTimber.target,
@@ -642,6 +730,78 @@ test.each(["frontier", "ore", "after inspection", "lost reserve"] as const)(
         basisTick: condition === "after inspection" ? 31 : 16,
         travelAnchor: { subject: travelHint.subject, target: travelHint.target } });
       await expect(access(f.file("intent.json"))).rejects.toThrow();
+    } finally {
+      reply.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each(["same target", "different target", "never returned", "unsafe"] as const)(
+  "The ordinary tick-817 oak ray dropout keeps only the same live grant (%s)",
+  async result => {
+    const log = "minecraft:oak_log";
+    const anchor = { subject: `block:${log}`, target: "m-10" };
+    const travelHint = { ...anchor, kind: "resource", bearingDegrees: -48.131897, footing: "dry", windowBlocks: 1.6 } as const;
+    const still: Partial<MacroObservation> = { goal: "diamond", epoch: 5, stance: 6, safety: { clear: true, revision: 2 },
+      inventory: { [log]: 4, "minecraft:crafting_table": 1 },
+      workOrder: { id: "retired-job", state: "blocked", detail: "No witnessed drop, harvest face, or reserve-safe recipe can advance the requested stock." },
+      opportunities: [{ id: "o-2", verb: "continue", summary: "Craft planks in the inventory grid", risk: "guarded",
+        evidence: "The visible inventory holds the ingredients for this vanilla recipe.",
+        material: { subject: "recipe:planks", target: "recipe-planks", spends: { [log]: 1 } } }],
+    };
+    const visible = { ...still, travelHint, opportunities: [...still.opportunities!,
+      { id: "o-20", verb: "inspect", summary: `Center the visible ${log}`, risk: "read",
+        evidence: "A lit face is visible away from the current crosshair.", anchor } as const] };
+    const policy = {
+      target: { kind: "stock", item: log, count: 8 }, allowedEffects: [`break:${log}`], costCaps: [],
+      reserves: [], maxBreaks: 4, maxCrafts: 0, maxPlacements: 0,
+    } as const;
+    const requests: MacroRequest[] = [];
+    const reply = Promise.withResolvers<void>();
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      await reply.promise;
+      return workReply(request, { kind: "work", policy }, 1200);
+    }, "Gather enough wood to carry six logs for travel and continue toward a diamond.", 8);
+    try {
+      await f.observe(692, visible);
+      await f.observe(812, visible);
+      reply.resolve();
+      await f.observe(817, still);
+      expect(f.actor.status()).toMatchObject({ lastDisposition: "work_start_deferred", staleDecisions: 0, issuedWorkOrders: 0 });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+
+      if (result === "same target") {
+        await f.observe(822, visible);
+        expect(await f.order()).toMatchObject({ ...policy, travelAnchor: anchor, basisTick: 822, expiresTick: 1892, origin: "model" });
+      } else {
+        if (result === "different target") {
+          await f.observe(822, { ...still, travelHint: { ...travelHint, target: "m-11" } });
+          await f.observe(827, visible);
+        } else if (result === "unsafe") {
+          await f.observe(822, { ...visible, epoch: 6, safety: { clear: false, revision: 3 } });
+        } else {
+          await f.observe(822, still);
+          await f.observe(832, visible);
+        }
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        expect(f.actor.status()).toMatchObject({ lastDisposition: "stale", staleDecisions: 1 });
+      }
+      expect(requests.map(request => request.observation.tick)).toEqual([692]);
+      expect(f.actor.status()).toMatchObject({ providerDispatches: 1, issued: 0,
+        issuedWorkOrders: result === "same target" ? 1 : 0, completedModelWorkOrders: 0 });
+      expect(await readFile(f.file("receipts.jsonl"), "utf8")).toBe("");
+      expect(hasConfirmedTerraEffect(f.actor.status())).toBe(false);
+      const history = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      const deferred = history.find(event => event.event === "work_start_deferred");
+      expect(deferred).toMatchObject({ basis: { tick: 817 }, travelAnchor: anchor });
+      const terminal = result === "same target" ? "work_order_issued" : "stale";
+      expect(history.filter(event => event.event === terminal)).toEqual([
+        expect.objectContaining({ requestId: deferred!.requestId }),
+      ]);
     } finally {
       reply.resolve();
       await f.actor.stop();
@@ -3248,94 +3408,6 @@ test("A stale premise removes its planning notice and Stop leaves no planning au
     await expect(access(f.file("planning.json"))).rejects.toThrow();
   } finally {
     reply.resolve();
-    await f.actor.stop();
-    await f.clean();
-  }
-});
-
-test.each(["matching later witness", "camera receipt only"] as const)(
-  "An inherited ceiling first view opens only the paid outlook and waits for %s", async condition => {
-    const outlook = { id: "o-startup", verb: "survey", risk: "read", summary: "Frame the outlook ahead",
-      evidence: "The current first-person view points almost straight up at nearby lit cover. Look forward from the same stance; no movement or contact is authorized." } as const;
-    const resumed = { ...wallState, goal: "nether_portal" };
-    const requests: MacroRequest[] = [];
-    const quote = Promise.withResolvers<void>();
-    const f = await durableFixture(async request => {
-      requests.push(request);
-      await quote.promise;
-      return workReply(request, { kind: "work", policy: wallPolicy, openingViewId: outlook.id });
-    }, "Find a diamond with the carried iron pickaxe and protect the existing raw iron.", 3);
-    try {
-      // Native has entered play but has no first usable render to publish yet.
-      await f.actor.poll();
-      expect(requests).toHaveLength(0);
-      await f.observe(6, { ...resumed, opportunities: [outlook] });
-      expect(requests).toHaveLength(1);
-      expect(requests[0]).toMatchObject({ trigger: "first", observation: { tick: 6, opportunities: [outlook] },
-        work: { demand: "first", openingViewIds: [outlook.id] } });
-      await expect(access(f.file("intent.json"))).rejects.toThrow();
-      await expect(access(f.file("work.json"))).rejects.toThrow();
-
-      quote.resolve();
-      await f.actor.poll();
-      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
-      expect(intent).toMatchObject({ basisTick: 6, opportunityId: outlook.id, skillHash: null });
-      await f.receipt(intent.id, 10, "accepted");
-      await f.observe(16, resumed);
-      await expect(access(f.file("work.json"))).rejects.toThrow();
-
-      await f.receipt(intent.id, 22, "completed", "The first-person camera rendered the outlook ahead.");
-      await f.observe(22, { ...resumed, prospectOpening: wall });
-      await expect(access(f.file("work.json"))).rejects.toThrow();
-      if (condition === "matching later witness") {
-        await f.observe(27, { ...resumed, prospectOpening: wall });
-        const order = await f.order();
-        expect(order).toMatchObject({ basisTick: 27, origin: "model", reserves: wallPolicy.reserves });
-        expect(new Set(order.allowedEffects)).toEqual(new Set(wallPolicy.allowedEffects));
-      } else {
-        await f.observe(27, resumed);
-        await f.observe(182, { ...resumed, opportunities: [caveSurvey] });
-        await expect(access(f.file("work.json"))).rejects.toThrow();
-      }
-      expect(requests).toHaveLength(1);
-      expect(f.actor.status()).toMatchObject({ issued: 1, completedReceipts: 0, completedModelWorkOrders: 0 });
-      await expect(access(f.file("intent.json"))).rejects.toThrow();
-    } finally {
-      quote.resolve();
-      await f.actor.stop();
-      await f.clean();
-    }
-  },
-);
-
-test("A first standalone fixed survey wakes constrained planning only for newly visible physical work", async () => {
-  const requests: MacroRequest[] = [];
-  const quote = Promise.withResolvers<void>();
-  const f = await durableFixture(async request => {
-    requests.push(request);
-    await quote.promise;
-    return workReply(request, requests.length === 1 ? { kind: "opportunity", opportunityId: caveSurvey.id } : { kind: "abstain" });
-  }, "Look for a dry entrance to quarry for diamond.", 3);
-  try {
-    await f.observe(6, { ...wallState, opportunities: [caveSurvey] });
-    expect(requests).toHaveLength(1);
-    quote.resolve();
-    await f.actor.poll();
-    const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
-    await f.receipt(intent.id, 10, "accepted");
-    await f.receipt(intent.id, 22, "completed", "The first-person camera rendered the requested survey angle.");
-    await f.observe(91, { ...wallState, opportunities: [{ ...caveSurvey, id: "right", summary: "Survey right" }] });
-    expect(requests).toHaveLength(1);
-    expect(await readFile(f.file("history.jsonl"), "utf8")).toContain('"event":"survey_awaiting_witness"');
-    await expect(access(f.file("work.json"))).rejects.toThrow();
-    const station = { id: "furnace", verb: "interact", risk: "guarded", summary: "Open the visible furnace",
-      evidence: "A lit station face is inside vanilla use reach." } as const;
-    await f.observe(96, { ...wallState, opportunities: [station] });
-    expect(requests).toHaveLength(2);
-    expect(requests[1]).toMatchObject({ observation: { tick: 96, opportunities: [station] },
-      lastReceipt: { id: intent.id, status: "completed" } });
-  } finally {
-    quote.resolve();
     await f.actor.stop();
     await f.clean();
   }

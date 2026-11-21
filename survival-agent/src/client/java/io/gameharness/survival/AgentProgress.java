@@ -1523,7 +1523,7 @@ final class AgentProgress {
 
     /** Only ordinary trail work may continue under a witnessed low ceiling; never widen the pillar. */
     private String tryStallMineHandback(BlockPos standing) {
-        if (!arrived(standing) || c.player.isTouchingWater() || returnableMine.unjoined(standing)
+        if (!arrived(standing) || c.player.isTouchingWater() || returnableMine.unjoined()
                 || caves.active() || trail.size() < 3
                 || portal != null && portal.castEligible()) return null;
         int last = activeTrail() - 1;
@@ -3907,13 +3907,13 @@ final class AgentProgress {
         }
         if (surfaceApproach.step(c.player.getBlockPos())) return;
         if (resource != Resource.STONE && fieldWood.step()) return;
-        double range = resource != Resource.STONE && (surfaceDeparture() || !has(TORCH, 2))
-            ? REACH - 0.35 : SEARCH;
-        if (workOre(resource, range, resource != Resource.STONE)) return;
         if (returnableMine.active() && (resource == Resource.DIAMOND || resource == Resource.IRON)) {
             workReturnableMine(c.player.getBlockPos(), depth);
             return;
         }
+        double range = resource != Resource.STONE && (surfaceDeparture() || !has(TORCH, 2))
+            ? REACH - 0.35 : SEARCH;
+        if (workOre(resource, range, resource != Resource.STONE)) return;
         if (resource != Resource.STONE && prepareMining(depth)) return;
         if (resource != Resource.STONE && hands.count(TORCH) + 4 * hands.count(FUEL) < LOCAL_LIGHT
             && affordsWood(localTableWood(), 3) && workOre(Resource.COAL, range, false)) return;
@@ -3936,7 +3936,7 @@ final class AgentProgress {
         // Stocking a dark mine can take longer than a strategy's lifetime.
         // Offer the actual route choice, not the eventual ore objective at spawn.
         BlockPos standing = c.player.getBlockPos();
-        if (returnableMine.unjoined(standing) || standing.getY() > depth && !returnableMine.stockedForNewLeg(this)) return;
+        if (returnableMine.unjoined() || standing.getY() > depth && !returnableMine.stockedForNewLeg(this)) return;
         prospected |= bit;
         prospectingOre = resource;
         // An offer is passive: no view, movement, supplies or timing changes
@@ -3950,7 +3950,7 @@ final class AgentProgress {
         if (offer != null && expedition.hasAdvice(offer) && expeditionOffer() == offer
                 && tick >= nextDigStart && expeditionTurnReady()) {
             BlockPos standing = c.player.getBlockPos();
-            if (!returnableMine.unjoined(standing) && (standing.getY() <= depth || returnableMine.stockedForNewLeg(this))) {
+            if (!returnableMine.unjoined() && (standing.getY() <= depth || returnableMine.stockedForNewLeg(this))) {
                 var selected = expedition.take(offer, true);
                 if (selected != null) {
                     prospectingYaw = c.player.getYaw();
@@ -6587,10 +6587,10 @@ final class AgentProgress {
         }
         if (nextFoot == null && (surfaceApproach.step(standing) || !c.player.isOnGround())) return;
         boolean returnableDescent = nextFoot == null && toward == null && !lavaProspecting
-            && (standing.getY() > depth || returnableMine.unjoined(standing))
+            && (standing.getY() > depth || returnableMine.unjoined())
             && (sought == Resource.DIAMOND || sought == Resource.IRON) && (has(DEEP_PICK, 1) || has(STONE_PICK, 1));
-        if (returnableDescent && returnableMine.unjoined(standing)) {
-            workReturnableMine(standing, depth);
+        if (returnableDescent && returnableMine.unjoined()) {
+            workReturnableMine(standing, depth, preferExcavation);
             return;
         }
         if (nextFoot == null && !trail.isEmpty() && !standing.equals(trail.getLast())) {
@@ -6709,8 +6709,7 @@ final class AgentProgress {
         AgentReturnableMine.Outcome outcome = returnableMine.step(this, current, depth, preferred, preferExcavation);
         if (!returnableMine.surveyingCave()) status = returnableMine.status();
         if (outcome == AgentReturnableMine.Outcome.SUPPLIES) seekExpeditionSupplies("returnable mine supplies");
-        else if (outcome == AgentReturnableMine.Outcome.EXHAUSTED
-                && !returnableNearbyAnchor(current)) localBlock = status;
+        else if (outcome == AgentReturnableMine.Outcome.EXHAUSTED) localBlock = status;
     }
 
     boolean returnableCaveOpening(BlockPos current, BlockPos planned, Direction bearing) {
@@ -6734,18 +6733,13 @@ final class AgentProgress {
 
     boolean mineCaveHandedOff() { return caveRetreat.shaft != null || target != null; }
 
-    private boolean returnableNearbyAnchor(BlockPos current) {
-        if (returnableMine.unjoined(current)) return false;
+    BlockPos returnableRetainedStep(BlockPos current) {
         int index = trail.lastIndexOf(current);
-        if (index < 2 || index != activeTrail() - 1 || returnIndex >= 0 || resumeIndex >= 0) return false;
+        if (index < 1 || index != activeTrail() - 1 || returnIndex >= 0 || resumeIndex >= 0) return null;
         BlockPos previous = trail.get(index - 1);
         int horizontal = Math.abs(previous.getX() - current.getX()) + Math.abs(previous.getZ() - current.getZ());
         // Do not infer a route across a fall, fluid link, or recovery's vertical pillar.
-        // Only an exact previously proved mine pair may seed this fallback.
-        if (horizontal != 1 || !dugSteps.get(index)) return false;
-        if (!startReturn(index - 1, false)) return false;
-        status = "returning on verified mine treads to look for another anchor";
-        return true;
+        return horizontal == 1 && dugSteps.get(index) ? previous : null;
     }
 
     int returnableTorches() { return hands.count(TORCH); }
@@ -6755,14 +6749,22 @@ final class AgentProgress {
     void rememberReturnableMotion() { rememberMotion(); }
 
     void recordReturnableDrop(BlockPos from, BlockPos to, Direction bearing) {
-        recordReturnableLevel(from, to, bearing);
+        recordReturnableRelocation(from, to, bearing);
         returnableDrop = new ReturnableDrop(returnableDrop == null ? 1 : returnableDrop.sequence() + 1,
             from, to, body.actionTick());
         stairLength++;
     }
 
-    void recordReturnableLevel(BlockPos from, BlockPos to, Direction bearing) {
-        if (!trail.isEmpty() && from.equals(trail.getLast())) appendGrounded(to, true);
+    void recordReturnableRelocation(BlockPos from, BlockPos to, Direction bearing) {
+        if (!trail.isEmpty() && from.equals(trail.getLast())) {
+            int revisit = trail.lastIndexOf(to);
+            if (revisit < 0) appendGrounded(to, true);
+            else {
+                trail.subList(revisit + 1, trail.size()).clear();
+                if (dugSteps.length() > revisit + 1) dugSteps.clear(revisit + 1, dugSteps.length());
+                litIndex = Math.min(litIndex, trail.size());
+            }
+        }
         caves.walkedDry(from, to);
         caves.witnessedDry(to, from);
         body.recordWalkedLeg(from, to);
@@ -6789,6 +6791,7 @@ final class AgentProgress {
     private boolean returnableOreReachable(BlockHitResult hit) {
         BlockPos position = hit.getBlockPos();
         return !underMineFootprint(position) && reachableResourceFace(position) && !protectRecoveryBlock(position)
+            && !AgentReturnableMine.protectedCutAttachment(c.world, position)
             && c.player.getEyePos().squaredDistanceTo(hit.getPos()) <= (REACH - 0.40) * (REACH - 0.40);
     }
 
@@ -6797,11 +6800,10 @@ final class AgentProgress {
     }
 
     AgentReturnableMine.Face returnableFace(BlockHitResult hit) {
-        return returnableFace(hit.getBlockPos(), state(hit));
-    }
-
-    private boolean returnableCutAllowed(BlockPos position, BlockState observed) {
-        return returnableFace(position, observed) == AgentReturnableMine.Face.MINEABLE;
+        BlockPos cell = hit.getBlockPos();
+        var face = returnableFace(cell, state(hit));
+        return face == AgentReturnableMine.Face.MINEABLE && AgentReturnableMine.protectedCutAttachment(c.world, cell)
+            ? AgentReturnableMine.Face.PROTECTED : face;
     }
 
     private AgentReturnableMine.Face returnableFace(BlockPos position, BlockState observed) {
@@ -6809,7 +6811,7 @@ final class AgentProgress {
         if (protectRecoveryBlock(position)) return AgentReturnableMine.Face.PROTECTED;
         if (!observed.getFluidState().isEmpty()) return AgentReturnableMine.Face.FLUID;
         if (observed.getBlock() instanceof net.minecraft.block.FallingBlock || dangerous(observed)
-                || !(observed.isIn(BlockTags.BASE_STONE_OVERWORLD) || observed.isIn(BlockTags.DIRT)
+                || !(observed.isIn(BlockTags.BASE_STONE_OVERWORLD) || observed.isIn(BlockTags.DIRT) || observed.isOf(Blocks.GRASS_BLOCK)
                 || observed.isOf(Blocks.TUFF) || observed.isOf(Blocks.CALCITE) || observed.isOf(Blocks.CLAY)
                 || observed.isOf(Blocks.DRIPSTONE_BLOCK))) return AgentReturnableMine.Face.MATERIAL;
         return tools.canHarvest(observed) ? AgentReturnableMine.Face.MINEABLE : AgentReturnableMine.Face.TOOL;
@@ -7063,9 +7065,11 @@ final class AgentProgress {
         BlockState state = state(hit);
         if (returnable) {
             if (resourceHandoff && handoffReturnableResource(hit)) return Dig.RESOURCE;
-            if (state.isReplaceable() && state.getFluidState().isEmpty() && !dangerous(state))
+            // An outline (grass, a torch) is not a wall and should not be dug.
+            if (state.getFluidState().isEmpty() && !AgentBody.dryCaveDanger(state)
+                    && state.getCollisionShape(c.world, position).isEmpty())
                 return returnableClearance(point);
-            if (!returnableCutAllowed(position, state)) return Dig.BLOCKED;
+            if (!returnableCutAllowed(hit)) return Dig.BLOCKED;
             Vec3d above = Vec3d.ofCenter(position.up(), 0.20);
             BlockHitResult cover = perceive(above, c.player.getEyePos().distanceTo(above) + 0.04);
             if (cover != null && cover.getBlockPos().equals(position.up())

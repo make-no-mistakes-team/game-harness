@@ -27,7 +27,7 @@ final class AgentSurfaceTread {
     private final Direction travel;
     private final Vec3d center, floorAim, nearFloorAim, chestAim, headAim;
     private final BlockPos sourceSupport, landingSupport;
-    private final boolean isolated, witnessedOutbound, ordinaryGrade;
+    private final boolean isolated, witnessedOutbound, ordinaryGrade, stockAccess;
     private final AgentDryCaveRoute.Probe levelProbe;
     private final AgentWalkedRoute.Motion motion = new AgentWalkedRoute.Motion();
     private final long started;
@@ -38,12 +38,12 @@ final class AgentSurfaceTread {
     private AgentSurfaceTread ahead;
 
     AgentSurfaceTread(Edge edge, boolean returning, long started) {
-        this(edge, returning, started, false, false, false);
+        this(edge, returning, started, false, false, false, false);
     }
 
     /** The ordinary prospect just re-witnessed this landing and both passage samples. */
     static AgentSurfaceTread witnessedOutbound(Edge edge, long tick) {
-        return new AgentSurfaceTread(edge, false, tick, false, true, false);
+        return new AgentSurfaceTread(edge, false, tick, false, true, false, false);
     }
 
     static boolean ordinaryRiseSide(BlockPos from, Direction travel, BlockHitResult hit) {
@@ -66,17 +66,24 @@ final class AgentSurfaceTread {
     }
 
     static AgentSurfaceTread ordinaryGrade(Edge edge, BlockPos from, long tick) {
-        return new AgentSurfaceTread(edge, edge.lower.equals(from), tick, false, true, true);
+        return new AgentSurfaceTread(edge, edge.lower.equals(from), tick, false, true, true, false);
+    }
+
+    /** Ordinary stock/supply work may collect; it still uses the same checked level/grade motor. */
+    static AgentSurfaceTread ordinaryStock(Edge edge, BlockPos from, long tick) {
+        return new AgentSurfaceTread(edge, !edge.upper.equals(from), tick, false, true,
+            edge.upper.getY() != edge.lower.getY(), true);
     }
 
     private AgentSurfaceTread(Edge edge, boolean returning, long started, boolean isolated,
-                              boolean witnessedOutbound, boolean ordinaryGrade) {
+                              boolean witnessedOutbound, boolean ordinaryGrade, boolean stockAccess) {
         this.edge = edge;
         this.returning = returning;
         this.started = started;
         this.isolated = isolated;
         this.witnessedOutbound = witnessedOutbound;
         this.ordinaryGrade = ordinaryGrade;
+        this.stockAccess = stockAccess;
         from = returning ? edge.lower : edge.upper;
         to = returning ? edge.upper : edge.lower;
         travel = returning ? edge.down.getOpposite() : edge.down;
@@ -101,7 +108,7 @@ final class AgentSurfaceTread {
         BlockPos upper = up ? to : from, lower = up ? from : to;
         var edge = new Edge(upper, client.world.getBlockState(upper.down()),
             lower, client.world.getBlockState(lower.down()), up ? travel.getOpposite() : travel);
-        return new AgentSurfaceTread(edge, up, tick, true, false, false);
+        return new AgentSurfaceTread(edge, up, tick, true, false, false, false);
     }
 
     boolean inFlight() { return drivingSince >= 0; }
@@ -240,7 +247,7 @@ final class AgentSurfaceTread {
         if (drivingSince >= 0 && tick - drivingSince > DRIVE_TICKS)
             return refuse("The body did not ground on the dry landing within the tread's movement window.");
         if (!body.hasRecentView()) return drivingSince < 0 ? Result.CHECKING : Result.MOVING;
-        if ((isolated || ordinaryGrade) && !body.macroNoVisiblePickup(center, Math.min(from.getY(), to.getY()),
+        if ((isolated || ordinaryGrade && !stockAccess) && !body.macroNoVisiblePickup(center, Math.min(from.getY(), to.getY()),
                 Math.max(from.getY(), to.getY()) + 0.32)) return refuse("The dry tread no longer has a pickup-free sweep.");
         if (drivingSince < 0) {
             if (!player.isOnGround() || !player.getBlockPos().equals(from))

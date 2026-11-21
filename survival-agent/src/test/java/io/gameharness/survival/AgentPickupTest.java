@@ -12,8 +12,10 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import net.minecraft.block.Blocks;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
@@ -86,19 +88,58 @@ final class AgentPickupTest {
     }
 
     @Test
-    void airborneOreAtTheLipKeepsItsOwnBoundedAttemptWithoutGivingPickupCredit() {
+    void aLogOnTheGrassShelfNeedsTheExactWitnessedOneBlockRise() {
+        var from = new BlockPos(0, 62, 0);
+        var shelf = from.east().up();
+        var player = PLAYER.offset(0.5, 62, 0.5);
+        var log = item(2.2, 63, 0.5);
+        assertEquals(RIGHT, AgentPickup.input(player, log, true, null, 180));
+        assertEquals(new AgentPickup.Access(shelf, Direction.EAST),
+            AgentPickup.dryAccess(player, log, from, true, (step, bearing) -> step.equals(shelf)));
+        assertNull(AgentPickup.dryAccess(player, log, from, true, (step, bearing) -> false),
+            "seeing the log supplies neither top nor passage proof");
+        assertNull(AgentPickup.dryAccess(player, log, from, (step, bearing) -> step.equals(shelf)),
+            "a scoped level/down route cannot acquire a new rise");
+    }
+
+    @Test
+    void aStockShelfUsesTheGeneralGradeProofInEitherDirection() {
+        var from = new BlockPos(0, 62, 0);
+        var to = from.east().up();
+        var stone = Blocks.STONE.getDefaultState();
+        var grass = Blocks.GRASS_BLOCK.getDefaultState();
+        var top = new BlockHitResult(Vec3d.ofBottomCenter(to), Direction.UP, to.down(), false);
+        assertNull(AgentSurfaceTread.witnessedGradeEdge(from, stone, Direction.EAST, top, grass, false),
+            "the item and even the visible top cannot authorize a jump into an obstructed crown");
+        var edge = AgentSurfaceTread.witnessedGradeEdge(from, stone, Direction.EAST, top, grass, true);
+        assertNotNull(edge);
+        var up = AgentSurfaceTread.ordinaryStock(edge, from, 22);
+        assertEquals(from, up.from);
+        assertEquals(to, up.to);
+        assertTrue(up.returning);
+        var down = AgentSurfaceTread.ordinaryStock(edge, to, 51);
+        assertEquals(to, down.from);
+        assertEquals(from, down.to);
+        assertFalse(down.returning);
+    }
+
+    @Test
+    void airborneStockKeepsItsOwnBoundedAttemptWithoutGivingPickupCredit() {
         var feet = new Vec3d(-19.504, 57, 15.300);
-        var airborne = new Vec3d(-20.9, 57.3, 16.7);
+        var airborne = item(-20.9, 57.3, 16.7);
         var attempt = new AgentPickup.Pursuit(2372, 0, feet, airborne, false, false);
-        attempt.observe(2374, feet, airborne.add(0.1, 0, 0), false);
-        attempt.observe(2380, feet.add(0, 0, 0.21), airborne.add(0.2, -0.7, 0.15), false);
+        attempt.observe(2374, feet, airborne.offset(0.1, 0, 0), false);
+        attempt.observe(2380, feet.add(0, 0, 0.21), airborne.offset(0.2, -0.7, 0.15), false);
         assertTrue(attempt.settling(2380));
+        assertNull(attempt.groundedBounds(2380), "a falling item cannot authorize tread movement");
         assertFalse(attempt.stockGained(0));
-        assertTrue(attempt.canReacquire(2392));
-        assertFalse(attempt.canReacquire(2393));
         assertFalse(attempt.settling(2404), "a stationary ungrounded item cannot hold work forever");
-        attempt.observe(2381, feet, airborne.add(0.2, -1.3, 0.15), true);
+        var landed = airborne.offset(0.2, -1.3, 0.15);
+        attempt.observe(2381, feet, landed, true);
         assertFalse(attempt.settling(2381), "a grounded lower item now needs a witnessed approach");
+        assertEquals(landed, attempt.groundedBounds(2401), "the last sighting can outlive a brief terrain glance");
+        assertFalse(attempt.stockGained(0), "retaining the grounded sighting does not establish pickup");
+        assertNull(attempt.groundedBounds(2408), "a stale sighting cannot start a new tread");
         assertTrue(attempt.stockGained(1));
         assertTrue(attempt.expired(2553), "repeated movement cannot extend the absolute pursuit");
     }

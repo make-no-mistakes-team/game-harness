@@ -3466,6 +3466,20 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             0, 0, target, witnessed, scope, stockFooting);
     }
 
+    /** New ordinary movement needs a current top. Height differences use the general grade proof and sweep. */
+    AgentSurfaceTread.Edge witnessedOrdinaryTread(BlockPos from, BlockPos to, Direction bearing) {
+        if (!AgentSurfaceTread.cardinalTread(from, to, bearing)) return null;
+        if (from.getY() == to.getY()) {
+            return witnessedStockTread(from, to, bearing)
+                ? new AgentSurfaceTread.Edge(from, client.world.getBlockState(from.down()),
+                    to, client.world.getBlockState(to.down()), bearing) : null;
+        }
+        BlockState source = ordinaryGradeSource(from, bearing);
+        if (source == null) return null;
+        var grade = ordinaryGradeTop(from, bearing, source, ordinaryGradeTopHit(to.down(), bearing));
+        return grade == null ? null : grade.edge();
+    }
+
     /** Collision may veto this exact visible path, but cannot supply a top or passage ray. */
     boolean witnessedStockTread(BlockPos from, BlockPos to, Direction bearing) {
         int grade = to.getY() - from.getY();

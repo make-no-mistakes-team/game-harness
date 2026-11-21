@@ -1,5 +1,6 @@
 package io.gameharness.survival;
 
+import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
 import net.minecraft.item.ItemStack;
 import net.minecraft.util.math.BlockPos;
@@ -12,6 +13,7 @@ import net.minecraft.util.math.Vec3d;
 final class AgentPickup {
     private static final int PASSIVE_GRACE_TICKS = 12;
     private static final int QUIET_TICKS = 24;
+    private static final int SIGHTING_TICKS = 26;
     private static final double MOVED_SQUARED = 0.0064;
     private static final Direction[] CARDINAL = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
 
@@ -19,37 +21,41 @@ final class AgentPickup {
 
     /** Timed evidence for one exact sighting; only matching player stock is a receipt. */
     static final class Pursuit {
-        private final int started, stock, unseenLimit, duration;
+        private final int started, stock, duration;
         private int seen, changed;
-        private Vec3d feet, item;
+        private Vec3d feet;
+        private Box item, changedItem;
         private boolean grounded;
 
-        Pursuit(int tick, int stock, Vec3d feet, Vec3d item, boolean grounded, boolean timber) {
+        Pursuit(int tick, int stock, Vec3d feet, Box item, boolean grounded, boolean timber) {
             this.stock = stock;
             this.feet = feet;
-            this.item = item;
+            this.item = changedItem = item;
             this.grounded = grounded;
             started = seen = changed = tick;
-            unseenLimit = timber ? 26 : 12;
             duration = timber ? 70 : 180;
         }
 
-        void observe(int tick, Vec3d feet, Vec3d item, boolean grounded) {
+        void observe(int tick, Vec3d feet, Box item, boolean grounded) {
             seen = tick;
-            if (this.grounded == grounded && this.item.squaredDistanceTo(item) <= MOVED_SQUARED
+            this.item = item;
+            double dx = item.minX - changedItem.minX, dy = item.minY - changedItem.minY, dz = item.minZ - changedItem.minZ;
+            if (this.grounded == grounded
+                    && dx * dx + dy * dy + dz * dz <= MOVED_SQUARED
                     && this.feet.squaredDistanceTo(feet) <= MOVED_SQUARED) return;
             changed = tick;
             this.grounded = grounded;
-            this.item = item;
+            changedItem = item;
             this.feet = feet;
         }
 
         boolean stockGained(int count) { return count > stock; }
-        boolean canReacquire(int tick) { return tick - seen <= unseenLimit; }
+        boolean canReacquire(int tick) { return tick - seen <= SIGHTING_TICKS; }
         boolean expired(int tick) { return tick - started > duration; }
         long quiet(int tick) { return tick - changed; }
         boolean quietExpired(int tick) { return quiet(tick) >= QUIET_TICKS; }
         boolean settling(int tick) { return !grounded && !quietExpired(tick) && !expired(tick); }
+        Box groundedBounds(int tick) { return grounded && canReacquire(tick) && !expired(tick) ? item : null; }
     }
 
     enum Scope {
@@ -84,9 +90,13 @@ final class AgentPickup {
 
     /** No movement needed; inventory confirmation still belongs to vanilla. */
     static boolean passiveOverlap(Box player, Box drop) {
-        return drop.maxY > player.minY - 0.5 && drop.minY < player.maxY + 0.5
-            && drop.maxX > player.minX - 1 && drop.minX < player.maxX + 1
-            && drop.maxZ > player.minZ - 1 && drop.minZ < player.maxZ + 1;
+        return passiveOverlap(player, drop, 0, 0, 0);
+    }
+
+    static boolean passiveOverlap(Box player, Box drop, double x, double y, double z) {
+        return drop.maxY > player.minY + y - 0.5 && drop.minY < player.maxY + y + 0.5
+            && drop.maxX > player.minX + x - 1 && drop.minX < player.maxX + x + 1
+            && drop.maxZ > player.minZ + z - 1 && drop.minZ < player.maxZ + z + 1;
     }
 
     static boolean shouldCheckDryAccess(Box player, Box drop, boolean grounded, long quietTicks) {
@@ -95,20 +105,33 @@ final class AgentPickup {
 
     /** Choose a stance, not a path to the item's center. The caller must positively witness the tread. */
     static Access dryAccess(Box player, Box drop, BlockPos from, BiPredicate<BlockPos, Direction> witnessed) {
+        return dryAccess(player, drop, from, false, witnessed);
+    }
+
+    static Access dryAccess(Box player, Box drop, BlockPos from, boolean allowRise,
+                            BiPredicate<BlockPos, Direction> witnessed) {
+        return selectDryAccess(player, drop, from, allowRise,
+            (foot, bearing) -> witnessed.test(foot, bearing) ? new Access(foot, bearing) : null);
+    }
+
+    /** Rank the same exact stances and retain the actual witness, without making the caller raycast twice. */
+    static <T> T selectDryAccess(Box player, Box drop, BlockPos from, boolean allowRise,
+                                BiFunction<BlockPos, Direction, T> witnessed) {
         double px = (player.minX + player.maxX) * 0.5, pz = (player.minZ + player.maxZ) * 0.5;
         double dx = (drop.minX + drop.maxX) * 0.5 - px, dz = (drop.minZ + drop.maxZ) * 0.5 - pz;
         double dy = drop.minY - player.minY;
-        Access best = null;
+        T best = null;
         double bestDistance = dx * dx + dy * dy + dz * dz - 0.04;
         for (Direction bearing : CARDINAL) {
             BlockPos level = from.offset(bearing);
-            for (int grade = 0; grade >= (dy < -0.35 ? -1 : 0); --grade) {
-                BlockPos foot = grade == 0 ? level : level.down();
+            for (int grade = allowRise && dy > 0.35 ? 1 : 0; grade >= (dy < -0.35 ? -1 : 0); --grade) {
+                BlockPos foot = grade == 0 ? level : level.up(grade);
                 double x = foot.getX() + 0.5 - px, y = foot.getY() - player.minY, z = foot.getZ() + 0.5 - pz;
                 double distance = (dx - x) * (dx - x) + (dy - y) * (dy - y) + (dz - z) * (dz - z);
-                if (distance >= bestDistance || !passiveOverlap(player.offset(x, y, z), drop)
-                        || !witnessed.test(foot, bearing)) continue;
-                best = new Access(foot, bearing);
+                if (distance >= bestDistance || !passiveOverlap(player, drop, x, y, z)) continue;
+                T proof = witnessed.apply(foot, bearing);
+                if (proof == null) continue;
+                best = proof;
                 bestDistance = distance;
             }
         }

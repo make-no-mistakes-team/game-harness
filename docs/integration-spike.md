@@ -44,27 +44,27 @@ bun run play:agent --strategy terra --macro-requests 8 diamond 1800
 Advice changes a method at a safe decision point. It cannot authorize a
 click, spend an item, or make the player stop. A native acknowledgment
 means the player used the suggested method, not that it found the resource.
-The player gathers missing supplies before asking how to mine an ore.
-On a supply trip, connected dry ground under a canopy can be a usable
-exit; seeing open sky is not required. If a ceiling rules out one climb,
-the player can still collect a reachable resource or take another
-visible exit. It prefers level ground; a one-block rise also needs a
-confirmed landing and room to jump. A fall or lava blocks that handoff
-until the emergency is over. When the player equips a torch
-to light a mine tread, the mine stays active through that inventory
-transaction. Equipping it alone does not count as lighting the tread.
-The player can approach a low ore seam by a checked stair or light a
-dark pocket after a confirmed ore break. Neither counts as a pickup.
-Standing entirely on firm footing, it can open the adjacent block
-without first scouting a second exit. The cut does not authorize a
-step: the landing, clearance, and return still need to be checked.
 Vanilla inventory or dimension evidence verifies the goal separately.
 Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.
 
+The player gathers supplies for the next stretch of mine, keeping
+enough light for the return. From solid footing it can cut an adjacent
+block without first scouting a second exit. To step into the opening
+it must see a safe landing, clearance
+and a way back. If a descent is blocked, it can try a short level passage
+through visible natural rock before looking for another descent. On a
+supply trip, a grass shelf under a canopy may lead out. Picking
+up a log or ore on a shelf requires an actual inventory gain. Equipping
+a torch to inspect a dark pocket does not end the mining job.
+
 A useful pause is still play. For example, the player can watch the
 furnace finish one raw iron. Count the original load, not the input
 remaining: the last ore of a larger batch is still part of that batch.
+Once a larger batch is burning, the player can close the screen and
+pick up a useful drop or do nearby workshop work. If nothing is safe
+or useful, it can watch the surroundings until it is time to check the
+output. It does not have the output until it takes it from the furnace.
 A threat takes precedence even when only one item is cooking. To use
 an old furnace, the player must be able to reach its recorded route.
 If nothing is cooking there, it can instead build one from carried

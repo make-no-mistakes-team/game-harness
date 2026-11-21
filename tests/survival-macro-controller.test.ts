@@ -1203,6 +1203,9 @@ test("A first standalone fixed survey wakes constrained planning only for newly 
   }
 });
 
+const changedJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAB//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8Aa3//2Q==", "base64");
+const changedHash = createHash("sha256").update(changedJpeg).digest("hex");
+
 test.each(["changed paid view", "first native view", "fresh physical cap", "equal/rekeyed image", "old render", "unbound view",
   "absent frame", "no completed read", "unsafe scope", "expired handoff", "request budget", "another survey",
   "unsupported work", "independent work"] as const)(
@@ -1222,8 +1225,6 @@ test.each(["changed paid view", "first native view", "fresh physical cap", "equa
     const scene = { ...grassyWorksite, ...visualScene, health: 16, food: 17, travelHint: undefined,
       inventory: { ...grassyWorksite.inventory, "minecraft:oak_planks": 8 },
       opportunities: [ground, other, ...unchanged] };
-    const changedJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAB//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8Aa3//2Q==", "base64");
-    const changedHash = createHash("sha256").update(changedJpeg).digest("hex");
     const followupBinding = { captureId: `vc-${"f".repeat(32)}`, renderFrame: condition === "old render" ? visualBinding.renderFrame : 310 };
     const frame: NonNullable<SurvivalMacroConfig["frame"]> = async ({ run, life, epoch, tick }, _signal, requestId) => {
       const first = tick === 95;
@@ -1288,6 +1289,106 @@ test.each(["changed paid view", "first native view", "fresh physical cap", "equa
       if (condition !== "changed paid view") expect(f.actor.status().providerDispatches).toBe(postLook ? 2 : 1);
     } finally {
       quote.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
+test.each(["changed image", "unchanged rekeyed image"] as const)(
+  "A paid left survey after a witnessed visual read buys at most one fresh read-only nomination (%s)", async condition => {
+    const requests: MacroRequest[] = [];
+    const captured: number[] = [];
+    const firstTick = 20, surveyTick = 35, completedTick = 44, postLookTick = 50;
+    const scene = { ...visualScene, goal: "diamond", epoch: 3, opportunities: [caveSurvey] };
+    const right = { ...caveSurvey, id: "right", summary: "Survey right from this stance" };
+    // The survey's paid pre-look image differs from the earlier nominated image.
+    const surveyJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAB//EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AP3//2Q==", "base64");
+    const surveyBinding = { captureId: `vc-${"b".repeat(32)}`, renderFrame: visualBinding.renderFrame + 1 };
+    const postLookBinding = { captureId: `vc-${"c".repeat(32)}`, renderFrame: surveyBinding.renderFrame + 1 };
+    const changed = condition === "changed image";
+    const frame: NonNullable<SurvivalMacroConfig["frame"]> = async ({ run, life, epoch, tick }, _signal, requestId) => {
+      captured.push(tick);
+      const data = tick === firstTick ? captureJpeg : tick === surveyTick || !changed ? surveyJpeg : changedJpeg;
+      return { source: "verified-game-display", run, life, epoch, tick, width: 1, height: 1, mimeType: "image/jpeg", data,
+        visualBinding: tick === firstTick ? visualBinding : tick === surveyTick ? surveyBinding : postLookBinding,
+        artifact: { relativePath: `macro-frames/${requestId}.jpg`, sha256: createHash("sha256").update(data).digest("hex"),
+          verify: async () => true } };
+    };
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      expect(await request.verifyFrameDispatch?.()).toBe(true);
+      const frameSha256 = createHash("sha256").update(request.frame!.data).digest("hex");
+      if (request.observation.tick === surveyTick) {
+        // A paid ordinary response has the transmitted SHA, not a nomination tool binding.
+        return { ...workReply(request, { kind: "opportunity", opportunityId: caveSurvey.id }), frameSha256 };
+      }
+      const action = request.observation.tick === firstTick ? visualNomination : request.observation.tick === postLookTick
+        ? { ...visualNomination, captureId: postLookBinding.captureId, imageSha256: frameSha256,
+          region: { x: 0.6, y: 0.35, width: 0.2, height: 0.2 } }
+        : { kind: "opportunity", opportunityId: right.id } as const;
+      return { ...workReply(request, action), frameSha256, frameVisualBinding: request.frame?.visualBinding };
+    }, "Look for a dry way forward without moving or collecting.", 6, () => frame);
+    try {
+      await f.observe(firstTick, scene);
+      await pollVisual(f);
+      const firstProbe = parseMacroVisualProbe(JSON.parse(await readFile(f.file("visual-probe.json"), "utf8")));
+      expect(firstProbe).toMatchObject({ basisTick: firstTick, captureId: visualBinding.captureId, imageSha256: captureHash });
+      expect(f.actor.status()).toMatchObject({ providerDispatches: 1, issued: 0, issuedWorkOrders: 0 });
+      const { v, id, run, life, epoch, requestId, captureId, imageSha256 } = firstProbe;
+      await writeFile(f.file("visual-probe-result.json"), JSON.stringify({
+        v, id, run, life, epoch, requestId, captureId, imageSha256, tick: 23, status: "witnessed",
+        candidateId: reconOffer.anchor.target, subject: "block:minecraft:grass_block", distanceBlocks: 4,
+      }), { mode: 0o600 });
+
+      await f.observe(surveyTick, scene);
+      await pollVisual(f);
+      expect(requests[1]).toMatchObject({ observation: { life, epoch, stance: scene.stance, opportunities: [caveSurvey] },
+        visual: { mayNominate: false, read: { status: "witnessed", candidateId: reconOffer.anchor.target } } });
+      expect(requests[1]?.visual?.reconOpportunityId).toBeUndefined();
+      expect(requests[1]?.frame?.visualBinding).toBeUndefined();
+      await expect(access(f.file("visual-probe.json"))).rejects.toThrow();
+      const intent = parseMacroIntent(JSON.parse(await readFile(f.file("intent.json"), "utf8")));
+      expect(intent).toMatchObject({ basisTick: surveyTick, opportunityId: caveSurvey.id, skillHash: null });
+      expect(intent.recon).toBeUndefined();
+      await f.receipt(intent.id, 38, "accepted");
+      await f.observe(38, scene);
+      await pollVisual(f);
+      expect(captured).toEqual([firstTick, surveyTick]);
+      await f.receipt(intent.id, completedTick, "completed", "The first-person camera rendered the requested survey angle.");
+      await f.observe(completedTick, scene);
+      expect(captured).toEqual([firstTick, surveyTick]);
+
+      await f.observe(postLookTick, { ...scene, opportunities: [right] });
+      await pollVisual(f);
+      expect(captured).toEqual([firstTick, surveyTick, postLookTick]);
+      const paidTicks = changed ? [firstTick, surveyTick, postLookTick] : [firstTick, surveyTick];
+      expect(requests.map(request => request.observation.tick)).toEqual(paidTicks);
+      let laterTick = 100;
+      if (changed) {
+        expect(requests[2]).toMatchObject({ observation: { life, epoch, stance: scene.stance, opportunities: [] },
+          visual: { mayNominate: true, postLook: true }, frame: { visualBinding: postLookBinding },
+          lastReceipt: { id: intent.id, status: "completed" } });
+        const nextProbe = parseMacroVisualProbe(JSON.parse(await readFile(f.file("visual-probe.json"), "utf8")));
+        expect(nextProbe).toMatchObject({ run, life, epoch, basisTick: postLookTick, captureId: postLookBinding.captureId,
+          imageSha256: changedHash, region: { x: 0.6, y: 0.35, width: 0.2, height: 0.2 } });
+        expect(nextProbe.requestId).not.toBe(requestId);
+        laterTick = nextProbe.expiresTick;
+      } else {
+        await expect(access(f.file("visual-probe.json"))).rejects.toThrow();
+      }
+      for (const name of ["intent.json", "work.json"]) await expect(access(f.file(name))).rejects.toThrow();
+
+      for (const tick of [laterTick, 1400]) {
+        await f.observe(tick, { ...scene, opportunities: [{ ...right, id: `right-${tick}` }] });
+        await pollVisual(f);
+      }
+      expect(requests.map(request => request.observation.tick)).toEqual(paidTicks);
+      expect(captured).toEqual([firstTick, surveyTick, postLookTick]);
+      expect(f.actor.status()).toMatchObject({ requests: paidTicks.length, providerDispatches: paidTicks.length,
+        issued: 1, completedReceipts: 1, issuedWorkOrders: 0 });
+      for (const name of ["visual-probe.json", "intent.json", "work.json"]) await expect(access(f.file(name))).rejects.toThrow();
+    } finally {
       await f.actor.stop();
       await f.clean();
     }

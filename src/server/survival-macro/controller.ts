@@ -279,6 +279,8 @@ interface Work<T> {
     { readonly ok: false; readonly detail: string; readonly settledAt: number; readonly preflight?: "stale" | "invalid" | "rotation" };
 }
 
+type CameraFrame = MacroVisualBinding & { readonly imageSha256: string };
+
 interface Decision {
   readonly requestId: string;
   readonly observation: MacroObservation;
@@ -297,7 +299,8 @@ interface Decision {
   readonly visualFollowup?: true;
   readonly postLook?: PostLook;
   providerDispatched?: true;
-  deliveredVisual?: MacroVisualBinding & { readonly imageSha256: string; readonly verify: () => Promise<boolean> };
+  deliveredVisual?: CameraFrame & { readonly verify: () => Promise<boolean> };
+  comparisonFrame?: CameraFrame; // Sent pixels for a later camera comparison; never a nomination grant.
 }
 
 interface VisualProbe {
@@ -376,7 +379,7 @@ interface Issued {
   readonly offer: MacroOpportunity;
   readonly openingWorkView?: true;
   readonly paidCameraRead?: true;
-  readonly cameraFrame?: Pick<NonNullable<Decision["deliveredVisual"]>, "captureId" | "renderFrame" | "imageSha256">;
+  readonly cameraFrame?: CameraFrame;
   readonly reserves?: readonly MacroStockFloor[];
   readonly priorTargets?: ReadonlySet<string>;
   readonly reconUntil?: number;
@@ -1211,7 +1214,8 @@ export class SurvivalMacroController {
       this.postLook = undefined;
       return;
     }
-    if (observation.tick <= look.terminalTick || !this.visualContext(observation)?.mayNominate ||
+    if (observation.tick <= look.terminalTick || !this.isVisualHandoff(observation) ||
+        (this.visualBases.has(this.visualBasis(observation)) && !look.issued.cameraFrame) ||
         this.closing || !this.config.strategist || this.unavailable || this.requests >= this.limits.maxRequests) return;
     const reserves = this.floorScope?.life === observation.life ? this.floorScope.reserves : [];
     if (!hasStock(observation, reserves) || this.postLookHasOrdinaryStart(look, observation)) return;
@@ -1273,7 +1277,9 @@ export class SurvivalMacroController {
       return;
     }
     const key = this.visualBasis(source);
-    if (this.visualBases.has(key)) {
+    // One completed, paid camera turn may expose a distinct image on the same stance.
+    // begin() checks that image against the one actually sent before the turn.
+    if (this.visualBases.has(key) && !plan.postLook?.issued.cameraFrame) {
       await this.record("visual_nomination_refused", { requestId: plan.requestId, reason: "This unchanged visual stance was already nominated." });
       return;
     }
@@ -3113,6 +3119,7 @@ export class SurvivalMacroController {
         const verify = artifact?.verify;
         // Only an owned, immutable archive can carry native visual authority.
         const binding = visual?.mayNominate && verify ? visualBinding : undefined;
+        const compareOnly = visual?.mayNominate === false && !!visual.read && !!visualBinding && sample.captureSource !== "x11";
         const frame: MacroFrame = binding ? { ...ordinaryFrame, visualBinding: binding } : ordinaryFrame;
         let sent = false;
         try {
@@ -3124,7 +3131,7 @@ export class SurvivalMacroController {
           }
           signal.throwIfAborted();
           let dispatchVerified = false;
-          const verifyFrameDispatch = binding && verify ? async () => {
+          const verifyFrameDispatch = (binding || compareOnly) && verify ? async () => {
             const latest = await this.ipc!.read("observation.json", parseMacroObservation);
             dispatchVerified = sameNativeFrameScope(observation, latest) &&
               (!postLook || latest !== null && this.retainedPostLook(postLook, latest) &&
@@ -3136,6 +3143,8 @@ export class SurvivalMacroController {
           if (sent && dispatchVerified && binding && verify && artifact &&
               result.frameVisualBinding?.captureId === binding.captureId && result.frameVisualBinding.renderFrame === binding.renderFrame) {
             context.deliveredVisual = { ...binding, imageSha256: artifact.sha256, verify };
+          } else if (sent && dispatchVerified && compareOnly && visualBinding && artifact) {
+            context.comparisonFrame = { ...visualBinding, imageSha256: artifact.sha256 };
           }
           return result;
         } finally {
@@ -4284,11 +4293,12 @@ export class SurvivalMacroController {
       await this.rejectStale(plan, "intent_basis_changed_at_publication");
       return false;
     }
+    const beforeLook = plan.deliveredVisual ?? plan.comparisonFrame;
     const macro: Issued = { requestId: plan.requestId, intent, scope: refreshed, offer: after!,
       ...(openingPolicy ? { openingWorkView: true } : {}),
       ...(plan.providerDispatched && !authority && (openingPolicy || before.verb === "survey" && before.risk === "read" && !before.anchor)
-        ? { paidCameraRead: true, ...(plan.deliveredVisual ? { cameraFrame: {
-          captureId: plan.deliveredVisual.captureId, renderFrame: plan.deliveredVisual.renderFrame, imageSha256: plan.deliveredVisual.imageSha256,
+        ? { paidCameraRead: true, ...(beforeLook ? { cameraFrame: {
+          captureId: beforeLook.captureId, renderFrame: beforeLook.renderFrame, imageSha256: beforeLook.imageSha256,
         } } : {}) } : {}),
       ...(reconFinding ? { reserves, reconUntil: Math.min(performance.now() + MACRO_RECON_MAX_TICKS * 50,
         reconFinding.probe.startedAt + VISUAL_WITNESS_MS) } : {}),

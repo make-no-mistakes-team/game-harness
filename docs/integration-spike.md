@@ -245,8 +245,9 @@ without that binding cannot supply a target. The image includes its
 read deadline because the game keeps ticking while Terra answers. A
 late answer cannot extend the deadline or authorize a move.
 If a requested camera look finds no physical start, a genuinely new
-bound image can give Terra one more chance to nominate a surface. It
-does not start another sequence of camera turns.
+bound image can give Terra one more chance to nominate a surface, even
+if it checked the pre-turn view from that same footing. Repeating the
+old pixels does not qualify. This does not start a sequence of camera turns.
 
 After the client confirms a surface, Terra can authorize a separate
 scouting move toward it: up to three checked legs and six blocks of

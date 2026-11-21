@@ -1,7 +1,9 @@
 package io.gameharness.survival;
 
 import net.minecraft.block.Blocks;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.EmptyBlockView;
 import org.junit.jupiter.api.BeforeAll;
@@ -23,6 +25,32 @@ final class VisibleHorizonTest {
 
     @BeforeAll
     static void initializeVanilla() { VanillaTestResources.initialize(); }
+
+    @Test
+    void alternatingRowsCanRecheckTheSameIdleOakWithoutInheritingAWindow() {
+        Vec3d feet = new Vec3d(-48.82, 67, 22.25);
+        Vec3d eye = feet.add(0, 1.62, 0);
+        Vec3d aim = new Vec3d(-48.8, 67.4, 29);
+        var sampled = new BlockHitResult(aim, Direction.NORTH, BlockPos.ofFloored(aim), false);
+        var rechecked = new BlockHitResult(aim, Direction.NORTH, sampled.getBlockPos(), false);
+        var oak = Blocks.OAK_LOG.getDefaultState();
+        var prior = new AgentBody.HorizonView(null, null, eye, feet, Vec3d.ZERO, 3, 10, 0, 0, 47.4f, 40.95f);
+        var next = new AgentBody.HorizonView(null, null, eye, feet, Vec3d.ZERO, 9, 15, 0, 0, 47.4f, 40.95f);
+        var cue = new AgentVisibleHorizon.IdleAim(prior, sampled, oak, AgentWorkOrder.TravelKind.RESOURCE);
+
+        assertEquals(rechecked, cue.recheck(next, 9, ignored -> rechecked, ignored -> oak));
+        assertNull(cue.recheck(next, 9, ignored -> null, ignored -> oak), "a clipped or occluded aim cannot be carried");
+        assertNull(cue.recheck(next, 9, ignored -> rechecked, ignored -> Blocks.SPRUCE_LOG.getDefaultState()));
+        assertNull(cue.recheck(next, 6, ignored -> rechecked, ignored -> oak));
+        var changedFace = new BlockHitResult(aim, Direction.WEST, sampled.getBlockPos(), false);
+        assertNull(cue.recheck(next, 9, ignored -> changedFace, ignored -> oak));
+        assertFalse(cue.sameCamera(eye, 48, 40.95f));
+        var moved = new AgentBody.HorizonView(null, null, eye, feet.add(0.1, 0, 0), Vec3d.ZERO,
+            10, 16, 0, 0, 47.4f, 40.95f);
+        assertNull(cue.recheck(moved, 9, ignored -> rechecked, ignored -> oak));
+        var expired = new AgentBody.HorizonView(null, null, eye, feet, Vec3d.ZERO, 28, 35, 0, 0, 47.4f, 40.95f);
+        assertNull(cue.recheck(expired, 9, ignored -> rechecked, ignored -> oak));
+    }
 
     @Test
     void canStartOnTheVisibleNextTopWithoutProvingTheFartherOrReverseRoute() {

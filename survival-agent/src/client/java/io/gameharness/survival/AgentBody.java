@@ -322,6 +322,7 @@ final class AgentBody {
         resetIntentions();
         if (hazardWorld != client.world || hazardPlayer != client.player) {
             levelWallSight.forget();
+            visibleHorizon.forgetIdleAim();
             hazards.clear();
             headroom.reset();
             stepSupport = null;
@@ -338,10 +339,12 @@ final class AgentBody {
         if (client.player != null && client.player.isAlive() && client.player.isInLava()) beginLavaEscape();
         headroom.observe(tick, available && !lavaEmergency && client.getOverlay() == null);
         if (!available) {
+            visibleHorizon.forgetIdleAim();
             stableDryTicks = 0;
             return;
         }
         var player = client.player;
+        visibleHorizon.observeIdleFeet(player.getPos(), player.getYaw(), player.getPitch());
         if (horizonApplied != null && horizonAppliedTick == tick - 1) observeHorizonTravel(player);
         if (hasView()) scanFluids(AgentHazards.SIGHT_RANGE, true, false, false);
         boolean dry = player.isOnGround() && !player.isInLava() && !player.isTouchingWater()
@@ -495,6 +498,7 @@ final class AgentBody {
         observedPlayer = client.player;
         observedAtTick = tick;
         eye = context.camera().getPos();
+        visibleHorizon.observeIdleCamera(eye, yaw, pitch);
         levelWallSight.observePose(eye, yaw, pitch);
         observedYaw = yaw;
         observedPitch = pitch;
@@ -512,6 +516,7 @@ final class AgentBody {
         eye = null;
         renderedCrosshair = null;
         observedAtNanos = 0;
+        visibleHorizon.forgetIdleAim();
         levelWallSight.forget();
         threats.begin(0);
         clearContact();
@@ -1482,6 +1487,7 @@ final class AgentBody {
 
     /** One short approach to an independently rendered cue; there is no queue of virtual waypoints. */
     static final class HorizonTravel {
+        private static final float GAIT_PITCH = 28, FOOTING_GLANCE_PITCH = 38;
         final AgentVisibleHorizon.Target target;
         final Vec3d goal;
         final double arrival;
@@ -1489,6 +1495,7 @@ final class AgentBody {
         private final AgentVisibleHorizon.ContactPulse pulse;
         private int stoppedAt = -1, precisionTicks;
         private boolean issued, beenDriven, wet, wadeStarted;
+        private boolean glanceUsed, glancing;
         private float bearing = Float.NaN, blockedBearing = Float.NaN, issuedBearing = Float.NaN;
         private HorizonMotion motion;
         private BlockPos dryFrom, dryTo;
@@ -1510,6 +1517,14 @@ final class AgentBody {
         boolean progressed() { return motion != null && motion.progressed; }
         boolean waded() { return wet; }
         boolean pulseIssued() { return pulse != null && pulse.used(); }
+
+        float gazePitch() { return glancing ? FOOTING_GLANCE_PITCH : GAIT_PITCH; }
+
+        void maybeGlance(boolean surfaceMissing, boolean settledGaze) {
+            if (!glanceUsed && surfaceMissing && settledGaze) glanceUsed = glancing = true;
+        }
+
+        void resumeGaze() { glancing = false; }
     }
 
     /** Forward input and camera rotation aren't receipts; sample displacement after vanilla consumed the keys. */
@@ -1723,6 +1738,10 @@ final class AgentBody {
         return turn < -23 ? -1 : turn > 23 ? 1 : 0;
     }
 
+    static float horizonGazeTurn(float yaw, float goal) {
+        return MathHelper.clamp(MathHelper.wrapDegrees(goal - yaw), -8, 8);
+    }
+
     enum HorizonPace { COAST, SLOW, WALK }
 
     static HorizonPace horizonPace(double known, double braking, double goal, boolean wet, boolean contactOnly) {
@@ -1770,29 +1789,45 @@ final class AgentBody {
             // Do not correct in midair or press jump into a new or unseen lane.
             return horizonWait(travel, Refusal.SOURCE_UNGROUNDED, null);
         }
-        var chosen = visibleHorizon.workWindow(travel.target, travel.allowWade, travel.bearing, travel.blockedBearing,
-            direct, travel.pulse, !travel.beenDriven && !targetReady && distance > travel.arrival);
+        if (travel.pulse != null && !travel.pulse.canJoin(frameSequence))
+            return horizonWait(travel, Refusal.CONTACT_PULSE_SPENT, null);
+        if (travel.issued) travel.resumeGaze();
+        float yaw = player.getYaw();
+        float steeringTurn = horizonGazeTurn(yaw, direct);
+        boolean left = !client.options.leftKey.isUnbound(), right = !client.options.rightKey.isUnbound();
+        var chosen = visibleHorizon.dryKeyWindow(travel.target, yaw, direct, steeringTurn, travel.blockedBearing,
+            left, right);
+        boolean dry = chosen != null;
+        boolean surfaceMissing = !dry && visibleHorizon.rejectedSurface();
+        boolean allowPulse = travel.pulse != null && !travel.pulse.used() && !travel.beenDriven
+            && !targetReady && distance > travel.arrival;
+        if (!dry && (travel.allowWade || allowPulse)) {
+            var special = visibleHorizon.workWindow(travel.target, travel.allowWade, travel.bearing,
+                travel.blockedBearing, direct, travel.pulse, allowPulse);
+            if (horizonWadeWindow(special) || special != null && special.contactOnly()) chosen = special;
+        }
         if (chosen == null) {
-            lookAlongGait(Float.isFinite(travel.bearing) ? travel.bearing : direct,
-                travel.stoppedAt >= 0 && tick - travel.stoppedAt >= 3 ? 38 : 28);
+            // A lost support can earn one deliberate glance. Neither a lateral
+            // correction nor coasting by itself is a reason to look down.
+            travel.maybeGlance(surfaceMissing, travel.stoppedAt >= 0 && tick - travel.stoppedAt >= 3
+                && player.getVelocity().horizontalLengthSquared() < 0.0025
+                && renderedDirection(direct, HorizonTravel.GAIT_PITCH, 6));
+            lookAlongGait(direct, travel.gazePitch());
             return horizonWait(travel, null, null);
         }
-        travel.bearing = chosen.yaw();
-        float aim = chosen.yaw();
-        float turn = MathHelper.wrapDegrees(aim - player.getYaw());
-        int lateral = horizonSide(turn);
-        if (lateral < 0 && client.options.leftKey.isUnbound() || lateral > 0 && client.options.rightKey.isUnbound())
-            lateral = 0;
-        float actual = player.getYaw() + 45 * lateral;
-        boolean wade = horizonWadeWindow(chosen);
-        // The movement gaze stays ahead, not on every support sample. One brief
-        // downward correction may expose a short floor that just left the render.
-        float pitch = wade ? 24 : travel.stoppedAt >= 0 && tick - travel.stoppedAt >= 3 ? 38 : 28;
-        lookAlongGait(aim, pitch);
-        float difference = MathHelper.wrapDegrees(aim - actual);
-        if (Math.abs(difference) > 24) return horizonWait(travel, Refusal.STEERING_ALIGNMENT, chosen);
+        boolean wade = !dry && horizonWadeWindow(chosen);
+        float gaze = wade ? chosen.yaw() : direct;
+        float pitch = wade ? 24 : travel.gazePitch();
+        lookAlongGait(gaze, pitch);
+        if (wade) travel.bearing = chosen.yaw();
+        float turn = MathHelper.wrapDegrees(chosen.yaw() - yaw);
+        int lateral = dry ? Math.round(turn / 45) : horizonSide(turn);
+        if (lateral < 0 && !left || lateral > 0 && !right) lateral = 0;
+        float actual = yaw + 45 * lateral;
+        float difference = MathHelper.wrapDegrees(chosen.yaw() - actual);
+        if (!dry && Math.abs(difference) > 24) return horizonWait(travel, Refusal.STEERING_ALIGNMENT, chosen);
         boolean local = chosen.contactOnly();
-        var window = Math.abs(difference) < 0.01 ? chosen : local ? visibleHorizon.contactWindow(travel.target, actual)
+        var window = dry || Math.abs(difference) < 0.01 ? chosen : local ? visibleHorizon.contactWindow(travel.target, actual)
             : visibleHorizon.window(travel.target, actual);
         if (window == null) return horizonWait(travel, null, null);
         if (window.medium() != chosen.medium() || player.isTouchingWater() && !wade)
@@ -1801,10 +1836,10 @@ final class AgentBody {
         double known = window.knownDistance();
         double braking = window.brakingDistance();
         boolean contactOnly = window.contactOnly();
-        // A rendered frame may turn the player before vanilla consumes the
-        // held keys. Check the other end of that small steering arc as well.
-        float steeringTurn = MathHelper.clamp(turn, -8, 8);
-        if (Math.abs(steeringTurn) > (local ? 0.01 : 3)) {
+        // Dry key selection already proved both ends. The special contact and
+        // bank paths keep their own equally bounded optical checks.
+        if (wade) steeringTurn = horizonGazeTurn(yaw, gaze);
+        if (!dry && Math.abs(steeringTurn) > (local ? 0.01 : 3)) {
             var steered = local ? visibleHorizon.contactWindow(travel.target, actual + steeringTurn)
                 : visibleHorizon.window(travel.target, actual + steeringTurn);
             if (steered == null) return horizonWait(travel, null, null);
@@ -1835,7 +1870,7 @@ final class AgentBody {
         if (hazardAhead(actual, reach)) return horizonWait(travel, Refusal.HAZARD, window);
         // This is an intent for the actual on-foot keys, not a displacement receipt.
         prioritizeMovement();
-        lookAlongGait(player.getYaw() + steeringTurn, pitch);
+        lookAlongGait(yaw + steeringTurn, pitch);
         horizonHeading = actual;
         horizonReach = reach;
         horizonSide = lateral;
@@ -2009,7 +2044,7 @@ final class AgentBody {
     }
 
     record HorizonView(ClientWorld world, ClientPlayerEntity player, Vec3d eye, Vec3d feet,
-                       Vec3d velocity, long frame, int tick, int ageTicks, double displacement) {}
+                       Vec3d velocity, long frame, int tick, int ageTicks, double displacement, float yaw, float pitch) {}
 
     HorizonView horizonView() {
         if (!hasView() || System.nanoTime() - observedAtNanos > 160_000_000L) return null;
@@ -2017,7 +2052,7 @@ final class AgentBody {
         double displacement = eye.distanceTo(player.getEyePos());
         return displacement <= 0.36
             ? new HorizonView(client.world, player, eye, player.getPos(), player.getVelocity(),
-                frameSequence, tick, tick - observedAtTick, displacement) : null;
+                frameSequence, tick, tick - observedAtTick, displacement, observedYaw, observedPitch) : null;
     }
 
     Refusal horizonViewRefusal() {
@@ -2034,15 +2069,25 @@ final class AgentBody {
 
     /** A passed-in candidate is just a ray direction until its exact lit point and face are seen. */
     BlockHitResult horizonWitness(BlockHitResult witness) {
+        return horizonWitness(witness, false);
+    }
+
+    BlockHitResult horizonRecheck(BlockHitResult witness) {
+        return horizonWitness(witness, true);
+    }
+
+    private BlockHitResult horizonWitness(BlockHitResult witness, boolean recheck) {
         if (witness == null || witness.getType() != HitResult.Type.BLOCK || witness.isInsideBlock()) return null;
         Vec3d point = witness.getPos();
         double distance = eye.distanceTo(point);
         if (distance < 0.05 || distance > range(MAX_RANGE) || !inView(point)) return null;
         // All three caches contain actual lit Ray.SIGHT first hits from this exact
         // projection, never a vanilla outline or a sample with different fluid semantics.
-        if (horizonSightlineFrame == frameSequence && horizonSightlineHit == witness) return witness;
-        if (horizonCueFrame == frameSequence) for (var hit : horizonCueSamples) if (hit == witness) return witness;
-        if (sampleFrame == frameSequence) for (int i = 0; i < sampleCount; ++i) if (samples[i] == witness) return witness;
+        if (!recheck) {
+            if (horizonSightlineFrame == frameSequence && horizonSightlineHit == witness) return witness;
+            if (horizonCueFrame == frameSequence) for (var hit : horizonCueSamples) if (hit == witness) return witness;
+            if (sampleFrame == frameSequence) for (int i = 0; i < sampleCount; ++i) if (samples[i] == witness) return witness;
+        }
         if (horizonWitnessRays <= 0) {
             visibleHorizon.notePreview(Refusal.TARGET_RAY_BUDGET);
             return null;

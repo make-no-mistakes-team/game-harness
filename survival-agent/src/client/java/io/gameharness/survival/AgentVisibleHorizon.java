@@ -1,9 +1,11 @@
 package io.gameharness.survival;
 
 import java.util.Locale;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import net.minecraft.block.BlockState;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -32,6 +34,7 @@ final class AgentVisibleHorizon {
     record Evidence(String phase, String stage, long frame, double known, double braking, long refusals, boolean terminal) {}
 
     private static final int MAX_TRANSITIONS = 32;
+    private static final int IDLE_AIM_TICKS = 12;
     private static final int TARGET_TICKS = 64;
     private static final double TARGET_TRAVEL = 8;
     private static final double HEIGHT_TOLERANCE = 0.055;
@@ -62,6 +65,29 @@ final class AgentVisibleHorizon {
         Vec3d point() { return hit.getPos(); }
         long frame() { return view.frame(); }
         double observedRange() { return observedRange; }
+    }
+
+    /** The last offered aim only. A new first hit and a new footing proof are separate requirements. */
+    record IdleAim(AgentBody.HorizonView pose, BlockHitResult hit, BlockState state, AgentWorkOrder.TravelKind kind) {
+        boolean sameCamera(Vec3d eye, float yaw, float pitch) {
+            return pose.eye().equals(eye) && sameDirection(yaw, pitch);
+        }
+
+        boolean sameDirection(float yaw, float pitch) {
+            return MathHelper.wrapDegrees(pose.yaw() - yaw) == 0 && pose.pitch() == pitch;
+        }
+
+        BlockHitResult recheck(AgentBody.HorizonView live, double distance,
+                               Function<BlockHitResult, BlockHitResult> firstHit, Function<BlockPos, BlockState> revealedState) {
+            if (live == null || pose.world() != live.world() || pose.player() != live.player()
+                    || live.tick() - pose.tick() > IDLE_AIM_TICKS || !pose.feet().equals(live.feet())
+                    || !sameCamera(live.eye(), live.yaw(), live.pitch())
+                    || live.eye().squaredDistanceTo(hit.getPos()) > distance * distance) return null;
+            BlockHitResult actual = firstHit.apply(hit);
+            return actual != null && actual.getType() == HitResult.Type.BLOCK && !actual.isInsideBlock()
+                && actual.getBlockPos().equals(hit.getBlockPos()) && actual.getSide() == hit.getSide()
+                && revealedState.apply(actual.getBlockPos()) == state ? actual : null;
+        }
     }
 
     record Window(Target target, float yaw, double knownDistance, double brakingDistance,
@@ -133,6 +159,8 @@ final class AgentVisibleHorizon {
     }
 
     private final AgentBody body;
+    private final Function<BlockHitResult, BlockHitResult> idleFirstHit;
+    private final Function<BlockPos, BlockState> idleRevealedState;
     private final BearingCheck<Target, Window> checkedWindow = this::checkedWindow;
     private final BearingCheck<Target, Window> checkedContact = (target, yaw, dry) -> checkedContactWindow(target, yaw);
     private final PatchCache patches = new PatchCache();
@@ -147,17 +175,21 @@ final class AgentVisibleHorizon {
     private double known, braking;
     private Refusal refusal;
     private long refusals;
+    private IdleAim idleAim;
     private boolean previewing;
     private Refusal previewRefusal;
     private long previewRefusals;
     private double previewKnown, previewBraking;
     private Window previewWindow;
+    private Target previewRecheckedAim;
     private boolean previewTangent;
     private final Transition preview = new Transition("preview"), drive = new Transition("drive");
     private final Transition wade = new Transition("wade");
 
     AgentVisibleHorizon(AgentBody body) {
         this.body = body;
+        idleFirstHit = body::horizonRecheck;
+        idleRevealedState = pos -> memoView.world().getBlockState(pos);
     }
 
     private static final class Transition {
@@ -190,6 +222,7 @@ final class AgentVisibleHorizon {
         previewRefusals = 0;
         previewKnown = previewBraking = Double.NaN;
         previewWindow = null;
+        previewRecheckedAim = null;
         previewTangent = false;
     }
 
@@ -208,12 +241,17 @@ final class AgentVisibleHorizon {
         }
     }
 
-    void reportPreview(boolean grade) {
+    void reportPreview(boolean grade, Target nominated) {
         previewing = false;
+        boolean rechecked = nominated != null && nominated == previewRecheckedAim;
+        previewRecheckedAim = null;
         if (grade) {
-            preview.report("offered_one_block_grade", body.renderedFrame(), Double.NaN, Double.NaN, previewRefusals, false);
+            preview.report(rechecked ? "offered_one_block_grade_rechecked" : "offered_one_block_grade",
+                body.renderedFrame(), Double.NaN, Double.NaN, previewRefusals, false);
         } else if (previewWindow != null && previewRefusal != Refusal.ANCHOR_UNAVAILABLE) {
-            preview.report(previewTangent ? "offered_tangent" : "offered_direct",
+            String stage = previewTangent ? rechecked ? "offered_tangent_rechecked" : "offered_tangent"
+                : rechecked ? "offered_direct_rechecked" : "offered_direct";
+            preview.report(stage,
                 previewWindow.frame, previewWindow.knownDistance, previewWindow.brakingDistance, previewRefusals, false);
         } else {
             Refusal reason = previewRefusal == null ? Refusal.NO_GOAL_GRADE_OR_MATERIAL_FACE : previewRefusal;
@@ -267,6 +305,39 @@ final class AgentVisibleHorizon {
     Patch wadePatch(AgentBody.HorizonView view, int x, int z) {
         useView(view);
         return patches.at(x, z);
+    }
+
+    IdleAim idleAim(AgentWorkOrder.TravelKind kind) {
+        return idleAim != null && idleAim.kind == kind ? idleAim : null;
+    }
+
+    void rememberIdleAim(Target target, AgentWorkOrder.TravelKind kind) {
+        idleAim = new IdleAim(target.view, target.hit, target.view.world().getBlockState(target.hit.getBlockPos()), kind);
+    }
+
+    void forgetIdleAim() { idleAim = null; }
+
+    void observeIdleCamera(Vec3d eye, float yaw, float pitch) {
+        if (idleAim != null && !idleAim.sameCamera(eye, yaw, pitch)) forgetIdleAim();
+    }
+
+    void observeIdleFeet(Vec3d feet, float yaw, float pitch) {
+        if (idleAim != null && (!idleAim.pose.feet().equals(feet) || !idleAim.sameDirection(yaw, pitch)))
+            forgetIdleAim();
+    }
+
+    Target recheckIdleAim(double distance) {
+        if (idleAim == null) return null;
+        var view = body.horizonView();
+        if (view != null) useView(view);
+        var live = idleAim.recheck(view, distance, idleFirstHit, idleRevealedState);
+        if (live == null) {
+            forgetIdleAim();
+            return null;
+        }
+        var target = new Target(view, live);
+        if (previewing) previewRecheckedAim = target;
+        return target;
     }
 
     Target target(BlockHitResult witness) {
@@ -323,6 +394,46 @@ final class AgentVisibleHorizon {
 
     Window window(Target target, float yaw) {
         return prepare(target) ? checkedWindow(target, yaw, true) : null;
+    }
+
+    Window dryKeyWindow(Target target, float yaw, float goal, float yawStep, float blocked,
+                        boolean left, boolean right) {
+        return prepare(target) ? selectDryKeys(target, yaw, goal, yawStep, blocked, left, right, checkedWindow) : null;
+    }
+
+    boolean rejectedSurface() { return (refusals & Refusal.SURFACE_NOT_RENDERED.bit) != 0; }
+
+    static <C> Window selectDryKeys(C context, float yaw, float goal, float yawStep, float blocked,
+                                    boolean left, boolean right, BearingCheck<C, Window> check) {
+        float turn = MathHelper.wrapDegrees(goal - yaw);
+        int shoulder = turn <= 0 ? -1 : 1;
+        boolean diagonalFirst = Math.abs(turn) >= 23;
+        for (int i = 0; i < 3; ++i) {
+            int side = i == 0 ? (diagonalFirst ? shoulder : 0)
+                : i == 1 ? (diagonalFirst ? 0 : shoulder) : -shoulder;
+            if (side < 0 && !left || side > 0 && !right) continue;
+            float actual = yaw + 45 * side;
+            if (Math.abs(MathHelper.wrapDegrees(actual - goal)) > 55
+                    || Math.abs(MathHelper.wrapDegrees(actual + yawStep - goal)) > 55) continue;
+            Window start = tryBearing(actual, blocked, context, false, check);
+            if (!dryKeyProof(start)) continue;
+            if (Math.abs(yawStep) <= 0.01) return start;
+            // Vanilla may consume the input anywhere along this bounded camera correction.
+            Window end = tryBearing(actual + yawStep, blocked, context, false, check);
+            if (!dryKeyProof(end)) continue;
+            double known = Math.min(start.knownDistance, end.knownDistance);
+            double braking = Math.max(start.brakingDistance, end.brakingDistance);
+            if (known <= braking) continue;
+            return known == start.knownDistance && braking == start.brakingDistance ? start
+                : new Window(start.target, actual, known, braking, Medium.DRY, start.frame,
+                    start.ageTicks, start.displacement, null, false);
+        }
+        return null;
+    }
+
+    private static boolean dryKeyProof(Window window) {
+        return window != null && window.medium == Medium.DRY && !window.contactOnly
+            && window.knownDistance > window.brakingDistance;
     }
 
     Window contactWindow(Target target) {

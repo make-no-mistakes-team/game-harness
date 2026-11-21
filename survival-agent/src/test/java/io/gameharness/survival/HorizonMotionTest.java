@@ -116,6 +116,53 @@ final class HorizonMotionTest {
         return new AgentVisibleHorizon.Window(null, 0, known, braking, medium, 1, 0, 0, dryBank, false);
     }
 
+    @Test
+    void theOakApproachTurnsTowardTheGoalButOnlyWalksOnExactProvedKeyHeadings() {
+        // L2VIlT t158: facing 47 degrees at the start of a nearly straight south approach.
+        float startYaw = 47.42813f;
+        float towardOak = 0.25f;
+        var first = AgentVisibleHorizon.selectDryKeys(null, startYaw, towardOak,
+            AgentBody.horizonGazeTurn(startYaw, towardOak), Float.NaN, true, true,
+            (ignored, yaw, wet) -> yaw > -6 && yaw < 3 ? dryWindow(yaw, yaw < 0 ? 0.48 : 1.6) : null);
+        assertEquals(2.42813f, first.yaw(), 0.0001f); // W+A, not the exact goal ray.
+        assertEquals(0.48, first.knownDistance()); // Use the shorter end-of-turn proof.
+
+        // A lost straight window can change the feet without making the eyes chase the shoulder.
+        float lookingAtOak = 0.25f;
+        float eyeTurn = AgentBody.horizonGazeTurn(lookingAtOak, towardOak);
+        var shoulder = AgentVisibleHorizon.selectDryKeys(null, lookingAtOak, towardOak, eyeTurn,
+            Float.NaN, true, true,
+            (ignored, yaw, wet) -> yaw < -40 ? dryWindow(yaw, 0.8) : null);
+        assertEquals(-44.75f, shoulder.yaw());
+        assertEquals(0, eyeTurn);
+        assertNull(AgentVisibleHorizon.selectDryKeys(null, lookingAtOak, towardOak, eyeTurn,
+            Float.NaN, false, true,
+            (ignored, yaw, wet) -> yaw < -40 ? dryWindow(yaw, 0.8) : null));
+
+        // The geometric bearing can be visible even if the actual keys lack a proved arc.
+        assertNull(AgentVisibleHorizon.selectDryKeys(null, startYaw, towardOak,
+            AgentBody.horizonGazeTurn(startYaw, towardOak), Float.NaN, true, true,
+            (ignored, yaw, wet) -> yaw >= 0 && yaw < 3 ? dryWindow(yaw, 1.6) : null));
+    }
+
+    @Test
+    void aClippedFootingWindowCanSpendOneGlanceButNotTogglePitchAtEachStop() {
+        var travel = new AgentBody.HorizonTravel(null, point(7), 1, false);
+        assertEquals(28, travel.gazePitch());
+        travel.maybeGlance(false, true);
+        travel.maybeGlance(true, false);
+        assertEquals(28, travel.gazePitch());
+        travel.maybeGlance(true, true);
+        assertEquals(38, travel.gazePitch());
+        travel.resumeGaze();
+        travel.maybeGlance(true, true);
+        assertEquals(28, travel.gazePitch());
+    }
+
+    private static AgentVisibleHorizon.Window dryWindow(float yaw, double known) {
+        return new AgentVisibleHorizon.Window(null, yaw, known, 0.30, AgentVisibleHorizon.Medium.DRY, 1, 0, 0, null, false);
+    }
+
     private static Vec3d point(double x) { return new Vec3d(x, 0, 0); }
 
     /** Same post-friction velocity recurrence as normal vanilla stone-floor input, without a game fixture. */

@@ -2244,7 +2244,6 @@ final class AgentMacroControl {
         boolean forWork = selection != HorizonSelection.PREVIEW;
         if (forWork && !horizonStartAvailable()) return null;
         var horizon = body.visibleHorizon();
-        if (preferred == null) preferred = body.horizonSightline(distance);
         var scope = forWork && travelAnchorOutstanding() ? work.order.travelAnchor() : null;
         OrdinaryTravelTarget grade = null, glance = null, contact = null;
         for (int i = 0; i < horizonCandidateCells.length; ++i) {
@@ -2259,16 +2258,31 @@ final class AgentMacroControl {
                 return goal.test(hit) && (!forWork || !work.rejected.contains(cell)
                     && !work.horizonAttempts.contains(cell));
             };
-            BlockHitResult hit = i == 0 && preferred != null
-                    && matches.test(world.getBlockState(preferred.getBlockPos())) && eligible.test(preferred)
-                ? preferred : null;
+            AgentVisibleHorizon.Target target = null;
+            BlockHitResult hit = null;
+            if (i == 0) {
+                var aim = horizon.idleAim(kind);
+                if (aim != null && matches.test(aim.state()) && (scope == null || scope.target().equals(
+                        materialTargets.get(travelAnchorKey(aim.hit().getBlockPos(), kind))))) {
+                    var live = horizon.recheckIdleAim(distance);
+                    if (live != null && eligible.test(live.hit())) {
+                        target = live;
+                        hit = live.hit();
+                    }
+                }
+                if (hit == null) {
+                    var first = preferred == null ? body.horizonSightline(distance) : preferred;
+                    if (first != null && matches.test(world.getBlockState(first.getBlockPos())) && eligible.test(first))
+                        hit = first;
+                }
+            }
             if (hit == null) {
                 hit = body.horizonCue(matches, distance, eligible);
                 if (hit == null) hit = body.find(matches, distance, eligible).orElse(null);
                 if (hit == null) break;
             }
             horizonCandidateCells[i] = hit.getBlockPos().asLong();
-            var target = horizon.target(hit);
+            if (target == null) target = horizon.target(hit);
             if (target == null) continue;
             var window = horizon.window(target, allowWade);
             if (usableHorizonWindow(window, allowWade)) return new OrdinaryTravelTarget(target, kind, window, null);
@@ -8003,7 +8017,9 @@ final class AgentMacroControl {
                 else horizon.notePreview(AgentVisibleHorizon.Refusal.ANCHOR_UNAVAILABLE);
             }
         }
-        horizon.reportPreview(witness != null && witness.grade != null);
+        if (witness == null) horizon.forgetIdleAim();
+        else horizon.rememberIdleAim(nominated.target(), nominated.kind());
+        horizon.reportPreview(witness != null && witness.grade != null, witness == null ? null : nominated.target());
         return witness;
     }
 

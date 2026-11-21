@@ -55,6 +55,9 @@ to light a mine tread, the mine stays active through that inventory
 transaction. Equipping it alone does not count as lighting the tread.
 The player can approach a low ore seam by a checked stair or light a
 dark pocket after a confirmed ore break. Neither counts as a pickup.
+Standing entirely on firm footing, it can open the adjacent block
+without first scouting a second exit. The cut does not authorize a
+step: the landing, clearance, and return still need to be checked.
 Vanilla inventory or dimension evidence verifies the goal separately.
 Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.

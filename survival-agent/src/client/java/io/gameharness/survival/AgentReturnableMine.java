@@ -25,14 +25,13 @@ final class AgentReturnableMine {
     private static final int RETIRED_LIMIT = 32;
     private static final int RELOCATION_TICKS = 620;
     private static final int RELOCATION_HOPS = 10;
-    private static final int CAP_EXIT_TICKS = 155;
     private static final int DEPARTURE_VIEW_TICKS = 38;
     private static final Direction[] CARDINALS = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
     // The tallest samples cover the lower tread's jump takeoff, not just standing room.
     private static final double[] CLEARANCE_HEIGHTS = {0.20, 0.97, 1.79, 2.86};
 
     enum Outcome { WORKING, REACHED, FAILED, DIVERTED, EXHAUSTED, SUPPLIES }
-    private enum Phase { ANCHOR, CHOOSE, OPEN, CAP_EXIT, CUT, LIGHT, FORWARD, DRIVE, REVERSE, TRIM_RETURN, RELOCATE }
+    private enum Phase { ANCHOR, CHOOSE, OPEN, CUT, LIGHT, FORWARD, DRIVE, REVERSE, TRIM_RETURN, RELOCATE }
     private record Refusal(BlockPos foot, Direction bearing, Face fact) {}
     enum Face { UNSEEN, NO_LANDING, NO_EXIT, DARK, OCCLUDED, FLUID, LAVA, FOOTPRINT, PROTECTED, MATERIAL, TOOL, FAILED, MINEABLE }
 
@@ -113,12 +112,11 @@ final class AgentReturnableMine {
     private long revealedFrame = -1, equipmentJob;
     private BlockPos anchor, from, to, detachedRim, workCell, reverseCeiling, pendingLight;
     private BlockPos departureTo, relocationRefused;
-    private Vec3d aim, resumeCutAim;
+    private Vec3d aim;
     private Direction preferred, bearing, caveBearing, departureBearing;
     private BlockHitResult departureTop;
     private BlockState departureSurface;
     private AgentSurfaceTread crossing;
-    private AgentSurfaceTread.Edge capEscape;
     private Phase phase, afterLight;
     private boolean litHere, trimmed, cavePending, openTread, departureBacktrack;
     private String relocationRefusal;
@@ -152,7 +150,7 @@ final class AgentReturnableMine {
     boolean hasProgressLease() {
         int now = body.actionTick();
         return continuing(now)
-            && (phase == Phase.RELOCATE || phase == Phase.CAP_EXIT || phase == Phase.CHOOSE || phase == Phase.OPEN
+            && (phase == Phase.RELOCATE || phase == Phase.CHOOSE || phase == Phase.OPEN
                 || progressAt >= started && now - progressAt <= PROGRESS_LEASE_TICKS
                 || cavePending && now - caveSince <= CAVE_TURN_LIMIT
                 || caveSurveySpent && (phase == Phase.ANCHOR || phase == Phase.CHOOSE)
@@ -161,7 +159,7 @@ final class AgentReturnableMine {
 
     boolean hasRetryProgressLease() {
         int now = body.actionTick();
-        return continuing(now) && (phase == Phase.RELOCATE || phase == Phase.CAP_EXIT || routeWork.recent(now));
+        return continuing(now) && (phase == Phase.RELOCATE || routeWork.recent(now));
     }
 
     private boolean continuing(int now) {
@@ -307,14 +305,13 @@ final class AgentReturnableMine {
         if (now - started >= LEG_TICKS) return fail("returnable mine leg reached its time limit");
         if (phase != Phase.DRIVE && !dryGroundAt(checkingReturn() ? to : from))
             return fail("lost the committed dry mine stance");
-        if (!settling() && phase != Phase.CAP_EXIT && bearing != null
+        if (!settling() && bearing != null
                 && body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65))
             return fail("visible lava vetoed the mine bearing");
         switch (phase) {
             case ANCHOR -> anchor(now);
             case CHOOSE -> choose(host, now);
             case OPEN -> open(host, now);
-            case CAP_EXIT -> depart(host, now);
             case CUT -> cut(host, now);
             case LIGHT -> light(host, now);
             case FORWARD -> prove(host, now, false);
@@ -389,7 +386,6 @@ final class AgentReturnableMine {
                         bearing = candidate;
                         to = nextTread(candidate);
                         treadEvidence = 0;
-                        capEscape = null;
                         trimmed = openTread = false;
                         Vec3d contactAim = aim;
                         begin(Phase.CUT, now);
@@ -480,7 +476,6 @@ final class AgentReturnableMine {
         cut = 2;
         cutSample = 0;
         treadEvidence = 0;
-        capEscape = null;
         trimmed = openTread = false;
         begin(Phase.CUT, now);
     }
@@ -529,10 +524,9 @@ final class AgentReturnableMine {
                         else fail("the witnessed stair cap is " + fact);
                         return;
                     }
-                    if (capEscape == null || !edgeStillClear(capEscape)) {
-                        resumeCutAim = aim;
-                        begin(Phase.CAP_EXIT, now);
-                        resetDeparture(now);
+                    if (body.dryCaveContact(from) == null ||
+                            !stationaryCap(from, workCell, bearing, player.getBoundingBox())) {
+                        fail("the visible mine cap cannot be opened from independent, settled footing");
                         return;
                     }
                 }
@@ -778,7 +772,6 @@ final class AgentReturnableMine {
     }
 
     private void depart(AgentProgress host, int now) {
-        boolean escapingCap = phase == Phase.CAP_EXIT;
         if (crossing != null) {
             switch (crossing.step(client, body, now)) {
                 case CHECKING -> { }
@@ -813,37 +806,27 @@ final class AgentReturnableMine {
             }
             return;
         }
-        if (escapingCap && now - phaseSince >= CAP_EXIT_TICKS
-                || !escapingCap && hopCount >= RELOCATION_HOPS) {
-            if (escapingCap) fail("no independent dry exit was proved before cutting the cap");
-            else relocationFailed("the checked relocation reached its walking limit without a distinct dry start");
+        if (hopCount >= RELOCATION_HOPS) {
+            relocationFailed("the checked relocation reached its walking limit without a distinct dry start");
             return;
         }
         if (!dryGroundAt(from)) {
-            if (escapingCap) fail("lost the footing at the mine cap");
-            else relocationFailed("lost the grounded footing for mine relocation");
+            relocationFailed("lost the grounded footing for mine relocation");
             return;
         }
         if (!center(from)) return;
-        if (departureTo == null && !nextDeparture(host, escapingCap, now)) {
-            if (escapingCap) fail("no independent dry exit was proved before cutting the cap");
-            else relocationFailed("no further safe opening, grounded level tread, or one-block rise was proved");
+        if (departureTo == null && !nextDeparture(host, now)) {
+            relocationFailed("no further safe opening, grounded level tread, or one-block rise was proved");
             return;
         }
         Direction lane = departureBearing;
         if (!body.hazardAhead(lane.getPositiveHorizontalDegrees(), 1.65)) {
             var edge = observeDeparture(now);
             if (edge != null) {
-                if (escapingCap) {
-                    capEscape = edge;
-                    begin(Phase.CUT, now);
-                    aim = resumeCutAim;
-                } else {
-                    crossing = from.getY() == departureTo.getY() ? AgentSurfaceTread.witnessedOutbound(edge, now)
-                        : AgentSurfaceTread.ordinaryGrade(edge, from, now);
-                    status = from.getY() < departureTo.getY() ? "climbing to a witnessed dry top with clear headroom"
-                        : "following a witnessed dry tread away from the exhausted mine start";
-                }
+                crossing = from.getY() == departureTo.getY() ? AgentSurfaceTread.witnessedOutbound(edge, now)
+                    : AgentSurfaceTread.ordinaryGrade(edge, from, now);
+                status = from.getY() < departureTo.getY() ? "climbing to a witnessed dry top with clear headroom"
+                    : "following a witnessed dry tread away from the exhausted mine start";
                 return;
             }
             if (now - departureSince < DEPARTURE_VIEW_TICKS) return;
@@ -851,7 +834,7 @@ final class AgentReturnableMine {
             // when this bearing really exposes space below the retained footing.
             BlockPos lower = from.offset(lane).down();
             Vec3d opening = offset(Vec3d.ofCenter(lower, 0.83), lane, 0.37);
-            if (!escapingCap && !unjoined() && !departureBacktrack
+            if (!unjoined() && !departureBacktrack
                     && body.dryCaveSpace(opening) == AgentBody.DryRouteSample.CLEAR
                     && offerCave(host, lower, lane, now)) return;
         }
@@ -859,7 +842,7 @@ final class AgentReturnableMine {
         else relocationFailed("could not reverify the last dry tread to try a different relocation bearing");
     }
 
-    private boolean nextDeparture(AgentProgress host, boolean escapingCap, int now) {
+    private boolean nextDeparture(AgentProgress host, int now) {
         while (departureChoice <= 8) {
             int index = departureChoice++;
             BlockPos candidate;
@@ -871,11 +854,10 @@ final class AgentReturnableMine {
                 boolean upward = ((index - 1) % 2 == 0) == unjoined();
                 candidate = from.offset(option(lane)).up(upward ? 1 : 0);
             }
-            if (escapingCap && candidate.getX() == to.getX() && candidate.getZ() == to.getZ()) continue;
-            if (!escapingCap && seenDuringRelocation(candidate)) continue;
+            if (seenDuringRelocation(candidate)) continue;
             if (selectDeparture(candidate, now)) return true;
         }
-        if (!escapingCap && pathSize > 1 && selectDeparture(searchPath[pathSize - 2], now)) {
+        if (pathSize > 1 && selectDeparture(searchPath[pathSize - 2], now)) {
             departureBacktrack = true;
             return true;
         }
@@ -939,16 +921,6 @@ final class AgentReturnableMine {
             && (grade ? body.ordinaryGradeSweep(from, departureTo) : body.dryRouteSweep(from, departureTo));
         if (!clear) departureSince = now - DEPARTURE_VIEW_TICKS;
         return witnessedTransit(from, departureTo, departureBearing, departureTop, source, departureSurface, clear);
-    }
-
-    private boolean edgeStillClear(AgentSurfaceTread.Edge edge) {
-        boolean forward = from.equals(edge.upper());
-        BlockPos other = forward ? edge.lower() : edge.upper();
-        Direction lane = forward ? edge.down() : edge.down().getOpposite();
-        return !body.hazardAhead(lane.getPositiveHorizontalDegrees(), 1.65)
-            && world.getBlockState(edge.upper().down()) == edge.upperSupport()
-            && world.getBlockState(edge.lower().down()) == edge.lowerSupport()
-            && body.walkedLaneDry(from, other, lane) && AgentSurfaceTread.retainedLaneClear(client, from, other, lane);
     }
 
     static AgentSurfaceTread.Edge witnessedTransit(BlockPos from, BlockPos to, Direction lane, BlockHitResult top,
@@ -1016,7 +988,6 @@ final class AgentReturnableMine {
             case ANCHOR -> "checking the stable dry anchor for a returnable mine leg";
             case CHOOSE -> "looking for a witnessed mine face on a safe bearing";
             case OPEN -> "no obstruction to cut; looking for the exact dry landing of the opening";
-            case CAP_EXIT -> "checking an independent dry exit before cutting a witnessed cap";
             case CUT -> "clearing one witnessed cell of the returnable mine stair";
             case LIGHT -> "lighting the dry mine tread from stable support";
             case FORWARD -> "checking the next dry mine tread and its jump clearance";
@@ -1053,8 +1024,6 @@ final class AgentReturnableMine {
         cavePending = false;
         anchor = from = to = workCell = null;
         crossing = null;
-        capEscape = null;
-        resumeCutAim = null;
         clearDeparture(body.actionTick());
         pendingLight = null;
         equipmentJob = 0;
@@ -1124,6 +1093,14 @@ final class AgentReturnableMine {
         return hit != null && hit.getType() == HitResult.Type.BLOCK && !hit.isInsideBlock()
             && cap.equals(hit.getBlockPos())
             && (AgentBody.matchesDryRouteTop(hit, cap) || hit.getSide() == bearing.getOpposite());
+    }
+
+    /** Opening the adjacent column is stationary; FORWARD must separately prove a tread before any step. */
+    static boolean stationaryCap(BlockPos foot, BlockPos cap, Direction bearing, net.minecraft.util.math.Box hull) {
+        return bearing.getOffsetY() == 0 && cap.getX() == foot.getX() + bearing.getOffsetX()
+            && cap.getZ() == foot.getZ() + bearing.getOffsetZ() && cap.getY() == foot.getY() - 1
+            && hull.minX >= foot.getX() && hull.maxX <= foot.getX() + 1.0
+            && hull.minZ >= foot.getZ() && hull.maxZ <= foot.getZ() + 1.0;
     }
 
     /** Negative-only attachment veto for this already witnessed cut, never a search for usable terrain. */

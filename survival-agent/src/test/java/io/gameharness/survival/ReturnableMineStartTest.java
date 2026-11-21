@@ -9,6 +9,7 @@ import net.minecraft.fluid.FluidState;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.BlockView;
@@ -28,6 +29,18 @@ final class ReturnableMineStartTest {
     @BeforeAll
     static void initializeVanilla() {
         VanillaTestResources.initialize();
+    }
+
+    @Test
+    void anAdjacentCapCanBeCutFromFirmFootingWithoutAuthorizingTheStepIntoIt() {
+        BlockPos cap = RIM.east().down();
+        Box settled = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        assertTrue(AgentReturnableMine.stationaryCap(RIM, cap, EAST, settled));
+        assertFalse(AgentReturnableMine.stationaryCap(RIM, cap, EAST, settled.offset(0.3, 0, 0)),
+            "part of the body is over the prospective hole");
+        assertFalse(AgentReturnableMine.stationaryCap(RIM, RIM.down(), EAST, settled));
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, cap, EAST, null, Blocks.STONE.getDefaultState(),
+            Blocks.STONE.getDefaultState(), true), "a stationary cut did not witness the landing below it");
     }
 
     @Test

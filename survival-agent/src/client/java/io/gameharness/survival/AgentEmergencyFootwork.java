@@ -3,8 +3,8 @@ package io.gameharness.survival;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
-/** One audible fuse: a blocked bearing stays retired until another cue. */
-final class AgentFuseEscape {
+/** Bounded dry retreat for a single threat bearing; never grants a jump or an unseen landing. */
+final class AgentEmergencyFootwork {
     static final float PITCH = 58;
     static final float DRIVE_ALIGNMENT = 3;
     private static final float[] SIDE_TURNS = {-38, 38, -65, 65, -95, 95};
@@ -62,9 +62,8 @@ final class AgentFuseEscape {
         if (alternate || !retired) {
             landing = terrain.dryLanding(bearing);
             if (landing != null) return action = Action.DRIVE;
-            if (!settled) return action = Action.ALIGN;
-            if (alternate) return brace();
-            retired = true;
+            if (alternate) return settled ? brace() : (action = Action.ALIGN);
+            retired = settled;
         }
 
         // The recent contact only nominates a heading. The living scene must still

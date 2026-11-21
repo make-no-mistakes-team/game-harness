@@ -360,6 +360,10 @@ striking an unseen mob. Ambient sound alone does not start or extend
 the emergency. Shields and tools remain subject to the job's stock
 protections.
 
+When repeated ranged hits show that bracing is not working, a player
+without a usable shield or cover can try a checked, level escape lane.
+The player does not claim a dodge merely for turning or pressing a key.
+
 For the rhythm of the whole run, inspect `outcome.json` → `pauseEvidence`.
 It flags long stops and clusters of shorter ones and gives their times in
 the recording. The provider overlap is reported separately: a pending

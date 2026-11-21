@@ -821,9 +821,10 @@ final class AgentProgress {
             interruptHands();
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
-            if (defense.rangedStep(tick, protectedHeadroom, safetySpend))
-                step(forward(defense.rangedRetreatYaw()), false, false);
+            defense.rangedStep(tick, protectedHeadroom, safetySpend);
             if (macroEngaged && defense.confirmedCover()) macro.safetyEffect(defense.status());
+            if (macroEngaged && defense.confirmedRangedRetreat())
+                macro.safetyEffect("confirmed voluntary dodge on a witnessed dry lane");
             stallGuard.priorityAim();
             status = defense.status();
             return;
@@ -6954,7 +6955,7 @@ final class AgentProgress {
         boolean creeper = threat instanceof CreeperEntity;
         // Defer to the actual fall controller before issuing a ranged brace. Avoid the
         // generic damage turn/backtrack when a ranged shot is the corroborating cue.
-        if (!creeper && defense.observeRanged(ears, threat, hurt)) return false;
+        if (!creeper && defense.observeRanged(ears, threat, hurt, tick)) return false;
         if (!creeper
                 && defense.observeMelee(ears, threat, hurt,
                     c.player.getHealth() <= 10 && wantsHealingMeal(), tick, safetySpend)) return false;

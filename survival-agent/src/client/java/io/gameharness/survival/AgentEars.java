@@ -29,7 +29,7 @@ final class AgentEars implements SoundInstanceListener {
 
     private final MinecraftClient client;
     private final Supplier<Screen> renderedScreen;
-    private final AgentFuseEscape fuseEscape = new AgentFuseEscape();
+    private final AgentEmergencyFootwork fuseEscape = new AgentEmergencyFootwork();
     private int escapeTicks;
     private boolean newFuse;
     private float away;
@@ -166,18 +166,14 @@ final class AgentEars implements SoundInstanceListener {
         body.prioritizeMovement();
         var player = client.player;
         Vec3d feet = player.getPos();
-        Vec3d walked = body.recentEmergencyFooting();
-        double dx = walked == null ? 0 : walked.x - feet.x, dz = walked == null ? 0 : walked.z - feet.z;
-        float walkedBearing = walked != null && Math.abs(feet.y - walked.y) <= 0.055 && dx * dx + dz * dz >= 0.04
-            ? (float) Math.toDegrees(Math.atan2(-dx, dz)) : Float.NaN;
         boolean lava = body.lavaEmergency();
-        var action = fuseEscape.step(feet, body.fuseViewYaw(), body.fuseViewPitch(),
+        var action = fuseEscape.step(feet, body.defensiveViewYaw(), body.defensiveViewPitch(),
             player.isOnGround() && !lava, body.appliedEmergencyForward() && player.hurtTime == 0 && !lava,
-            explosionCue != null && explosionCue.monotonicNs() >= lastFuseNs, body, walkedBearing);
+            explosionCue != null && explosionCue.monotonicNs() >= lastFuseNs, body, body.recentEmergencyBearing());
         if (lava) return; // The separate lava egress remains the final motor owner.
         switch (action) {
-            case ALIGN -> body.turnUrgent(fuseEscape.bearing(), AgentFuseEscape.PITCH);
-            case DRIVE -> body.driveFuseLane(fuseEscape.landing(), fuseEscape.bearing());
+            case ALIGN -> body.turnUrgent(fuseEscape.bearing(), AgentEmergencyFootwork.PITCH);
+            case DRIVE -> body.driveCheckedEmergencyLane(fuseEscape.landing(), fuseEscape.bearing());
             case BRACE -> body.braceForFuse(away + 180);
         }
     }

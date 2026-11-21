@@ -92,13 +92,18 @@ final class AgentDefense {
     private int zombieLookAligned;
     private float zombieLookYaw;
     private boolean rangedAudible, rangedUnderFire, rangedCoverTried;
-    private boolean coverReceipt;
+    private boolean coverReceipt, rangedRetreatReceipt, rangedHitNow;
     private float rangedYaw, rangedPitch;
     private long rangedUntil;
     private int rangedSelectAfter;
     private BlockPos rangedCover;
     private Block rangedCoverBlock;
     private int rangedCoverUntil, rangedCoverSlot, rangedCoverCount;
+    private final RangedFire rangedFire = new RangedFire();
+    private final AgentEmergencyFootwork rangedFootwork = new AgentEmergencyFootwork();
+    private Vec3d rangedBlockedAt;
+    private boolean rangedFootworkStarted;
+    private int rangedDriveTick = -1;
     private final MeleeRecovery melee = new MeleeRecovery();
     private Vec3d meleeStart, meleeSurveyFrom;
     private LivingEntity meleeVisible, meleeAttacker;
@@ -438,15 +443,37 @@ final class AgentDefense {
         return Math.abs(MathHelper.wrapDegrees(a - b));
     }
 
+    /** Track actual damage, not the number of shots or the number of requested keys. */
+    static final class RangedFire {
+        private static final int DAMAGE_WINDOW = 100;
+        private int lastHit = -DAMAGE_WINDOW;
+        private float from = Float.NaN;
+        private boolean repeated;
+
+        boolean hit(int tick, float toward) {
+            repeated = tick - lastHit < DAMAGE_WINDOW && turnDifference(toward, from) <= 50;
+            if (!repeated) from = toward;
+            lastHit = tick;
+            return repeated;
+        }
+
+        boolean repeated(int tick) { return repeated && tick - lastHit < DAMAGE_WINDOW; }
+        float away() { return MathHelper.wrapDegrees(from + 180); }
+    }
+
     boolean rangedActive() { return rangedUntil != 0 && System.nanoTime() - rangedUntil < 0; }
 
-    boolean observeRanged(AgentEars ears, LivingEntity visible, boolean hurt) {
+    boolean observeRanged(AgentEars ears, LivingEntity visible, boolean hurt, int tick) {
+        rangedHitNow = hurt && !client.player.isOnFire();
         var cue = ears.takeFreshRangedCue();
         boolean active = rangedActive();
         Vec3d seen = hurt && visible instanceof RangedAttackMob
                 && (visible.isHolding(Items.BOW) || visible.isHolding(Items.CROSSBOW)) ? body.threatPoint() : null;
         if (cue == null && seen == null) {
-            if (active && hurt) rangedUnderFire = true;
+            if (active && hurt) {
+                rangedUnderFire = true;
+                recordRangedImpact(tick);
+            }
             return active;
         }
         if (!active) {
@@ -469,61 +496,113 @@ final class AgentDefense {
             // An opposing audio cue alone does not spin the player or pin this alert.
             return active;
         }
+        recordRangedImpact(tick);
         rangedUntil = System.nanoTime() + RANGED_ALERT_NANOS;
         return true;
     }
 
-    boolean rangedStep(int tick, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend) {
-        coverReceipt = false;
+    private void recordRangedImpact(int tick) {
+        if (rangedHitNow && !rangedFire.hit(tick, rangedYaw)) {
+            rangedFootworkStarted = false;
+            rangedBlockedAt = null;
+        }
+    }
+
+    void rangedStep(int tick, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend) {
+        coverReceipt = rangedRetreatReceipt = false;
         markDanger(tick);
         forgetContact();
         body.prioritizeMovement();
         var player = client.player;
-        status = rangedAudible ? "bracing after a nearby skeleton shot" : "bracing after damage near a visible archer";
+        status = rangedAudible ? "responding to a nearby skeleton shot" : "responding to a visible archer";
         // The fall controller has already had priority. Never add a movement key to the impulse.
-        if (!player.isOnGround() || player.isTouchingWater() || player.hasVehicle() || client.currentScreen != null)
-            return false;
+        if (!player.isOnGround() || player.isTouchingWater() || player.hasVehicle() || client.currentScreen != null) {
+            status = "ranged threat; waiting for grounded dry footing";
+            return;
+        }
         body.sneak();
         body.turnUrgent(rangedYaw, MathHelper.clamp(rangedPitch, -55, 65));
         ItemStack main = player.getMainHandStack();
-        boolean offhand = SHIELD.test(player.getOffHandStack()) && canWear(player.getOffHandStack(), spend);
-        if (SHIELD.test(main) && canWear(main, spend) || offhand && AgentBody.shieldSafeMainHand(main)
+        boolean useBound = !client.options.useKey.isUnbound();
+        boolean offhand = useBound && SHIELD.test(player.getOffHandStack()) && canWear(player.getOffHandStack(), spend);
+        if (useBound && SHIELD.test(main) && canWear(main, spend) || offhand && AgentBody.shieldSafeMainHand(main)
                 && !(main.isIn(ItemTags.AXES) && body.shieldStartWouldUseBlock())) {
             body.guardRangedBearing(rangedYaw);
             if (player.isBlocking() && SHIELD.test(player.getActiveItem())) status = "blocking toward ranged fire";
-            return false;
+            return;
         }
-        if (player.isUsingItem() || !body.hasRecentView()) return false;
+        if (player.isUsingItem()) return;
         var inventory = player.getInventory();
         int safeHand = -1, coverSlot = -1;
-        boolean heldBack = SHIELD.test(player.getOffHandStack()) && !offhand;
         for (int slot = 0; slot < PlayerInventory.HOTBAR_SIZE; slot++) {
             if (slot != inventory.selectedSlot && client.options.hotbarKeys[slot].isUnbound()) continue;
             ItemStack stack = inventory.getStack(slot);
-            if (SHIELD.test(stack)) {
+            if (useBound && SHIELD.test(stack)) {
                 if (canWear(stack, spend)) {
                     safeHand = slot;
                     break;
                 }
-                heldBack = true;
             }
             if (offhand && safeHand < 0 && (stack.isEmpty() || stack.isIn(ItemTags.SWORDS)
                     || stack.isIn(ItemTags.PICKAXES))) safeHand = slot;
             if (coverMaterial(stack)) {
-                if (spend != null && !spend.test(stack)) heldBack = true;
-                else if (coverSlot < 0 || slot == inventory.selectedSlot) coverSlot = slot;
+                if ((spend == null || spend.test(stack)) && (coverSlot < 0 || slot == inventory.selectedSlot))
+                    coverSlot = slot;
             }
         }
         if (safeHand >= 0) {
             selectRangedSlot(safeHand, tick);
-            return false;
+            return;
         }
-        boolean cover = !offhand && rangedUnderFire && tryRangedCover(tick, coverSlot, protectsRoute, spend);
-        return heldBack && !cover;
+        if (!offhand && rangedUnderFire && (useBound || rangedCover != null)
+                && tryRangedCover(tick, coverSlot, protectsRoute, spend)) return;
+        if (rangedFire.repeated(tick)) {
+            evadeRangedFire(tick);
+            return;
+        }
+        status = "ranged threat; no usable shield or cover";
     }
 
-    float rangedRetreatYaw() { return rangedYaw + 180; }
+    private void evadeRangedFire(int tick) {
+        var player = client.player;
+        Vec3d feet = player.getPos();
+        // Release the guard stance before a checked dodge; never inherit its crouch or use.
+        body.pauseWork();
+        body.prioritizeMovement();
+        if (rangedHitNow || player.hurtTime > 0 && player.getVelocity().y > 0.06) {
+            status = "under repeated fire; waiting for the hit impulse to settle";
+            return;
+        }
+        if (!rangedFootworkStarted || rangedBlockedAt != null && feet.squaredDistanceTo(rangedBlockedAt) >= 0.36) {
+            rangedFootwork.start(rangedFire.away());
+            rangedFootworkStarted = true;
+            rangedBlockedAt = null;
+        }
+        var action = rangedFootwork.step(feet, body.defensiveViewYaw(), body.defensiveViewPitch(), true,
+            tick == rangedDriveTick + 1 && body.appliedEmergencyForward() && player.hurtTime == 0,
+            false, body, body.recentEmergencyBearing());
+        rangedRetreatReceipt = rangedFootwork.advanced();
+        switch (action) {
+            case ALIGN -> {
+                body.turnUrgent(rangedFootwork.bearing(), AgentEmergencyFootwork.PITCH);
+                status = "under repeated fire; checking for a short dry lane";
+            }
+            case DRIVE -> {
+                body.driveCheckedEmergencyLane(rangedFootwork.landing(), rangedFootwork.bearing());
+                rangedDriveTick = tick;
+                status = rangedRetreatReceipt ? "under repeated fire; confirmed a voluntary dodge on a witnessed dry lane"
+                    : "under repeated fire; requesting a dodge on a witnessed dry lane";
+            }
+            case BRACE -> {
+                if (rangedBlockedAt == null) rangedBlockedAt = feet;
+                body.sneak();
+                status = "under repeated fire without usable protection; no short dry lane proved";
+            }
+        }
+    }
+
     boolean confirmedCover() { return coverReceipt; }
+    boolean confirmedRangedRetreat() { return rangedRetreatReceipt; }
 
     private boolean tryRangedCover(int tick, int slot, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend) {
         var player = client.player;

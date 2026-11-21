@@ -3,7 +3,7 @@ package io.gameharness.survival;
 import net.minecraft.util.math.Vec3d;
 import org.junit.jupiter.api.Test;
 
-import static io.gameharness.survival.AgentFuseEscape.Action.*;
+import static io.gameharness.survival.AgentEmergencyFootwork.Action.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 final class AgentFuseEscapeTest {
@@ -16,7 +16,7 @@ final class AgentFuseEscapeTest {
 
     @Test
     void theThreeJumpTraceRetiresTheFailedBearingBeforeTheSecondJump() {
-        var escape = new AgentFuseEscape();
+        var escape = new AgentEmergencyFootwork();
         var terrain = new Terrain();
         escape.start(EAST);
         assertEquals(DRIVE, escape.step(feet(66), EAST, 5, true, false, false, terrain, Float.NaN));
@@ -48,7 +48,7 @@ final class AgentFuseEscapeTest {
 
     @Test
     void nearCollisionSwitchesImmediatelyButAnUnsupportedOrHazardousSideNeverDrives() {
-        var escape = new AgentFuseEscape();
+        var escape = new AgentEmergencyFootwork();
         var terrain = new Terrain();
         terrain.wall = terrain.side = true;
         escape.start(EAST);
@@ -70,7 +70,7 @@ final class AgentFuseEscapeTest {
 
     @Test
     void creditsOnlyGroundedHorizontalProgressFromAnAppliedEscapeKey() {
-        var escape = new AgentFuseEscape();
+        var escape = new AgentEmergencyFootwork();
         var terrain = new Terrain();
         escape.start(EAST);
         escape.step(feet(66), EAST, 58, true, false, false, terrain, Float.NaN);
@@ -82,7 +82,7 @@ final class AgentFuseEscapeTest {
 
     private static Vec3d feet(double y) { return new Vec3d(X, y, Z); }
 
-    private static final class Terrain implements AgentFuseEscape.Terrain {
+    private static final class Terrain implements AgentEmergencyFootwork.Terrain {
         boolean wall, side;
 
         @Override public boolean obstructed(float bearing) { return wall && bearing == EAST; }

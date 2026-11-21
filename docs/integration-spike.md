@@ -46,8 +46,12 @@ bun run play:agent --strategy terra --macro-requests 8 --task 'Choose your next 
 When you select Terra, one of those requests may run during world loading.
 It receives the task and a description of available actions, but no game
 frame or inventory. Terra can suggest alternatives: craft from surplus wood
-if the player has it, or gather wood if there is a tree in reach. Only one
-branch can start. It must match an actual observation, even when the advice
+if the player has it, or gather wood from a visible tree. An exact log
+can start the gathering job before it is in reach if the first live view
+shows a safe approach. A tree-shaped patch of foliage does not qualify.
+The host checks the same source and footing before issuing the job; it
+need not call Terra again just to start walking. Only one branch can
+start. It must match an actual observation, even when the advice
 refers to “the log you see” rather than a particular wood species. A branch
 can include up to three jobs. If the opening asks for three logs and the
 player already has three, the craft can start without sending the player

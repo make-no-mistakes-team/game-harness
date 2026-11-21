@@ -576,6 +576,62 @@ const result = (proposal: FirstPlanInference["proposal"], outcome: FirstPlanInfe
   ({ stage: PRE_SPAWN_GOAL_ONLY, model: TERRA_MODEL_ID, outcome, proposal, dispatched: true,
     latencyMs: 2, providerStartedAtMs: performance.now(), usage: null, costUsd: null }) satisfies FirstPlanInference;
 
+const oak = "minecraft:oak_log";
+const oakApproach = { kind: "resource", subject: `block:${oak}`, target: "oak-trunk",
+  footing: "dry", windowBlocks: 1.6, bearingDegrees: -6 } as const;
+const travelRequest = { goal: "diamond", objective: "Gather at least six logs for travel, then continue toward diamond." } as const;
+const travelAdvice = {
+  kind: "first_policy", reserves: [],
+  branches: [{ requires: [], policy: { kind: "harvest_stock", resource: "witnessed_log", count: 6, maxBreaks: 4 } }],
+} as const;
+const travelInventory = (logs: number) => ({ [oak]: logs, "minecraft:crafting_table": 1 });
+
+test("a first approach only binds eligible exact timber and never credits travel as stock or a priced harvest", () => {
+  const live = view({ goal: travelRequest.goal, stance: 1, inventory: travelInventory(4), travelHint: oakApproach });
+  const scope = { ...liveScope, first: live };
+  const exact = { ...travelAdvice, branches: [{ requires: [], policy: { ...travelAdvice.branches[0].policy, resource: oak } }] };
+  const first = exact.branches[0]!;
+  expect(bindFirstPlan(travelRequest, exact, live, scope)).toMatchObject({
+    input: oak, liveTargets: [oakApproach.target], travelHint: oakApproach,
+    policy: { target: { kind: "stock", item: oak, count: 6 }, reserves: [], costCaps: [],
+      allowedEffects: [`break:${oak}`], maxBreaks: 4 },
+  });
+  for (const sample of [
+    { ...live, travelHint: { ...oakApproach, subject: "block:minecraft:birch_log" } },
+    { ...live, travelHint: { ...oakApproach, subject: "block:minecraft:oak_leaves" } },
+    { ...live, travelHint: { ...oakApproach, kind: "woodland_frontier" as const, subject: "landmark:woodland" } },
+    { ...live, opportunities: [{ ...offer("costly-oak", "break", `block:${oak}`, { "minecraft:wooden_axe": 1 }),
+      material: { subject: `block:${oak}`, target: oakApproach.target, spends: { "minecraft:wooden_axe": 1 } } }] },
+  ]) expect(bindFirstPlan(travelRequest, exact, sample, scope)).toEqual({ reason: "no_matching_live_material" });
+  expect(bindFirstPlan(travelRequest, travelAdvice, { ...live, opportunities: [birch] }, scope))
+    .toEqual({ reason: "ambiguous_material_binding" });
+  expect(bindFirstPlan(travelRequest, exact, { ...live, safety: { clear: false, revision: 2 } }, scope))
+    .toEqual({ reason: "live_scope_changed" });
+  expect(bindFirstPlan(travelRequest, { ...exact, reserves: [{ item: oak, count: 5 }] }, live, scope))
+    .toEqual({ reason: "protected_stock_missing" }); // Even one safely approachable tree does not earn a floor.
+  expect(bindFirstPlan(travelRequest, { ...exact, branches: [{ ...first, requires: [{ item: oak, count: 6 }] }] }, live, scope))
+    .toEqual({ reason: "stock_prerequisite_missing" });
+  expect(bindFirstPlan(travelRequest, exact, live, { ...scope, first: { ...live, inventory: travelInventory(2) },
+    protectedReserves: [{ item: oak, count: 4 }] })).toEqual({ reason: "protected_stock_missing" });
+  expect(bindFirstPlan(travelRequest, { ...exact, branches: [{ ...first, policy: { ...first.policy, maxBreaks: 0 } }] }, live, scope))
+    .toEqual({ reason: "no_matching_live_material" });
+  expect(bindFirstPlan(travelRequest, { ...exact, branches: [{ ...first, policy: { ...first.policy, resource: "minecraft:coal" } }] },
+    { ...live, travelHint: { ...oakApproach, subject: "block:minecraft:coal_ore" } }, scope))
+    .toEqual({ reason: "no_matching_live_material" });
+});
+
+test("one feasible plank acquisition binds an exact approach, without excess spending or a fictitious reserve", () => {
+  const live = view({ stance: 1, travelHint: oakApproach });
+  expect(bindFirstPlan(request, planks, live, { ...liveScope, first: live })).toMatchObject({
+    travelHint: oakApproach, policy: { target: { item: "minecraft:oak_planks", count: 4 }, maxBreaks: 1, maxCrafts: 1,
+      allowedEffects: [`break:${oak}`, "craft:oak_planks"], costCaps: [{ item: oak, count: 1 }] },
+  });
+  expect(bindFirstPlan(request, { ...planks, reserves: [{ item: oak, count: 1 }] }, live, liveScope))
+    .toEqual({ reason: "protected_stock_missing" });
+  expect(bindFirstPlan(request, { ...planks, branches: [{ ...plankBranch, policy: { ...plankBranch.policy, count: 8 } }] },
+    live, liveScope)).toEqual({ reason: "work_resource_shortage" });
+});
+
 async function fixture(infer: FirstPlanStrategist, signal?: AbortSignal, maxRequests = 1, strategy: "terra" | "deterministic" = "terra",
   opening: FirstPlanRequest = { ...request, objective: "Mine a stone pickaxe" }) {
   const dir = await mkdtemp(path.join(tmpdir(), "survival-first-plan-"));
@@ -611,6 +667,113 @@ async function fixture(infer: FirstPlanStrategist, signal?: AbortSignal, maxRequ
     try { await controller.stop(); } finally { await rm(dir, { recursive: true, force: true }); }
   } };
 }
+
+test.each([
+  ["a1BHaY", 7, 4, [{ id: "read-oak", verb: "inspect", risk: "read", summary: "Inspect visible oak",
+    evidence: "A different view is needed", anchor: { subject: oakApproach.subject, target: oakApproach.target } }] as const],
+  ["RoUp1d", 6, 2, []],
+  ["first rendered publication", 9, 4, undefined],
+] as const)("%s uses the one prepared quote on the first actual oak approach", async (_, tick, logs, opportunities) => {
+  const wire = JSON.stringify({ advice: travelAdvice });
+  expect(validateJsonSchemaValue(firstPlanContext(travelRequest)!.tools![0]!.parameters, JSON.parse(wire)).success).toBe(true);
+  const f = await fixture(async () => result(parseFirstPlanToolArguments(wire)), undefined, 2, "terra", travelRequest);
+  try {
+    const inventory = travelInventory(logs);
+    if (opportunities) {
+      await f.observe({ goal: travelRequest.goal, tick, epoch: 3, stance: 1, inventory, opportunities, quiescent: false });
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      expect(f.liveCalls()).toBe(0);
+    }
+    const readyTick = opportunities ? tick + 5 : tick;
+    await f.observe({ goal: travelRequest.goal, tick: readyTick, epoch: 3, stance: 1, inventory, quiescent: false,
+      travelHint: oakApproach });
+    const work = await f.order();
+    expect(work).toMatchObject({ origin: "model", basisTick: readyTick, target: { item: oak, count: 6 },
+      reserves: [], costCaps: [], allowedEffects: [`break:${oak}`],
+      travelAnchor: { subject: oakApproach.subject, target: oakApproach.target }, maxBreaks: 4 });
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({
+      event: "first_plan_bound", firstBasis: { run: work.run, life: 1, epoch: 3, tick },
+      actionableBasis: { run: work.run, life: 1, epoch: 3, tick: readyTick }, liveTargets: [oakApproach.target],
+      travelHint: oakApproach, nativeAccepted: false,
+    }));
+    expect(f.controller.status()).toMatchObject({ requests: 1, issuedWorkOrders: 1 });
+    expect(f.liveCalls()).toBe(0);
+  } finally { await f.close(); }
+});
+
+test("an unrelated travel-only render does not displace the first ordinary guarded start", async () => {
+  const f = await fixture(async () => result(planks), undefined, 2);
+  try {
+    await f.observe({ stance: 1, travelHint: { ...oakApproach, subject: "block:minecraft:coal_ore" }, quiescent: false });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await f.observe({ tick: 10, stance: 1, opportunities: [spruce] });
+    expect(await f.order()).toMatchObject({ basisTick: 10, allowedEffects: ["break:minecraft:spruce_log", "craft:spruce_planks"] });
+    expect(f.liveCalls()).toBe(0);
+  } finally { await f.close(); }
+});
+
+test.each([
+  ["rewritten resource ID", { travelHint: { ...oakApproach, target: "another-oak" } }, "fresh_binding_changed"],
+  ["lost braking window", { travelHint: undefined }, "no_matching_live_material"],
+  ["different footing", { travelHint: { ...oakApproach, footing: "shallow_water_with_bank" as const } }, "fresh_binding_changed"],
+  ["changed epoch", { epoch: 4 }, "fresh_binding_changed"],
+  ["changed stance", { stance: 2 }, "fresh_binding_changed"],
+  ["unsafe render", { travelHint: undefined, safety: { clear: false, revision: 2 } }, "live_scope_changed"],
+] as const)("the first exact approach cannot be reused after %s", async (_label, next, reason) => {
+  const reply = Promise.withResolvers<FirstPlanInference>();
+  const f = await fixture(async () => reply.promise, undefined, 2, "terra", travelRequest);
+  try {
+    const live = { goal: travelRequest.goal, tick: 7, epoch: 3, stance: 1, inventory: travelInventory(4), travelHint: oakApproach };
+    await f.observe(live);
+    reply.resolve(result(travelAdvice));
+    await f.observe({ ...live, tick: 12, ...next });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({ event: "first_plan_rejected", reason }));
+  } finally {
+    reply.resolve(result(null, "cancelled"));
+    await f.close();
+  }
+});
+
+test("a future six-log floor becomes binding before the prepared spending stage, not before the approach", async () => {
+  const oakPlanks = "minecraft:oak_planks";
+  const [branch] = travelAdvice.branches;
+  const advice = openingAdvice({ ...travelAdvice, branches: [{
+    ...branch, policy: { ...branch.policy, count: 8 },
+    then: [stockStage(boundPlanks, 8, [{ item: boundSource, count: 8 }], [{ kind: "craft_bound_planks" }],
+      [{ item: boundSource, count: 2 }], [{ item: boundSource, count: 6 }], 2)],
+  }] });
+  const f = await fixture(async () => result(advice), undefined, 2, "terra", travelRequest);
+  try {
+    await f.observe({ goal: travelRequest.goal, stance: 1, inventory: travelInventory(4), travelHint: oakApproach });
+    const harvest = await f.order();
+    expect(harvest).toMatchObject({ travelAnchor: { subject: oakApproach.subject, target: oakApproach.target },
+      target: { item: oak, count: 8 }, reserves: [], costCaps: [] });
+    await f.receipt(harvest.id, 6, "accepted");
+    await f.receipt(harvest.id, 40, "completed");
+    await f.controller.poll();
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    await f.observe({ goal: travelRequest.goal, tick: 40, epoch: 2, stance: 2, inventory: travelInventory(8) });
+    const craft = await f.order();
+    expect(craft).toMatchObject({ id: harvest.nextWorkId!, target: { item: oakPlanks, count: 8 },
+      maxBreaks: 0, maxCrafts: 2, reserves: [{ item: oak, count: 6 }], costCaps: [{ item: oak, count: 2 }] });
+    expect(craft.travelAnchor).toBeUndefined();
+    expect(f.liveCalls()).toBe(0);
+  } finally { await f.close(); }
+});
+
+test("an honestly quoted but absent travel reserve rejects startup and releases ordinary planning", async () => {
+  const f = await fixture(async () => result({ ...travelAdvice, reserves: [{ item: { kind: "bound_source" }, count: 6 }] }),
+    undefined, 2, "terra", travelRequest);
+  try {
+    await f.observe({ goal: travelRequest.goal, stance: 1, inventory: travelInventory(4), travelHint: oakApproach });
+    await expect(access(f.file("work.json"))).rejects.toThrow();
+    expect(f.liveCalls()).toBe(1);
+    expect(await f.log("history.jsonl")).toContainEqual(expect.objectContaining({
+      event: "first_plan_rejected", reason: "protected_stock_missing",
+    }));
+  } finally { await f.close(); }
+});
 
 test("one paid startup request uses the existing quota and publishes only after a real matching view", async () => {
   const sent = Promise.withResolvers<FirstPlanRequest>();

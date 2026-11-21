@@ -1,8 +1,8 @@
 import type { Context, Tool } from "@oh-my-pi/pi-ai";
 import { SURVIVAL_AGENT_GOALS, type SurvivalAgentGoal } from "../../shared/survival-agent-ui.ts";
 import {
-  MACRO_MAX_WORK_STAGES, parseMacroWorkPolicy, parseMacroWorkStages, type MacroInference, type MacroObservation,
-  type MacroStockFloor, type MacroWorkPolicy, type MacroWorkStage,
+  MACRO_MAX_WORK_STAGES, parseMacroWorkPolicy, parseMacroWorkStages, sameTravelTarget, travelHintMatchesPolicy,
+  type MacroInference, type MacroObservation, type MacroStockFloor, type MacroTravelHint, type MacroWorkPolicy, type MacroWorkStage,
 } from "./protocol.ts";
 import { VANILLA_HARVEST_SOURCES as harvestSources, VANILLA_TIMBER_RECIPES as timber } from "./vanilla-harvest.ts";
 import { preflightVanillaWork, VANILLA_WORK_RECIPE_KEYS } from "./vanilla-work.ts";
@@ -86,10 +86,14 @@ const stageSchema = schema({ requires: floorList(1, 32), policy: schema({
   costCaps: floorList(0, 32), reserves: floorList(0, 32),
   maxBreaks: { type: "integer", enum: [0] }, maxCrafts: integer, maxPlacements: integer,
 }) });
-const branchFields = { requires: floorsSchema, policy: { anyOf: [
-  schema({ kind: choice("harvest_stock"), resource: choice(...harvestChoices), count: integer, maxBreaks: integer }),
-  schema({ kind: choice("plank_stock"), source: choice(...timberChoices), count: integer, maxBreaks: integer, maxCrafts: integer }),
-] } };
+const openingCount = { ...integer, description: "Total stock to reach, not an amount to add or a required starting count." };
+const branchFields = {
+  requires: { ...floorsSchema, description: "Stock this branch needs already held before its first action." },
+  policy: { anyOf: [
+    schema({ kind: choice("harvest_stock"), resource: choice(...harvestChoices), count: openingCount, maxBreaks: integer }),
+    schema({ kind: choice("plank_stock"), source: choice(...timberChoices), count: openingCount, maxBreaks: integer, maxCrafts: integer }),
+  ] },
+};
 const branchSchema = { anyOf: [schema(branchFields), schema({ ...branchFields,
   then: { type: "array", minItems: 1, maxItems: MACRO_MAX_WORK_STAGES - 1, items: stageSchema },
 })] };
@@ -101,7 +105,8 @@ const firstPlanTool: Tool = {
     schema({ kind: choice("defer") }),
     schema({ kind: choice("defer"), category: choice(...DEFER_CATEGORIES) }),
     schema({
-      kind: choice("first_policy"), reserves: floorsSchema,
+      kind: choice("first_policy"),
+      reserves: { ...floorsSchema, description: "Protected entry stock across all branches. Do not put a future gathering target here." },
       branches: { type: "array", minItems: 1, maxItems: MAX_BRANCHES, items: branchSchema },
     }),
   ] } }),
@@ -111,12 +116,13 @@ const PROMPT = `Give a conditional first Survival policy using only the invocati
 Use first_policy only if this small vocabulary can express a goal-relevant opening consistent with the exact task (the task does not change the invocation goal). Otherwise return defer. Give 1 to ${MAX_BRANCHES} independent branches in priority order. Only one branch can bind: alternatives never contribute stock, effects, budgets or authority to each other.
 If ideal starting stock, species, or another prerequisite is unknown, include a separate safe acquisition branch when allowed, with its own explicit caps and real prerequisites, or defer instead of guessing. A branch with maxBreaks zero can never harvest. Keep the same task constraints in every alternative. Do not assume a surplus above a reserve, and do not omit a user's no-spend condition to make an alternative possible. These are the only first-stage policies:
 - harvest_stock: retain a total count of a supported vanilla item after a witnessed break or pickup. Resource may be an exact timber item, a timber selector below, minecraft:cobblestone, or minecraft:coal. Stone and coal require the right equipped tool and a fresh native harvest offer. maxBreaks is 0..4 (0 means pickup only).
-- plank_stock: retain a total count of planks from one exact eligible timber input or use a timber selector below. The host binds a uniquely supported input to its actual vanilla plank output using a matching inventory recipe, a witnessed drop, or a safe native break offer. maxCrafts is 1..2, and maxBreaks is 0..2 (0 forbids breaking). Each craft may spend one exact timber item and no other item.
+- plank_stock: retain a total count of planks from one exact eligible timber input or use a timber selector below. The host binds a uniquely supported input to its actual vanilla plank output using a matching inventory recipe, a witnessed drop, a safe native break, or a safe exact timber approach when timber needs to be acquired. maxCrafts is 1..2, and maxBreaks is 0..2 (0 forbids breaking). Each craft may spend one exact timber item and no other item.
 Use witnessed_log for one witnessed unstripped Overworld log species. Use witnessed_timber only if any supported source form, including wood, stripped logs, stems or bamboo blocks, is allowed. Do not assume a species. Exact item IDs always stay exact.
-For either policy, count is the total stock target from 1..8, not an amount to add. Size one useful batch around the task's downstream material needs and retained stock, not merely the smallest possible first action. Give explicit finite effect caps appropriate to that batch. One matching live opportunity can start it; this is not proof that the rest of the batch exists. Mining permission requires a matching zero-spend break offer and binds at most one exact block type. A pickup or recipe alone cannot grant mining. The native actor verifies each subsequent action against current evidence, and may stop if it cannot safely continue. The first stage cannot place anything or spend outside plank_stock.
+For either policy, count is the total stock target from 1..8, not an amount to add. Size one useful batch around the task's downstream material needs and retained stock, not merely the smallest possible first action. Give explicit finite effect caps appropriate to that batch. One matching live opportunity can start it; this is not proof that the rest of the batch exists. Breaking binds at most one exact block type. A matching zero-spend break offer can start the batch; a current exact timber approach can start the same bounded work with already-held floors, but supplies no stock, leaves, other cover, or break permission at a distance. A pickup or recipe alone cannot grant breaking. The native actor rechecks every action and may stop if it cannot safely continue. The first stage cannot place anything or spend outside plank_stock.
 Each floor is {item,count}, with a count from 1..2304. item is an exact minecraft:item ID, {"kind":"bound_source"} (the one actual timber input or harvest output), or {"kind":"bound_planks"} (the exact vanilla plank output of the actual timber, unavailable for stone or coal). These are inventory items, never block IDs, wildcards or species sums.
-Each branch's requires (0..4) are starting inventory prerequisites, true on the first native observation and at admission. Shared reserves (0..4) protect exact stock in every branch. A zero-spend first harvest may earn its exact reserve only within the target, cap and actually witnessed means. A spending first stage requires the reserves and adequate surplus. Do not put future stock into the starting requires.
-A branch may include then (1..${MACRO_MAX_WORK_STAGES - 1}) only for useful adjacent work on the same opening. Each entry has positive requires and a normal finite stock policy. requires are real inventory thresholds rechecked after the previous stage's accepted and completed native receipts. The target is total stock, which can be the invocation item when the recipes and ingredients are supported; do not target portal entry or smelting. Include only necessary exact craft effects, {"kind":"craft_bound_planks"} for the bound timber, and place:minecraft:crafting_table only if needed and capped (0..1 per stage). Later stages never grant block breaking. costCaps are explicit aggregate ingredient/placement costs for that stage, not grants to spend reserves. A stage's reserves add to the inherited reserves and can never reduce them. Put a reserve not yet held in its own producing stage; no earlier stage may spend that stock below the proposed reserve. No speculative receipt, ingredient, workstation, or stocked intermediate authorizes action.
+Each branch's requires (0..4) are starting inventory prerequisites, true on the first native observation and at admission. Shared reserves (0..4) protect exact stock in every branch. An approach requires all shared reserves already held. A zero-spend first harvest can earn an exact reserve only when witnessed in-reach breaks or drops already cover the deficit within the target and cap. A spending first stage requires the reserves and adequate surplus.
+Keep stock still to be acquired out of opening requires and shared reserves. For "gather six logs for travel", quote a harvest_stock target of six, not a starting requirement or shared floor of six; this stage spends none. If a later stage spends two logs, target eight in the harvest, then require eight and reserve six in the spending stage. That protects the gathered stock before it can be spent without assuming it already exists at spawn. If the task explicitly requires stock already held before the first action, keep that actual floor; do not convert it to a target.
+A branch may include then (1..${MACRO_MAX_WORK_STAGES - 1}) only for useful adjacent work on the same opening. Each entry has positive requires and a normal finite stock policy. requires are real inventory thresholds rechecked after the previous stage's accepted and completed native receipts. The target is total stock, which can be the invocation item when the recipes and ingredients are supported; do not target portal entry or smelting. Include only necessary exact craft effects, {"kind":"craft_bound_planks"} for the bound timber, and place:minecraft:crafting_table only if needed and capped (0..1 per stage). Later stages never grant block breaking. costCaps are explicit aggregate ingredient/placement costs for that stage, not grants to spend reserves. A stage's reserves add to the inherited reserves and can never reduce them. Declare a future floor in the stage that produces it or requires it already held. No earlier stage may spend that stock below the proposed reserve. No speculative receipt, ingredient, workstation, or stocked intermediate authorizes action.
 Check vanilla ingredients and batch yields before proposing numbers. Account for retained stock in addition to spend on the result, missing intermediate recipes, and a crafting table if not already supported. Include every required cost and effect within the caps. Reuse held gear through a real starting prerequisite instead of remaking it; a carried table is different from a placed, witnessed table. If a stage will make its own workstation or tools, budget their ingredients, recipes and any placement instead of requiring those finished items at stage entry. Defer if the task or floor is contradictory, universal or summed across species, or the available vocabulary cannot express it. Optionally provide one of the structured defer categories, never private reasoning.`;
 
 export function firstPlanContext({ goal, objective }: FirstPlanRequest): Context | undefined {
@@ -257,6 +263,7 @@ interface FirstPlanCandidate {
   readonly input: string;
   readonly policy: MacroWorkPolicy;
   readonly liveTargets: readonly string[];
+  readonly travelHint?: MacroTravelHint;
   readonly requires: readonly MacroStockFloor[];
   readonly then?: readonly MacroWorkStage[];
   readonly stockSatisfied?: readonly MacroStockFloor[];
@@ -281,24 +288,28 @@ export function bindFirstPlan(
   const breaks = new Map<string, Set<string>>();
   const drops = new Map<string, Set<string>>();
   const recipes = new Map<string, Set<string>>();
+  let travel = live.travelHint?.kind === "resource" && live.stance !== undefined && !live.pendingWork ? live.travelHint : undefined;
+  const add = (map: typeof breaks, item: string, target: string) => {
+    let targets = map.get(item);
+    if (!targets) map.set(item, targets = new Set());
+    targets.add(target);
+  };
   for (const { verb, risk, material } of live.opportunities) {
     if (!material || risk !== "guarded") continue;
-    const add = (map: typeof breaks, item: string) => {
-      let targets = map.get(item);
-      if (!targets) map.set(item, targets = new Set());
-      targets.add(material.target);
-    };
-    if (verb === "break" && material.subject.startsWith("block:") && Object.keys(material.spends).length === 0)
-      add(breaks, material.subject.slice("block:".length));
-    else if (verb === "collect" && material.subject.startsWith("item:") && Object.keys(material.spends).length === 0)
-      add(drops, material.subject.slice("item:".length));
-    else if (verb === "continue" && material.subject === "recipe:planks") {
-      for (const [item, count] of Object.entries(material.spends)) if (count === 1 && timber.has(item)) add(recipes, item);
+    if (verb === "break" && material.subject.startsWith("block:")) {
+      if (Object.keys(material.spends).length === 0) add(breaks, material.subject.slice("block:".length), material.target);
+      else if (travel && sameTravelTarget(travel, material)) travel = undefined;
+    } else if (verb === "collect" && material.subject.startsWith("item:") && Object.keys(material.spends).length === 0) {
+      add(drops, material.subject.slice("item:".length), material.target);
+    } else if (verb === "continue" && material.subject === "recipe:planks") {
+      const spends = Object.entries(material.spends);
+      const [item, count] = spends[0] ?? [];
+      if (spends.length === 1 && item && count === 1 && timber.has(item)) add(recipes, item, material.target);
     }
   }
 
   let reason: NoBinding = "stock_prerequisite_missing";
-  const witnesses = { breaks, drops, recipes };
+  const witnesses = { breaks, drops, recipes, travel };
   const reserves = [...advice.reserves, ...scope.protectedReserves];
   for (let branchIndex = 0; branchIndex < advice.branches.length; branchIndex++) {
     if (pinnedBranch !== undefined && pinnedBranch !== branchIndex) continue;
@@ -483,7 +494,8 @@ function bindHeldOpening(
 
 function bindBranch(
   branch: FirstPlanBranch, live: MacroObservation, holds: (floor: MacroStockFloor) => boolean,
-  floors: readonly FirstPlanFloor[], { breaks, drops, recipes }: { breaks: Witnesses; drops: Witnesses; recipes: Witnesses },
+  floors: readonly FirstPlanFloor[],
+  { breaks, drops, recipes, travel }: { breaks: Witnesses; drops: Witnesses; recipes: Witnesses; travel?: MacroTravelHint },
   skipSatisfiedOpening: boolean,
 ): FirstPlanCandidate | NoBinding {
   const { policy } = branch;
@@ -503,13 +515,16 @@ function bindBranch(
     if (reason === "stock_prerequisite_missing") reason = "no_matching_live_material";
     const reserves = resolvedFloors(floors, item);
     if (!reserves) { reason = "invalid_conditional_program"; continue; }
+    // Timber can be harvested without a tool. A horizon hint cannot prove the
+    // equipped tool, price or yield of stone and ore, or authorize cover.
+    const approach = policy.maxBreaks > 0 && timber.has(item) && travel?.subject === `block:${item}` ? travel : undefined;
     const consider = (target: string, liveTargets: readonly string[], blockId?: string,
-      craft?: { readonly recipe: string; readonly cap: number }, witnessedFloorStock = 0) => {
+      craft?: { readonly recipe: string; readonly cap: number }, witnessedFloorStock = 0, travelHint?: MacroTravelHint) => {
       if (!liveTargets.length) return;
       // A single offer is the entrance condition for a batch. Starting below
-      // a reserve is different: today's evidence must still cover the deficit.
-      if (reserves.length > 32 || reserves.some(floor => stock(floor.item) < floor.count &&
-          (craft || floor.item !== target || witnessedFloorStock < floor.count || policy.count < floor.count))) {
+      // a reserve needs in-reach evidence; a short approach cannot earn it.
+      if (reserves.length > 32 || (travelHint ? !reserves.every(holds) : reserves.some(floor => stock(floor.item) < floor.count &&
+          (craft || floor.item !== target || witnessedFloorStock < floor.count || policy.count < floor.count)))) {
         reason = "protected_stock_missing";
         return;
       }
@@ -519,6 +534,11 @@ function bindBranch(
         costCaps: craft ? [{ item, count: craft.cap }] : [], reserves,
         maxBreaks: blockId ? policy.maxBreaks : 0, maxCrafts: craft?.cap ?? 0, maxPlacements: 0,
       });
+      if (travelHint && !travelHintMatchesPolicy(travelHint, compiled)) return;
+      if (travelHint && craft && preflightVanillaWork(live, [{ policy: compiled, requires }]).kind === "shortage") {
+        reason = "work_resource_shortage";
+        return;
+      }
       const then = branch.then && resolveStages({ policy: compiled, requires }, branch.then, item);
       if (branch.then && !then) { reason = "invalid_conditional_program"; return; }
       const final = then?.at(-1)?.policy;
@@ -528,7 +548,8 @@ function bindBranch(
         return;
       }
       if (candidate) { ambiguous = true; return; }
-      candidate = { input: item, liveTargets, requires, policy: compiled, ...(then ? { then } : {}) };
+      candidate = { input: item, liveTargets, requires, policy: compiled, ...(travelHint ? { travelHint } : {}),
+        ...(then ? { then } : {}) };
     };
     if (policy.kind === "harvest_stock") {
       const held = stock(item);
@@ -548,7 +569,9 @@ function bindBranch(
       // Each distinct offer can contribute one item to the conservative
       // reserve check; neither a break nor stack size is promised.
       const witnessedFloorStock = held + Math.max(visibleDrops?.size ?? 0, Math.min(policy.maxBreaks, visibleBreaks?.size ?? 0));
-      consider(item, [...(visibleDrops ?? []), ...(visibleBreaks ?? [])], blockId, undefined, witnessedFloorStock);
+      const liveTargets = [...(visibleDrops ?? []), ...(visibleBreaks ?? [])];
+      if (liveTargets.length) consider(item, liveTargets, blockId, undefined, witnessedFloorStock);
+      else if (approach) consider(item, [approach.target], item, undefined, 0, approach);
     } else {
       const recipe = timber.get(item);
       if (!recipe) continue;
@@ -558,8 +581,10 @@ function bindBranch(
       const craft = hasSurplus ? recipes.get(item) : undefined;
       const collect = drops.get(item);
       const mine = policy.maxBreaks > 0 ? breaks.get(item) : undefined;
-      consider(target, [...(craft ?? []), ...(collect ?? []), ...(mine ?? [])], mine ? item : undefined,
-        { recipe, cap: policy.maxCrafts });
+      const liveTargets = [...(craft ?? []), ...(collect ?? []), ...(mine ?? [])];
+      const batch = { recipe, cap: policy.maxCrafts };
+      if (liveTargets.length) consider(target, liveTargets, mine ? item : undefined, batch);
+      else if (approach && !hasSurplus) consider(target, [approach.target], item, batch, 0, approach);
     }
   }
   return ambiguous ? "ambiguous_material_binding" : candidate ?? reason;

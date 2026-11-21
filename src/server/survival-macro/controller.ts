@@ -246,6 +246,7 @@ interface FirstPlanning {
   readonly done: Promise<void>;
   first?: { readonly view: MacroObservation; readonly observedAt: number };
   actionable?: MacroObservation;
+  resourceView?: MacroObservation;
   result?: { readonly inference: FirstPlanInference | null; readonly settledAt: number;
     readonly advice: ReturnType<typeof parseFirstPlanAdvice> };
   dispatchedAt?: number;
@@ -1305,16 +1306,19 @@ export class SurvivalMacroController {
     const now = performance.now();
     if (observed && current) work.first ??= { view: current, observedAt: this.observedAt };
     const first = work.first?.view;
-    const inViewWindow = !!first && !!current && now - work.first!.observedAt <= FIRST_ACTIONABLE_VIEW_MS &&
-      current.tick - first.tick <= FIRST_ACTIONABLE_VIEW_TICKS;
+    const insideFirstView = (view: MacroObservation) => !!first &&
+      performance.now() - work.first!.observedAt <= FIRST_ACTIONABLE_VIEW_MS && view.tick - first.tick <= FIRST_ACTIONABLE_VIEW_TICKS;
+    const inViewWindow = !!current && insideFirstView(current);
     if (terminal || this.closing || this.config.signal?.aborted) work.rejection = terminal ?? "stop";
     else if (first && (!current || !firstPlanScopeMatches(request, first, current, this.config.run)))
       work.rejection ??= current ? "live_scope_changed" : "live_observation_stale";
     else if ((!work.result && now >= work.until) || (work.result && work.result.settledAt > work.until))
       work.rejection ??= "request_timeout";
-    else if (!work.actionable && observed && inViewWindow && current?.opportunities.length)
-      work.actionable = current;
-    if (first && !work.actionable && !inViewWindow && !work.result)
+    else if (observed && inViewWindow && current) {
+      if (current.travelHint?.kind === "resource") work.resourceView ??= current;
+      if (current.opportunities.length) work.actionable ??= current;
+    }
+    if (first && !work.actionable && !work.resourceView && !inViewWindow && !work.result)
       work.rejection ??= "first_actionable_view_deadline";
     if (work.rejection && !work.result) work.cancel.abort();
     const result = work.result;
@@ -1362,8 +1366,9 @@ export class SurvivalMacroController {
     const bindingScope = {
       run: this.config.run, first, protectedReserves: this.floorScope?.life === first.life ? this.floorScope.reserves : [],
     };
-    const actionable = work.actionable;
-    if (!actionable) {
+    const { actionable: offered, resourceView: resource } = work;
+    const firstStart = offered && (!resource || offered.tick <= resource.tick) ? offered : resource;
+    if (!firstStart) {
       // Even before rendering, native inventory is real. Do not wait for an
       // explicitly false condition, nor use a view arriving after this window.
       const check = bindFirstPlan(request, advice, current, bindingScope);
@@ -1373,10 +1378,23 @@ export class SurvivalMacroController {
       return;
     }
     if (!observed) return;
-    const original = bindFirstPlan(request, advice, actionable, bindingScope);
+    const firstBinding = bindFirstPlan(request, advice, firstStart, bindingScope);
+    // An inspect offer can precede the actual rendered approach. Give only a
+    // new resource hint the rest of the existing first-view window, not a new quote.
+    // An unrelated hint by itself does not displace the first ordinary offer.
+    const missingStart = "reason" in firstBinding && firstBinding.reason === "no_matching_live_material";
+    const secondStart = missingStart ? (firstStart === offered ? resource : offered) : undefined;
+    if (missingStart && !secondStart && (!offered || !resource) && inViewWindow) return;
+    const secondBinding = secondStart && secondStart !== firstStart ? bindFirstPlan(request, advice, secondStart, bindingScope) : undefined;
+    // A second publication behind a real offer can add a physical approach,
+    // not substitute a later ordinary offer for the original one.
+    const useSecond = secondBinding && (firstStart !== offered || "reason" in secondBinding || !!secondBinding.travelHint);
+    const original = useSecond ? secondBinding : firstBinding;
+    const actionable = useSecond ? secondStart! : firstStart;
     if ("reason" in original) return reject(original.reason);
     const stageOffset = original.stockSatisfied?.length ?? 0;
-    if (stageOffset && !inViewWindow) return reject("first_actionable_view_deadline");
+    const travel = original.travelHint;
+    if ((stageOffset || travel) && !inViewWindow) return reject("first_actionable_view_deadline");
     const key = workPolicyKey(original.policy);
     const startingStock = original.stockSatisfied ? digest(original.stockSatisfied) : null;
     const expiresTick = actionable.tick + this.limits.maxIntentTtlTicks;
@@ -1386,34 +1404,36 @@ export class SurvivalMacroController {
     let diagnostic: VanillaWorkDiagnostic | undefined;
     let bound = original;
     let freshRejection: string | undefined;
+    const rebind = (fresh: MacroObservation) => {
+      if (this.job || performance.now() - this.observedAt > this.limits.maxObservationAgeMs) {
+        freshRejection = this.job ? "native_work_incumbent" : "live_observation_stale";
+        return false;
+      }
+      if (stageOffset || travel) {
+        if (!insideFirstView(fresh)) {
+          freshRejection = "first_actionable_view_deadline";
+          return false;
+        }
+        if (fresh.epoch !== actionable.epoch || (travel &&
+            (!this.isCurrentHandoff(fresh) || !sameTravelReacquisitionScope(actionable, fresh)))) {
+          freshRejection = "fresh_binding_changed";
+          return false;
+        }
+      }
+      const binding = bindFirstPlan(request, advice, fresh, bindingScope, original.branchIndex);
+      if ("reason" in binding || binding.input !== original.input || workPolicyKey(binding.policy) !== key ||
+          (travel ? !sameTravelReacquisitionHint(travel, binding.travelHint) : !!binding.travelHint) ||
+          (binding.stockSatisfied ? digest(binding.stockSatisfied) : null) !== startingStock ||
+          (declared && (!binding.liveTargets.some(target => original.liveTargets.includes(target)) ||
+            digest(binding.then) !== digest(original.then)))) {
+        freshRejection = "reason" in binding ? binding.reason : "fresh_binding_changed";
+        return false;
+      }
+      bound = binding;
+      return true;
+    };
     const job = await this.publishWork(actionable, original.policy, "model", requestId, expiresTick,
-      original.requires, undefined, fresh => {
-        if (this.job || performance.now() - this.observedAt > this.limits.maxObservationAgeMs) {
-          freshRejection = this.job ? "native_work_incumbent" : "live_observation_stale";
-          return false;
-        }
-        if (stageOffset) {
-          if (performance.now() - work.first!.observedAt > FIRST_ACTIONABLE_VIEW_MS ||
-              fresh.tick - first.tick > FIRST_ACTIONABLE_VIEW_TICKS) {
-            freshRejection = "first_actionable_view_deadline";
-            return false;
-          }
-          if (fresh.epoch !== actionable.epoch) {
-            freshRejection = "fresh_binding_changed";
-            return false;
-          }
-        }
-        const binding = bindFirstPlan(request, advice, fresh, bindingScope, original.branchIndex);
-        if ("reason" in binding || binding.input !== original.input || workPolicyKey(binding.policy) !== key ||
-            (binding.stockSatisfied ? digest(binding.stockSatisfied) : null) !== startingStock ||
-            (declared && (!binding.liveTargets.some(target => original.liveTargets.includes(target)) ||
-              digest(binding.then) !== digest(original.then)))) {
-          freshRejection = "reason" in binding ? binding.reason : "fresh_binding_changed";
-          return false;
-        }
-        bound = binding;
-        return true;
-      }, stageIds, declared && !stageOffset ? (fresh => {
+      original.requires, undefined, rebind, stageIds, declared && !stageOffset ? (fresh => {
         const checked = preflightVanillaWork(fresh, declared);
         if ("detail" in checked && checked.detail !== undefined) diagnostic = checked;
         if (checked.kind === "shortage") {
@@ -1425,7 +1445,9 @@ export class SurvivalMacroController {
           stageIds!.nextWorkId = workStageIds(requestId, stages, 0).nextWorkId;
         }
         return true;
-      }) : undefined);
+      }) : undefined, undefined, undefined,
+      travel ? (_basis, latest) => rebind(latest) : undefined,
+      travel ? () => ({ travelAnchor: { subject: travel.subject, target: travel.target } }) : undefined);
     if (!job) {
       if (diagnostic && freshRejection === "work_resource_shortage") await this.reportWorkShortage(requestId, diagnostic, this.view!.observation);
       return reject(freshRejection ?? (this.closing || this.config.signal?.aborted ? "stop" :
@@ -1451,6 +1473,7 @@ export class SurvivalMacroController {
     await this.record("first_plan_bound", {
       ...scope, id: job.order.id, basis: basis(job.source), firstBasis: basis(first), actionableBasis: basis(actionable),
       branchIndex: bound.branchIndex, branchCount: advice.branches.length, input: bound.input, liveTargets: bound.liveTargets,
+      ...(travel ? { travelHint: travel } : {}),
       ...(declared ? { declaredStages: declared.length + stageOffset } : {}),
       ...(bound.stockSatisfied ? { firstIssuedStage: stageOffset + 1, eligibleSuffixStages: stages!.length,
         stockSatisfied: bound.stockSatisfied.map(({ item, count }, index) =>

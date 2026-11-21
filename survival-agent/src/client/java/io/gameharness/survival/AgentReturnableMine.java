@@ -78,6 +78,14 @@ final class AgentReturnableMine {
                     && now - phaseSince < CAVE_TURN_LIMIT);
     }
 
+    boolean stockedForNewLeg(AgentProgress host) {
+        return suppliedSteps(host) > 0;
+    }
+
+    private static int suppliedSteps(AgentProgress host) {
+        return Math.min(host.returnableTorches() - TORCH_RESERVE, (host.returnableToolUses() - TOOL_RESERVE) / 3);
+    }
+
     void observeBreak(BlockPos position) {
         if (witnessedLowCeiling() != null && reverseCeiling.up(2).equals(position)) reverseCeiling = null;
         if (active() && position.equals(workCell)) {
@@ -106,7 +114,7 @@ final class AgentReturnableMine {
         finish(Outcome.DIVERTED, "yielding the returnable mine leg to other work");
     }
 
-    Outcome step(AgentProgress host, BlockPos standing, int depth, Direction preference) {
+    Outcome step(AgentProgress host, BlockPos standing, int depth, Direction preference, boolean preferExcavation) {
         resetWorld();
         int now = body.actionTick();
         if (active() && lastTurn != now - 1) interrupt();
@@ -116,8 +124,8 @@ final class AgentReturnableMine {
             if (levelOnly && levelSpent)
                 return finish(Outcome.EXHAUSTED, "no verified return from the new tread");
             if (!dryGroundAt(standing)) return finish(Outcome.DIVERTED, "waiting for dry mine footing");
-            limit = Math.min(levelOnly ? 1 : LEG_LIMIT, Math.min(levelOnly ? 1 : standing.getY() - depth,
-                Math.min(host.returnableTorches() - TORCH_RESERVE, (host.returnableToolUses() - TOOL_RESERVE) / 3)));
+            limit = Math.min(levelOnly ? 1 : LEG_LIMIT,
+                Math.min(levelOnly ? 1 : standing.getY() - depth, suppliedSteps(host)));
             if (limit <= 0) return finish(levelOnly ? Outcome.EXHAUSTED : Outcome.SUPPLIES,
                 "keeping a light and tool reserve for the mine return");
             anchor = from = standing.toImmutable();
@@ -132,7 +140,9 @@ final class AgentReturnableMine {
             started = now;
             progressAt = now - PROGRESS_LEASE_TICKS - 1;
             begin(Phase.ANCHOR, now);
-            if (player.hurtTime == 0 && !player.isOnFire() && !player.hasVehicle()
+            // This detour is optional. A later opening encountered while
+            // proving a candidate lane still gets the standard cave checks.
+            if (!preferExcavation && player.hurtTime == 0 && !player.isOnFire() && !player.hasVehicle()
                     && host.startMineCaveSurvey(from, preferred)) {
                 if (host.mineCaveHandedOff()) return finish(Outcome.DIVERTED, host.status());
                 holdCave(host, preferred, now);

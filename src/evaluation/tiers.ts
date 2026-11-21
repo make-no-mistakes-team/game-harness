@@ -39,6 +39,8 @@ export const TEST_TIERS = Object.freeze({
     "tests/minecraft-adapter.test.ts", // Actual registered possession/verifier logic; no gameplay support claim.
     "tests/minecraft-craft.test.ts", // Ordered recipe quantities, partial server receipts and registered admission.
     "tests/survival-macro-trial.test.ts", // Exact target, direction, and settlement witnesses; no game.
+    "tests/survival-agent-result.test.ts",
+    "tests/survival-agent-strategy-options.test.ts",
     "tests/adapter-scenarios.test.ts", // Independent manifest/progress uses the same registered interpreter, never Runtime's verdict.
     "tests/policy-comparison.test.ts", // Comparison policy/math; no provider or gameplay.
   ]),
@@ -78,6 +80,7 @@ export const TEST_TIERS = Object.freeze({
     "tests/resident-worker.test.ts", // Actual Node supervisor/module thread and protocol; Docker is a separate smoke gate.
     "tests/survival-macro-skills.test.ts", // Private source selection and static gates; isolated worker smoke is opt-in.
     "tests/survival-macro-controller.test.ts",
+    "tests/survival-macro-expedition.test.ts",
     "tests/survival-macro-memory.test.ts",
     "tests/survival-macro-protocol.test.ts",
     "tests/survival-native-gap-review.test.ts",

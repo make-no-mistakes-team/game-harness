@@ -102,9 +102,28 @@ function terraOutcome(outcome: Record<string, unknown>): SurvivalAgentSnapshot["
   const strategy = outcome.strategy as Record<string, unknown> | null | undefined;
   if (strategy?.strategy !== "terra" || strategy.model !== TERRA_MODEL_ID) return null;
   const status = SURVIVAL_AGENT_STRATEGY_OUTCOMES.find(value => value === strategy.outcome);
-  if (status === "native_effect_completed" && (strategy.admission !== "admitted" || !hasConfirmedTerraEffect(strategy.status)))
+  if (status === "strategy_applied" || status === "no_advice_applied") {
+    if (strategy.control !== "local") return null;
+    const counters = strategy.status as { providerDispatches?: unknown; applied?: unknown } | null;
+    if (status === "strategy_applied" && !(strategy.admission === "admitted" &&
+        typeof counters?.applied === "number" && Number.isSafeInteger(counters.applied) && counters.applied > 0 &&
+        typeof counters.providerDispatches === "number" && Number.isSafeInteger(counters.providerDispatches) &&
+        counters.providerDispatches >= counters.applied)) return null;
+  }
+  if (status === "native_effect_completed" &&
+      (strategy.control === "local" || strategy.admission !== "admitted" || !hasConfirmedTerraEffect(strategy.status)))
     return null;
   return status ?? null;
+}
+
+/** Vanilla goal proof and a model's contribution are different results. */
+export function projectSurvivalResult(outcome: Record<string, unknown>, requested: SurvivalAgentStart["strategy"], exitCode: number | null) {
+  const strategyOutcome = requested === "terra" ? terraOutcome(outcome) : null;
+  const strategy = outcome.strategy as { strategy?: unknown; control?: unknown; model?: unknown } | null;
+  const local = strategy?.control === "local" && strategy.strategy === "terra" && strategy.model === TERRA_MODEL_ID;
+  const won = exitCode === 0 && outcome.status === "won" && (outcome.verification as { verified?: unknown } | null)?.verified === true &&
+    (requested === "deterministic" || local || strategyOutcome === "native_effect_completed");
+  return { strategyOutcome, won, local };
 }
 
 function outcomeStatus(outcome: Record<string, unknown>) {
@@ -263,8 +282,7 @@ export class SurvivalAgent {
       const authority = path.join(temporary, "Xauthority");
       await (await open(authority, "wx", 0o600)).close();
       attempt.stop.signal.throwIfAborted();
-      attempt.view.status = attempt.strategy === "terra" ? "Checking Terra authorization before Minecraft starts." :
-        "Starting Minecraft in a fresh Normal Survival world.";
+      attempt.view.status = "Starting Minecraft in a fresh Normal Survival world.";
       status = await this.run(attempt, tools, authority);
     } catch (error) {
       status = attempt.stop.signal.aborted ? "Agent stopped before Minecraft started." :
@@ -363,13 +381,12 @@ export class SurvivalAgent {
       agentVitals(attempt.view, await readJson(path.join(run, "progress.json")));
       const outcome = await readJson(path.join(run, "outcome.json"));
       if (outcome?.schemaVersion === 1 && outcome.goal === attempt.goal && typeof outcome.status === "string") {
-        const strategyOutcome = attempt.view.strategyOutcome = attempt.strategy === "terra" ? terraOutcome(outcome) : null;
-        attempt.view.won = exit.code === 0 && outcome.status === "won" &&
-          (outcome.verification as { verified?: unknown } | null)?.verified === true &&
-          (attempt.strategy === "deterministic" || strategyOutcome === "native_effect_completed");
+        const { strategyOutcome, won, local } = projectSurvivalResult(outcome, attempt.strategy, exit.code);
+        attempt.view.strategyOutcome = strategyOutcome;
+        attempt.view.won = won;
         if (outcome.finalStage === "macro_startup" && strategyOutcome === "provider_unavailable")
           return `Could not start Terra. Check OpenAI connection in Settings and make sure your account offers ${TERRA_MODEL_ID}.`;
-        if (attempt.strategy === "terra" && strategyOutcome !== "native_effect_completed" &&
+        if (attempt.strategy === "terra" && !local && strategyOutcome !== "native_effect_completed" &&
             (outcome.benchmark as { confirmed?: unknown } | null)?.confirmed === true)
           return "The vanilla goal was verified, but no Terra action was confirmed.";
         return outcome.status === "won" && !attempt.view.won ? "The agent’s goal could not be verified." : outcomeStatus(outcome);

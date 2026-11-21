@@ -132,6 +132,26 @@ test("the runner rejects malformed paid stamps and never seals a different playe
     expect(await sealPendingFurnace(source, evidence)).toBeUndefined();
   }));
 
+test("ordinary charcoal carries the original load but cannot stand in for protected iron", () =>
+  fixture(async ({ source, child, rewrite }) => {
+    const ordinary = { ...snapshot, ordinary: true, raw: "minecraft:stripped_birch_wood",
+      output: "minecraft:charcoal", fuel: undefined, fuelCount: 0, fuelTicks: 0, maximumFuel: 0, minimumOutput: 1 };
+    await rewrite(ordinary);
+    const sealed = { ...source, seal: await sealPendingFurnace(source, evidence) };
+    expect(sealed.seal).toBeDefined();
+    const copy = await child("Ord001");
+    const parent = await readPendingFurnaceParent(sealed);
+    await preparePendingFurnace(copy.dir, copy.run, copy.save, sealed, parent);
+    expect(await readJson(copy.dir, record)).toMatchObject({
+      ordinary: true, output: "minecraft:charcoal", units: 2, minimumOutput: 1, basis: "resume",
+    });
+    for (const change of [{ ordinary: undefined }, { raw: "minecraft:crimson_stem" },
+      { output: "minecraft:iron_ingot" }, { units: 4 }, { fuel: "minecraft:coal" }]) {
+      await rewrite({ ...ordinary, ...change });
+      expect(await sealPendingFurnace(source, evidence)).toBeUndefined();
+    }
+  }));
+
 const route = {
   footing: [-2, 28, 513],
   edges: [[-3, 27, 514, -3, 27, 513], [-3, 27, 513, -2, 28, 513]],

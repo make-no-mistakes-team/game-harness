@@ -10,8 +10,6 @@ import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.UUID;
-import net.minecraft.Bootstrap;
-import net.minecraft.SharedConstants;
 import net.minecraft.item.Items;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
@@ -31,8 +29,7 @@ final class PendingFurnaceMemoryTest {
 
     @BeforeAll
     static void vanilla() {
-        SharedConstants.createGameVersion();
-        Bootstrap.initialize();
+        VanillaTestResources.initialize();
     }
 
     private Path runDirectory() throws IOException {
@@ -49,6 +46,27 @@ final class PendingFurnaceMemoryTest {
         return memory.pay(id, "minecraft:overworld", new BlockPos(-1, 28, 513), Direction.NORTH,
             new BlockPos(-2, 28, 513), new AgentHands.IronBatch(2, Items.COAL, 1, 1600), 3, 0, 1,
             Map.of(Items.COBBLESTONE, 3), tick, 82);
+    }
+
+    @Test
+    void nativeCharcoalStoresThePaidCountSeparatelyFromProtectedIron() throws IOException {
+        var dir = runDirectory();
+        var memory = new AgentPendingFurnaceMemory(dir);
+        assertTrue(memory.bind(OWNER, 1, 1, 0));
+        var batch = new AgentLocalSmelt.Batch(Items.STRIPPED_BIRCH_WOOD, 3, 2);
+        assertTrue(memory.payOrdinary(TICKET, "minecraft:overworld", new BlockPos(-1, 28, 513), Direction.NORTH,
+            new BlockPos(-2, 28, 513), batch, 1, 25, 83));
+        assertTrue(memory.park(TICKET, 35, 112));
+        assertEquals(batch, memory.current().ordinaryBatch());
+        assertNull(memory.current().batch());
+        assertFalse(pay(memory, OTHER, 40));
+        memory.runnerClose(120, 330, null);
+        var row = JsonParser.parseString(Files.readString(dir.resolve("pending-furnace.json"))).getAsJsonObject();
+        assertTrue(row.get("ordinary").getAsBoolean());
+        assertEquals(3, row.get("units").getAsInt());
+        assertEquals(2, row.get("minimumOutput").getAsInt());
+        assertFalse(row.has("fuel"));
+        assertTrue(Files.exists(dir.resolve("pending-furnace-close.json")));
     }
 
     @Test

@@ -180,6 +180,8 @@ final class AgentHands {
     private AgentWorkOrder.Budget craftBudget;
     private IronBatch boundedIron;
     private AgentWorkOrder.Budget smeltBudget;
+    private AgentLocalSmelt.Load ordinaryLoad;
+    private AgentLocalSmelt.Withdrawal ordinaryWithdrawal;
     private boolean scopedSmelt;
     private int ironDeposited, fuelDeposited;
     private long workEvidence;
@@ -607,6 +609,19 @@ final class AgentHands {
         return false;
     }
 
+    boolean collectLocalSmelt(FurnaceScreen furnace, AgentLocalSmelt.Batch batch, AgentLocalSmelt.Withdrawal receipt) {
+        if (!canWorkFurnace(furnace)) return report("smelt", "no exact clean furnace screen");
+        var handler = furnace.getScreenHandler();
+        var sync = (AgentFurnaceSync) handler;
+        Slot output = handler.getOutputSlot();
+        if (batch.view(sync.agent$furnaceContentsSynced() && sync.agent$furnaceOutputUpdates() > 0,
+                handler.isBurning(), handler.getSlot(0).getStack(), output.getStack()) != AgentLocalSmelt.View.READY)
+            return report("smelt", "the witnessed result changed");
+        if (!collectSmelt(furnace, output, batch.units())) return false;
+        ordinaryWithdrawal = receipt;
+        return true;
+    }
+
     private boolean collectSmelt(FurnaceScreen furnace, Slot output, int exactUnits) {
         ItemStack finished = output.getStack();
         if (!storageRoom(finished, null)) return report("smelt", "inventory full");
@@ -617,14 +632,14 @@ final class AgentHands {
         return true;
     }
 
-    boolean smelt(boolean charcoal, int batchLimit) {
+    boolean smelt(boolean charcoal, int batchLimit, AgentLocalSmelt.Load receipt, boolean refuel) {
         if (busy() || c.player == null || c.world == null) return false;
         if (!(c.currentScreen instanceof FurnaceScreen furnace)) return report("smelt", "furnace required");
         var handler = furnace.getScreenHandler();
         if (!handler.getCursorStack().isEmpty()) return report("smelt", "cursor occupied");
         Slot input = handler.getSlot(0), fuel = handler.getSlot(1), output = handler.getOutputSlot();
         ItemStack finished = output.getStack();
-        if (!finished.isEmpty()) {
+        if (!finished.isEmpty() && !refuel) {
             if (!finished.isOf(charcoal ? Items.CHARCOAL : Items.IRON_INGOT))
                 return report("smelt", "unrelated furnace output");
             return collectSmelt(furnace, output, 0);
@@ -638,6 +653,7 @@ final class AgentHands {
         Slot inputSource = null;
         int inputCount = input.getStack().getCount();
         if (inputCount == 0) {
+            if (refuel) return report("smelt", "no input");
             inputSource = findStorage(handler, charcoal ? stack -> stack.isIn(ItemTags.LOGS_THAT_BURN)
                     : stack -> stack.isOf(Items.RAW_IRON));
             if (inputSource == null) return report("smelt", "no input");
@@ -681,6 +697,7 @@ final class AgentHands {
         inputCount = Math.min(inputCount, affordable);
 
         start(Job.SMELT, "smelt", furnace);
+        ordinaryLoad = inputSource == null ? null : receipt;
         // In a cold, empty furnace, finish loading the fuel before the input can ignite it.
         if (fuelSource != null) transfer(fuelSource, fuel, fuelCount, false);
         if (inputSource != null) transfer(inputSource, input, inputCount, false);
@@ -1123,11 +1140,16 @@ final class AgentHands {
             finish(book ? "recipe book did not close" : "slot gesture had no expected effect");
             return false;
         }
-        if (boundedIron != null && isFurnacePlacement()) {
+        if ((boundedIron != null || ordinaryLoad != null) && isFurnacePlacement()) {
             int deposited = click.cursorBefore.getCount() - cursor.getCount();
-            if (slot.id == 0) ironDeposited += deposited;
-            else fuelDeposited += deposited;
+            if (boundedIron != null) {
+                if (slot.id == 0) ironDeposited += deposited;
+                else fuelDeposited += deposited;
+            }
+            if (ordinaryLoad != null && slot.id == 0) ordinaryLoad.placed(click.step.item, deposited);
         }
+        if (ordinaryWithdrawal != null && click.step.mode == Mode.RESULT) ordinaryWithdrawal.take();
+        if (ordinaryWithdrawal != null && click.step.mode == Mode.STORE && cursor.isEmpty()) ordinaryWithdrawal.store();
         if (!book && click.step.mode != Mode.QUICK_RESULT) ++workEvidence;
         if (click.step.mode == Mode.STORE && cursor.isEmpty()) resultStored = true;
         if (!motion.settled && !click.holdTail && layoutStillMatches(click, scaleX, scaleY) && motion.inside(x, y)) {
@@ -1849,6 +1871,8 @@ final class AgentHands {
         craftBudget = null;
         boundedIron = null;
         smeltBudget = null;
+        ordinaryLoad = null;
+        ordinaryWithdrawal = null;
         scopedSmelt = false;
         ironDeposited = fuelDeposited = 0;
         craftSettleDeadline = 0;

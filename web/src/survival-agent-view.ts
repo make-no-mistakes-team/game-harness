@@ -8,6 +8,8 @@ const goalNames: Record<SurvivalAgentGoal, string> = {
 };
 
 const strategyOutcomeLabels: Record<NonNullable<SurvivalAgentSnapshot["strategyOutcome"]>, string> = {
+  strategy_applied: "The player used a strategy suggested by Terra.",
+  no_advice_applied: "No Terra strategy was applied.",
   native_effect_completed: "A Terra action was confirmed in Minecraft.",
   no_completed_effect: "No Terra action was confirmed.",
   provider_unavailable: "Terra was unavailable.",

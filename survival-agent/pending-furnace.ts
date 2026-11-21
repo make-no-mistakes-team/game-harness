@@ -29,10 +29,11 @@ const snapshot = z.strictObject({
   v: z.literal(1), run, world: uuid, owner: uuid, id: uuid, originId: uuid, originWorld: uuid,
   dimension: z.enum(["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"]),
   pos: cell, footing: cell, facing: z.enum(["north", "south", "east", "west"]),
-  raw: z.literal("minecraft:raw_iron"), units: z.int().min(1).max(64),
-  fuel: z.string().regex(/^minecraft:(?:coal|charcoal|stick|[a-z0-9_]{1,40}_planks)$/),
-  fuelCount: z.int().min(1).max(64), fuelTicks: z.int().min(1).max(1_600),
-  output: z.literal("minecraft:iron_ingot"), syncId: z.int().min(1).max(255),
+  ordinary: z.literal(true).optional(),
+  raw: z.string().regex(/^minecraft:[a-z0-9_]{1,96}$/), units: z.int().min(1).max(64),
+  fuel: z.string().regex(/^minecraft:(?:coal|charcoal|stick|[a-z0-9_]{1,40}_planks)$/).optional(),
+  fuelCount: z.int().min(0).max(64), fuelTicks: z.int().min(0).max(1_600),
+  output: z.enum(["minecraft:iron_ingot", "minecraft:charcoal"]), syncId: z.int().min(1).max(255),
   minimumOutput: z.int().min(0).max(64), maximumFuel: z.int().min(0).max(64),
   basis: z.enum(["live", "resume", "clue"]),
   state: z.enum(["paid", "parked", "collected", "cancelled", "disappeared"]),
@@ -79,11 +80,16 @@ function validBreadcrumbs(route: z.infer<typeof breadcrumbs>, [sx, sy, sz]: z.in
 function readSnapshot(text: string | null | undefined, current: Scope) {
   const row = parse(snapshot, text);
   if (!row || !text || row.run !== current.run || row.world !== current.world ||
-      row.fuelCount !== Math.ceil(row.units * 200 / row.fuelTicks) ||
       row.minimumOutput > row.units || row.maximumFuel > row.fuelCount || row.paid.frame < 1 ||
       Math.abs(row.pos[0] - row.footing[0]) > 6 || Math.abs(row.pos[1] - row.footing[1]) > 6 ||
       Math.abs(row.pos[2] - row.footing[2]) > 6 ||
       row.breadcrumbs && (row.basis !== "resume" || !validBreadcrumbs(row.breadcrumbs, row.pos))) return;
+  if (row.ordinary) {
+    if (row.units > 3 || row.fuel || row.fuelCount || row.fuelTicks || row.floors ||
+        (row.output === "minecraft:iron_ingot" ? row.raw !== "minecraft:raw_iron" :
+          !/^minecraft:(?:stripped_)?(?:acacia|birch|cherry|dark_oak|jungle|mangrove|oak|pale_oak|spruce)_(?:log|wood)$/.test(row.raw))) return;
+  } else if (row.raw !== "minecraft:raw_iron" || row.output !== "minecraft:iron_ingot" || !row.fuel ||
+      row.fuelCount < 1 || row.fuelTicks < 1 || row.fuelCount !== Math.ceil(row.units * 200 / row.fuelTicks)) return;
   const own = row.paid.run === row.run;
   if (own !== (row.originId === row.id && row.originWorld === row.world) ||
       (row.basis === "live" && (!own || row.lost || row.gone)) ||

@@ -8,6 +8,7 @@ export const SURVIVAL_AGENT_STRATEGIES = ["deterministic", "terra"] as const;
 export type SurvivalAgentStrategy = (typeof SURVIVAL_AGENT_STRATEGIES)[number];
 export const TERRA_MODEL_ID = "gpt-6.1-terra";
 export const SURVIVAL_AGENT_STRATEGY_OUTCOMES = [
+  "strategy_applied", "no_advice_applied",
   "native_effect_completed", "no_completed_effect", "provider_unavailable", "refused", "provider_error",
   "budget_limited", "display_lost", "protocol_fault", "cleanup_failed",
 ] as const;

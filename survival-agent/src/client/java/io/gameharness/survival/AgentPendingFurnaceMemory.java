@@ -41,11 +41,11 @@ final class AgentPendingFurnaceMemory {
                         String dimension, int[] pos, int[] footing, String facing, String raw, int units, String fuel,
                         int fuelCount, int fuelTicks, String output, int syncId, int minimumOutput, int maximumFuel,
                         String basis, String state, Stamp paid, Stamp parked, Stamp lost, Stamp gone, Stamp ended,
-                        Floor[] floors, AgentWalkedRoute.Breadcrumbs breadcrumbs) {
+                        Floor[] floors, AgentWalkedRoute.Breadcrumbs breadcrumbs, Boolean ordinary) {
         Wire with(Basis basis, State state, Stamp parked, Stamp lost, Stamp gone, Stamp ended) {
             return new Wire(v, run, world, owner, id, originId, originWorld, dimension, pos, footing, facing,
                 raw, units, fuel, fuelCount, fuelTicks, output, syncId, minimumOutput, maximumFuel,
-                key(basis), key(state), paid, parked, lost, gone, ended, floors, null);
+                key(basis), key(state), paid, parked, lost, gone, ended, floors, null, ordinary);
         }
 
         Stamp latest() {
@@ -56,6 +56,7 @@ final class AgentPendingFurnaceMemory {
     static final class Entry {
         private final Wire row;
         private final AgentHands.IronBatch batch;
+        private final AgentLocalSmelt.Batch ordinaryBatch;
         private final BlockPos pos, footing;
         private final Direction facing;
         private final Map<Item, Integer> floors;
@@ -66,6 +67,8 @@ final class AgentPendingFurnaceMemory {
         private Entry(Wire row, AgentHands.IronBatch batch) {
             this.row = row;
             this.batch = batch;
+            ordinaryBatch = Boolean.TRUE.equals(row.ordinary)
+                ? new AgentLocalSmelt.Batch(knownItem(row.raw), row.units, row.minimumOutput) : null;
             pos = fromCell(row.pos);
             footing = fromCell(row.footing);
             facing = Direction.valueOf(row.facing.toUpperCase(Locale.ROOT));
@@ -81,6 +84,7 @@ final class AgentPendingFurnaceMemory {
         BlockPos footing() { return footing; }
         Direction facing() { return facing; }
         AgentHands.IronBatch batch() { return batch; }
+        AgentLocalSmelt.Batch ordinaryBatch() { return ordinaryBatch; }
         int minimumOutput() { return row.minimumOutput; }
         int maximumFuel() { return row.maximumFuel; }
         int syncId() { return row.syncId; }
@@ -145,14 +149,21 @@ final class AgentPendingFurnaceMemory {
             if (row.v != 1 || !scope.run.equals(row.run) || !scope.world.equals(row.world) ||
                     !owner.toString().equals(row.owner) || !validUuid(row.id) || !validUuid(row.originId) ||
                     row.id.equals(row.originId) || !validUuid(row.originWorld) || row.originWorld.equals(row.world) ||
-                    row.paid == null || row.run.equals(row.paid.run) || !("resume".equals(row.basis) || "clue".equals(row.basis)) ||
-                    !RAW.equals(row.raw) || !OUTPUT.equals(row.output)) throw new IllegalArgumentException();
-            Identifier fuelId = Identifier.tryParse(row.fuel);
-            if (fuelId == null || !Registries.ITEM.containsId(fuelId)) throw new IllegalArgumentException();
-            var batch = new AgentHands.IronBatch(row.units, Registries.ITEM.get(fuelId), row.fuelCount, row.fuelTicks);
+                    row.paid == null || row.run.equals(row.paid.run) || !("resume".equals(row.basis) || "clue".equals(row.basis)))
+                throw new IllegalArgumentException();
+            AgentHands.IronBatch batch = null;
+            if (row.ordinary == null) {
+                if (!RAW.equals(row.raw) || !OUTPUT.equals(row.output)) throw new IllegalArgumentException();
+                batch = new AgentHands.IronBatch(row.units, knownItem(row.fuel), row.fuelCount, row.fuelTicks);
+                if (!validBatch(batch, row.minimumOutput, row.maximumFuel)) throw new IllegalArgumentException();
+            } else if (!row.ordinary || row.fuel != null || row.fuelCount != 0 || row.fuelTicks != 0
+                    || row.maximumFuel != 0 || row.floors != null || !validOrdinary(knownItem(row.raw), row.units, row.minimumOutput)
+                    || !row.output.equals(itemId(AgentLocalSmelt.result(knownItem(row.raw))))) {
+                throw new IllegalArgumentException();
+            }
             Entry restored = new Entry(row, batch);
-            if (!validBatch(batch, row.minimumOutput, row.maximumFuel) || !validStation(row.dimension, restored.pos,
-                    restored.footing, restored.facing) || !validSync(row.syncId) || restored.state == State.COLLECTED ||
+            if (!validStation(row.dimension, restored.pos, restored.footing, restored.facing)
+                    || !validSync(row.syncId) || restored.state == State.COLLECTED ||
                     restored.state == State.CANCELLED || restored.state == State.DISAPPEARED && restored.basis != Basis.CLUE)
                 throw new IllegalArgumentException();
             if (row.breadcrumbs != null && (restored.basis != Basis.RESUME ||
@@ -183,7 +194,7 @@ final class AgentPendingFurnaceMemory {
             if (entry.ticket.equals(ticket))
                 return entry.state == State.PAID && entry.basis == Basis.LIVE && stamp.equals(entry.row.paid)
                     && entry.pos.equals(pos) && entry.footing.equals(footing) && entry.dimension().equals(dimension)
-                    && entry.facing == facing && entry.batch.equals(batch) && entry.syncId() == syncId
+                    && entry.facing == facing && batch.equals(entry.batch) && entry.syncId() == syncId
                     && entry.minimumOutput() == visibleOutput && entry.maximumFuel() == visibleFuel
                     && entry.floors.equals(floors);
             if (current() != null || !atOrAfter(stamp, entry.row.latest())) return false;
@@ -200,7 +211,19 @@ final class AgentPendingFurnaceMemory {
         return store(new Wire(1, scope.run, scope.world, owner.toString(), ticket.toString(), ticket.toString(), scope.world,
             dimension, cell(pos), cell(footing), key(facing), RAW, batch.units(), Registries.ITEM.getId(batch.fuel()).toString(),
             batch.fuelCount(), batch.fuelTicks(), OUTPUT, syncId, visibleOutput, visibleFuel, "live", "paid",
-            stamp, null, null, null, null, restrictions, null), batch);
+            stamp, null, null, null, null, restrictions, null, null), batch);
+    }
+
+    boolean payOrdinary(UUID ticket, String dimension, BlockPos pos, Direction facing, BlockPos footing,
+                        AgentLocalSmelt.Batch batch, int syncId, long tick, long frame) {
+        Stamp stamp = stamp(tick, frame);
+        if (stamp == null || frame == 0 || ticket == null || !validSync(syncId)
+                || !validStation(dimension, pos, footing, facing) || !validOrdinary(batch.raw(), batch.units(), batch.minimumOutput())
+                || current() != null || entry != null && !atOrAfter(stamp, entry.row.latest())) return false;
+        return store(new Wire(1, scope.run, scope.world, owner.toString(), ticket.toString(), ticket.toString(), scope.world,
+            dimension, cell(pos), cell(footing), key(facing), itemId(batch.raw()), batch.units(), null, 0, 0,
+            itemId(AgentLocalSmelt.result(batch.raw())), syncId, batch.minimumOutput(), 0, "live", "paid", stamp,
+            null, null, null, null, null, null, true), null);
     }
 
     boolean park(UUID ticket, long tick, long frame) {
@@ -315,6 +338,18 @@ final class AgentPendingFurnaceMemory {
             batch.fuelCount() == AgentHands.ironFuelNeeded(batch.units(), batch.fuelTicks()) &&
             output >= 0 && output <= batch.units() && fuel >= 0 && fuel <= batch.fuelCount();
     }
+
+    private static boolean validOrdinary(Item raw, int units, int output) {
+        return AgentLocalSmelt.result(raw) != Items.AIR && units >= 1 && units <= 3 && output >= 0 && output <= units;
+    }
+
+    private static Item knownItem(String id) {
+        Identifier key = Identifier.tryParse(id);
+        if (key == null || !Registries.ITEM.containsId(key)) throw new IllegalArgumentException();
+        return Registries.ITEM.get(key);
+    }
+
+    private static String itemId(Item item) { return Registries.ITEM.getId(item).toString(); }
 
     private static boolean validStation(String dimension, BlockPos pos, BlockPos footing, Direction facing) {
         return dimension != null && DIMENSIONS.contains(dimension) && facing != null && facing.getAxis().isHorizontal()

@@ -70,6 +70,9 @@ public final class AgentClient implements ClientModInitializer {
     private AgentProgress progress;
     private AgentEars ears;
     private AgentMacroControl macro;
+    private AgentExpedition expedition;
+    private ClientWorld expeditionWorld;
+    private ClientPlayerEntity expeditionPlayer;
     private AgentVisual visual;
     private AgentPendingFurnaceMemory pendingFurnaceMemory;
     private AgentPauseEpisodes pauses;
@@ -160,6 +163,7 @@ public final class AgentClient implements ClientModInitializer {
         active = this;
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
             if (hands != null) hands.discardLifeInputs();
+            if (expedition != null) expedition.close();
             stopMacro("actor_exit", "The client is stopping.");
             if (macro != null) macro.drain();
             if (progress != null) progress.saveMemory(true);
@@ -299,11 +303,16 @@ public final class AgentClient implements ClientModInitializer {
     }
 
     public static void confirmScopedFurnaceUse(ClientPlayerEntity player, BlockHitResult hit) {
-        if (active != null && active.macro != null) active.macro.confirmScopedFurnaceUse(player, hit);
+        if (active == null) return;
+        if (active.macro != null) active.macro.confirmScopedFurnaceUse(player, hit);
+        if (active.progress != null && (active.macro == null || !active.macro.engaged()))
+            active.progress.confirmLocalFurnaceUse(player, hit);
     }
 
     public static void observeFurnaceBlock(ClientWorld world, BlockPos pos, BlockState state) {
-        if (active != null && active.macro != null) active.macro.observeFurnaceBlock(world, pos, state);
+        if (active == null) return;
+        if (active.macro != null) active.macro.observeFurnaceBlock(world, pos, state);
+        if (active.progress != null) active.progress.observeLocalFurnaceBlock(world, pos, state);
     }
 
     private void observeFurnaceChunk(ClientWorld world, WorldChunk chunk) {
@@ -422,6 +431,7 @@ public final class AgentClient implements ClientModInitializer {
         pendingFurnaceMemory = new AgentPendingFurnaceMemory(directory);
         if (ownedSinglePlayer) pendingFurnaceMemory.bind(client.player.getUuid(), 1, tick, 0);
         macro = AgentMacroControl.create(directory, goal, pendingFurnaceMemory);
+        if (macro == null) expedition = AgentExpedition.open(directory, goal);
         // The runner keeps every prepared/diagnostic actor in its separate trusted evidence root.
         if (macro != null && macro.visualTransportEnabled()
                 && !directory.getParent().endsWith("diagnostic-runs"))
@@ -435,7 +445,7 @@ public final class AgentClient implements ClientModInitializer {
         body = new AgentBody(client, this::recordContact, this::recordLook, lookSeed + respawns);
         if (visual != null) body.bindVisual(visual);
         hands = new AgentHands(client);
-        progress = new AgentProgress(client, body, hands, goal, new AgentMemory(directory));
+        progress = new AgentProgress(client, body, hands, goal, new AgentMemory(directory), expedition, pendingFurnaceMemory);
         craftSequence = stallSequence = 0;
         returnableDropSequence = 0;
         lastFuseCheckNs = lastFuseCheckTick = fuseTick = 0;
@@ -483,6 +493,7 @@ public final class AgentClient implements ClientModInitializer {
         if (tick == 0) tick = 1;
         pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
         if (macro != null) macro.suspend(tick, "The player died.");
+        resetExpeditionView();
         releaseLifeInputs(client);
         ++deaths;
         ended = !allowRespawn;
@@ -491,7 +502,10 @@ public final class AgentClient implements ClientModInitializer {
         if (allowRespawn) {
             respawn = new AgentRespawn();
             lifeDeadline = System.nanoTime() + CONTROL_TIMEOUT;
-        } else stopMacro("death_no_respawn", "No respawn is authorized.");
+        } else {
+            stopMacro("death_no_respawn", "No respawn is authorized.");
+            if (expedition != null) expedition.close();
+        }
         return true;
     }
 
@@ -599,6 +613,7 @@ public final class AgentClient implements ClientModInitializer {
         ended = true;
         stopMacro("respawn_failed", "Vanilla respawn failed.");
         publish(client, "respawn stopped", false, failure, true, System.currentTimeMillis());
+        if (expedition != null) expedition.close();
     }
 
     private void drive(MinecraftClient client) {
@@ -617,6 +632,11 @@ public final class AgentClient implements ClientModInitializer {
             pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
             releaseLifeInputs(client);
             stopMacro("connection_closed", "The admitted loopback connection closed.");
+            if (expedition != null) {
+                resetExpeditionView();
+                publishExpedition(null, false, "The Survival connection closed.");
+                expedition.close();
+            }
             if (lifePhase != LifePhase.PLAYING) failLife(client, "Connection closed before respawn completed.");
             else { ended = true; closeMovement(); }
             return;
@@ -633,10 +653,24 @@ public final class AgentClient implements ClientModInitializer {
             if (visual != null) visual.invalidate();
             pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
             if (macro != null) macro.suspend(tick, "The player left the current Survival view.");
+            if (expedition != null && expeditionWorld != null) {
+                resetExpeditionView();
+                publishExpedition(null, false, "Waiting for the Survival view.");
+            }
             body.release();
             hands.discardLifeInputs();
             lastYaw = lastPitch = Float.NaN;
             return;
+        }
+        if (expedition != null) {
+            if (!survival(client)) {
+                if (expeditionWorld != null) resetExpeditionView();
+            } else if (expeditionWorld != client.world || expeditionPlayer != client.player) {
+                if (expeditionWorld != null) resetExpeditionView();
+                expeditionWorld = client.world;
+                expeditionPlayer = client.player;
+            }
+            expedition.begin(1 + respawns, tick);
         }
         if (pendingFurnaceMemory.current() != null && !soleFurnaceActor(client, client.player))
             pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
@@ -744,6 +778,7 @@ public final class AgentClient implements ClientModInitializer {
         progress.saveMemory(ended);
         publish(client, fleeing ? "evading a primed creeper: " + ears.fuseStatus() : progress.status(), won, null,
             false, 0);
+        if (won && expedition != null) expedition.close();
     }
 
     private void observeContinuityIdle() {
@@ -781,10 +816,18 @@ public final class AgentClient implements ClientModInitializer {
                 macro.closeFurnaceForStop();
                 pendingBreadcrumbs = macro.pendingCloseBreadcrumbs();
             }
+            if (progress != null && (macro == null || !macro.engaged())) {
+                var local = progress.closeLocalFurnaceForStop(soleFurnaceActor(client, client.player));
+                if (local != null) pendingBreadcrumbs = local;
+            }
             hands.releaseWorkInventory(true);
             releaseLifeInputs(client);
         }
         if (pauses != null) pauses.close("runner_stop");
+        if (expedition != null) {
+            publishExpedition(admittedPlayer(client), false, "The expedition stopped.");
+            expedition.close();
+        }
         stopMacro("actor_exit", "The owning runner ended the attempt.");
         if (body != null && pendingFurnaceMemory != null && lifePhase == LifePhase.PLAYING &&
                 soleFurnaceActor(client, client.player))
@@ -931,9 +974,44 @@ public final class AgentClient implements ClientModInitializer {
         position(event, "cue_origin", cue.origin());
     }
 
+    private void resetExpeditionView() {
+        if (expedition == null) return;
+        expeditionWorld = null;
+        expeditionPlayer = null;
+        expedition.reset();
+        progress.resetExpedition();
+    }
+
+    private void publishExpedition(ClientPlayerEntity player, boolean offerAllowed, String activity) {
+        expedition.begin(1 + respawns, tick);
+        var offer = offerAllowed ? progress.expeditionOffer() : null;
+        if (!expedition.shouldPublish(offer, activity)) return;
+        var counts = new JsonObject();
+        if (player != null) {
+            var inventory = player.getInventory();
+            for (int i = 0; i < inventory.size(); ++i) {
+                var stack = inventory.getStack(i);
+                if (stack.isEmpty()) continue;
+                var item = Registries.ITEM.getId(stack.getItem());
+                if (!item.getNamespace().equals("minecraft")) continue;
+                String id = item.toString();
+                counts.addProperty(id, stack.getCount() + (counts.has(id) ? counts.get(id).getAsInt() : 0));
+            }
+        }
+        expedition.publish(offer, counts, player == null ? 0 : player.getHealth(),
+            player == null ? 0 : player.getHungerManager().getFoodLevel(), activity);
+    }
+
     private void publish(MinecraftClient client, String status, boolean won, String failure, boolean boundary,
                          long wallMs) {
         var player = admittedPlayer(client);
+        if (expedition != null) {
+            boolean live = !ended && !boundary && expeditionWorld != null && playing(client) && survival(client);
+            String activity = won ? "The Survival goal was verified."
+                : live ? progress.expeditionActivity(status.startsWith("evading a primed creeper"))
+                : lifePhase == LifePhase.PLAYING ? "Waiting for the Survival view." : "Waiting for a live player.";
+            publishExpedition(player, live, activity);
+        }
         String owner = macro == null ? "deterministic" : macro.owner();
         String planningState = macro == null ? "" : macro.planningState();
         String planningEvidence = macro == null ? "" : macro.planningEvidence();

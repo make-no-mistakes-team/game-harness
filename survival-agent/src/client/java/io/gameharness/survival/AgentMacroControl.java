@@ -1910,7 +1910,8 @@ final class AgentMacroControl {
     }
 
     private AgentPendingFurnaceMemory.Entry pendingEntry() {
-        return trial || ipc.workMode == null ? null : pendingFurnaceMemory.current();
+        var entry = trial || ipc.workMode == null ? null : pendingFurnaceMemory.current();
+        return entry != null && entry.ordinaryBatch() == null ? entry : null;
     }
 
     private Map<Item, Integer> pendingFloors() {

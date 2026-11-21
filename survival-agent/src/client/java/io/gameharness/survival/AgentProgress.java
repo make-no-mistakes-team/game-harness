@@ -42,6 +42,7 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.GameMode;
 import net.minecraft.world.World;
 
 /** Inventory-driven decisions; coordinates are observations, traveled waypoints or dig intentions. */
@@ -67,6 +68,10 @@ final class AgentProgress {
     private static final int ORE_MEMORY_LIMIT = 18;
     private static final int TIMBER_WORK_TICKS = 190;
     private static final int TIMBER_RECENT = 24;
+    private static final AgentExpedition.Option WOODLAND = new AgentExpedition.Option("search_woodland",
+        "Continue looking for natural timber rather than detouring to visible planks.");
+    private static final AgentExpedition.Option SALVAGE = new AgentExpedition.Option("salvage_visible_planks",
+        "Take a checked route to the visible planks for immediate wood supplies.");
     private static final Predicate<ItemStack> LOG = stack -> stack.isIn(ItemTags.LOGS);
     private static final Predicate<ItemStack> BURNABLE_LOG = stack -> stack.isIn(ItemTags.LOGS_THAT_BURN);
     private static final Predicate<ItemStack> PLANK = stack -> stack.isIn(ItemTags.PLANKS);
@@ -136,6 +141,7 @@ final class AgentProgress {
     private enum Footing { LEVEL, DOWN, STEEP, JUMP, WATER, EDGE, UNKNOWN, BLOCKED }
     enum Dig { LOOKING, CLEAR, BLOCKED, DARK, LIP, RESOURCE }
     private enum Firing { NONE, IRON, CHARCOAL }
+    private enum FurnaceSide { TORCHES, LIGHT, STICKS, PICK }
     private enum Forage { ANIMAL, BERRIES, DROP }
     private enum WorkshopView {
         CURRENT, GROUND, FIRST_WALL, FIRST_FLOOR, SECOND_WALL, SECOND_FLOOR, EXHAUSTED;
@@ -197,6 +203,15 @@ final class AgentProgress {
     private final MinecraftClient c;
     private final AgentBody body;
     private final AgentHands hands;
+    private final AgentExpedition expedition;
+    private AgentExpedition.Prospecting prospecting;
+    private Resource prospectingOre;
+    private int prospected;
+    private float prospectingYaw;
+    private AgentExpedition.Offer woodOffer;
+    private AgentExpedition.Option woodPreference;
+    private int woodOfferedUntil, woodPreferenceUntil, woodCheckAfter, woodSearchTouched;
+    private boolean woodOffered;
     private final AgentTools tools;
     private final AgentStallGuard stallGuard;
     private final AgentOverlandSearch overland;
@@ -266,7 +281,37 @@ final class AgentProgress {
     private int furnaceDemand;
     private boolean furnaceLoaded;
     private boolean furnaceNeedsFuel;
-    private boolean furnaceTransferPending;
+    private Direction furnaceContactFacing;
+    private BlockPos furnaceContactFooting;
+    private final AgentPendingFurnaceMemory pendingFurnaceMemory;
+    private LocalFurnace localFurnace;
+    private boolean checkedSavedFurnace;
+
+    private static final class LocalFurnace {
+        final BlockPos pos, footing;
+        final Direction facing;
+        final ClientWorld world;
+        final AgentLocalSmelt.Load loading;
+        final int syncId;
+        AgentLocalSmelt.Batch batch;
+        AgentLocalSmelt.Withdrawal withdrawal;
+        AgentWalkedRoute restoredRoute;
+        java.util.UUID ticket;
+        FurnaceSide side;
+        BlockPos routeFrom, routeTo;
+        int sideUntil, triedSide, retryAt, mismatchSince;
+        boolean lost;
+
+        LocalFurnace(BlockPos pos, BlockPos footing, Direction facing, ClientWorld world, int syncId,
+                     AgentLocalSmelt.Load loading) {
+            this.pos = pos;
+            this.footing = footing;
+            this.facing = facing;
+            this.world = world;
+            this.syncId = syncId;
+            this.loading = loading;
+        }
+    }
     private Resource sought;
     private int soughtSince;
     private Resource miningResource;
@@ -447,11 +492,14 @@ final class AgentProgress {
     private BlockPos witnessedStairCut;
     private int witnessedStairCutTick;
 
-    AgentProgress(MinecraftClient c, AgentBody body, AgentHands hands, String goal, AgentMemory memory) {
+    AgentProgress(MinecraftClient c, AgentBody body, AgentHands hands, String goal, AgentMemory memory,
+                  AgentExpedition expedition, AgentPendingFurnaceMemory pendingFurnaceMemory) {
         this.c = c;
         this.body = body;
         this.hands = hands;
+        this.expedition = expedition;
         this.memory = memory;
+        this.pendingFurnaceMemory = pendingFurnaceMemory;
         tools = new AgentTools(c, hands);
         stallGuard = new AgentStallGuard(c, body, hands, tools, this::protectRecoveryBlock, this::safeSupport,
             this::recordStallFooting, this::tryStallMineHandback);
@@ -728,6 +776,42 @@ final class AgentProgress {
         return status;
     }
 
+    void resetExpedition() {
+        prospecting = null;
+        prospectingOre = null;
+        prospected = 0;
+        woodOffer = null;
+        woodPreference = null;
+        woodPreferenceUntil = woodCheckAfter = 0;
+        woodOffered = false;
+    }
+
+    AgentExpedition.Offer expeditionOffer() {
+        var ore = prospecting == null ? null : prospecting.live();
+        if (ore != null && (prospectingOre == Resource.IRON
+                ? !has(DEEP_PICK, 1) && hands.count(INGOT) + hands.count(RAW_IRON) < 3
+                : !has(DIAMOND, portal == null ? 1 : 3) && (portal == null || !portalStarted))) return ore;
+        return tick < woodOfferedUntil && tick - woodSearchTouched <= 32 ? woodOffer : null;
+    }
+
+    String expeditionActivity(boolean fleeing) {
+        if (fleeing || body.lavaEmergency() || defense.meleeActive() || defense.rangedActive())
+            return "Responding to an immediate threat.";
+        if (firing != Firing.NONE) return "Preparing or using a furnace.";
+        if (hands.busy() || c.currentScreen != null) return "Using the inventory or a workstation.";
+        if (mealUntil != 0 || forage != null) return "Eating or gathering food.";
+        if (returnIndex >= 0 || supplyEgress.active()) return "Finding supplies along a checked route.";
+        if (caves.active() || caves.routingDry()) return "Checking a witnessed cave route.";
+        if (target != null) return "Working toward exposed ore or rock.";
+        if (prospecting != null && sought == prospectingOre && prospecting.scouting(tick))
+            return "Looking for exposed " + prospectingOre.label + " and usable cave openings.";
+        if (nextFoot != null || returnableMine.active()) return "Working on a locally checked mine route.";
+        if (timberWitness != null || timberChop != null || overland.driving()
+                || (woodOffer != null && tick < woodOfferedUntil && tick - woodSearchTouched <= 32))
+            return "Looking for or gathering wood and supplies.";
+        return "Working toward the Survival goal.";
+    }
+
     void afterRespawn() {
         dropReclaim = new DropReclaim();
         status = "looking for nearby drops after respawn";
@@ -738,6 +822,10 @@ final class AgentProgress {
         tick++;
         ordinarySurfaceWork = macro == null || !macro.engaged();
         observeStairLight();
+        if (ordinarySurfaceWork) {
+            restoreLocalFurnace();
+            observeLocalFurnaceTransfers();
+        }
         observeFurnaceCook();
         if (portal != null) stallGuard.surveyReceipt(portal.castSurveyEvidence());
         stallGuard.navigationSurveyReceipt(caves.drySurveyEvidence());
@@ -960,6 +1048,7 @@ final class AgentProgress {
             workReturnableMine(c.player.getBlockPos(), returnableMine.depth());
             return;
         }
+        if (stepLocalFurnaceSide()) return;
         if (refitMinedPick()) return;
         if (caves.active() && surveyCave(null)) return;
         if (caves.routingDry() && surveyDryForMine(c.player.getBlockPos(),
@@ -1613,7 +1702,7 @@ final class AgentProgress {
     }
 
     private boolean ownsFurnaceScreen(FurnaceScreen screen) {
-        return screen != null && c.currentScreen == screen && furnaceScreenWorld == c.world
+        return screen != null && c.player != null && c.currentScreen == screen && furnaceScreenWorld == c.world
             && c.player.currentScreenHandler == screen.getScreenHandler() && furnaceWitness != null
             && furnaceWitness.equals(furnace.position)
             && c.player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(furnaceWitness)) <= 4.75 * 4.75;
@@ -1630,7 +1719,6 @@ final class AgentProgress {
         if (!ownsFurnaceScreen(furnaceScreen)) {
             furnaceScreen = null;
             furnaceScreenWorld = null;
-            furnaceTransferPending = false;
         } else {
             var handler = furnaceScreen.getScreenHandler();
             var input = handler.getSlot(0).getStack();
@@ -1661,7 +1749,12 @@ final class AgentProgress {
     private void handleFurnace(FurnaceScreen screen) {
         if (screen != furnaceScreen) {
             BlockPos used = confirmStationUse(furnace);
-            if (used == null) {
+            var job = localFurnace;
+            var saved = pendingFurnaceMemory.current();
+            if (used == null || furnaceContactFacing == null || furnaceContactFooting == null
+                    || job != null && (!used.equals(job.pos) || furnaceContactFacing != job.facing || job.lost)
+                    || saved != null && saved.pos().equals(used) && saved.dimension().equals(furnaceDimension())
+                        && (job == null || !saved.ticket().equals(job.ticket))) {
                 screen.close();
                 return;
             }
@@ -1675,14 +1768,17 @@ final class AgentProgress {
             screen.close();
             return;
         }
-        if (furnaceTransferPending) {
-            // This same screen survived Hands' real slot gestures. Start the sync
-            // window now, not before the cursor has even put the fuel and input down.
-            furnaceTransferPending = false;
-            furnaceWarmUntil = tick + 24;
-        }
         status = firing == Firing.IRON ? "smelting iron" : "making charcoal";
         var handler = screen.getScreenHandler();
+        var sync = (AgentFurnaceSync) handler;
+        if (!sync.agent$furnaceContentsSynced() || sync.agent$furnaceOutputUpdates() == 0) {
+            if (tick >= furnaceWarmUntil) screen.close();
+            return;
+        }
+        if (localFurnace != null && localFurnace.batch != null) {
+            handlePaidFurnace(screen, localFurnace);
+            return;
+        }
         ItemStack input = handler.getSlot(0).getStack();
         ItemStack output = handler.getOutputSlot().getStack();
         if (!input.isEmpty() && !furnaceInput(input) || !output.isEmpty() && !output.isOf(furnaceOutput())) {
@@ -1699,17 +1795,13 @@ final class AgentProgress {
             screen.close();
             return;
         }
-        int hunger = c.player.getHungerManager().getFoodLevel();
-        boolean food = tick >= mealRetry && tick >= mealQuietUntil && (hunger <= 14 || canRefuelHealing(hunger))
-            && c.player.isOnGround() && !c.player.isTouchingWater() && bestMeal(hunger) >= 0;
         boolean urgentLight = needsFurnaceLight();
-        if (!ready && (food || urgentLight && has(FUEL, 1))) {
+        if (!ready && (leaveFurnaceForFood() || urgentLight && has(FUEL, 1))) {
             screen.close();
             return;
         }
         boolean cooking = !input.isEmpty() && handler.isBurning();
-        boolean deferOutput = ready && output.getCount() < 3 && !urgentLight && !food;
-        if (cooking && (!ready || deferOutput)) {
+        if (cooking && !ready) {
             if (stallGuard.furnaceAdvancing(tick) || tick < furnaceWarmUntil) {
                 status = firing == Firing.IRON ? "watching iron smelt" : "watching charcoal smelt";
                 return;
@@ -1732,8 +1824,11 @@ final class AgentProgress {
         }
         int limit = firing == Firing.CHARCOAL ? furnaceDemand
             : Math.max(1, Math.min(3, furnaceDemand - hands.count(INGOT)));
-        if (hands.smelt(firing == Firing.CHARCOAL, limit)) {
-            furnaceTransferPending = true;
+        var loading = input.isEmpty() && output.isEmpty() ? new AgentLocalSmelt.Load() : null;
+        if (hands.smelt(firing == Firing.CHARCOAL, limit, loading, false)) {
+            if (loading != null)
+                localFurnace = new LocalFurnace(furnaceWitness, furnaceContactFooting, furnaceContactFacing,
+                    c.world, handler.syncId, loading);
             furnaceNeedsFuel = false;
             return;
         }
@@ -1744,6 +1839,318 @@ final class AgentProgress {
             if (!result.equals("smelt: no input")) blockStation(furnace, result);
         }
         screen.close();
+    }
+
+    private int furnaceFoodRetry;
+
+    private boolean leaveFurnaceForFood() {
+        int hunger = c.player.getHungerManager().getFoodLevel();
+        if (!dryFieldFooting() || tick < mealQuietUntil) return false;
+        if (tick >= mealRetry && (hunger <= 14 || canRefuelHealing(hunger)) && bestMeal(hunger) >= 0) return true;
+        if (tick < furnaceFoodRetry || hunger > 10 && !needsEmergencyFood(hunger)) return false;
+        furnaceFoodRetry = tick + 80; // Let the ordinary forage owner try without an open/close loop.
+        return true;
+    }
+
+    private void handlePaidFurnace(FurnaceScreen screen, LocalFurnace job) {
+        if (job.lost) {
+            screen.close();
+            return;
+        }
+        var handler = screen.getScreenHandler();
+        var input = handler.getSlot(0).getStack();
+        var output = handler.getOutputSlot().getStack();
+        var view = job.batch.view(true, handler.isBurning(), input, output);
+        if (view == AgentLocalSmelt.View.CHANGED) {
+            // The input/output packets can cross for a vanilla cooking tick.
+            if (job.mismatchSince == 0) job.mismatchSince = tick;
+            if (tick - job.mismatchSince < 12 || tick < furnaceWarmUntil) return;
+            job.lost = true;
+            if (job.ticket != null) pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
+            screen.close();
+            blockStation(furnace, "the paid furnace slots no longer match the original batch");
+            return;
+        }
+        job.mismatchSince = 0;
+        if (view == AgentLocalSmelt.View.READY) {
+            if (leaveFurnaceForFood()) {
+                screen.close();
+                return;
+            }
+            if (job.withdrawal == null) {
+                var receipt = new AgentLocalSmelt.Withdrawal();
+                if (hands.collectLocalSmelt(screen, job.batch, receipt)) {
+                    job.withdrawal = receipt;
+                    return;
+                }
+            }
+            if (hands.status().equals("smelt: inventory full")) {
+                screen.close();
+                retryLocalFurnace(job, hands.status());
+            }
+            return;
+        }
+        if (leaveFurnaceForFood() || needsFurnaceLight() && torchCraftBatches(LOCAL_LIGHT) > 0) {
+            screen.close();
+            return;
+        }
+        if (view == AgentLocalSmelt.View.COOKING) {
+            if (job.batch.mayDoSideWork() && stallGuard.furnaceAdvancing(tick)) {
+                FurnaceSide side = furnaceOpportunity(job);
+                if (side != null && hands.releasedForPendingWork()) {
+                    screen.close();
+                    if (c.currentScreen == null) {
+                        job.side = side;
+                        job.sideUntil = tick + 90;
+                        job.triedSide |= 1 << side.ordinal();
+                        status = "leaving the paid furnace to do local work";
+                        if (job.ticket != null) pendingFurnaceMemory.park(job.ticket, tick, body.renderedFrame());
+                    }
+                    return;
+                }
+            }
+            if (stallGuard.furnaceAdvancing(tick) || tick < furnaceWarmUntil) {
+                status = firing == Firing.IRON ? "watching iron smelt" : "watching charcoal smelt";
+            } else {
+                screen.close();
+                retryLocalFurnace(job, "the paid furnace cook bar stopped advancing");
+            }
+            return;
+        }
+        if (tick < furnaceWarmUntil) return;
+        // A paid batch can be refueled, never topped up with fresh input while outstanding.
+        if (hands.smelt(firing == Firing.CHARCOAL, input.getCount(), null, true)) {
+            furnaceWarmUntil = tick + 40;
+            furnaceNeedsFuel = false;
+            return;
+        }
+        furnaceNeedsFuel = hands.status().equals("smelt: no fuel");
+        screen.close();
+        if (!furnaceNeedsFuel) retryLocalFurnace(job, hands.status());
+    }
+
+    private String furnaceDimension() { return c.world.getRegistryKey().getValue().toString(); }
+
+    /** Only a vanilla accepted use edge can tie a new handler to this furnace. */
+    void confirmLocalFurnaceUse(net.minecraft.client.network.ClientPlayerEntity actor, BlockHitResult hit) {
+        if (actor != c.player || firing == Firing.NONE || furnace.lastUse == null
+                || !furnace.lastUse.equals(hit.getBlockPos()) || tick - furnace.opened > 2) return;
+        BlockState block = state(hit);
+        if (!block.isOf(Blocks.FURNACE)) return;
+        furnaceContactFacing = block.get(net.minecraft.block.AbstractFurnaceBlock.FACING);
+        furnaceContactFooting = actor.getBlockPos();
+    }
+
+    void observeLocalFurnaceBlock(ClientWorld world, BlockPos pos, BlockState state) {
+        var job = localFurnace;
+        if (job == null || job.lost || job.world != world || !job.pos.equals(pos)
+                || state.isOf(Blocks.FURNACE)
+                    && state.get(net.minecraft.block.AbstractFurnaceBlock.FACING) == job.facing) return;
+        job.lost = true;
+    }
+
+    private void restoreLocalFurnace() {
+        if (checkedSavedFurnace) return;
+        checkedSavedFurnace = true;
+        var saved = pendingFurnaceMemory.current();
+        if (saved == null || !saved.mayInvestigateCollection() || saved.ordinaryBatch() == null
+                || !saved.dimension().equals(furnaceDimension())
+                || !AgentClient.ownsSinglePlayerFurnaceWorld(c, c.player)) return;
+        var job = new LocalFurnace(saved.pos(), saved.footing(), saved.facing(), c.world, saved.syncId(), null);
+        job.batch = saved.ordinaryBatch();
+        job.ticket = saved.ticket();
+        if (saved.breadcrumbs() != null) {
+            job.restoredRoute = new AgentWalkedRoute();
+            job.restoredRoute.restore(saved.breadcrumbs());
+        }
+        localFurnace = job;
+        firing = job.batch.raw() == Items.RAW_IRON ? Firing.IRON : Firing.CHARCOAL;
+        furnace.position = furnaceWitness = job.pos;
+        furnaceLoaded = true;
+        furnaceDemand = (firing == Firing.IRON ? hands.count(INGOT) : 0) + job.batch.units();
+    }
+
+    private void observeLocalFurnaceTransfers() {
+        if (localFurnace != null && !hands.busy())
+            settleLocalFurnace(localFurnace.batch == null && AgentClient.ownsSinglePlayerFurnaceWorld(c, c.player));
+    }
+
+    private void settleLocalFurnace(boolean persist) {
+        var job = localFurnace;
+        if (job == null) return;
+        if (job.batch == null) {
+            if (job.loading.units == 0) {
+                localFurnace = null;
+                return;
+            }
+            int minimumOutput = 0;
+            if (ownsFurnaceScreen(furnaceScreen)) {
+                ItemStack output = furnaceScreen.getScreenHandler().getOutputSlot().getStack();
+                if (output.isOf(AgentLocalSmelt.result(job.loading.raw)) && output.getCount() <= job.loading.units)
+                    minimumOutput = output.getCount();
+            }
+            job.batch = new AgentLocalSmelt.Batch(job.loading.raw, job.loading.units, minimumOutput);
+            furnaceLoaded = true;
+            furnaceWarmUntil = tick + 24;
+            if (persist && !job.lost && job.world == c.world) {
+                var ticket = java.util.UUID.randomUUID();
+                if (pendingFurnaceMemory.payOrdinary(ticket, furnaceDimension(), job.pos, job.facing, job.footing,
+                        job.batch, job.syncId, tick, body.renderedFrame())) job.ticket = ticket;
+            }
+        }
+        var receipt = job.withdrawal;
+        if (receipt != null && receipt.hasStoredResult()) {
+            if (job.ticket != null)
+                pendingFurnaceMemory.end(job.ticket, AgentPendingFurnaceMemory.State.COLLECTED, tick, body.renderedFrame());
+            if (ownsFurnaceScreen(furnaceScreen)) furnaceScreen.close();
+            localFurnace = null;
+            finishFire();
+            return;
+        }
+        if (receipt != null && receipt.wasTaken()) {
+            job.lost = true;
+            if (job.ticket != null) pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
+        }
+        job.withdrawal = null;
+        if (job.ticket != null) {
+            var saved = pendingFurnaceMemory.current();
+            if (job.lost) pendingFurnaceMemory.discontinuity(tick, body.renderedFrame());
+            else if (saved == null || !saved.mayInvestigateCollection()) job.lost = true;
+        }
+    }
+
+    AgentWalkedRoute.Breadcrumbs closeLocalFurnaceForStop(boolean persist) {
+        settleLocalFurnace(persist);
+        var job = localFurnace;
+        if (ownsFurnaceScreen(furnaceScreen)) interruptHands();
+        if (!persist || job == null || job.ticket == null || job.lost
+                || !dryFieldFooting() || !hands.stableCraftFooting()) return null;
+        BlockPos foot = c.player.getBlockPos();
+        if (job.restoredRoute != null) {
+            var restored = job.restoredRoute.breadcrumbs(foot.asLong());
+            if (restored != null) return restored;
+        }
+        int from = trail.lastIndexOf(foot), to = trail.lastIndexOf(job.footing);
+        if (from < 0 || to < 0 || from == to || Math.abs(from - to) > AgentWalkedRoute.SAVED_EDGES) return null;
+        int direction = Integer.signum(to - from);
+        var route = new AgentWalkedRoute();
+        route.anchor(job.footing.asLong());
+        for (int i = from; i != to; i += direction)
+            route.landed(trail.get(i).asLong(), trail.get(i + direction).asLong());
+        return route.breadcrumbs(foot.asLong());
+    }
+
+    private FurnaceSide furnaceOpportunity(LocalFurnace job) {
+        if (!hands.stableCraftFooting() || !job.footing.equals(c.player.getBlockPos())) return null;
+        if (untried(job, FurnaceSide.TORCHES) && torchCraftBatches(LOCAL_LIGHT) > 0) return FurnaceSide.TORCHES;
+        if (untried(job, FurnaceSide.LIGHT) && trail.size() - litIndex >= 7 && has(TORCH, 2)) return FurnaceSide.LIGHT;
+        if (untried(job, FurnaceSide.STICKS) && firing == Firing.IRON && !has(DEEP_PICK, 1)
+                && !has(STICK, 2) && has(PLANK, 2)) return FurnaceSide.STICKS;
+        if (untried(job, FurnaceSide.PICK) && firing == Firing.CHARCOAL && !has(DEEP_PICK, 1)
+                && localStation(table, null) && has(STONE, 3) && affordsWood(0, 2)) {
+            int stoneUses = pickUses(STONE_PICK);
+            if (stoneUses > 0 && stoneUses < 12) return FurnaceSide.PICK;
+        }
+        return null;
+    }
+
+    private static boolean untried(LocalFurnace job, FurnaceSide side) {
+        return (job.triedSide & (1 << side.ordinal())) == 0;
+    }
+
+    private boolean stepLocalFurnaceSide() {
+        var job = localFurnace;
+        if (job == null || job.side == null) return false;
+        if (!job.lost && tick < job.sideUntil && job.footing.equals(c.player.getBlockPos()) && dryFieldFooting()) {
+            switch (job.side) {
+                case TORCHES -> {
+                    if (craftTorches(LOCAL_LIGHT)) { job.side = null; return true; }
+                }
+                case LIGHT -> {
+                    if (shouldLight(false)) { status = "lighting the workshop passage"; return true; }
+                }
+                case STICKS -> {
+                    if (!has(STICK, 2) && hands.craft("stick")) {
+                        status = "making sticks for the next iron tool";
+                        job.side = null;
+                        return true;
+                    }
+                }
+                case PICK -> {
+                    if (pickUses(STONE_PICK) < 12 && hands.stableCraftFooting()) {
+                        BlockHitResult bench = body.find(TABLE_BLOCK, 3.75, hit -> hit.getBlockPos().equals(table.position)).orElse(null);
+                        if (bench != null) {
+                            requestTable("stone_pickaxe", null, 0, 2);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        if (job.side == FurnaceSide.PICK && "stone_pickaxe".equals(tableRecipe)) tableRecipe = null;
+        job.side = null;
+        return false;
+    }
+
+    private void retryLocalFurnace(LocalFurnace job, String reason) {
+        job.retryAt = tick + 30;
+        status = reason;
+    }
+
+    private void returnToLocalFurnace(LocalFurnace job) {
+        if (job.lost || job.world != c.world) {
+            status = "the paid furnace can no longer be verified";
+            return;
+        }
+        if (tick < job.retryAt || c.player.isTouchingWater() || c.player.isInLava()
+                || job.routeTo == null && !dryFieldFooting()) return;
+        if (furnaceNeedsFuel) {
+            status = "preparing fuel for the paid furnace";
+            if (hands.stableCraftFooting() && hands.prepareSmeltFuel(false)) furnaceNeedsFuel = false;
+            else retryLocalFurnace(job, "the paid furnace needs usable fuel");
+            return;
+        }
+        furnace.position = furnaceWitness = job.pos;
+        Vec3d center = Vec3d.ofCenter(job.pos);
+        if (c.player.getEyePos().squaredDistanceTo(center) <= REACH * REACH) {
+            BlockHitResult face = body.find(FURNACE_BLOCK, REACH, hit -> job.pos.equals(hit.getBlockPos())
+                && state(hit).get(net.minecraft.block.AbstractFurnaceBlock.FACING) == job.facing).orElse(null);
+            if (face != null && hands.stableCraftFooting()) {
+                status = "opening the paid furnace";
+                job.routeFrom = job.routeTo = null;
+                openStation(furnace, face, AgentBody.Contact.INTERACT);
+                return;
+            }
+            if (job.footing.equals(c.player.getBlockPos())
+                    && openOutlinedStation(furnace, center)) return;
+        }
+        if (job.routeTo != null && arrived(job.routeTo)) job.routeFrom = job.routeTo = null;
+        if (job.routeTo == null && hands.stableCraftFooting()) {
+            BlockPos foot = c.player.getBlockPos();
+            int from = trail.lastIndexOf(foot), to = trail.lastIndexOf(job.footing);
+            if (from >= 0 && to >= 0 && from != to) {
+                for (int i = from, step = Integer.signum(to - from); i != to; i += step)
+                    if (!adjacent(trail.get(i), trail.get(i + step))) { to = -1; break; }
+                if (to >= 0) job.routeTo = trail.get(from + Integer.signum(to - from));
+            }
+            if (job.routeTo == null && job.restoredRoute != null) {
+                long next = job.restoredRoute.next(foot.asLong());
+                if (next != AgentRouteGraph.NO_CELL) job.routeTo = BlockPos.fromLong(next);
+            }
+            job.routeFrom = foot;
+        }
+        if (job.routeTo != null) {
+            status = "returning to the paid furnace on walked footing";
+            if (driveKnownStep(job.routeFrom, job.routeTo) != Walk.BLOCKED) return;
+            job.routeFrom = job.routeTo = null;
+            gaitStep = null;
+            retryLocalFurnace(job, "the walked step back to the paid furnace is blocked");
+        } else if (hands.stableCraftFooting()) {
+            if (c.player.getEyePos().squaredDistanceTo(center) <= REACH * REACH) {
+                if (!body.aligned(center)) body.aim(center);
+                status = "looking at the witnessed paid furnace";
+            } else status = "no witnessed return route to the paid furnace";
+        }
     }
 
     private boolean canAddBoat(String recipe) {
@@ -2355,6 +2762,15 @@ final class AgentProgress {
     }
 
     private boolean craftTorches(int reserve) {
+        int batches = torchCraftBatches(reserve);
+        if (batches <= 0) return false;
+        List<String> recipes = woodBatch(0, batches);
+        for (int i = 0; i < batches; i++) recipes.add("torch");
+        status = "crafting torches";
+        return hands.craftBatch(recipes);
+    }
+
+    private int torchCraftBatches(int reserve) {
         int held = hands.count(TORCH);
         int batches = Math.min(Math.min(3, hands.count(FUEL)), torchBatches(reserve, held));
         while (batches > 0 && !affordsWood(localTableWood(), batches + 2)) batches--;
@@ -2364,11 +2780,7 @@ final class AgentProgress {
             batches = Math.min(Math.min(3, hands.count(FUEL)), torchBatches(reserve, held));
             while (batches > 0 && !affordsWood(0, batches)) --batches;
         }
-        if (batches <= 0) return false;
-        List<String> recipes = woodBatch(0, batches);
-        for (int i = 0; i < batches; i++) recipes.add("torch");
-        status = "crafting torches";
-        return hands.craftBatch(recipes);
+        return batches;
     }
 
     private boolean prepareLight(boolean departure) {
@@ -2497,6 +2909,11 @@ final class AgentProgress {
     }
 
     private void fire(Firing batch, int demand) {
+        if (localFurnace != null && localFurnace.batch != null) {
+            if (needsFurnaceLight() && has(FUEL, 1) && craftTorches(LOCAL_LIGHT)) return;
+            returnToLocalFurnace(localFurnace);
+            return;
+        }
         if (firing == Firing.NONE) {
             firing = batch;
             furnaceDemand = demand;
@@ -2722,6 +3139,10 @@ final class AgentProgress {
             ? AgentBody.Preparation.RECEIPT : c.player.isSneaking()
                 ? AgentBody.Preparation.STANCE : AgentBody.Preparation.READY;
         if (body.useContact(hit, mode, readiness)) {
+            if (station == furnace) {
+                furnaceContactFacing = null;
+                furnaceContactFooting = null;
+            }
             station.opened = tick;
             station.lastUse = hit.getBlockPos();
             station.openAttempts++;
@@ -3357,6 +3778,7 @@ final class AgentProgress {
             sought = resource;
             soughtSince = tick;
         }
+        watchExpeditionOreRoute(resource);
         status = "seeking " + resource.label;
         if (returnableOre != null) {
             if (target != null && miningResource == returnableOre) {
@@ -3394,12 +3816,96 @@ final class AgentProgress {
         if (resource != Resource.STONE && hands.count(TORCH) + 4 * hands.count(FUEL) < LOCAL_LIGHT
             && affordsWood(localTableWood(), 3) && workOre(Resource.COAL, range, false)) return;
         target = null;
+        if (workExpeditionOreRoute(resource, depth)) return;
         if ((activeTrail() > 1 || resumeIndex >= 0 || tick - soughtSince > onSurfaceTicks)
             && tick >= nextDigStart && (c.player.isOnGround() || activeTrail() > 0) && !c.player.isTouchingWater()) {
             excavate(depth, null);
         } else {
             explore();
         }
+    }
+
+    private void watchExpeditionOreRoute(Resource resource) {
+        if (expedition == null || prospectingOre == resource || resource != Resource.IRON && resource != Resource.DIAMOND)
+            return;
+        int bit = 1 << resource.ordinal();
+        if ((prospected & bit) != 0) return;
+        prospected |= bit;
+        prospectingOre = resource;
+        // An offer is passive: no view, movement, supplies or timing changes
+        // until a current answer is accepted at the next ordinary decision.
+        prospecting = new AgentExpedition.Prospecting(resource == Resource.IRON ? "iron_route" : "diamond_route");
+    }
+
+    private boolean workExpeditionOreRoute(Resource resource, int depth) {
+        if (prospectingOre != resource) return false;
+        var offer = prospecting.live();
+        if (offer != null && expedition.hasAdvice(offer) && expeditionOffer() == offer
+                && tick >= nextDigStart && expeditionTurnReady()) {
+            BlockPos standing = c.player.getBlockPos();
+            if (!returnableMine.unjoined(standing) && (standing.getY() <= depth || returnableMine.stockedForNewLeg(this))) {
+                var selected = expedition.take(offer, true);
+                if (selected != null) {
+                    prospectingYaw = c.player.getYaw();
+                    boolean open = selected == AgentExpedition.Prospecting.VISIBLE && activeTrail() <= 1
+                        && (supplyEgress.outdoors() || (body.supplyPerspective(prospectingYaw) & AgentBody.SUPPLY_OPEN) != 0);
+                    prospecting.choose(selected, tick, open);
+                }
+            }
+        }
+        return switch (prospecting.turn(tick)) {
+            case LOCAL -> false;
+            case EXCAVATE -> {
+                excavate(depth, null, true);
+                yield true;
+            }
+            case SCOUT -> prospectVisibleOre(resource);
+        };
+    }
+
+    private boolean prospectVisibleOre(Resource resource) {
+        if (!dryFieldFooting() || !body.hasRecentView() || c.player.hurtTime > 0 || c.player.isOnFire()
+                || localFurnace != null || c.player.isUsingItem()) return false;
+        BlockPos standing = c.player.getBlockPos();
+        Direction facing = c.player.getHorizontalFacing();
+        if (prospecting.overland()) {
+            if (surveyCave(standing.offset(facing), facing)) return true;
+            explore();
+        } else {
+            // WorkOre already checked this frame. Take each distinct view at
+            // most once; any found route still needs the regular cave proofs.
+            float bearing, pitch;
+            switch (prospecting.view()) {
+                case 0 -> { bearing = prospectingYaw - 42; pitch = 8; }
+                case 1 -> { bearing = prospectingYaw + 43; pitch = 14; }
+                default -> { bearing = prospectingYaw; pitch = 43; }
+            }
+            if (body.renderedDirection(bearing, pitch, 9)) {
+                prospecting.sawView();
+                if (surveyCave(standing.offset(facing), facing)) return true;
+                if (!prospecting.scouting(tick)) return false;
+            } else {
+                body.turn(bearing, pitch);
+            }
+        }
+        status = "prospecting visible terrain for " + resource.label;
+        return true;
+    }
+
+    private boolean expeditionTurnReady() {
+        return c.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL && c.currentScreen == null
+            && c.getOverlay() == null && c.player.currentScreenHandler == c.player.playerScreenHandler
+            && c.player.currentScreenHandler.getCursorStack().isEmpty() && hands.releasedForPendingWork()
+            && hands.stableCraftFooting() && body.hasRecentView() && !c.player.isUsingItem()
+            && !c.player.isOnFire() && c.player.hurtTime == 0 && !body.lavaEmergency()
+            && !body.horizonWaterInFlight() && !c.options.attackKey.isPressed() && !c.options.useKey.isPressed()
+            && !c.interactionManager.isBreakingBlock() && pendingStairLight == null
+            && localFurnace == null && firing == Firing.NONE && !(table.lastUse != null && tick - table.opened <= 10)
+            && pickupItem == null && tick >= pickupUntil && tick >= timberDropUntil
+            && oreProbe == null && nextFoot == null && returnIndex < 0 && resumeIndex < 0
+            && exitStart == null && !caves.active() && !caves.routingDry() && !returnableMine.active()
+            && !overland.driving() && !supplyEgress.active() && !stallGuard.ownsRecovery()
+            && (ordinaryApproach == null || ordinaryApproachTick < tick - 1);
     }
 
     private boolean workOre(Resource resource, double range, boolean remember) {
@@ -3727,6 +4233,8 @@ final class AgentProgress {
         }
         if (startReachableTimber(true)) return;
         if (!overland.owns(player.getBlockPos()) && supplyEgress.seek(supplies)) return;
+        boolean bootstrap = ordinarySurfaceWork && !has(WOOD_PICK, 1) && !has(STONE_PICK, 1) && !has(DEEP_PICK, 1);
+        if (expedition != null && bootstrap && applyWoodPreference()) return;
         BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), 22, this::timberCandidate).orElse(null);
         if (log != null) {
             witnessTimber(log);
@@ -3738,8 +4246,42 @@ final class AgentProgress {
             return;
         }
         if (!ordinarySurfaceWork) return;
-        if (!has(WOOD_PICK, 1) && !has(STONE_PICK, 1) && !has(DEEP_PICK, 1) && seekSurfaceSupply()) return;
+        if (bootstrap && (woodPreference != WOODLAND || tick >= woodPreferenceUntil) && seekSurfaceSupply()) return;
         stepOverland();
+    }
+
+    private boolean applyWoodPreference() {
+        if (c.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL) return false;
+        if (woodOffer != null && tick - woodSearchTouched > 32) woodOffer = null;
+        woodSearchTouched = tick;
+        if (woodPreference == SALVAGE && tick < woodPreferenceUntil && overland.guiding(tick)) {
+            // Finish the chosen visible detour on ordinary overland proofs, not
+            // by holding a model-specified bearing or cutting an unknown route.
+            if (!seekSurfaceSupply()) stepOverland();
+            return true;
+        }
+        if (woodOffer == null || tick < woodCheckAfter || !expedition.hasAdvice(woodOffer)
+                || expeditionOffer() != woodOffer || !expeditionTurnReady())
+            return false;
+        woodCheckAfter = tick + 5;
+        var plank = body.find(SUPPLY_WOOD, 16, hit -> !timberUnderfoot(hit.getBlockPos())
+            && !supportsTrail(hit.getBlockPos()) && !triedSupplyCuts.contains(hit.getBlockPos())).orElse(null);
+        if (plank == null) return false;
+        var selected = expedition.take(woodOffer, true);
+        if (selected == null) return false;
+        woodOffer = null;
+        woodPreferenceUntil = tick + 170;
+        woodPreference = selected;
+        overland.interrupt(); // Only discard idle guidance; a driving leg returned earlier.
+        if (selected == WOODLAND) return false;
+        if (timberInReach(plank)) {
+            rememberTimberSite(triedSupplyCuts, plank.getBlockPos());
+            beginTimberChop(plank, false);
+        } else {
+            overland.guide(plank.getBlockPos(), tick);
+            stepOverland();
+        }
+        return true;
     }
 
     private boolean seekSurfaceSupply() {
@@ -3759,6 +4301,11 @@ final class AgentProgress {
         if (overland.guiding(tick)) return false;
         var landmark = body.find(SUPPLY_WOOD, 16,
             hit -> !timberInReach(hit) && newSupplyLandmark(hit.getBlockPos())).orElse(null);
+        if (landmark != null && expedition != null && !woodOffered) {
+            woodOffered = true;
+            woodOffer = new AgentExpedition.Offer("timber_source", WOODLAND, SALVAGE);
+            woodOfferedUntil = tick + 200;
+        }
         if (landmark == null && !has(table.item, 1))
             landmark = body.find(TABLE_BLOCK, 16, hit -> newSupplyLandmark(hit.getBlockPos())).orElse(null);
         if (landmark == null) return false;
@@ -5570,6 +6117,10 @@ final class AgentProgress {
     }
 
     private void excavate(int depth, Vec3d toward) {
+        excavate(depth, toward, false);
+    }
+
+    private void excavate(int depth, Vec3d toward, boolean preferExcavation) {
         if (nextFoot == null && c.player.isOnGround() && fieldBench.pack()) return;
         BlockPos standing = c.player.getBlockPos();
         if (resumeIndex >= 0) {
@@ -5612,7 +6163,7 @@ final class AgentProgress {
         }
         BlockPos current = trail.getLast();
         if (returnableDescent) {
-            workReturnableMine(current, depth);
+            workReturnableMine(current, depth, preferExcavation);
             return;
         }
         if (current.getY() > depth) status = "descending a mined staircase";
@@ -5702,8 +6253,12 @@ final class AgentProgress {
     }
 
     private void workReturnableMine(BlockPos current, int depth) {
+        workReturnableMine(current, depth, false);
+    }
+
+    private void workReturnableMine(BlockPos current, int depth, boolean preferExcavation) {
         Direction preferred = digDirection == null ? c.player.getHorizontalFacing() : digDirection;
-        AgentReturnableMine.Outcome outcome = returnableMine.step(this, current, depth, preferred);
+        AgentReturnableMine.Outcome outcome = returnableMine.step(this, current, depth, preferred, preferExcavation);
         if (!returnableMine.surveyingCave()) status = returnableMine.status();
         if (outcome == AgentReturnableMine.Outcome.SUPPLIES) seekExpeditionSupplies("returnable mine supplies");
         else if (outcome == AgentReturnableMine.Outcome.EXHAUSTED

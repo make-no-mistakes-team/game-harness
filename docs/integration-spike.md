@@ -7,9 +7,7 @@ client plays toward a resource goal or a Nether portal in a new Normal Survival
 world. It uses the installed Minecraft Java 1.21.4 client and the project's
 existing server download and EULA consent. Sign in with the official Launcher
 before starting. On Linux it also needs Xvfb, xauth, FFmpeg with x11grab and
-libx264, Bun, and JDK 21. Terra uses `scrot` 1.10 or newer from `/usr/bin` or
-`/bin` for faster request-time screenshots when available; otherwise it uses
-FFmpeg. The run recorder still requires FFmpeg.
+libx264, Bun, and JDK 21. FFmpeg records the local display.
 
 ```sh
 # Select JDK 21 in JAVA_HOME, then run from the checkout root.
@@ -29,21 +27,43 @@ goal** starts the setup for another fresh world. The desktop will not take
 over an ordinary agent run already active in a terminal. **Deterministic
 (no model)** is the default and does not require a model login.
 
-To use Terra in a new ordinary world, choose **Terra (gpt-6.1-terra)** under
-**Agent strategy** before starting. The connected OpenAI account must offer
-that exact model. Requests count toward account usage and may send live
-game frames to OpenAI. If Terra cannot start, the app reports the failure rather
-than switching models or starting a deterministic run. When a run closes,
-the app reports a confirmed Terra action only if Minecraft supplied a
-completion receipt. This is separate from verifying the vanilla goal.
+To use a strategy advisor, choose **Terra (gpt-6.1-terra)** under
+**Agent strategy**. The same local player controls movement, tools, inventory,
+mining, and threat response from the start. It keeps pursuing the goal while
+Terra thinks, declines to choose, runs out of requests, or cannot connect.
+With a connected account, Terra can see the goal, carried items, health,
+hunger, current activity, and the strategies the player can use. Ordinary
+advice uses text, not screenshots. Requests count toward account usage.
 
-From the terminal, put the strategy options before the goal:
+From the terminal, select the advisor before the goal:
 
 ```sh
-bun run play:agent --strategy terra --macro-requests 8 --task 'Choose your next subgoal from what you can see.' diamond 360
+bun run play:agent --strategy terra --macro-requests 8 diamond 1800
 ```
 
-When you select Terra, one of those requests may run during world loading.
+Advice changes a method at a safe decision point. It cannot authorize a
+click, spend an item, or make the player stop. A native acknowledgment
+means the player used the suggested method, not that it found the resource.
+Vanilla inventory or dimension evidence verifies the goal separately.
+Use `--continue-from RUN_BASENAME` after the time limit to continue a
+saved campaign. Ordinary advisory play does not create skill-trial worlds.
+
+A useful pause is still play. For example, the player can watch the
+furnace finish one raw iron. Count the original load, not the input
+remaining: the last ore of a larger batch is still part of that batch.
+A threat takes precedence even when only one item is cooking.
+
+### Explicit work-order experiments
+
+The experimental controller below gives Terra authority over individual
+work orders. It is not the ordinary player described above. Select it
+explicitly for a constrained task:
+
+```sh
+bun run play:agent --strategy terra --control constrained --macro-requests 8 --task 'Choose your next subgoal from what you can see.' diamond 360
+```
+
+In that experiment, one of those requests may run during world loading.
 It receives the task and a description of available actions, but no game
 frame or inventory. Terra can suggest alternatives: craft from surplus wood
 if the player has it, or gather wood from a visible tree. An exact log

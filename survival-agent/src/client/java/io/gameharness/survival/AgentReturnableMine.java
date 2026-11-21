@@ -278,7 +278,20 @@ final class AgentReturnableMine {
     private void lowerChoice(AgentProgress host, Direction candidate, int now) {
         if (cut > 0 && offerCave(host, workCell.down(cut), candidate, now)) return;
         aim = null;
-        if (--cut < 0) rejectChoice(candidate, now, Face.OPEN);
+        if (--cut >= 0) return;
+        // A clear column needs no excavation. Only a visible supporting top
+        // admits the ordinary clearance proof; air alone proves no landing.
+        BlockPos landing = nextTread(candidate);
+        Vec3d floor = offset(Vec3d.ofBottomCenter(landing), candidate, 0.34).add(0, -0.035, 0);
+        if (body.dryRouteFloor(floor, landing.down()) == null || !body.dryRouteSweep(from, landing)) {
+            rejectChoice(candidate, now, Face.OPEN);
+            return;
+        }
+        bearing = candidate;
+        to = landing;
+        treadEvidence = 0;
+        trimmed = false;
+        begin(Phase.FORWARD, now);
     }
 
     private boolean offerCave(AgentProgress host, BlockPos planned, Direction direction, int now) {

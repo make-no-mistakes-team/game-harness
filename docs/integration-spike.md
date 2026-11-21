@@ -260,6 +260,12 @@ lower block, it can continue in the same direction.
 The report distinguishes placement, grounded arrival, and the lowest
 footing reached. Only a diamond in inventory counts as a pickup.
 
+In local mode without Terra, the player can use an already open mine
+passage without breaking another block. It checks an adjacent tread
+only when it sees the dry supporting face. It verifies body clearance
+before stepping and checks the return from the landing. An open column
+with no visible floor does not qualify.
+
 The three-second planning deadline is a diagnostic target, not a
 guarantee about the footage. If no safe, authorized action is available,
 the player reports the obstruction. The idle deadline never chooses

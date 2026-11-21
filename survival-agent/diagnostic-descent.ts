@@ -8,7 +8,7 @@ import type { SurvivalAgentGoal } from "../src/shared/survival-agent-ui.ts";
 
 export const descentVariants = ["water", "boat", "cave"] as const;
 export type DescentVariant = (typeof descentVariants)[number];
-export const terrainVariants = ["birch", "ceiling", "wade-terra"] as const;
+export const terrainVariants = ["birch", "ceiling", "wade-terra", "brake-terra"] as const;
 export type TerrainVariant = (typeof terrainVariants)[number];
 type FixtureVariant = DescentVariant | TerrainVariant;
 type Cell = readonly [number, number, number];
@@ -87,6 +87,16 @@ export const terrainFixtures = {
       inletX: 4, channelZ: 1, bedY: 63, centralWaterLevel: 4,
       ore: [0, 64, 6],
       route: "Level stone bed between two dry banks; no dry route through the side walls.",
+    },
+  },
+  "brake-terra": {
+    goal: "diamond",
+    start: [0.5, 64, 0.60],
+    pitch: 25,
+    kit: [["iron_pickaxe", 1]],
+    terrain: {
+      gap: { x: [-12, 12], z: [4, 9], bottomY: 52 },
+      ore: [0, 64, 10],
     },
   },
 } as const satisfies Record<TerrainVariant, Fixture>;
@@ -251,6 +261,22 @@ async function wadeTerrain(console: (steps: Command[], allowMismatch?: boolean) 
 }
 
 function terrain(variant: Exclude<TerrainVariant, "wade-terra">): Command[] {
+  if (variant === "brake-terra") {
+    const { start: [, y], terrain: { gap: { x: [left, right], z: [lip, last], bottomY }, ore } } =
+      terrainFixtures[variant];
+    return [
+      fill([left, y - 1, -4], [right, y - 1, 13], "stone"),
+      fill([left, bottomY, lip], [right, y - 1, last], "air"),
+      set(ore, "diamond_ore"),
+      inspect([0, y - 1, lip - 1], "stone"),
+      inspect([0, y - 1, lip], "air"),
+      inspect([0, bottomY, lip], "air"),
+      inspect([0, bottomY - 1, lip], "stone"),
+      inspect([0, y - 1, last], "air"),
+      inspect([0, y - 1, last + 1], "stone"),
+      inspect(ore, "diamond_ore"),
+    ];
+  }
   if (variant === "birch") {
     const { upperStem: high, alternateStem: alternate } = terrainFixtures.birch.terrain;
     return [

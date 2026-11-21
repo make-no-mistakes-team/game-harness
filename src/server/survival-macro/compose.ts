@@ -11,10 +11,11 @@ import {
   SurvivalMacroController, type DisplayCaptureFailure, type SurvivalMacroConfig, type UnavailableFrame,
 } from "./controller.ts";
 import { createNativeGapReview } from "./gap-review.ts";
+import { preparedStockReady, samePreparedStockView } from "./prepared-stock.ts";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_LOOKAHEAD_MAX_CRACK, MACRO_MAX_PLANNING_IDLE_MS, MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
   liveCorrectionEvidence, readMacroObservation, sameLiveCorrectionScope, sameTravelTarget,
-  type MacroBasis, type MacroInference, type MacroObservation, type MacroProposal, type MacroStrategist,
+  type MacroBasis, type MacroInference, type MacroObservation,
 } from "./protocol.ts";
 import { MACRO_AUTOMATIC_SKILL_VERBS, SurvivalMacroSkills } from "./skills.ts";
 import { frameDimensions, openTerraStrategist, type TerraStrategist } from "./terra.ts";
@@ -28,12 +29,6 @@ const REQUEST_TIMEOUT_MS = 35_000;
 const LOW_RISK_VERBS = Object.freeze(MACRO_TRIAL_VERBS.filter(verb =>
   MACRO_AUTOMATIC_SKILL_VERBS.some(allowed => allowed === verb)));
 
-function shallowStockView(view: MacroObservation | undefined) {
-  return view?.travelHint?.footing === "shallow_water_with_bank" && view.travelHint.kind === "resource" &&
-    view.travelHint.subject === "block:minecraft:diamond_ore" && !view.workOrder && !view.pendingWork &&
-    (view.inventory["minecraft:diamond"] ?? 0) === 0;
-}
-
 export interface TrustedSurvivalDisplay {
   readonly display: string;
   readonly authority: string;
@@ -42,15 +37,18 @@ export interface TrustedSurvivalDisplay {
 
 export function declareTerraStrategy(
   options: { maxRequests: number; task?: string; startup?: "allow" | "off" }, wallMs: number,
-  lane?: { preparedDiagnostic: true; shallowWork?: true },
+  lane?: { preparedDiagnostic: true; shallowWork?: true; brakeWork?: never } |
+    { preparedDiagnostic: true; brakeWork: true; shallowWork?: never },
 ) {
   const preparedDiagnostic = lane?.preparedDiagnostic === true;
-  if (lane?.shallowWork && (!options.task || options.maxRequests !== 1))
-    throw new Error("Prepared shallow-water work requires a goal and one live Terra request.");
+  const stockFooting = lane?.brakeWork ? "dry" : lane?.shallowWork ? "shallow_water_with_bank" : undefined;
+  if (stockFooting && (!options.task || options.maxRequests !== 1))
+    throw new Error("Prepared stock work requires a goal and one live Terra request.");
   return {
     strategy: "terra" as const, model: TERRA_MODEL_ID, task: options.task ?? null, preparedDiagnostic,
     startup: preparedDiagnostic ? "off" as const : options.startup ?? "allow",
-    workMode: preparedDiagnostic && !lane?.shallowWork ? null : options.task ? "constrained" : "preset",
+    workMode: preparedDiagnostic && !stockFooting ? null : options.task ? "constrained" : "preset",
+    ...(stockFooting === "dry" ? { brakeWork: true as const } : {}),
     limits: { maxRequests: options.maxRequests, maxRuntimeMs: wallMs, requestTimeoutMs: REQUEST_TIMEOUT_MS,
       planningIdleMs: MACRO_MAX_PLANNING_IDLE_MS },
     frame: { source: "verified-game-display", format: "image/jpeg", maxBytes: FRAME_BYTES, timeoutMs: FRAME_TIMEOUT_MS },
@@ -270,7 +268,8 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     throw new Error("This Terra attempt did not admit goal-only startup inference.");
   const run = path.basename(dir);
   const macroDir = path.join(dir, "macro");
-  const shallowWork = declaration.preparedDiagnostic && declaration.workMode === "constrained";
+  const stockFooting = declaration.preparedDiagnostic && declaration.workMode === "constrained"
+    ? declaration.brakeWork ? "dry" : "shallow_water_with_bank" : undefined;
   let controller: SurvivalMacroController | undefined;
   let skills: SurvivalMacroSkills | undefined;
   let terra: TerraStrategist | undefined;
@@ -309,7 +308,7 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
   async function assertDispatch(basis: MacroBasis, lookahead?: MacroObservation, work?: MacroObservation, correction?: MacroObservation) {
     const fresh = await readMacroObservation(macroDir, !!correction);
     assertDisplay();
-    if (shallowWork && (!shallowStockView(work) || !shallowStockView(fresh ?? undefined))) return false;
+    if (stockFooting && (!work || !fresh || !samePreparedStockView(work, fresh, stockFooting))) return false;
     const burn = work?.workOrder?.progress?.smeltBurn;
     const activeBurn = fresh?.workOrder?.progress?.smeltBurn;
     const ticket = work?.pendingWork;
@@ -356,6 +355,7 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
       terra = await openTerraStrategist({
         strategy: "terra", authDirectory: options.authDirectory, runId: run, signal,
         requestTimeoutMs: declaration.limits.requestTimeoutMs, assertDispatch,
+        ...(stockFooting ? { preparedStock: stockFooting } : {}),
         ...(firstPlanGoal !== undefined ? {
           assertFirstPlanDispatch,
           onFirstPlanDispatch: ({ osNs }) => rememberDispatch(osNs, PRE_SPAWN_GOAL_ONLY),
@@ -405,24 +405,10 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     }
     const nativeReview = declaration.preparedDiagnostic ? undefined :
       await createNativeGapReview({ runDir: dir, projectRoot, actorJarSha256, capabilityVersion: MACRO_CAPABILITIES_VERSION });
-    const infer = terra.infer;
-    // The diagnostic can narrow this one real reply, never create or repair an order.
-    const strategist: MacroStrategist = shallowWork ? async (request, signal) => {
-      const result = await infer(request, signal);
-      if (result.outcome !== "completed") return result;
-      const action = (result.proposal as MacroProposal | null)?.action;
-      if (action?.kind === "work" && !action.openingViewId && !action.afterWorkId && !action.duringWaitFor && !action.duringWait) {
-        const { target, allowedEffects, maxBreaks, maxCrafts, maxPlacements } = action.policy;
-        if (target.kind === "stock" && target.item === "minecraft:diamond" && target.count === 1 &&
-            allowedEffects.length === 1 && allowedEffects[0] === "break:minecraft:diamond_ore" &&
-            maxBreaks === 1 && maxCrafts === 0 && maxPlacements === 0) return result;
-      }
-      return { ...result, proposal: null, outcome: "invalid" };
-    } : infer;
     controller = new SurvivalMacroController({
-      runDir: dir, run, strategy: "terra", strategist, skills, trial: trials,
+      runDir: dir, run, strategy: "terra", strategist: terra.infer, skills, trial: trials,
       nativeReview, durableWork: declaration.workMode !== null,
-      ...(shallowWork ? { initialWorkView: shallowStockView } : {}),
+      ...(stockFooting ? { preparedStockReady: preparedStockReady(stockFooting) } : {}),
       objective: declaration.task ?? undefined, limits: declaration.limits,
       ...(firstPlanGoal !== undefined ? {
         firstPlan: { request: { goal: firstPlanGoal, objective: declaration.task?.trim() }, infer: terra.firstPlan },
@@ -461,5 +447,6 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
   }
 
   const providerTimeline = () => admission === "admitted" && !incompleteProviderSpans ? providerSpans : undefined;
-  return { start, stop, outcome, assertDisplay, providerTimeline };
+  return { start, stop, outcome, assertDisplay, providerTimeline,
+    stockNotExercised: () => controller?.stockNotExercised() };
 }

@@ -25,6 +25,31 @@ function liveWorkSchema(duringWaitFor?: string) {
   return wire.parameters;
 }
 
+test("Prepared stock exposes an exact single-order tool without the ordinary prospecting instruction", () => {
+  const observation = { v: 1, run: "run", life: 1, epoch: 3, tick: 117, goal: "diamond", stance: 1,
+    health: 20, food: 20, inventory: { "minecraft:iron_pickaxe": 1 }, opportunities: [], recent: [], quiescent: false,
+    safety: { clear: true, revision: 1 }, travelHint: { kind: "resource", subject: "block:minecraft:diamond_ore",
+      target: "ore-a", footing: "dry", bearingDegrees: 0, windowBlocks: 1.6 },
+  } as const;
+  const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
+  const context = terraPlanContext({ observation, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+    lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200, maxPlanTtlTicks: 7_200 },
+    observation, undefined, "dry");
+  const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses")!;
+  const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
+  const [wire] = convertOpenAICodexResponsesTools(context!.tools!, model);
+  if (wire?.type !== "function") throw new Error("Expected a prepared stock proposal tool.");
+  expect(wire.strict).toBe(true);
+  const schema = JSON.stringify(wire.parameters);
+  expect(context!.systemPrompt?.join("\n")).toContain("short checked approach");
+  expect(schema).toContain("break:minecraft:diamond_ore");
+  expect(schema).toContain('"enum":[1]');
+  expect(schema).toContain("minecraft:iron_pickaxe");
+  expect(schema).toContain("abstain");
+  expect(schema).not.toContain("work-program");
+  expect(schema).not.toContain("prospect");
+});
+
 test("A prospect opening is a bounded dry wall clue, never a material opportunity", () => {
   const observation = {
     v: 1, run: "run", life: 1, epoch: 1, tick: 20, goal: "diamond", health: 20, food: 20, stance: 1,

@@ -7,6 +7,7 @@ import {
   bindFirstPlan, firstPlanScopeMatches, parseFirstPlanAdvice, PRE_SPAWN_GOAL_ONLY,
   type FirstPlanInference, type FirstPlanRequest, type FirstPlanStrategist,
 } from "./bootstrap.ts";
+import { filterPreparedStockProposal } from "./prepared-stock.ts";
 import {
   MACRO_CAPABILITIES_VERSION, MACRO_COLLECT_PENDING, MACRO_DEFER_PENDING, MACRO_DIAMOND_PROSPECT, MACRO_IRON_SMELT, MACRO_WATER_CLUE, MACRO_WATER_FILL,
   MACRO_SMELT_OVERLAP_MIN_COOK_TICKS,
@@ -107,8 +108,8 @@ export interface SurvivalMacroConfig {
   readonly objective?: string;
   /** Outcome-level jobs require explicitly admitted Terra. */
   readonly durableWork?: boolean;
-  /** A prepared run can wait for its required rendered evidence before its first paid decision. */
-  readonly initialWorkView?: (observation: MacroObservation) => boolean;
+  /** One prepared stock request, after matching rendered evidence; no other effects. */
+  readonly preparedStockReady?: (observation: MacroObservation) => boolean;
   readonly strategist?: MacroStrategist;
   readonly firstPlan?: { readonly request: FirstPlanRequest; readonly infer: FirstPlanStrategist };
   readonly skills?: SurvivalMacroSkills;
@@ -194,6 +195,12 @@ interface View {
   readonly changedAt: number;
   readonly evidence: string;
   readonly query: string;
+}
+
+interface PreparedStockDecision {
+  readonly requestId: string;
+  readonly disposition: string;
+  readonly reason: string;
 }
 
 interface ReplyCorrection {
@@ -775,6 +782,7 @@ export class SurvivalMacroController {
   private lastProviderOutcome: MacroInference["outcome"] | null = null;
   private lastProviderLatencyMs: number | null = null;
   private lastDisposition: string | null = null;
+  private preparedStockDecision?: PreparedStockDecision;
   private budget: MacroStatus["budget"] = null;
   private readonly models = new Set<string>();
   private requests = 0;
@@ -855,6 +863,9 @@ export class SurvivalMacroController {
       this.objective = objective;
     }
     if (config.durableWork && config.strategy === "terra") this.workMode = this.objective ? "constrained" : "preset";
+    if (config.preparedStockReady && (this.workMode !== "constrained" || this.limits.maxRequests !== 1 ||
+        config.firstPlan || config.skills || config.trial || config.nativeReview))
+      throw new Error("Prepared stock work requires one constrained live request and no secondary authority.");
     this.marker = { v: 1, run: config.run, ...(this.workMode ? { workMode: this.workMode } : {}) };
   }
 
@@ -936,6 +947,16 @@ export class SurvivalMacroController {
       budget: this.budget, lastReceipt: this.lastReceipt, lastProviderOutcome: this.lastProviderOutcome, lastDisposition: this.lastDisposition,
       lastProviderLatencyMs: this.lastProviderLatencyMs,
     };
+  }
+
+  stockNotExercised(): PreparedStockDecision | undefined {
+    if (!this.config.preparedStockReady || this.polling || this.closing || this.faulted || this.unreportedDispatches ||
+        !this.preparedStockDecision || this.busy || this.queuedWork || this.job || this.lastAcceptedJob) return;
+    const job = this.newestJob;
+    if (job) return { requestId: this.preparedStockDecision.requestId, disposition: "native_not_admitted",
+      reason: job.terminal ? "The native actor ended the stock order before accepting it." :
+        "The host withdrew the stock order without an eligible native acceptance." };
+    return this.preparedStockDecision;
   }
 
   isNeutralHandoff(observation: MacroObservation): boolean {
@@ -1174,7 +1195,7 @@ export class SurvivalMacroController {
     // terminal tick. Do not spend a decision on a pre-effect view plus its outcome.
     if (!this.job && current.tick <= this.handoffAfterTick && !(this.workMode && current.pendingWork?.parked)) return;
     if (this.workMode) {
-      if (this.requests === 0 && this.config.initialWorkView && !this.config.initialWorkView(current)) return;
+      if (this.requests === 0 && this.config.preparedStockReady && !this.config.preparedStockReady(current)) return;
       await this.scheduleWork(this.view!);
       return;
     }
@@ -2712,12 +2733,22 @@ export class SurvivalMacroController {
     const expired = !!proposal && ttlValid && !!current && current.tick >= proposal.expiresTick;
     const preflight = result.ok ? undefined : result.preflight;
     const rotation = !!context.correction && (preflight === "rotation" || (inference?.observationRotating && inference.dispatched === false));
-    const disposition = rotation ? "deferred_rotation" :
+    const decision = rotation ? "deferred_rotation" :
       stale || expired || (!!inference && !basisMatches) || inference?.outcome === "stale" || preflight === "stale" ? "stale" :
       late ? "timed_out" : preflight === "invalid" ? "invalid" : !inference ? "provider_error" : inference.outcome !== "completed" ? inference.outcome :
       !proposal || !ttlValid || !model ? "invalid" : "proposed";
+    const filtered = this.config.preparedStockReady && decision === "proposed" && proposal
+      ? filterPreparedStockProposal(proposal.action, original) : undefined;
+    const disposition = filtered?.disposition ?? decision;
     const reason = rotation ? "A rotating observation deferred the correction before provider dispatch." :
-      rejection ? macroReplyRejectionDetail(rejection) : result.ok ? null : result.detail;
+      rejection ? macroReplyRejectionDetail(rejection) : filtered?.reason ?? (result.ok ? null : result.detail);
+    if (this.config.preparedStockReady) this.preparedStockDecision = {
+      requestId: context.requestId, disposition, reason: reason ?? (
+        decision === "proposed" ? "No stock order could be published from the current physical witness." :
+        decision === "stale" ? "The live stock witness or request basis changed before a job could be authorized." :
+        decision === "invalid" ? "Terra returned no valid stock decision." :
+        `The single request ended as ${decision}; no stock work was authorized.`),
+    };
     const recovery = this.intentRecovery;
     if (recovery?.kind === "restored-survey") {
       // Only the next valid, idle gap can confirm the interruption. The
@@ -2740,7 +2771,8 @@ export class SurvivalMacroController {
         this.correctedContexts.add(correction.key);
         if (this.workQuery) this.workQuery.tick = original.tick;
       }
-    } else if (disposition === "invalid" && reason && rejection && inference?.dispatched === true && current) {
+    } else if (!this.config.preparedStockReady && disposition === "invalid" && reason && rejection &&
+        inference?.dispatched === true && current) {
       this.offerReplyCorrection(context, current,
         { kind: "invalid_reply", detail: `The previous tool reply was invalid. No effect was authorized. ${reason}` });
     }
@@ -2749,7 +2781,8 @@ export class SurvivalMacroController {
     this.lastDisposition = disposition;
     // Keep candidate contents only in private review storage, not the run trace.
     const hadReviewPatch = !rejection && disposition !== "invalid" && proposal?.action.kind === "gap" && !!proposal.action.reviewPatch;
-    const recordedProposal: MacroProposal | null = rejection || disposition === "invalid" ? null : proposal?.action.kind === "gap" && hadReviewPatch
+    const recordedProposal: MacroProposal | null = rejection || disposition === "invalid" ||
+      filtered?.disposition === "prepared_stock_refused" ? null : proposal?.action.kind === "gap" && hadReviewPatch
       ? { ...proposal, action: { kind: "gap", capability: proposal.action.capability, suggestion: proposal.action.suggestion } }
       : proposal;
     await this.append(this.proposals, {
@@ -2759,6 +2792,7 @@ export class SurvivalMacroController {
       latencyMs: Math.round(result.settledAt - startedAt), providerLatencyMs: positiveFinite(inference?.latencyMs),
       frameSha256: inference?.frameSha256 && /^[a-f0-9]{64}$/.test(inference.frameSha256) ? inference.frameSha256 : null,
       disposition, reason, proposal: recordedProposal,
+      ...(filtered ? { filteredAction: proposal?.action.kind } : {}),
       ...(correction ? { correctionOf: correction.requestId } : {}),
       ...(context.lookahead ? { conditionalOn: context.lookahead.origin.intent.id } : {}),
       ...(context.workDemand ? {
@@ -2770,6 +2804,8 @@ export class SurvivalMacroController {
       } : {}),
       ...(hadReviewPatch ? { reviewPatchProposed: true } : {}),
     });
+    // No prepared read, gap, out-of-scope or stale reply acquires native authority.
+    if (this.config.preparedStockReady && disposition !== "proposed") return;
     const lookahead = context.lookahead;
     if (lookahead) {
       const action = proposal?.action;

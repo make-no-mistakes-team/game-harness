@@ -26,7 +26,7 @@ import { preparePendingFurnace, readPendingFurnaceParent, sealPendingFurnace } f
 import { finalPlanningEvidence } from "./planning-evidence.ts";
 import { readStrategy, type TerraOptions } from "./strategy-options.ts";
 import { monitorDescent, verifyDescent } from "./verify-descent.ts";
-import { verifyTerrain } from "./verify-terrain.ts";
+import { monitorBrakeTerrain, verifyTerrain } from "./verify-terrain.ts";
 import { readSavedPlayerStats, retainsCompletedProgram, savedDeathDelta, verifySurvival, type ProgramWin } from "./verify.ts";
 import { MACRO_TRIAL_GOAL, MACRO_TRIAL_SECONDS, macroTrialActor, parseMacroTrialLaunch,
   reportMacroTrial, watchMacroTrialOwner, type MacroTrialLaunch } from "./macro-trial.ts";
@@ -107,7 +107,7 @@ type Progress = {
 type PlayingProgress = Extract<Progress, { alive: true }>;
 const STATUSES = ["won", "died", "respawn_timeout", "startup_limit", "wall_limit", "heartbeat_lost",
   "stalled", "goal_stalled", "storage_limit", "recording_limit", "interrupted",
-  "server_exit", "client_exit", "recorder_exit", "unverified", "failed", "trial_closed", "urgent_closed"] as const;
+  "server_exit", "client_exit", "recorder_exit", "unverified", "failed", "trial_closed", "urgent_closed", "brake_closed"] as const;
 type Status = (typeof STATUSES)[number];
 
 class Stop extends Error {
@@ -132,8 +132,8 @@ SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SEC
 --replay-incident: replay an ordinary save in the diagnostic lane; never a fresh run.
 diagnose:pool: test casting a Nether portal in a separate, pre-provisioned diagnostic world.
 --diagnostic-descent: test a dry fall, a chosen boat descent, or connected cave shelves.
---diagnostic-terrain: test timber reach, headroom, or a shallow-water approach.
-  wade-terra uses one live Terra request and a prepared diamond goal, without Survival benchmark credit.
+--diagnostic-terrain: test timber reach, headroom, a shallow crossing, or a stop before a drop.
+  wade-terra and brake-terra each use one live Terra request, without Survival benchmark credit.
 --diagnostic-urgent-creeper: test real Terra interruption in a prepared world, without Survival benchmark credit.
 --diagnostic-urgent-craft: test a creeper interrupting an actual crafting drag, without model or Survival benchmark credit.
 Diagnostics share one lane and cannot be continued as survival runs.
@@ -801,10 +801,14 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   const urgentCraft = diagnostic === "urgent-craft";
   const urgentDiagnostic = diagnostic === "urgent-creeper" || urgentCraft;
   const wadeDiagnostic = diagnostic === "wade-terra";
-  const terraDeclaration = wadeDiagnostic ? declareTerraStrategy({
+  const brakeDiagnostic = diagnostic === "brake-terra";
+  const stockDiagnostic = wadeDiagnostic || brakeDiagnostic;
+  const terraDeclaration = stockDiagnostic ? declareTerraStrategy({
     maxRequests: 1,
-    task: "Obtain one diamond with one finite stock work action on the visible diamond ore. Allow exactly one diamond-ore break and no crafting, placement, or prospecting.",
-  }, seconds * 1_000, { preparedDiagnostic: true, shallowWork: true }) :
+    task: brakeDiagnostic
+      ? "Test ordinary stock approach and braking: approach the visible diamond ore only while the native player can verify safe footing. Stop on supported ground before the gap; do not enter or cross it. Approaching and stopping safely, without collecting a diamond, is the test. Propose one ordinary stock order for one diamond so the native player can attempt the approach. Reserve the iron pickaxe, allow only one diamond-ore break if reachable from safe footing, and permit no other effect or item spend. If no safe near-term approach is supported, abstain."
+      : "Obtain one diamond from the visible diamond ore with one ordinary stock order. Cross only where the native player verifies shallow water and a dry bank; stop if support is no longer safe. Reserve the iron pickaxe, permit only one diamond-ore break, and permit no other effect or item spend.",
+  }, seconds * 1_000, brakeDiagnostic ? { preparedDiagnostic: true, brakeWork: true } : { preparedDiagnostic: true, shallowWork: true }) :
     macroOptions && (!diagnostic || urgentDiagnostic)
     ? declareTerraStrategy(macroOptions, seconds * 1_000, urgentDiagnostic ? { preparedDiagnostic: true } : undefined)
     : undefined;
@@ -860,6 +864,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       { mode: 0o600 },
     );
     const urgentProbe = urgentDiagnostic ? createUrgentThreatProbe(dir, signal, record, urgentCraft ? "craft" : "terra") : undefined;
+    const brakeMonitor = brakeDiagnostic ? monitorBrakeTerrain(dir) : undefined;
     const progressFile = path.join(dir, "progress.json");
     const ledger = new LifeLedger(!provisioned);
     const readLifeReceipts = lifeReceiptReader(path.join(dir, LIFE_RECEIPTS));
@@ -887,6 +892,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     let declared = false;
     let trialJarSha256: string | undefined;
     let macroAttempt: ReturnType<typeof composeTerraSurvival> | undefined;
+    let stockNotExercised: ReturnType<NonNullable<typeof macroAttempt>["stockNotExercised"]>;
     let stage = "declaration";
     let server: Owned | undefined;
     let client: Owned | undefined;
@@ -900,6 +906,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     let claimProgress: PlayingProgress | null = null;
     let programWin: ProgramWin | null = null;
     let wadeWork: NonNullable<MacroStatus["lastWorkOrder"]> | undefined;
+    let brakeSettlement: Awaited<ReturnType<NonNullable<typeof brakeMonitor>>>;
     let goalClaim: { life: number; tick: number; wall_ms: number | null; deaths: number } | null = null;
     const statsDirectory = path.join(dir, "server/world/stats");
     let beforeStats: Awaited<ReturnType<typeof readSavedPlayerStats>> = null;
@@ -946,7 +953,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         ...(!macroTrial ? { pauseDiagnostics: PAUSE_DIAGNOSTICS } : {}),
         ...(benchmark ? { benchmark, strategy: terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         ...(macroTrial ? { macroTrial: { ordinaryRun: path.basename(macroTrial.ordinaryDir), maximumIntents: 1 } } : {}),
-        ...(wadeDiagnostic ? { strategy: terraDeclaration } : {}),
+        ...(stockDiagnostic ? { strategy: terraDeclaration } : {}),
         ...(urgentProbe ? { urgentThreat: urgentCraft ? urgentCraftDeclaration : urgentThreatDeclaration,
           strategy: terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         inactivity: { unchangedMs: STALL_MS, noGoalMilestoneMs: GOAL_STALL_MS,
@@ -1217,6 +1224,20 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
             if (progress.won) throw new Stop("unverified", "The ordinary goal ended before proving the descent.");
           } else if (urgentProbe && progress.won) {
             throw new Stop("unverified", "The actor stopped at the Survival goal before the diagnostic closed.");
+          } else if (brakeMonitor) {
+            if (progress.won || retainsGoal(goal, progress))
+              throw new Stop("unverified", "The resource was acquired; the run did not prove a stop before the drop.");
+            const work = macroAttempt?.outcome().status?.lastWorkOrder;
+            if (work?.accepted && progress.tick >= work.accepted.tick) {
+              brakeSettlement = await brakeMonitor(progress);
+              signal.throwIfAborted();
+              if (brakeSettlement) {
+                await record("brake_settled", { workOrderId: work.id, vetoTick: brakeSettlement.vetoTick,
+                  firstNeutralTick: brakeSettlement.first.tick, lastNeutralTick: brakeSettlement.last.tick });
+                signal.throwIfAborted();
+                throw new Stop("brake_closed", "Observed a candidate stop before the gap; closing the prepared diagnostic.");
+              }
+            }
           } else if (wadeDiagnostic) {
             const status = macroAttempt?.outcome().status;
             const work = status?.lastWorkOrder;
@@ -1248,6 +1269,14 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
             goalClaim = { life: ledger.life!, tick: progress.tick, wall_ms: progress.wall_ms ?? null, deaths: ledger.deaths };
             throw new Stop("won", diagnostic === "pool" ? "The agent cast and lit a portal and entered the Nether."
               : goal === "nether_portal" ? "The agent built a portal and entered the Nether." : `The agent obtained ${goal}.`);
+          }
+        }
+        if (stockDiagnostic) {
+          stockNotExercised = macroAttempt?.stockNotExercised();
+          if (stockNotExercised) {
+            await record("stock_not_exercised", { ...stockNotExercised });
+            signal.throwIfAborted();
+            throw new Stop("unverified", `Prepared stock work was not exercised: ${stockNotExercised.reason}`);
           }
         }
         if (typeof progress?.failure === "string") {
@@ -1358,7 +1387,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       catch (error) {
         const reason = error instanceof Error ? error.message : "Could not measure final run storage.";
         measuredBytes = null;
-        if (result.status === "won" || result.status === "trial_closed" || result.status === "urgent_closed")
+        if (result.status === "won" || result.status === "trial_closed" || result.status === "urgent_closed" ||
+            result.status === "brake_closed")
           result = new Stop("failed", reason);
         await record("final_storage_unreadable", { reason }).catch(() => {});
       }
@@ -1403,7 +1433,28 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       }
       let verification: Awaited<ReturnType<typeof verifySurvival> | ReturnType<typeof verifyDescent> |
         ReturnType<typeof verifyTerrain>> | null = null;
-      if (result.status === "won" && !serverSaved) {
+      const macroClosure = macroAttempt?.outcome();
+      if (brakeDiagnostic) {
+        if (result.status === "brake_closed") {
+          if (!serverSaved) result = new Stop("server_exit", "The vanilla server did not save the gap-stop diagnostic.");
+          else if (runnerStopRequestedNs === undefined || client?.exit?.code !== 0 || client.exit.signal !== null)
+            result = new Stop("client_exit", "The client did not acknowledge a clean gap-stop shutdown.");
+          else if (!drained || !lifeEvidenceReadable || recordedDeaths?.attempt !== 0 || !lastProgress?.alive ||
+              !ledger.currentPlaying(lastProgress) || macroClosure?.admission !== "admitted" ||
+              macroClosure.drain !== "closed" || macroClosure.authLost)
+            result = new Stop("unverified", "The live player and Terra lane were not verified through shutdown.");
+          else if (measuredBytes === null || measuredBytes > reserveBytes)
+            result = new Stop("storage_limit", "The gap-stop diagnostic exceeded its reservation.");
+          else if (recorder?.exit?.code !== 0 || !await stat(video).then(entry => entry.size > 0, () => false))
+            result = new Stop("recorder_exit", "The gap-stop diagnostic has no completed screen recording.");
+        }
+        verification = await verifyTerrain(dir, "brake-terra", lastProgress, undefined,
+          result.status === "brake_closed" && brakeSettlement
+            ? { settlement: brakeSettlement, status: macroClosure?.status ?? null } : undefined);
+        if (result.status === "brake_closed") {
+          result = new Stop(verification.verified ? "brake_closed" : "unverified", verification.reason);
+        }
+      } else if (result.status === "won" && !serverSaved) {
         result = new Stop("server_exit", "The vanilla server did not stop cleanly after the goal.");
       } else if (result.status === "won" && wadeDiagnostic &&
           (client?.exit?.code !== 0 || client.exit.signal !== null)) {
@@ -1420,7 +1471,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           result = new Stop("storage_limit", "Final artifacts exceeded the run reservation.");
       }
       const strategy = terraDeclaration
-        ? { ...(macroAttempt?.outcome() ?? { ...terraDeclaration, admission: "not_opened", drain: "not_started",
+        ? { ...(macroClosure ?? { ...terraDeclaration, admission: "not_opened", drain: "not_started",
           outcome: "no_completed_effect", status: null }), localFallbackTicks: lastProgress?.macro_fallback_ticks ?? null,
           planningWait: await finalPlanningEvidence(dir, lastPlanningSample) }
         : DETERMINISTIC_STRATEGY;
@@ -1455,7 +1506,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         ...(operatorStop ? { operatorStop: { serverSaved: saveEvidence } } : {}),
         ...(pauseEvidence ? { pauseEvidence } : {}),
         ...(benchmark ? { benchmark: { ...benchmark, confirmed: benchmarkConfirmed }, strategy } : {}),
-        ...(wadeDiagnostic ? { strategy } : {}),
+        ...(stockDiagnostic ? { strategy } : {}),
+        ...(stockNotExercised ? { stockNotExercised } : {}),
         ...(urgentThreat ? { urgentThreat, strategy } : {}),
         lifecycle: { ...life, receiptFile: LIFE_RECEIPTS, evidenceReadable: lifeEvidenceReadable,
           savedDeaths: recordedDeaths && { ...recordedDeaths, agreesWithObserved: recordedDeaths.attempt === ledger.deaths },
@@ -1485,7 +1537,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     }
     return receivedSignal === "SIGINT" ? 130 : receivedSignal === "SIGTERM" ? 143 :
       receivedSignal === "SIGHUP" ? 129 :
-      result.status === "won" || result.status === "trial_closed" || result.status === "urgent_closed" ? 0 : 1;
+      result.status === "won" || result.status === "trial_closed" || result.status === "urgent_closed" ||
+      result.status === "brake_closed" ? 0 : 1;
   } finally {
     try {
       if (canRelease) {

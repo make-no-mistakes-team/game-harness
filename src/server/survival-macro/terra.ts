@@ -11,6 +11,7 @@ import {
   type FirstPlanAdvice, type FirstPlanInference, type FirstPlanStrategist,
 } from "./bootstrap.ts";
 import { episodeMatchesBasis } from "./episode-memory.ts";
+import { PREPARED_STOCK, preparedStockView, type PreparedStockFooting } from "./prepared-stock.ts";
 import {
   MACRO_BREAK_EFFECTS, MACRO_CAPABILITIES_VERSION, MACRO_MAX_DIRECT_EFFECTS, MACRO_MAX_DIRECT_MS,
   MACRO_MAX_INTENT_TTL_TICKS, MACRO_MAX_PLAN_TTL_TICKS,
@@ -213,6 +214,34 @@ const lookaheadTool: Tool = {
   }),
 };
 
+function preparedStockTool(observation: MacroRequest["observation"]): Tool {
+  const readIds = observation.opportunities.filter(offer => offer.risk === "read").map(offer => offer.id);
+  const onlyString = (value: string) => ({ type: "string", enum: [value] });
+  const onlyInteger = (value: number) => ({ type: "integer", enum: [value] });
+  return {
+    name: TOOL_NAME, strict: true,
+    description: "Propose one stock order on the visible ore, or report why no live work should begin.",
+    parameters: strictObject({
+      subgoal: string, reason: string, successCondition: string, contingency: string, alternative: string, expiresTick: integer,
+      action: { anyOf: [
+        action("work", { policy: strictObject({
+          target: strictObject({ kind: onlyString("stock"), item: onlyString(PREPARED_STOCK.diamond), count: onlyInteger(1) }),
+          allowedEffects: { type: "array", items: onlyString(PREPARED_STOCK.effect), minItems: 1, maxItems: 1 },
+          costCaps: { type: "array", items: floor, maxItems: 0 },
+          reserves: { type: "array", items: strictObject({ item: onlyString(PREPARED_STOCK.tool), count: onlyInteger(1) }),
+            minItems: 1, maxItems: 1 },
+          maxBreaks: onlyInteger(1), maxCrafts: onlyInteger(0), maxPlacements: onlyInteger(0),
+        }) }),
+        ...(readIds.length ? [action("opportunity", { opportunityId: { type: "string", enum: readIds } })] : []),
+        action("gap", { capability: string }),
+        action("abstain"),
+      ] },
+    }),
+  };
+}
+
+const PREPARED_STOCK_PROMPT = `Use the supplied tool once. The live travelHint is evidence of a short checked approach toward the visible ore, not a route or proof that it is safe to reach or mine. When safe near-term progress is supported, use one ordinary stock work order; the native player rechecks support and clearance as it goes. Honor the user's stopping condition. Use the exact stock, effect and limits in the tool: costCaps is [], and reserves holds one iron pickaxe. The ore break is permitted only if ordinary native checks admit it from a safe stance; the work order does not permit excavation, bridging, jumping a gap, or any other effect. If no useful safe start is supported, abstain or state the observed gap. A read choice records your preference and does not issue input. Set expiresTick to an absolute tick after basis.tick, at most basis.tick + maxIntentTtlTicks, with enough time for a safe approach and rechecks.`;
+
 interface TerraProviderMoment {
   readonly monotonicMs: number;
   readonly wallMs: number;
@@ -231,6 +260,7 @@ export interface TerraOptions {
   readonly runId: string;
   readonly signal: AbortSignal;
   readonly requestTimeoutMs: number;
+  readonly preparedStock?: PreparedStockFooting;
   readonly assertDispatch?: (basis: MacroBasis, lookaheadBasis?: MacroRequest["observation"],
     workBasis?: MacroRequest["observation"], correctionBasis?: MacroRequest["observation"]) => boolean | void | Promise<boolean | void>;
   readonly onProviderDispatch?: (event: TerraProviderMoment & { readonly basis: MacroBasis }) => void;
@@ -300,10 +330,13 @@ function verifiedImage(frame: MacroFrame): { image: ImageContent; sha256: string
   };
 }
 
-export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image?: ImageContent): Context | undefined {
+export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image?: ImageContent,
+    preparedStock?: PreparedStockFooting): Context | undefined {
   const { observation, objective, feedback, lastReceipt, strategicEpisodes, trigger, capabilitiesVersion,
     skillGeneration, skillVerbs, selectedSkillHash, testedSkills, maxSkillEffects,
     maxIntentTtlTicks, maxPlanTtlTicks, frame, nativeReview, lookahead, work } = request;
+  if (preparedStock && (work?.mode !== "constrained" || work.demand !== "first" || work.current || lookahead ||
+      !preparedStockView(observation, preparedStock))) return;
   const receipt = lastReceipt?.run === basis.run && lastReceipt.life === basis.life && lastReceipt.tick <= basis.tick
     ? { id: lastReceipt.id, life: lastReceipt.life, tick: lastReceipt.tick,
       status: lastReceipt.status, detail: lastReceipt.detail } : null;
@@ -331,12 +364,13 @@ export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image
   });
   if (Buffer.byteLength(text) > MAX_PROMPT_BYTES) return;
   return {
-    systemPrompt: work && !lookahead ? [PROMPT, FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT] : [PROMPT],
+    systemPrompt: preparedStock ? [PREPARED_STOCK_PROMPT] :
+      work && !lookahead ? [PROMPT, FURNACE_PROMPT, DIAMOND_PROMPT, WATER_PROMPT] : [PROMPT],
     messages: [{
       role: "user", timestamp: Date.now(),
       content: image ? [{ type: "text", text }, image] : text,
     }],
-    tools: [lookahead ? lookaheadTool : work ? proposalTool(!!nativeReview, direct, work, observation) :
+    tools: [preparedStock ? preparedStockTool(observation) : lookahead ? lookaheadTool : work ? proposalTool(!!nativeReview, direct, work, observation) :
       proposalTools[nativeReview ? 1 : 0]![direct ? 1 : 0]!],
   };
 }
@@ -639,7 +673,7 @@ async function infer(
   if (request.frame && !session.model.input.includes("image")) return finish("provider_unavailable");
   const frame = request.frame ? verifiedImage(request.frame) : undefined;
   if (request.frame && !frame) return finish("invalid");
-  const context = terraPlanContext(request, basis, frame?.image);
+  const context = terraPlanContext(request, basis, frame?.image, options.preparedStock);
   if (!context) return finish("invalid");
   const result = await exchange<MacroProposal>(session, options, context, scope, started, raw => proposalFor(raw, request, basis),
     () => options.assertDispatch?.(basis, request.lookahead ? request.observation : undefined,

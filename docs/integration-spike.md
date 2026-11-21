@@ -367,6 +367,7 @@ Use the same stream to watch an individual skill trial:
 | `bun run play:agent --diagnostic-terrain birch 180` | Leave an unreachable birch log and harvest a reachable tree. |
 | `bun run play:agent --diagnostic-terrain ceiling 180` | Deal with a low ceiling and reach the upper step. |
 | `bun run play:agent --diagnostic-terrain wade-terra 180` | Cross a prepared shallow channel and collect a real diamond through one live Terra stock order. |
+| `bun run play:agent --diagnostic-terrain brake-terra 180` | Walk at least two blocks toward visible diamond ore, then stop before a six-block-wide, twelve-block-deep gap. |
 
 Only one diagnostic runs at a time. These trials prepare the terrain; the
 bucket and boat trials also supply the item. They do not test finding a cave
@@ -378,6 +379,22 @@ native horizon input, a grounded crossing with actual water contact to a
 new dry bank, then a diamond ore break and pickup corroborated by vanilla
 statistics after clean closure. The diagnostic does not exercise a deep-water
 refusal in-game and does not count as ordinary 1× Survival proof.
+
+`brake-terra` pairs with `wade-terra`: both offer the same one-diamond
+stock order, but the braking trial asks Terra to stop before the gap.
+Each waits for matching idle views of a safe initial approach before
+spending its one request. If no authorized order can follow the reply,
+the runner records `stockNotExercised` and closes without proof.
+
+The braking trial requires an accepted order, grounded travel under that
+order, and a fresh motor report of danger or insufficient support at the
+lip. The player must keep neutral controls on the near bank for at least
+20 ticks before shutdown, without damage, a
+pickup, or a completion receipt. `brake_closed` is a verified diagnostic
+result, not a Survival win. A timeout, an early stop, or a safe route around
+the gap does not prove this stop. The verifier joins the sole native order
+to the motor journal, sampled movement, and saved vanilla statistics. It
+does not measure between movement samples or cover other terrain.
 
 The desktop survival form takes a preset game goal, not a free-form task.
 The separate model-driven GameHarness workflow is described below.

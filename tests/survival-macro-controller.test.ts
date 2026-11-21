@@ -6,6 +6,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { createTrustedFrameCapture } from "../src/server/survival-macro/compose.ts";
 import { SurvivalMacroController, type SurvivalMacroConfig } from "../src/server/survival-macro/controller.ts";
+import { preparedStockReady } from "../src/server/survival-macro/prepared-stock.ts";
 import { hasConfirmedTerraEffect } from "../src/shared/survival-agent-ui.ts";
 import {
   MACRO_DIAMOND_PROSPECT, MacroDirectory, MacroObservationRotating, parseMacroIntent, parseMacroPlanning,
@@ -59,21 +60,25 @@ async function fixture(
   return { actor, file, run, pending, publish, observation, awaitWithdrawal, clean: () => rm(dir, { recursive: true, force: true }) };
 }
 
-async function durableFixture(strategist: MacroStrategist, objective?: string, maxRequests = 2) {
+async function durableFixture(strategist: MacroStrategist, objective?: string, maxRequests = 2,
+  frameFor?: (dir: string) => SurvivalMacroConfig["frame"], ready?: SurvivalMacroConfig["preparedStockReady"]) {
   const dir = await mkdtemp(path.join(tmpdir(), "survival-work-"));
   const run = path.basename(dir);
   const actor = new SurvivalMacroController({
-    runDir: dir, run, strategy: "terra", strategist, objective, durableWork: true, confirmNativeExit: async () => true,
-    limits: { maxRequests, pollMs: 1000, maxObservationAgeMs: 10_000, requestTimeoutMs: 3500 },
+    runDir: dir, run, strategy: "terra", strategist, objective, durableWork: true, confirmNativeExit: async () => true, frame: frameFor?.(dir),
+    limits: { maxRequests, pollMs: 1000, maxObservationAgeMs: 10_000, requestTimeoutMs: 3500 }, preparedStockReady: ready,
   });
   const file = (name: string) => path.join(actor.directory, name);
   const observation = (tick: number, change: Partial<MacroObservation> = {}): MacroObservation => ({
     v: 1, run, life: 1, epoch: 1, tick, goal: "wooden_pickaxe", health: 20, food: 20, inventory: {},
     opportunities: [], recent: [], quiescent: false, safety: { clear: true, revision: 1 }, ...change,
   });
-  async function observe(tick: number, change?: Partial<MacroObservation>) {
+  async function publishObservation(tick: number, change?: Partial<MacroObservation>) {
     await writeFile(file("observation.pending"), JSON.stringify(observation(tick, change)), { mode: 0o600 });
     await rename(file("observation.pending"), file("observation.json"));
+  }
+  async function observe(tick: number, change?: Partial<MacroObservation>) {
+    await publishObservation(tick, change);
     await actor.poll();
   }
   const order = async () => JSON.parse(await readFile(file("work.json"), "utf8"));
@@ -84,7 +89,7 @@ async function durableFixture(strategist: MacroStrategist, objective?: string, m
     })}\n`, { flag: "a", mode: 0o600 });
   }
   await actor.start();
-  return { actor, observe, order, receipt, file, clean: () => rm(dir, { recursive: true, force: true }) };
+  return { actor, observe, publishObservation, order, receipt, file, clean: () => rm(dir, { recursive: true, force: true }) };
 }
 
 function workReply(request: MacroRequest, action: MacroProposal["action"], ttl = 1100) {
@@ -101,6 +106,68 @@ function workReply(request: MacroRequest, action: MacroProposal["action"], ttl =
 
 const captureJpeg = Buffer.from("/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAAAf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AH//Z", "base64");
 const captureHash = createHash("sha256").update(captureJpeg).digest("hex");
+
+test.each(["stock", "abstain", "read", "overgrant", "unpaid stale"] as const)(
+  "Prepared stock starts from stable native evidence and distinguishes a terminal %s reply",
+  async choice => {
+    const requests: MacroRequest[] = [];
+    const reply = Promise.withResolvers<MacroInference>();
+    const policy = {
+      target: { kind: "stock", item: "minecraft:diamond", count: 1 },
+      allowedEffects: ["break:minecraft:diamond_ore"], costCaps: [],
+      reserves: [{ item: "minecraft:iron_pickaxe", count: 1 }], maxBreaks: 1, maxCrafts: 0, maxPlacements: 0,
+    } as const;
+    const f = await durableFixture(request => {
+      requests.push(request);
+      return reply.promise;
+    }, "Attempt a safe stock approach and stop at the gap.", 1, undefined, preparedStockReady("dry"));
+    const anchor = { subject: "block:minecraft:diamond_ore", target: "ore-a" };
+    const stable = { goal: "diamond", inventory: { "minecraft:iron_pickaxe": 1 }, stance: 1, quiescent: false,
+      travelHint: { ...anchor, kind: "resource", footing: "dry", bearingDegrees: 0, windowBlocks: 1.6 },
+      opportunities: [{ id: "view-left", verb: "survey", risk: "read", summary: "Look left", evidence: "Visible terrain" }],
+    } as const;
+    try {
+      await f.observe(3, stable);
+      await f.actor.poll();
+      expect(f.actor.status().requests).toBe(0);
+      await f.observe(8, { ...stable, travelHint: { ...stable.travelHint, target: "ore-b" } });
+      await f.observe(13, stable);
+      expect(f.actor.status().requests).toBe(0);
+      await f.observe(18, stable);
+      await f.actor.poll();
+      expect(f.actor.status().requests).toBe(1);
+      expect(f.actor.stockNotExercised()).toBeUndefined();
+      expect(requests[0]?.observation).toMatchObject({ tick: 18, travelHint: anchor });
+      const action = choice === "abstain" ? { kind: "abstain" } as const :
+        choice === "read" ? { kind: "opportunity", opportunityId: "view-left" } as const :
+        { kind: "work", policy: choice === "overgrant" ? { ...policy, maxBreaks: 2 } : policy } as const;
+      reply.resolve(choice === "unpaid stale"
+        ? { ...workReply(requests[0]!, action), proposal: null, outcome: "stale", dispatched: false }
+        : workReply(requests[0]!, action));
+      for (const tick of [23, 28, 33]) await f.observe(tick, stable);
+      if (choice === "stock") {
+        expect(await f.order()).toMatchObject({ ...policy, origin: "model", travelAnchor: anchor });
+        expect(f.actor.stockNotExercised()).toBeUndefined();
+      } else {
+        const disposition = {
+          abstain: "abstained", read: "read_only", overgrant: "prepared_stock_refused", "unpaid stale": "stale",
+        }[choice];
+        expect(f.actor.stockNotExercised()).toMatchObject({ disposition, reason: expect.any(String) });
+        const proposal = JSON.parse((await readFile(f.file("proposals.jsonl"), "utf8")).trim());
+        expect(proposal).toMatchObject({ disposition, providerOutcome: choice === "unpaid stale" ? "stale" : "completed",
+          ...(choice === "overgrant" ? { filteredAction: "work", reason: expect.stringContaining("one break") } : {}),
+          ...(choice === "abstain" || choice === "read" ? { proposal: { action } } : {}) });
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+        await expect(access(f.file("intent.json"))).rejects.toThrow();
+      }
+      expect(f.actor.status()).toMatchObject({ requests: 1, providerDispatches: choice === "unpaid stale" ? 0 : 1 });
+    } finally {
+      reply.resolve({ basis: requests[0]?.observation ?? { run: "unstarted", life: 1, epoch: 1, tick: 18 }, outcome: "cancelled",
+        proposal: null, model: "test-strategist", dispatched: false, costUsd: null, usage: null });
+      await f.actor.stop();
+      await f.clean();
+    }
+  });
 
 test.each(["stable", "unavailable", "newer tick", "new life", "display lost", "not dispatched"] as const)(
   "A live camera request with %s admits only an owned, exact-basis frame",

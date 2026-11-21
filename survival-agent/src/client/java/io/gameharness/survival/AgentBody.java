@@ -250,6 +250,9 @@ final class AgentBody {
     private float stepYaw, stepPitch;
     private int stepStarted, stepDriveTick;
     private Vec3d centerLanding;
+    private AgentPickup.Input pickupInput = AgentPickup.Input.WAIT;
+    private AgentVisibleHorizon.Track pickupLane;
+    private ItemEntity pickupTarget;
     private Vec3d lavaExitWaypoint;
     private boolean jumping;
     private boolean reachJump;
@@ -374,6 +377,9 @@ final class AgentBody {
     private void resetIntentions() {
         dryLanding = null;
         centerLanding = null;
+        pickupInput = AgentPickup.Input.WAIT;
+        pickupLane = null;
+        pickupTarget = null;
         forward = backward = fast = verifiedDescent = flatWalk = jumping = sneaking = swimmingDown = eating = false;
         emergencyWalk = false;
         dryRouteWalk = false;
@@ -549,6 +555,8 @@ final class AgentBody {
         boolean stepJump = false;
         Ground ground = Ground.CLEAR;
         boolean rolling = horizonIntent != null;
+        boolean pickupWalk = pickupInput != AgentPickup.Input.WAIT;
+        int pickupSide = pickupInput.right;
         boolean horizonHazardVeto = false;
         if (horizonCrossing != null && horizonCrossingOwner != horizonIntent)
             interruptHorizonWade(Refusal.INPUT_UNAVAILABLE);
@@ -559,6 +567,10 @@ final class AgentBody {
             advance = horizonForward;
             retreat = jump = false;
             crouch = horizonSneak;
+        } else if (pickupWalk) {
+            advance = pickupInput.forward > 0;
+            retreat = pickupInput.forward < 0;
+            jump = crouch = false;
         } else if (flatWalk && advance) {
             // The caller has checked a dry lane and sweep. Never inherit the ordinary
             // auto-jump, crouching advance, sprint latch, or tolerance for a lost render.
@@ -646,11 +658,11 @@ final class AgentBody {
                 attack = mining.equals(contact.pos) && contact.admits(hit);
             }
         }
-        boolean sprintRequested = !rolling && advance && fast && !crouch && ground == Ground.CLEAR;
-        if (advance || retreat || rolling && horizonSide != 0) {
-            float heading = rolling ? horizonHeading : player.getYaw() + (retreat ? 180 : 0);
+        boolean sprintRequested = !rolling && !pickupWalk && advance && fast && !crouch && ground == Ground.CLEAR;
+        if (advance || retreat || rolling && horizonSide != 0 || pickupSide != 0) {
+            float heading = rolling ? horizonHeading : player.getYaw() + (pickupWalk ? pickupInput.yawOffset : retreat ? 180 : 0);
             double reach = rolling ? horizonReach
-                : jump ? 3.2 : sprintRequested || player.isSprinting() ? 2.35 : crouch ? 0.70 : 1.35;
+                : pickupWalk ? pickupLane.braking() : jump ? 3.2 : sprintRequested || player.isSprinting() ? 2.35 : crouch ? 0.70 : 1.35;
             if (dryLanding != null && advance && !jump && !sprintRequested && !player.isSprinting() && player.isOnGround()) {
                 double dx = dryLanding.x - player.getX(), dz = dryLanding.z - player.getZ();
                 double distance = Math.hypot(dx, dz);
@@ -666,8 +678,9 @@ final class AgentBody {
                 horizonHazardVeto = rolling;
                 advance = retreat = sprintRequested = false;
                 horizonSide = 0;
+                pickupSide = 0;
                 horizonWade = false;
-                jump = !rolling && !dive && player.isSubmergedInWater();
+                jump = !rolling && !pickupWalk && !dive && player.isSubmergedInWater();
             }
         } else if (jump && !player.isTouchingWater()) {
             Vec3d motion = player.getVelocity();
@@ -677,9 +690,11 @@ final class AgentBody {
                         Math.sqrt(drift) * 9, 1.1, false, tick) > 0) jump = false;
         }
         // Vanilla latches sprint when Ctrl is released. Let up on W to brake, then walk again.
-        if ((advance || rolling) && !sprintRequested && player.isSprinting()) {
+        if ((advance || rolling || pickupWalk) && !sprintRequested && player.isSprinting()) {
             advance = false;
             horizonSide = 0;
+            if (pickupWalk) retreat = false;
+            pickupSide = 0;
         }
         boolean centerKeys = centerLanding != null && controlledBoat == null
             && player.isOnGround() && !player.isTouchingWater() && player.getVehicle() == null;
@@ -713,13 +728,9 @@ final class AgentBody {
             options.leftKey.setPressed(dry && rowLeft);
             options.rightKey.setPressed(dry && rowRight);
             ownsRowKeys = true;
-        } else if (rolling) {
-            options.leftKey.setPressed(horizonSide < 0);
-            options.rightKey.setPressed(horizonSide > 0);
-            ownsRowKeys = true;
-        } else if (centerKeys) {
-            options.leftKey.setPressed(centerLeft);
-            options.rightKey.setPressed(centerRight);
+        } else if (rolling || pickupWalk || centerKeys) {
+            options.leftKey.setPressed(rolling ? horizonSide < 0 : pickupWalk ? pickupSide < 0 : centerLeft);
+            options.rightKey.setPressed(rolling ? horizonSide > 0 : pickupWalk ? pickupSide > 0 : centerRight);
             ownsRowKeys = true;
         } else {
             releaseRowKeys();
@@ -727,12 +738,14 @@ final class AgentBody {
         // A second forward press can start vanilla sprint even with the sprint key up.
         // A paced approach can coast at the lip; don't turn its next pulse into a double-tap.
         if (advance && !options.forwardKey.isPressed()) {
-            if ((flatWalk || dryRouteWalk || rolling && !crouch) && !sprintRequested && tick - lastForwardPress < 8) {
+            if ((flatWalk || dryRouteWalk || pickupWalk || rolling && !crouch)
+                    && !sprintRequested && tick - lastForwardPress < 8) {
                 advance = false;
                 if (rolling) {
                     horizonSide = 0;
                     releaseRowKeys();
                 }
+                if (pickupWalk) releaseRowKeys(); // Never issue half of the checked diagonal.
                 jump = false;
             } else lastForwardPress = tick;
         }
@@ -747,6 +760,9 @@ final class AgentBody {
         ownsKeys = true;
         options.forwardKey.setPressed(advance);
         options.backKey.setPressed(retreat);
+        if (pickupWalk) visibleHorizon.reportPickup(pickupTarget,
+            advance || retreat || options.leftKey.isPressed() || options.rightKey.isPressed()
+                ? pickupInput.name() : "keys_vetoed", pickupLane);
         options.jumpKey.setPressed(jump);
         setSticky(options.sneakKey, crouch, options.getSneakToggled().getValue());
         setSticky(options.sprintKey, sprintRequested, options.getSprintToggled().getValue());
@@ -1722,6 +1738,7 @@ final class AgentBody {
     }
 
     void stopHorizonTravel(HorizonTravel travel) {
+        visibleHorizon.stopDryStride(travel);
         if (horizonWadeOwns(travel)) interruptHorizonWade(Refusal.INPUT_UNAVAILABLE);
         if (horizonIntent != travel) return;
         horizonIntent = null;
@@ -1795,7 +1812,7 @@ final class AgentBody {
         float yaw = player.getYaw();
         float steeringTurn = horizonGazeTurn(yaw, direct);
         boolean left = !client.options.leftKey.isUnbound(), right = !client.options.rightKey.isUnbound();
-        var chosen = visibleHorizon.dryKeyWindow(travel.target, yaw, direct, steeringTurn, travel.blockedBearing,
+        var chosen = visibleHorizon.dryKeyWindow(travel, yaw, direct, steeringTurn, travel.blockedBearing,
             left, right);
         boolean dry = chosen != null;
         boolean surfaceMissing = !dry && visibleHorizon.rejectedSurface();
@@ -2139,6 +2156,13 @@ final class AgentBody {
         return horizonTop(x, z, x + 0.5, view.feet.y, z + 0.5);
     }
 
+    /** Projection only: an in-frame missed or occluded top is not a clipped witness. */
+    boolean horizonTopClipped(HorizonView view, int x, int z) {
+        double level = view.feet.y - 0.025, yaw = Math.toRadians(observedYaw);
+        return !inView(x + 0.5 - 0.39 * Math.sin(yaw), level, z + 0.5 + 0.39 * Math.cos(yaw))
+            && !inView(x + 0.5, level, z + 0.5);
+    }
+
     private AgentVisibleHorizon.Patch horizonTop(int x, int z, double scanX, double level, double scanZ) {
         if (!inView(scanX, level - 0.025, scanZ)) return Refusal.SURFACE_NOT_RENDERED.unavailable;
         if (horizonTerrainRays <= 0) return Refusal.SURFACE_RAY_BUDGET.unavailable;
@@ -2282,6 +2306,20 @@ final class AgentBody {
         Vec3d flow = fluid.getVelocity(client.world, open);
         Refusal veto = AgentVisibleHorizon.Patch.waterRefusal(depth, flow);
         return veto == null ? AgentVisibleHorizon.Patch.water(top, floor, state) : veto.unavailable;
+    }
+
+    /** Negative-only live recheck of an already optically witnessed top. */
+    boolean pickupSupportUnchanged(AgentVisibleHorizon.Patch prior, double level) {
+        return prior.sameSupport(horizonSurface(prior.floor(), level));
+    }
+
+    /** Vanilla's thin ground-contact probe, restricted to the already occupied footprint. */
+    AgentVisibleHorizon.Patch pickupFootContact(HorizonView view, int x, int z) {
+        Box contact = AgentPickup.footContact(view.player.getBoundingBox(), x, z);
+        if (contact == null) return null;
+        BlockPos floor = view.world.findSupportingBlockPos(view.player, contact).orElse(null);
+        if (floor == null || floor.getX() != x || floor.getZ() != z) return null;
+        return horizonSurface(floor, view.feet.y);
     }
 
     static double horizonSupportTop(BlockView world, BlockPos floor, BlockState state) {
@@ -2958,20 +2996,97 @@ final class AgentBody {
 
     /** Apply the same visible-drop veto along the bounded vertical sweep as well. */
     boolean macroNoVisiblePickup(Vec3d landing, double minimumFeetY, double maximumFeetY) {
+        return pickupSweepClear(landing, minimumFeetY, maximumFeetY, 0, 0, null, AgentPickup.Scope.EXACT_ENTITY, null);
+    }
+
+    private boolean pickupSweepClear(Vec3d landing, double minimumFeetY, double maximumFeetY,
+                                     double driftX, double driftZ, ItemEntity target, AgentPickup.Scope scope,
+                                     Predicate<ItemEntity> stockFooting) {
         if (!hasView() || raysLeft <= 0) return false;
         var player = client.player;
         // The vanilla on-foot pickup envelope is 1 / 0.5 / 1 around the body.
         // Reserve an extra quarter-block for braking or a drifting drop.
         Box sweep = player.getBoundingBox().stretch(landing.x - player.getX(), 0, landing.z - player.getZ())
+            .stretch(driftX, 0, driftZ)
             .stretch(0, Math.min(0, minimumFeetY - player.getY()), 0)
             .stretch(0, Math.max(0, maximumFeetY - player.getY()), 0)
             .expand(1.25, 0.5, 1.25);
+        ItemStack selected = target == null ? ItemStack.EMPTY : target.getStack();
         for (ItemEntity item : client.world.getEntitiesByClass(ItemEntity.class, sweep,
-                candidate -> candidate.isAlive() && !candidate.isInvisibleTo(player))) {
+                candidate -> candidate != target && candidate.isAlive() && !candidate.isInvisibleTo(player))) {
             if (raysLeft <= 0) return false;
-            if (visibleEntityPoint(item, item.getBoundingBox().getCenter()) != null && !item.getStack().isEmpty()) return false;
+            if (visibleEntityPoint(item, item.getBoundingBox().getCenter()) == null) continue;
+            ItemStack neighbor = item.getStack();
+            if (!neighbor.isEmpty() && (!scope.permitsNeighbor(selected, neighbor)
+                    || stockFooting == null || !stockFooting.test(item))) return false;
         }
         return raysLeft > 0;
+    }
+
+    enum PickupResult { WAITING, MOVING, BLOCKED }
+
+    /** Called only for a drop admitted by the current rendered view, or null to wait without input. */
+    PickupResult pickUpVisible(ItemEntity drop, Vec3d waypoint, boolean exclusive) {
+        return pickUpVisible(drop, waypoint, exclusive ? AgentPickup.Scope.EXACT_ENTITY : AgentPickup.Scope.LOCAL, null);
+    }
+
+    PickupResult pickUpVisible(ItemEntity drop, Vec3d waypoint, AgentPickup.Scope scope,
+                               Predicate<ItemEntity> stockFooting) {
+        pauseWork(); // Stop carrying the last mining or travel look into passive pickup.
+        if (drop == null) return PickupResult.WAITING;
+        var player = client.player;
+        if (!hasView() || !client.isWindowFocused() || client.getOverlay() != null
+                || lavaEmergency || player.isOnFire() || player.isInLava() || player.hurtTime != 0
+                || player.isTouchingWater() || !player.isOnGround() || player.hasVehicle() || player.getAbilities().flying) {
+            visibleHorizon.reportPickup(drop, "unsafe_stance", null);
+            return PickupResult.BLOCKED;
+        }
+        AgentPickup.Input input = AgentPickup.input(player.getBoundingBox(), drop.getBoundingBox(), drop.isOnGround(),
+            waypoint, player.getYaw());
+        if (input == AgentPickup.Input.WAIT || player.isSprinting()) {
+            visibleHorizon.reportPickup(drop, player.isSprinting() ? "sprint_coast" : "passive_wait", null);
+            return PickupResult.WAITING;
+        }
+        if (input == AgentPickup.Input.UNREACHABLE || player.horizontalCollision) {
+            visibleHorizon.reportPickup(drop, player.horizontalCollision ? "body_collision" : "height_out_of_reach", null);
+            return PickupResult.BLOCKED;
+        }
+        var keys = client.options;
+        if (input.forward > 0 && keys.forwardKey.isUnbound() || input.forward < 0 && keys.backKey.isUnbound()
+                || input.right > 0 && keys.rightKey.isUnbound() || input.right < 0 && keys.leftKey.isUnbound()) {
+            visibleHorizon.reportPickup(drop, "unbound_key", null);
+            return PickupResult.BLOCKED;
+        }
+        float yaw = player.getYaw() + input.yawOffset;
+        boolean workStock = scope == AgentPickup.Scope.MATCHING_STOCK;
+        AgentVisibleHorizon.Track track = visibleHorizon.pickupTrack(drop, yaw, workStock);
+        if (track == null) {
+            var blocked = visibleHorizon.blockedPickupTrack();
+            if (workStock && blocked != null && blocked.refusal() == Refusal.SURFACE_NOT_RENDERED
+                    && Double.isFinite(blocked.braking()) && blocked.braking() <= 1.6
+                    && pickupSweepClear(drop, yaw, blocked, scope, stockFooting)
+                    && visibleHorizon.glanceAtPickupGround(drop, yaw)) return PickupResult.WAITING;
+            visibleHorizon.reportBlockedPickup(drop);
+            return PickupResult.BLOCKED;
+        }
+        if (scope != AgentPickup.Scope.LOCAL) {
+            if (!pickupSweepClear(drop, yaw, track, scope, stockFooting)) {
+                visibleHorizon.reportPickup(drop, "incidental_pickup_veto", track);
+                return PickupResult.BLOCKED;
+            }
+        }
+        pickupLane = track;
+        pickupTarget = drop;
+        pickupInput = input;
+        return PickupResult.MOVING;
+    }
+
+    private boolean pickupSweepClear(ItemEntity drop, float yaw, AgentVisibleHorizon.Track track,
+                                     AgentPickup.Scope scope, Predicate<ItemEntity> stockFooting) {
+        double angle = Math.toRadians(yaw), dx = -Math.sin(angle), dz = Math.cos(angle);
+        Vec3d landing = client.player.getPos().add(dx * track.braking(), 0, dz * track.braking());
+        return pickupSweepClear(landing, landing.y, landing.y, -dz * track.sideDrift(), dx * track.sideDrift(),
+            drop, scope, stockFooting);
     }
 
     void macroFlatWalk(Vec3d landing, float yaw, float pitch) {
@@ -3987,6 +4102,13 @@ final class AgentBody {
 
     Optional<ItemEntity> dropped(Predicate<ItemStack> matches, double distance) {
         return visibleEntity(ItemEntity.class, entity -> matches.test(entity.getStack()), distance);
+    }
+
+    boolean seesDrop(ItemEntity drop, double distance) {
+        if (!hasView() || !availableEntity(drop)) return false;
+        Vec3d center = drop.getBoundingBox().getCenter();
+        double max = range(distance);
+        return center.squaredDistanceTo(eye) <= max * max && visibleEntityPoint(drop, center) != null;
     }
 
     Optional<Entity> visibleEntity(Predicate<Entity> matches, double distance) {

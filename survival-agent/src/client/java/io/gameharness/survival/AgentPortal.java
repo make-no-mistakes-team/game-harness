@@ -127,7 +127,6 @@ final class AgentPortal {
     private int materialSince;
     private int lastMine;
     private int waitForDrop;
-    private Vec3d dropPoint;
     private Place gravel;
     private Target water;
     private Target lava;
@@ -403,7 +402,7 @@ final class AgentPortal {
                 return true;
             }
             if (tick < waitForDrop) {
-                body.aim(dropPoint);
+                body.pauseWork();
                 status = "looking for dropped " + label;
                 return true;
             }
@@ -439,7 +438,6 @@ final class AgentPortal {
         }
         if (!body.aligned(material.point)) return true;
         if (lastMine != 0 && tick - lastMine < 8) {
-            dropPoint = Vec3d.ofCenter(material.pos);
             waitForDrop = tick + 30;
         } else {
             ignore(material.pos);

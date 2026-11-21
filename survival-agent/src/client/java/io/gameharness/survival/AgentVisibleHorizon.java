@@ -4,6 +4,7 @@ import java.util.Locale;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import net.minecraft.block.BlockState;
+import net.minecraft.entity.ItemEntity;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
@@ -32,6 +33,36 @@ final class AgentVisibleHorizon {
     }
 
     record Evidence(String phase, String stage, long frame, double known, double braking, long refusals, boolean terminal) {}
+    record PickupEvidence(int item, long frame, Boolean grounded, String stage, Track track, int retainedTops) {}
+
+    private PickupEvidence pickupEvidence;
+    private int pickupEvidenceItem;
+    private Boolean pickupEvidenceGrounded;
+    private String pickupEvidenceStage;
+
+    void reportPickup(ItemEntity item, String stage, Track track) {
+        reportPickup(item.getId(), item.isOnGround(), stage, track);
+    }
+
+    void reportPickupUnseen(ItemEntity item, String stage) {
+        reportPickup(item.getId(), null, stage, null);
+    }
+
+    private void reportPickup(int item, Boolean grounded, String stage, Track track) {
+        if (pickupEvidenceItem == item && pickupEvidenceGrounded == grounded
+                && stage.equals(pickupEvidenceStage)) return;
+        pickupEvidenceItem = item;
+        pickupEvidenceGrounded = grounded;
+        pickupEvidenceStage = stage;
+        pickupEvidence = new PickupEvidence(pickupEvidenceItem, body.renderedFrame(), grounded, stage, track,
+            track == null ? 0 : pickupGround.used);
+    }
+
+    PickupEvidence takePickupEvidence() {
+        var result = pickupEvidence;
+        pickupEvidence = null;
+        return result;
+    }
 
     private static final int MAX_TRANSITIONS = 32;
     private static final int IDLE_AIM_TICKS = 12;
@@ -162,8 +193,14 @@ final class AgentVisibleHorizon {
     private final Function<BlockHitResult, BlockHitResult> idleFirstHit;
     private final Function<BlockPos, BlockState> idleRevealedState;
     private final BearingCheck<Target, Window> checkedWindow = this::checkedWindow;
+    private final BearingCheck<Target, Window> checkedDryStride = (target, yaw, wade) ->
+        checkedWindow(target, yaw, false, true);
     private final BearingCheck<Target, Window> checkedContact = (target, yaw, dry) -> checkedContactWindow(target, yaw);
     private final PatchCache patches = new PatchCache();
+    private final DryStrideSupport dryStride = new DryStrideSupport();
+    private final PickupSupport pickupSupport = new PickupSupport();
+    private final PickupGround pickupGround = new PickupGround();
+    private Track blockedPickupTrack;
     private final BlockHitResult[] witnesses = new BlockHitResult[8];
     private final Target[] targets = new Target[witnesses.length];
     private final float[] bearings = new float[8];
@@ -396,10 +433,14 @@ final class AgentVisibleHorizon {
         return prepare(target) ? checkedWindow(target, yaw, true) : null;
     }
 
-    Window dryKeyWindow(Target target, float yaw, float goal, float yawStep, float blocked,
+    Window dryKeyWindow(AgentBody.HorizonTravel travel, float yaw, float goal, float yawStep, float blocked,
                         boolean left, boolean right) {
-        return prepare(target) ? selectDryKeys(target, yaw, goal, yawStep, blocked, left, right, checkedWindow) : null;
+        if (!prepare(travel.target)) return null;
+        dryStride.begin(travel, memoView);
+        return selectDryKeys(travel.target, yaw, goal, yawStep, blocked, left, right, checkedDryStride);
     }
+
+    void stopDryStride(AgentBody.HorizonTravel travel) { dryStride.stop(travel); }
 
     boolean rejectedSurface() { return (refusals & Refusal.SURFACE_NOT_RENDERED.bit) != 0; }
 
@@ -442,6 +483,60 @@ final class AgentVisibleHorizon {
 
     Window contactWindow(Target target, float yaw) {
         return prepare(target) ? checkedContactWindow(target, yaw) : null;
+    }
+
+    /** A collection step uses the same optical and mechanical braking proof, without steering the view. */
+    Track pickupTrack(ItemEntity item, float yaw, boolean retainWorkGround) {
+        pickupGround.used = 0;
+        blockedPickupTrack = null;
+        var view = body.horizonView();
+        if (view == null) {
+            reportPickup(item, body.horizonViewRefusal().key, null);
+            return null;
+        }
+        useView(view);
+        if (memoStance == null) memoStance = body.horizonStance(view);
+        var stance = memoStance;
+        if (stance == null || stance.wet) {
+            reportPickup(item, stanceRefusal == null ? "unsafe_stance" : stanceRefusal.key, null);
+            return null;
+        }
+        double angle = Math.toRadians(yaw);
+        double dx = -Math.sin(angle), dz = Math.cos(angle);
+        pickupSupport.begin(item, view.tick(), retainWorkGround);
+        Track optical = trace(pickupSupport, stance, dx, dz);
+        if (optical.medium == Medium.DRY && optical.known > optical.braking) return optical;
+        // No new tile is authorized by contact alone. This pulse must stop on our actual top.
+        if (optical.refusal == Refusal.SURFACE_NOT_RENDERED || optical.refusal == Refusal.BRAKING_DISTANCE) {
+            Track contact = contactTrace(stance, dx, dz);
+            if (contact != null && patches.vetoDry(dx, dz, contact.sideDrift, contact.braking) == null) return contact;
+        }
+        blockedPickupTrack = optical;
+        return null;
+    }
+
+    void keepPickupGround(Object work) {
+        pickupGround.keep(work);
+    }
+
+    void clearPickupGround() {
+        pickupGround.last = null;
+    }
+
+    void witnessPickupGround(BlockPos subject) {
+        pickupGround.witness(subject);
+    }
+
+    Track blockedPickupTrack() { return blockedPickupTrack; }
+
+    boolean glanceAtPickupGround(ItemEntity item, float yaw) {
+        return pickupGround.glance(item, yaw, blockedPickupTrack);
+    }
+
+    void reportBlockedPickup(ItemEntity item) {
+        Track blocked = blockedPickupTrack;
+        if (blocked != null)
+            reportPickup(item, blocked.refusal == null ? "braking_distance" : blocked.refusal.key, blocked);
     }
 
     private float currentBearing(Target target) {
@@ -526,6 +621,10 @@ final class AgentVisibleHorizon {
     }
 
     private Window checkedWindow(Target target, float yaw, boolean allowWade) {
+        return checkedWindow(target, yaw, allowWade, false);
+    }
+
+    private Window checkedWindow(Target target, float yaw, boolean allowWade, boolean stride) {
         var view = memoView;
         var stance = memoStance;
         if (!Float.isFinite(yaw) || !body.horizonBearingInView(view, yaw))
@@ -535,7 +634,7 @@ final class AgentVisibleHorizon {
         double toX = target.point().x - stance.x, toZ = target.point().z - stance.z;
         double progress = dx * toX + dz * toZ;
         if (progress <= 0.05) return reject(Refusal.NO_GOAL_GRADE_OR_MATERIAL_FACE, null);
-        Track track = observedTrack(stance, yaw, dx, dz);
+        Track track = stride ? trace(dryStride, stance, dx, dz) : observedTrack(stance, yaw, dx, dz);
         if (track.medium == Medium.UNKNOWN) return reject(track.refusal, track);
         if (track.known <= track.braking) return reject(Refusal.BRAKING_DISTANCE, track);
         // A short contact-only coast is not an approach or a promise of another pulse.
@@ -732,10 +831,11 @@ final class AgentVisibleHorizon {
         return new Track(0, Double.POSITIVE_INFINITY, Medium.UNKNOWN, 0, 0, Refusal.BRAKING_DISTANCE);
     }
 
-    /** Footprint-only memoization. Never carry optical support to a new render or physical pose. */
+    /** Raw and dry-stride results are memoized only for the current rendered pose. */
     private final class PatchCache implements Support {
         private final long[] keys = new long[48];
         private final Patch[] data = new Patch[keys.length];
+        private final Patch[] strideData = new Patch[keys.length];
         private AgentBody.HorizonView view;
         private int size;
 
@@ -750,18 +850,335 @@ final class AgentVisibleHorizon {
             return null;
         }
 
-        @Override public Patch at(int x, int z) {
+        private int sample(int x, int z) {
             long key = BlockPos.asLong(x, 0, z);
-            for (int i = 0; i < size; ++i) if (keys[i] == key) return data[i];
-            if (size >= keys.length) return Refusal.SURFACE_RAY_BUDGET.unavailable;
-            Patch patch = body.horizonPatch(view, x, z);
+            for (int i = 0; i < size; ++i) if (keys[i] == key) return i;
+            if (size >= keys.length) return -1;
             keys[size] = key;
-            data[size++] = patch;
-            return patch;
+            data[size] = body.horizonPatch(view, x, z);
+            strideData[size] = null;
+            return size++;
+        }
+
+        @Override public Patch at(int x, int z) {
+            int slot = sample(x, z);
+            return slot < 0 ? Refusal.SURFACE_RAY_BUDGET.unavailable : data[slot];
         }
 
         @Override public Refusal vetoDry(double dx, double dz, double drift, double braking) {
             return body.horizonSweep(dx, dz, drift, braking - MARGIN, braking, Medium.DRY);
         }
+    }
+
+    /** Only a dry rolling leg uses contact at other occupied cells or a recently clipped top. */
+    private final class DryStrideSupport implements Support {
+        private final RecentDryTops tops = new RecentDryTops();
+        private final Predicate<Patch> unchanged = patch -> body.pickupSupportUnchanged(patch, memoStance.y);
+        private AgentBody.HorizonTravel owner;
+        private AgentBody.HorizonView last;
+
+        void begin(AgentBody.HorizonTravel travel, AgentBody.HorizonView view) {
+            if (owner != travel || last == null || last.world() != view.world() || last.player() != view.player()
+                    || view.tick() - last.tick() > 2 || last.feet().squaredDistanceTo(view.feet()) > 0.16
+                    || Math.abs(last.feet().y - view.feet().y) > HEIGHT_TOLERANCE) clear();
+            owner = travel;
+            last = view;
+        }
+
+        void stop(AgentBody.HorizonTravel travel) {
+            if (owner != travel) return;
+            clear();
+            owner = null;
+            last = null;
+        }
+
+        private void clear() {
+            tops.clear();
+            for (int i = 0; i < patches.size; ++i) patches.strideData[i] = null;
+        }
+
+        @Override public Patch at(int x, int z) {
+            int slot = patches.sample(x, z);
+            if (slot < 0) return Refusal.SURFACE_RAY_BUDGET.unavailable;
+            Patch found = patches.strideData[slot];
+            if (found != null) return found;
+            found = resolve(patches.data[slot], x, z);
+            patches.strideData[slot] = found;
+            return found;
+        }
+
+        private Patch resolve(Patch optical, int x, int z) {
+            if (optical.medium == Medium.DRY) {
+                if (!optical.floor.equals(memoStance.contact)) tops.witness(optical, last.tick());
+                return optical;
+            }
+            if (optical.refusal == Refusal.SURFACE_NOT_RENDERED) {
+                Patch underFoot = body.pickupFootContact(last, x, z);
+                if (underFoot != null) return underFoot;
+                if (body.horizonTopClipped(last, x, z)) {
+                    Patch previous = tops.recheck(x, z, last.feet(), last.tick(), unchanged);
+                    return previous == null ? optical : previous;
+                }
+            }
+            tops.forget(x, z);
+            return optical;
+        }
+
+        @Override public Refusal vetoDry(double dx, double dz, double drift, double braking) {
+            return patches.vetoDry(dx, dz, drift, braking);
+        }
+    }
+
+    /** No window, brake distance or input survives from one render to the next. */
+    static final class RecentDryTops {
+        private static final int MAX_AGE_TICKS = 8;
+        private final Patch[] tops = new Patch[12];
+        private final int[] witnessed = new int[tops.length];
+        private int next;
+
+        void clear() {
+            for (int i = 0; i < tops.length; ++i) tops[i] = null;
+            next = 0;
+        }
+
+        void witness(Patch top, int tick) {
+            int slot = find(top.floor.getX(), top.floor.getZ());
+            if (slot < 0) {
+                slot = next;
+                next = (next + 1) % tops.length;
+            }
+            tops[slot] = top;
+            witnessed[slot] = tick;
+        }
+
+        Patch recheck(int x, int z, Vec3d feet, int tick, Predicate<Patch> unchanged) {
+            int slot = find(x, z);
+            if (slot < 0) return null;
+            Patch top = tops[slot];
+            double dx = Math.max(0, Math.max(x - feet.x, feet.x - x - 1));
+            double dz = Math.max(0, Math.max(z - feet.z, feet.z - z - 1));
+            if (dx * dx + dz * dz > 0.75 * 0.75) return null;
+            if (tick >= witnessed[slot] && tick - witnessed[slot] <= MAX_AGE_TICKS
+                    && Math.abs(top.y - feet.y) <= HEIGHT_TOLERANCE
+                    && unchanged.test(top)) return top;
+            tops[slot] = null;
+            return null;
+        }
+
+        void forget(int x, int z) {
+            int slot = find(x, z);
+            if (slot >= 0) tops[slot] = null;
+        }
+
+        private int find(int x, int z) {
+            for (int i = 0; i < tops.length; ++i) {
+                Patch top = tops[i];
+                if (top != null && top.floor.getX() == x && top.floor.getZ() == z) return i;
+            }
+            return -1;
+        }
+    }
+
+    /** Retain a short run of exact dry tops as they pass under the edge of a held pickup gaze. */
+    private final class PickupSupport implements Support {
+        private static final int TOP_AGE_TICKS = 8;
+        private final Patch[] recent = new Patch[8];
+        private final int[] witnessedAt = new int[recent.length];
+        private final int[] checkedAt = new int[recent.length];
+        private final long[] contactCells = new long[4];
+        private final Patch[] contactPatches = new Patch[contactCells.length];
+        private ItemEntity item;
+        private boolean retainWorkGround;
+        private int tick, next, contacts;
+
+        void begin(ItemEntity target, int now, boolean retainWorkGround) {
+            if (item != target || now - tick > 2) {
+                for (int i = 0; i < recent.length; i++) recent[i] = null;
+                next = 0;
+            }
+            item = target;
+            this.retainWorkGround = retainWorkGround;
+            if (now != tick) contacts = 0;
+            tick = now;
+        }
+
+        @Override public Patch at(int x, int z) {
+            Patch current = patches.at(x, z);
+            int slot = -1;
+            for (int i = 0; i < recent.length; i++) {
+                Patch old = recent[i];
+                if (old != null && old.floor.getX() == x && old.floor.getZ() == z) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (current.medium == Medium.DRY && !current.floor.equals(memoStance.contact)) {
+                if (slot < 0) {
+                    slot = next;
+                    next = (next + 1) % recent.length;
+                }
+                recent[slot] = current;
+                witnessedAt[slot] = tick;
+                checkedAt[slot] = tick;
+            } else if (slot >= 0) {
+                if (current.refusal == Refusal.SURFACE_NOT_RENDERED && tick - witnessedAt[slot] <= TOP_AGE_TICKS
+                        && (checkedAt[slot] == tick || body.pickupSupportUnchanged(recent[slot], memoStance.y))) {
+                    checkedAt[slot] = tick;
+                    return recent[slot];
+                }
+                // A changed or unsafe top invalidates its previous witness.
+                recent[slot] = null;
+            }
+            if (current.refusal != Refusal.SURFACE_NOT_RENDERED) return current;
+            long cell = BlockPos.asLong(x, 0, z);
+            int i = 0;
+            while (i < contacts && contactCells[i] != cell) ++i;
+            Patch contact;
+            if (i < contacts) {
+                contact = contactPatches[i];
+            } else {
+                contact = body.pickupFootContact(memoView, x, z);
+                if (contacts < contactCells.length) {
+                    contactCells[contacts] = cell;
+                    contactPatches[contacts++] = contact;
+                }
+            }
+            if (contact != null) return contact;
+            Patch retained = retainWorkGround ? pickupGround.recheck(x, z, memoView) : null;
+            return retained == null ? current : retained;
+        }
+
+        @Override public Refusal vetoDry(double dx, double dz, double drift, double braking) {
+            return patches.vetoDry(dx, dz, drift, braking);
+        }
+    }
+
+    /** Local top witnesses from ordinary work, never position or permission to recover an item. */
+    private final class PickupGround {
+        private static final int MAX_AGE = 96;
+        private static final double AREA_SQUARED = 25;
+        private final Patch[] tops = new Patch[24];
+        private final int[] seen = new int[tops.length], checked = new int[tops.length], usedAt = new int[tops.length];
+        private Object work;
+        private AgentBody.HorizonView last;
+        private Vec3d origin, glanceFrom;
+        private long sampledFrame = -1;
+        private int next, used, sampledTick, glanceTick, glanceItem;
+        private float glanceYaw;
+
+        void keep(Object owner) {
+            var view = body.horizonView();
+            if (view == null) return;
+            boolean newArea = owner != work || last == null || last.world() != view.world() || last.player() != view.player()
+                || last.feet().squaredDistanceTo(view.feet()) > 0.64
+                || Math.abs(origin.y - view.feet().y) > HEIGHT_TOLERANCE
+                || origin.squaredDistanceTo(view.feet()) > AREA_SQUARED;
+            if (newArea || view.tick() - last.tick() > 3) {
+                for (int i = 0; i < tops.length; i++) tops[i] = null;
+                work = owner;
+                origin = view.feet();
+                if (newArea) glanceFrom = null;
+                sampledFrame = -1;
+                sampledTick = view.tick() - 4;
+                next = 0;
+            }
+            last = view;
+        }
+
+        void witness(BlockPos subject) {
+            var view = last;
+            if (!current(view) || view.frame() == sampledFrame || view.tick() - sampledTick < 4) return;
+            var feet = view.feet();
+            double dx = subject.getX() + 0.5 - feet.x, dz = subject.getZ() + 0.5 - feet.z;
+            double distance = Math.hypot(dx, dz);
+            if (distance < 0.5) return;
+            dx /= distance;
+            dz /= distance;
+            sampledFrame = view.frame();
+            sampledTick = view.tick();
+            useView(view);
+            BlockPos contact = view.player().supportingBlockPos.orElse(null);
+            for (int ahead = 1; ahead <= 4; ++ahead) {
+                if (ahead > distance + 0.75) break;
+                for (int side = -1; side <= 1; ++side) {
+                    int x = MathHelper.floor(feet.x + dx * ahead + dz * side);
+                    int z = MathHelper.floor(feet.z + dz * ahead - dx * side);
+                    if (contact != null && contact.getX() == x && contact.getZ() == z) continue;
+                    Patch patch = patches.at(x, z);
+                    if (patch.medium == Medium.DRY
+                            && origin.squaredDistanceTo(x + 0.5, feet.y, z + 0.5) <= AREA_SQUARED) retain(patch, view.tick());
+                }
+            }
+        }
+
+        private void retain(Patch patch, int tick) {
+            int slot = find(patch.floor.getX(), patch.floor.getZ());
+            if (slot < 0) {
+                slot = next;
+                next = (next + 1) % tops.length;
+            }
+            tops[slot] = patch;
+            seen[slot] = checked[slot] = tick;
+        }
+
+        Patch recheck(int x, int z, AgentBody.HorizonView view) {
+            if (!current(view)) return null;
+            int slot = find(x, z);
+            if (slot < 0) return null;
+            Patch old = tops[slot];
+            int tick = view.tick();
+            if (!pickupTopFresh(seen[slot], tick, old.y, view.feet().y)
+                    || checked[slot] != tick && !body.pickupSupportUnchanged(old, view.feet().y)) {
+                tops[slot] = null;
+                return null;
+            }
+            checked[slot] = tick;
+            if (usedAt[slot] != tick) {
+                usedAt[slot] = tick;
+                used++;
+            }
+            return old;
+        }
+
+        boolean glance(ItemEntity item, float yaw, Track blocked) {
+            var view = memoView;
+            if (!current(view) || blocked == null || blocked.refusal != Refusal.SURFACE_NOT_RENDERED
+                    || !Double.isFinite(blocked.braking) || blocked.braking > DRY_LIMIT
+                    || view.velocity().horizontalLengthSquared() > 0.0064) return false;
+            var feet = view.feet();
+            double r = Math.toRadians(yaw);
+            if (patches.vetoDry(-Math.sin(r), Math.cos(r), blocked.sideDrift, blocked.braking) != null) return false;
+            if (glanceFrom != null && glanceFrom.squaredDistanceTo(feet) < 2.25) {
+                if (glanceItem != item.getId() || view.tick() - glanceTick >= 12) return false;
+            } else {
+                if (view.player().getPitch() >= 37
+                        && Math.abs(MathHelper.wrapDegrees(yaw - view.player().getYaw())) <= 15) return false;
+                glanceFrom = feet;
+                glanceTick = view.tick();
+                glanceItem = item.getId();
+                // Fixed broad terrain framing; never aim at or recompute from the item.
+                glanceYaw = view.player().getYaw()
+                    + MathHelper.clamp(MathHelper.wrapDegrees(yaw - view.player().getYaw()), -35, 35);
+            }
+            body.turnFixed(glanceYaw, 40);
+            reportPickup(item, "terrain_glance", blocked);
+            return true;
+        }
+
+        private int find(int x, int z) {
+            for (int i = 0; i < tops.length; ++i) {
+                Patch top = tops[i];
+                if (top != null && top.floor.getX() == x && top.floor.getZ() == z) return i;
+            }
+            return -1;
+        }
+
+        private boolean current(AgentBody.HorizonView view) {
+            return view != null && last != null && view.tick() == last.tick() && view.tick() == body.actionTick();
+        }
+    }
+
+    static boolean pickupTopFresh(int witnessed, int tick, double top, double level) {
+        return tick >= witnessed && tick - witnessed <= PickupGround.MAX_AGE && Math.abs(top - level) <= HEIGHT_TOLERANCE;
     }
 }

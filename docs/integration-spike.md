@@ -184,6 +184,21 @@ visible canopy, not a known log or a species claim. Neither cue prices
 a break or reports stock. The player checks each new view and brakes
 when the known ground runs out.
 
+On a dry approach the player can keep looking toward a tree while
+stepping to one side. It checks the ground under the movement it
+actually makes, not just the direction the camera faces. It can move
+closer than maximum mining reach when a dry lane to the trunk remains
+visible. If the lane ends first, it can still mine from a safe stance.
+As previously seen dry ground passes below the camera, the player can
+recheck those exact supporting blocks rather than stopping after every
+step. An unseen tile beyond the last support remains unproved.
+
+Mining needs the crosshair; picking up a drop does not. If a nearby
+drop is falling into reach, the player can keep looking at the trunk
+and let it fall. For a more distant visible drop it walks into pickup
+range without tracking the item with the camera. Only the actual
+pickup counts toward the requested stock.
+
 After an actual timber approach stops, `timberObstruction` can identify
 one rendered leaf in reach and the retained tree or woodland direction
 it blocks. A reachable log or verified dry lane takes priority. To clear
@@ -274,6 +289,17 @@ landing with room to jump back before stepping down. After reaching the
 lower block, it can continue in the same direction.
 The report distinguishes placement, grounded arrival, and the lowest
 footing reached. Only a diamond in inventory counts as a pickup.
+
+Before digging through cover, the player checks that a tool can still
+mine an exposed diamond afterward without breaking a protected stock
+floor. It can switch to a slower spare pick for deepslate instead of
+wearing down the only iron pick. On actual ore, the last use is allowed
+if the job covers the loss of that pick and its reserve permits it.
+
+A time extension keeps the spent break and placement counts. If a
+separate, newly funded job can pay for a previously refused cut or
+placement, the player can inspect that option again. The fresh grant
+does not clear a refusal caused by unsafe or changed ground.
 
 In local mode without Terra, the player can use an already open mine
 passage without breaking another block. It checks an adjacent tread

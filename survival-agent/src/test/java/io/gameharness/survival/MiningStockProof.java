@@ -14,6 +14,7 @@ import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.UnbreakableComponent;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.fluid.FluidState;
+import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.state.property.Properties;
@@ -102,6 +103,115 @@ final class MiningStockProof {
         var sword = new ItemStack(Items.WOODEN_SWORD);
         sword.setDamage(sword.getMaxDamage() - 2);
         require(AgentMiningStock.maxLoss(sword, log, world, pos) == 1, "two points of tool wear can exhaust two remaining");
+    }
+
+    @Test
+    void protectedTwoUseIronStaysReadyForOreWhileWoodCutsTheCover() {
+        var stock = new PlayerInventory(null);
+        var iron = pickWithUses(Items.IRON_PICKAXE, 2);
+        stock.setStack(0, iron);
+        stock.setStack(1, pickWithUses(Items.WOODEN_PICKAXE, 30));
+        var budget = diamondBudget(1, 1);
+
+        assertEquals(1, prospectCoverTool(stock, budget, Blocks.DEEPSLATE.getDefaultState()));
+        assertEquals(1, prospectCoverTool(stock, budget, Blocks.STONE.getDefaultState()));
+        assertEquals(AgentProspectTools.COVER_LOSES_HARVEST, AgentProspectTools.coverLoss(stock, 0,
+            Blocks.DEEPSLATE.getDefaultState(), EmptyBlockView.INSTANCE, BlockPos.ORIGIN, budget, slot -> true));
+        assertEquals(0, AgentProspectTools.coverLoss(stock, 1, Blocks.DEEPSLATE.getDefaultState(),
+            EmptyBlockView.INSTANCE, BlockPos.ORIGIN, budget, slot -> true));
+        assertEquals(iron.getMaxDamage() - 2, iron.getDamage());
+
+        iron.setDamage(iron.getMaxDamage() - 3);
+        assertEquals(0, prospectCoverTool(stock, budget, Blocks.DEEPSLATE.getDefaultState()));
+    }
+
+    @Test
+    void noSpareCoverToolCanConsumeTheOnlyAdmissibleOreUse() {
+        var stock = new PlayerInventory(null);
+        var iron = pickWithUses(Items.IRON_PICKAXE, 2);
+        stock.setStack(0, iron);
+        stock.setStack(1, new ItemStack(Items.STICK));
+        var budget = diamondBudget(1, 1);
+
+        assertEquals(AgentProspectTools.COVER_LOSES_HARVEST, prospectCoverTool(stock, budget, Blocks.DEEPSLATE.getDefaultState()));
+        assertEquals(0, diamondOreTool(stock, budget));
+
+        iron.setDamage(iron.getMaxDamage() - 1);
+        assertEquals(AgentProspectTools.HARVEST_PROTECTED, diamondOreTool(stock, budget));
+    }
+
+    @Test
+    void anExactlyPricedLastOreUseIsLegalButNotOnCover() {
+        var stock = new PlayerInventory(null);
+        var iron = pickWithUses(Items.IRON_PICKAXE, 2);
+        stock.setStack(0, iron);
+        var budget = diamondBudget(1, 0);
+
+        assertEquals(0, prospectCoverTool(stock, budget, Blocks.DEEPSLATE.getDefaultState()));
+        iron.setDamage(iron.getMaxDamage() - 1);
+        assertEquals(0, diamondOreTool(stock, budget));
+        assertEquals(AgentProspectTools.COVER_LOSES_HARVEST, prospectCoverTool(stock, budget, Blocks.DEEPSLATE.getDefaultState()));
+        assertEquals(AgentProspectTools.HARVEST_UNPRICED, diamondOreTool(stock, diamondBudget(0, 0)));
+
+        stock.setStack(1, pickWithUses(Items.IRON_PICKAXE, 1));
+        assertEquals(AgentProspectTools.COVER_LOSES_HARVEST, prospectCoverTool(stock, budget, Blocks.DEEPSLATE.getDefaultState()));
+        assertEquals(AgentProspectTools.COVER_LOSES_HARVEST,
+            prospectCoverTool(stock, diamondBudget(2, 1), Blocks.DEEPSLATE.getDefaultState()));
+        assertEquals(0, prospectCoverTool(stock, diamondBudget(2, 0), Blocks.DEEPSLATE.getDefaultState()));
+        budget.broken(Items.IRON_PICKAXE, 1);
+        assertEquals(AgentProspectTools.HARVEST_UNPRICED, diamondOreTool(stock, budget));
+    }
+
+    @Test
+    void unsuitableUnknownAndUnequippableToolsDoNotEstablishAnOreHarvest() {
+        var stock = new PlayerInventory(null);
+        stock.setStack(0, new ItemStack(Items.WOODEN_PICKAXE));
+        var budget = diamondBudget(2, 0);
+        assertEquals(AgentProspectTools.NO_HARVEST_TOOL, diamondOreTool(stock, budget));
+
+        // Non-vanilla stack shape: the native wear bound is unavailable.
+        stock.setStack(1, new ItemStack(Items.IRON_PICKAXE, 2));
+        assertEquals(AgentProspectTools.HARVEST_UNKNOWN_WEAR, diamondOreTool(stock, budget));
+        stock.setStack(1, new ItemStack(Items.IRON_PICKAXE));
+        assertEquals(AgentProspectTools.HARVEST_UNEQUIPPABLE, AgentProspectTools.harvestSlot(stock,
+            Blocks.DEEPSLATE_DIAMOND_ORE.getDefaultState(), EmptyBlockView.INSTANCE, BlockPos.ORIGIN, budget, slot -> slot == 0));
+        assertEquals(AgentProspectTools.NO_HARVEST_TOOL, AgentProspectTools.harvestSlot(stock,
+            Blocks.DIAMOND_ORE.getDefaultState(), EmptyBlockView.INSTANCE, BlockPos.ORIGIN, budget, slot -> true));
+    }
+
+    @Test
+    void diamondRoomDependsOnSlotsAndCompatibleStackCapacity() {
+        var stock = new PlayerInventory(null);
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; ++slot)
+            stock.setStack(slot, new ItemStack(Items.COBBLESTONE, 64));
+        require(!AgentProspectTools.roomForDiamond(stock), "a full inventory without a diamond stack has no diamond room");
+        stock.setStack(2, new ItemStack(Items.DIAMOND, 63));
+        require(AgentProspectTools.roomForDiamond(stock), "an existing diamond stack can take the drop");
+        stock.getStack(2).increment(1);
+        require(!AgentProspectTools.roomForDiamond(stock), "a full diamond stack cannot take the drop");
+        stock.setStack(2, ItemStack.EMPTY);
+        require(AgentProspectTools.roomForDiamond(stock), "an empty slot takes the drop");
+    }
+
+    private static AgentWorkOrder.Budget diamondBudget(int ironCost, int ironReserve) {
+        return new AgentWorkOrder.Budget(new AgentWorkOrder.Policy(false, new AgentWorkOrder.Target(Items.DIAMOND, 1, null),
+            Set.of("prospect:minecraft:diamond", "break:minecraft:deepslate_diamond_ore", "break:minecraft:deepslate",
+                "break:minecraft:stone"), Map.of(Items.IRON_PICKAXE, ironCost), Map.of(Items.IRON_PICKAXE, ironReserve), 4, 0, 0));
+    }
+
+    private static ItemStack pickWithUses(Item item, int uses) {
+        var stack = new ItemStack(item);
+        stack.setDamage(stack.getMaxDamage() - uses);
+        return stack;
+    }
+
+    private static int diamondOreTool(PlayerInventory stock, AgentWorkOrder.Budget budget) {
+        return AgentProspectTools.harvestSlot(stock, Blocks.DEEPSLATE_DIAMOND_ORE.getDefaultState(),
+            EmptyBlockView.INSTANCE, BlockPos.ORIGIN, budget, slot -> true);
+    }
+
+    private static int prospectCoverTool(PlayerInventory stock, AgentWorkOrder.Budget budget, BlockState cover) {
+        return AgentProspectTools.coverSlot(stock, cover, EmptyBlockView.INSTANCE, BlockPos.ORIGIN, budget, null, slot -> true);
     }
 
     @Test

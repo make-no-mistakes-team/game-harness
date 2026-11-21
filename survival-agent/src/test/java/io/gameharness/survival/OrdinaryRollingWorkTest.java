@@ -84,6 +84,24 @@ final class OrdinaryRollingWorkTest {
     }
 
     @Test
+    void firstLogUsesAComfortableStandoffRatherThanTheFirstReachablePose() {
+        Vec3d face = new Vec3d(-48.6, 68.1, 29);
+        BlockPos trunk = new BlockPos(-49, 68, 29);
+        Vec3d firstReach = new Vec3d(-48.7, 67, 24.80); // TD9bn7 first harvest
+        Vec3d workStance = new Vec3d(-48.6, 67, 28.24);
+        double arrival = AgentMacroControl.timberWorkArrival(firstReach, face, trunk, 0.6);
+        assertEquals(0.70, arrival, 0.001);
+        assertFalse(AgentMacroControl.timberReadyToCut(true, firstReach, face, arrival, false));
+        assertTrue(AgentMacroControl.timberReadyToCut(true, workStance, face, arrival, false));
+        assertTrue(AgentMacroControl.timberReadyToCut(true, firstReach, face, arrival, true),
+            "a lost dry continuation does not prohibit the otherwise safe distant cut");
+        assertFalse(AgentMacroControl.timberReadyToCut(false, firstReach, face, arrival, true));
+        assertEquals(0.80, AgentMacroControl.timberWorkArrival(firstReach, face, trunk, 0.8), 0.001);
+        assertEquals(1.20, AgentMacroControl.timberWorkArrival(firstReach,
+            new Vec3d(-48.7, 69, 29.5), trunk, 0.6), 0.001, "a top hit needs clearance from the near edge");
+    }
+
+    @Test
     void aPreparatoryLeafCostsOneBreakAndLeavesTheExactWoodGrantIntact() {
         var oak = Blocks.OAK_LEAVES.getDefaultState();
         var birch = Blocks.BIRCH_LEAVES.getDefaultState();

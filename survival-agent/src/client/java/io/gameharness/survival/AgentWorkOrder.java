@@ -69,6 +69,8 @@ record AgentWorkOrder(String id, int life, long epoch, long basis, long expires,
         }
 
         private boolean namedBreak(BlockState state) {
+            if (state.isOf(Blocks.DIAMOND_ORE)) return effects.contains("break:minecraft:diamond_ore");
+            if (state.isOf(Blocks.DEEPSLATE_DIAMOND_ORE)) return effects.contains("break:minecraft:deepslate_diamond_ore");
             return effects.contains("break:" + Registries.BLOCK.getId(state.getBlock()));
         }
 

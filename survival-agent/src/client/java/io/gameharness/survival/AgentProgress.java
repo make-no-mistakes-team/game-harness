@@ -291,16 +291,13 @@ final class AgentProgress {
     private int ignoreCursor;
     private int seekAfter;
     private int pickupUntil;
-    private Vec3d pickupLook;
     private int pickupBlockedUntil;
     private Predicate<ItemStack> pickupBlockedItem;
-    private Entity pickupEntity;
+    private ItemEntity pickupEntity;
     private Predicate<ItemStack> pickupItem;
-    private Vec3d pickupPosition;
     private int pickupCount;
     private int pickupStarted;
     private int pickupSeen;
-    private boolean pickupNeedsDetour;
     private boolean timberReady;
     private boolean departureKit;
     private boolean ordinarySurfaceWork;
@@ -1253,7 +1250,7 @@ final class AgentProgress {
                 chopTimber();
                 return AgentStallGuard.Alternative.WORKING;
             }
-            return collect(LOG, 2, false) || tick < timberDropUntil ? AgentStallGuard.Alternative.WORKING
+            return collect(LOG, 2) || tick < timberDropUntil ? AgentStallGuard.Alternative.WORKING
                 : AgentStallGuard.Alternative.REFUSED;
         };
         return "cutting a different reachable log at " + log.getBlockPos().toShortString();
@@ -1261,13 +1258,13 @@ final class AgentProgress {
 
     private String stallPickup(Predicate<ItemStack> drop, String name) {
         Vec3d feet = c.player.getPos();
-        Entity sighting = body.visibleEntity(entity -> entity instanceof ItemEntity item && drop.test(item.getStack())
+        ItemEntity sighting = (ItemEntity) body.visibleEntity(entity -> entity instanceof ItemEntity item && drop.test(item.getStack())
             && !stallDropsTried.contains(entity.getId()) && Math.abs(entity.getY() - feet.y) < 0.55, 1.85).orElse(null);
         if (sighting == null) return null;
         stallDropsTried.add(sighting.getId());
         int before = hands.count(drop);
         stallWork = () -> has(drop, before + 1) ? stallAcquired()
-            : collectObserved(drop, body.visibleEntity(entity -> entity == sighting, 1.85).orElse(null), false)
+            : collectObserved(drop, body.seesDrop(sighting, 1.85) ? sighting : null)
                 ? AgentStallGuard.Alternative.WORKING : AgentStallGuard.Alternative.REFUSED;
         return "collecting a newly available visible " + name + " drop";
     }
@@ -1291,7 +1288,7 @@ final class AgentProgress {
                 mineTarget(resource);
                 return AgentStallGuard.Alternative.WORKING;
             }
-            return collect(resource.drop, 2, false) || tick < pickupUntil ? AgentStallGuard.Alternative.WORKING
+            return collect(resource.drop, 2) || tick < pickupUntil ? AgentStallGuard.Alternative.WORKING
                 : AgentStallGuard.Alternative.REFUSED;
         };
         return "mining distinct visible " + resource.label + " at " + hit.getBlockPos().toShortString();
@@ -2148,10 +2145,10 @@ final class AgentProgress {
                 }
                 return true;
             }
-            if (collect(GRAVEL_DROPS, 3.5, false)) return true;
+            if (collect(GRAVEL_DROPS, 3.5)) return true;
             if (tick < dropUntil) {
                 status = "watching for the gravel or flint drop";
-                body.aim(gravelPoint);
+                body.pauseWork();
                 return true;
             }
             if (gravelAttempts >= GRAVEL_LIMIT) return finish();
@@ -2969,9 +2966,9 @@ final class AgentProgress {
     private final class FieldBench {
         private ClientWorld world;
         private BlockPos position;
-        private Vec3d center, face, drop;
+        private Vec3d center, face;
         private Predicate<ItemStack> output;
-        private int placedAt, outputBefore, packUntil, before, dropSeen;
+        private int placedAt, outputBefore, packUntil, before;
         private boolean packable, crafted, triedAxe, attacked, removed;
         private final Predicate<Entity> nearbyDrop = entity -> entity instanceof ItemEntity item
             && table.item.test(item.getStack()) && item.getPos().squaredDistanceTo(center) <= 2.25;
@@ -3061,27 +3058,12 @@ final class AgentProgress {
                 return true;
             }
             status = "collecting the packed crafting table";
-            Entity seen = body.visibleEntity(nearbyDrop, 4).orElse(null);
-            if (seen != null) {
-                drop = seen.getPos();
-                dropSeen = tick;
+            ItemEntity seen = (ItemEntity) body.visibleEntity(nearbyDrop, 4).orElse(null);
+            if (!roomForTable()) {
+                body.pauseWork();
+                return leave();
             }
-            if (drop == null || tick - dropSeen > 9) {
-                body.aim(new Vec3d(center.x, Math.min(center.y, c.player.getY() + 0.3), center.z));
-                return true;
-            }
-            Vec3d delta = drop.subtract(c.player.getPos());
-            if (delta.y < -0.7 || delta.y > 1.5) return leave();
-            if (delta.horizontalLengthSquared() < 0.22) {
-                body.aim(drop);
-                if (delta.y > 0.55 && c.player.isOnGround()) {
-                    if (body.jumpBlocked()) return leave();
-                    body.jumpForReach();
-                }
-                return true;
-            }
-            if (delta.y < 0.7 && delta.horizontalLengthSquared() <= 2.15 && walkMinedPickup(drop)) return true;
-            if (approach(drop, false, false) == Walk.BLOCKED) return leave();
+            if (body.pickUpVisible(seen, null, false) == AgentBody.PickupResult.BLOCKED) return leave();
             return true;
         }
 
@@ -3098,7 +3080,7 @@ final class AgentProgress {
             if (packUntil != 0) approachGoal = null;
             world = null;
             position = null;
-            center = face = drop = null;
+            center = face = null;
             output = null;
             packUntil = 0;
             packable = crafted = triedAxe = attacked = removed = false;
@@ -3214,13 +3196,13 @@ final class AgentProgress {
                     mineTarget(Resource.COAL);
                     return true;
                 }
-                Entity fuel = torches < light ? body.dropped(FUEL, 2.2).orElse(null) : null;
-                if (fuel != null && collectOnFooting(deepFoot, fuel.getPos())) {
+                ItemEntity fuel = torches < light ? body.dropped(FUEL, 2.2).orElse(null) : null;
+                if (fuel != null && collectOnFooting(deepFoot, fuel)) {
                     status = "collecting visible coal beside the surface workshop";
                     return true;
                 }
                 if (miningResource == Resource.COAL && tick < pickupUntil) {
-                    body.aim(pickupLook);
+                    body.pauseWork();
                     return true;
                 }
                 BlockHitResult coal = torches < light ? findOre(Resource.COAL, 2.5) : null;
@@ -3293,14 +3275,11 @@ final class AgentProgress {
             return false;
         }
 
-        private boolean collectOnFooting(BlockPos from, Vec3d drop) {
+        private boolean collectOnFooting(BlockPos from, ItemEntity item) {
+            Vec3d drop = item.getPos();
             double distance = drop.subtract(c.player.getPos()).horizontalLengthSquared();
             if (distance > 2.15 || !adjacent(from, BlockPos.ofFloored(drop)) || drop.y < c.player.getY()) return false;
-            if (drop.y > c.player.getY() + 0.45) {
-                body.aim(drop);
-                return true;
-            }
-            return distance <= 0.09 || walkMinedPickup(drop);
+            return body.pickUpVisible(item, null, false) != AgentBody.PickupResult.BLOCKED;
         }
 
         private boolean nearbyTrunk(BlockHitResult hit) {
@@ -3333,13 +3312,13 @@ final class AgentProgress {
             }
             boolean collected = has(LOG, logsBefore + 1);
             if (!collected && timberLastCut != null && tick < Math.min(until, timberDropUntil + 14)) {
-                Entity drop = body.visibleEntity(nearbyDrop, 3).orElse(null);
+                ItemEntity drop = (ItemEntity) body.visibleEntity(nearbyDrop, 3).orElse(null);
                 status = "collecting a low log beside the mine route";
                 if (drop == null) {
-                    body.aim(Vec3d.ofBottomCenter(timberLastCut));
+                    body.pauseWork();
                     return true;
                 }
-                if (collectOnFooting(anchor, drop.getPos())) return true;
+                if (collectOnFooting(anchor, drop)) return true;
             }
             if (!anchor.equals(standing) && tick < until + 26) {
                 status = "rejoining the witnessed mine footing";
@@ -3385,9 +3364,9 @@ final class AgentProgress {
                 mineTarget(returnableOre);
                 return;
             }
-            if (collect(returnableOre.drop, 3.1, false)) return;
+            if (collect(returnableOre.drop, 3.1)) return;
             if (miningResource == returnableOre && tick < pickupUntil) {
-                body.aim(pickupLook);
+                body.pauseWork();
                 return;
             }
             returnableOre = null;
@@ -3430,9 +3409,9 @@ final class AgentProgress {
             mineTarget(resource);
             return true;
         }
-        if (collect(resource.drop, Math.min(7, range), resource == Resource.STONE || has(TORCH, 2))) return true;
+        if (collect(resource.drop, Math.min(7, range))) return true;
         if (resource == miningResource && tick < pickupUntil) {
-            body.aim(pickupLook);
+            body.pauseWork();
             return true;
         }
         BlockHitResult hit = findOre(resource, range);
@@ -3565,9 +3544,9 @@ final class AgentProgress {
                 mineTarget(sight.resource);
                 return true;
             }
-            if (collect(sight.resource.drop, 3.5, false)) return true;
+            if (collect(sight.resource.drop, 3.5)) return true;
             if (miningResource == sight.resource && tick < pickupUntil) {
-                body.aim(pickupLook);
+                body.pauseWork();
                 return true;
             }
             clearOreProbe();
@@ -3735,8 +3714,7 @@ final class AgentProgress {
             var pickupWood = pickupItem == LOG || pickupItem == PLANK ? pickupItem : timberDropItem;
             if (collect(pickupWood, 7)) return;
             if (tick < timberDropUntil && hands.count(timberDropItem) <= timberDropCount) {
-                Vec3d cut = Vec3d.ofCenter(timberLastCut);
-                body.aim(new Vec3d(cut.x, Math.min(player.getY() + 0.32, cut.y), cut.z));
+                body.pauseWork();
                 status = timberDropItem == LOG ? "checking the trunk base for dropped logs"
                     : "checking the witnessed cut for dropped planks";
                 return;
@@ -4992,7 +4970,7 @@ final class AgentProgress {
             if (!body.aligned(targetPoint)) return;
             if (lastMining != 0 && tick - lastMining < 5) {
                 pickupUntil = tick + 19;
-                pickupLook = new Vec3d(targetPoint.x, Math.min(c.player.getY() + 0.35, targetPoint.y), targetPoint.z);
+                body.pauseWork();
                 forgetOreTarget();
                 target = null;
             } else if (horizontalDistance(c.player.getPos(), targetPoint) > 0.72) {
@@ -5058,24 +5036,20 @@ final class AgentProgress {
     }
 
     private boolean collect(Predicate<ItemStack> drop, double range) {
-        return collect(drop, range, true);
-    }
-
-    private boolean collect(Predicate<ItemStack> drop, double range, boolean mayDig) {
         if (tick < pickupBlockedUntil && pickupBlockedItem == drop) return false;
-        Entity entity;
+        ItemEntity entity;
         if (drop == LOG && timberWitness != null) {
             BlockPos stem = timberWitness.getBlockPos();
-            entity = body.visibleEntity(candidate -> candidate instanceof ItemEntity item && LOG.test(item.getStack())
+            entity = (ItemEntity) body.visibleEntity(candidate -> candidate instanceof ItemEntity item && LOG.test(item.getStack())
                 && Math.abs(item.getX() - stem.getX() - 0.5) <= 2.5
                 && Math.abs(item.getZ() - stem.getZ() - 0.5) <= 2.5, range).orElse(null);
         } else {
             entity = body.dropped(drop, range).orElse(null);
         }
-        return collectObserved(drop, entity, mayDig);
+        return collectObserved(drop, entity);
     }
 
-    private boolean collectObserved(Predicate<ItemStack> drop, Entity entity, boolean mayDig) {
+    private boolean collectObserved(Predicate<ItemStack> drop, ItemEntity entity) {
         if (pickupItem == drop && hands.count(drop) > pickupCount) {
             clearPickup();
             if (entity == null) return false;
@@ -5086,131 +5060,31 @@ final class AgentProgress {
                 pickupItem = drop;
                 pickupCount = hands.count(drop);
                 pickupStarted = tick;
-                pickupNeedsDetour = false;
             }
             pickupSeen = tick;
-            pickupPosition = entity.getPos();
         }
-        if (pickupItem != drop || pickupPosition == null) return false;
-        if (tick - pickupStarted > (drop == LOG ? 70 : 180) || tick - pickupSeen > (drop == LOG ? 26 : 95)) {
+        if (pickupItem != drop) return false;
+        if (tick - pickupStarted > (drop == LOG ? 70 : 180) || tick - pickupSeen > (drop == LOG ? 26 : 12)) {
             abandonPickup(drop, 45);
             return false;
         }
-        Vec3d position = pickupPosition;
-        Vec3d delta = position.subtract(c.player.getPos());
-        if (drop == DIAMOND || drop == RAW_IRON || drop == FUEL || drop == STONE) {
-            Walk pickup = walkOreDrop(entity, position, delta);
-            if (pickup != Walk.BLOCKED) {
+        switch (body.pickUpVisible(entity, null, false)) {
+            case BLOCKED -> {
+                abandonPickup(drop, 45);
+                status = "leaving the visible drop until there is a supported approach";
+            }
+            case WAITING -> status = "waiting for vanilla to collect a nearby drop";
+            case MOVING -> {
+                rememberMotion();
                 status = "collecting visible drops on supported ground";
-                return true;
-            }
-            // A loose item is not a route. Leave it for reobservation from a later
-            // grounded stance rather than excavating or jumping toward its last position.
-            abandonPickup(drop, 45);
-            status = "leaving the visible drop until there is a supported approach";
-            return true;
-        }
-        if (delta.getY() > 1.45) {
-            if (drop == LOG && tick - pickupSeen < 10 && tick - pickupStarted < 26) {
-                body.aim(position);
-                status = "watching a visible log fall";
-                return true;
-            }
-            clearPickup();
-            return false;
-        }
-        if (delta.getY() < -1.05 && drop != LOG) {
-            if (!mayDig) {
-                clearPickup();
-                return false;
-            }
-            if ((has(STONE_PICK, 1) || has(IRON_PICK, 1) || has(WOOD_PICK, 1))
-                && tick >= nextDigStart && c.player.isOnGround()) {
-                status = "cutting a staircase to visible drops";
-                excavate(BlockPos.ofFloored(position).getY(), position);
-                return true;
             }
         }
-        if (delta.horizontalLengthSquared() < 0.22) {
-            if (drop == LOG) {
-                if (delta.horizontalLengthSquared() > 0.04 && delta.y > -0.75 && delta.y < 0.55) {
-                    walkMinedPickup(position);
-                } else {
-                    body.aim(position);
-                }
-                status = "collecting a visible log at the trunk base";
-            } else {
-                body.turn(c.player.getYaw(), delta.y < 0 ? 68 : 35);
-            }
-            if (delta.getY() > 0.55) {
-                if (body.jumpBlocked()) {
-                    abandonPickup(drop, 32);
-                    return false;
-                }
-                body.jumpForReach();
-            }
-            if (entity != null || tick - pickupSeen < 12) return true;
-            clearPickup();
-            return false;
-        }
-        if (!pickupNeedsDetour && delta.getY() < 0.85 && delta.getY() > -0.8
-            && delta.horizontalLengthSquared() <= 2.15) {
-            if (walkMinedPickup(position)) return true;
-            pickupNeedsDetour = true;
-        }
-        if (approach(position, false, false) == Walk.BLOCKED) {
-            abandonPickup(drop, drop == LOG ? 8 : 32);
-            return false;
-        }
-        status = "collecting visible drops";
         return true;
-    }
-
-    private Walk walkOreDrop(Entity entity, Vec3d point, Vec3d delta) {
-        if (!dryFieldFooting()) return Walk.LOOKING;
-        if (delta.y < -0.42 || delta.y > 0.65) return Walk.BLOCKED;
-        if (entity == null)
-            return tick - pickupSeen <= 8 ? Walk.LOOKING : Walk.BLOCKED;
-        double distance = Math.sqrt(delta.horizontalLengthSquared());
-        if (distance <= 0.48 || !entity.isOnGround()) {
-            body.aim(point);
-            return Walk.LOOKING; // Wait for a settled visible item or passive pickup.
-        }
-        float yaw = yaw(delta);
-        body.turn(yaw, 48);
-        if (!body.renderedDirection(yaw, 48, 5) || bearingDistance(yaw, c.player.getYaw()) > 4)
-            return Walk.LOOKING;
-        if (body.hazardAhead(yaw, 1.25) || c.player.horizontalCollision || stuck >= 8) return Walk.BLOCKED;
-        Vec3d feet = c.player.getPos();
-        Vec3d eye = c.player.getEyePos();
-        Vec3d lane = forward(c.player.getYaw());
-        // Check both the near and braking portions of the actual body-width lane,
-        // not the block under the item, which may be beyond a hole.
-        double end = Math.min(0.83, distance);
-        for (int sample = 1; sample <= 2; sample++) {
-            double ahead = end * (sample == 1 ? 0.65 : 1);
-            for (int side = -1; side <= 1; side++) {
-                Vec3d foot = feet.add(ahead * lane.x + 0.27 * side * lane.z, 0,
-                    ahead * lane.z - 0.27 * side * lane.x);
-                Vec3d below = foot.add(0, -0.08, 0);
-                BlockHitResult floor = terrain(below, eye.distanceTo(below) + 0.06);
-                if (floor == null || floor.getSide() != Direction.UP || !safeSupport(floor)
-                        || Math.abs(floor.getPos().y - feet.y) > 0.08
-                        || horizontalDistance(floor.getPos(), foot) > 0.13
-                        || !body.clearTerrain(foot.add(0, 0.40, 0))
-                        || !body.clearTerrain(foot.add(0, 1.02, 0))) return Walk.BLOCKED;
-            }
-        }
-        // Crouch prevents a momentum tick at the brink and disables collision auto-jump.
-        body.sneak();
-        if (c.player.isSneaking()) walk(false);
-        return Walk.MOVING;
     }
 
     private void clearPickup() {
         pickupEntity = null;
         pickupItem = null;
-        pickupPosition = null;
     }
 
     private void abandonPickup(Predicate<ItemStack> drop, int duration) {
@@ -5236,7 +5110,7 @@ final class AgentProgress {
         private ItemEntity target;
         private Item item;
         private Predicate<ItemStack> collected;
-        private Vec3d lastPoint, waypoint;
+        private Vec3d waypoint;
 
         void cancel() { cancelled = true; }
 
@@ -5270,7 +5144,7 @@ final class AgentProgress {
                     if (++unseen > 3) finish("drop no longer in sight");
                     else {
                         status = "rechecking the last visible drop after respawn";
-                        body.aim(lastPoint); // Never move toward a stale sighting.
+                        body.pauseWork();
                     }
                 } else {
                     lookAround();
@@ -5284,13 +5158,12 @@ final class AgentProgress {
                 before = hands.count(collected);
             }
             unseen = 0;
-            lastPoint = seen.getPos();
             status = "collecting nearby visible drops after respawn";
             if (waypoint != null && horizontalDistance(c.player.getPos(), waypoint) <= 0.27) waypoint = null;
-            if (walkLocal(waypoint != null ? waypoint : lastPoint, waypoint == null) != Walk.BLOCKED) return;
+            if (body.pickUpVisible(seen, waypoint, false) != AgentBody.PickupResult.BLOCKED) return;
             if (waypoint == null && !triedWalkedTurn) {
                 triedWalkedTurn = true;
-                waypoint = walkedTurn(lastPoint);
+                waypoint = walkedTurn(seen.getPos());
                 if (waypoint != null) return;
             }
             finish("no safe grounded approach");
@@ -5324,37 +5197,6 @@ final class AgentProgress {
             } else settled = 0;
         }
 
-        private Walk walkLocal(Vec3d point, boolean toDrop) {
-            Vec3d feet = c.player.getPos();
-            double distance = horizontalDistance(feet, point);
-            if (toDrop && distance <= 0.38) {
-                body.aim(point);
-                return Walk.LOOKING; // Vanilla collects on contact.
-            }
-            float bearing = yaw(point.subtract(feet));
-            body.turn(bearing, LOOK_DOWN);
-            if (bearingDistance(bearing, c.player.getYaw()) > 4 || Math.abs(c.player.getPitch() - LOOK_DOWN) > 5)
-                return Walk.LOOKING;
-            float facing = c.player.getYaw();
-            if (body.hazardAhead(facing, 1.25) || c.player.horizontalCollision || stuck >= 8) return Walk.BLOCKED;
-            Vec3d lane = forward(facing);
-            Vec3d step = feet.add(lane.multiply(Math.min(distance, 0.85)));
-            for (int side = -1; side <= 1; side++) {
-                Vec3d edge = step.add(0.28 * side * lane.z, 0, -0.28 * side * lane.x);
-                Vec3d below = edge.add(0, -0.08, 0);
-                BlockHitResult floor = terrain(below, c.player.getEyePos().distanceTo(below) + 0.10);
-                if (floor == null || floor.getSide() != Direction.UP || !safeSupport(floor)
-                        || Math.abs(floor.getPos().y - feet.y) > 0.08
-                        || horizontalDistance(floor.getPos(), edge) > 0.14
-                        || !body.clearTerrain(edge.add(0, 0.40, 0))
-                        || !body.clearTerrain(edge.add(0, 1.05, 0))) return Walk.BLOCKED;
-            }
-            // Use the normal movement and passive pickup path, but don't jump, descend or detour.
-            body.sneak();
-            walk(false);
-            return Walk.MOVING;
-        }
-
         private Vec3d walkedTurn(Vec3d drop) {
             BlockPos standing = c.player.getBlockPos();
             int index = trail.lastIndexOf(standing);
@@ -5378,21 +5220,9 @@ final class AgentProgress {
 
         private void finish(String reason) {
             dropReclaim = null;
-            body.turn(c.player.getYaw(), c.player.getPitch());
+            body.pauseWork();
             status = "re-gearing after respawn: " + reason;
         }
-    }
-
-    private boolean walkMinedPickup(Vec3d position) {
-        Vec3d floor = position.add(0, -0.16, 0);
-        body.aim(floor);
-        if (!body.aligned(floor)) return true;
-        BlockHitResult hit = terrain(floor, 3.1);
-        if (hit == null || hit.getSide() != Direction.UP || !safeSupport(hit)
-            || Math.abs(hit.getPos().y - c.player.getY()) > 0.3
-            || horizontalDistance(hit.getPos(), position) > 0.36) return false;
-        walkDown(false);
-        return true;
     }
 
     private int pickUses(Predicate<ItemStack> kind) {
@@ -7462,10 +7292,9 @@ final class AgentProgress {
     }
 
     private boolean collectMealDrop() {
-        Entity seen = body.visibleEntity(candidate -> candidate == forageEntity, 6).orElse(null);
-        if (seen == null) {
+        if (!(forageEntity instanceof ItemEntity seen) || !body.seesDrop(seen, 6)) {
             if (tick - forageSeen > 14) return false;
-            body.aim(foragePoint);
+            body.pauseWork();
             status = "looking for the visible food drop";
             return true;
         }
@@ -7474,16 +7303,11 @@ final class AgentProgress {
         foragePoint = pos;
         forageSeen = tick;
         status = "collecting visible food";
-        double distance = horizontalDistance(c.player.getPos(), pos);
-        if (distance <= 0.38) {
-            body.aim(pos);
-            return true;
+        if (dangerInForageLane(pos.add(0, 0.25, 0))) {
+            body.pauseWork();
+            return false;
         }
-        if (distance <= 1.2) {
-            if (dangerInForageLane(pos.add(0, 0.25, 0))) return false;
-            if (walkMinedPickup(pos)) return true;
-        }
-        return advanceForage(pos);
+        return body.pickUpVisible(seen, null, false) != AgentBody.PickupResult.BLOCKED;
     }
 
     private boolean lookForMealDrop(boolean meatOnly) {
@@ -7508,7 +7332,8 @@ final class AgentProgress {
             }
         } else {
             if (forageAction != 0 && tick - forageAction > 14) return false;
-            body.aim(foragePoint);
+            if (forageAction == 0) body.aim(foragePoint);
+            else body.pauseWork();
         }
         status = forageAction == 0 ? "aiming at visible ripe berries" : "harvesting visible berries";
         return true;
@@ -7522,7 +7347,8 @@ final class AgentProgress {
         Entity animal = body.visibleEntity(candidate -> candidate == forageEntity && edibleAnimal(candidate), 8).orElse(null);
         if (animal == null) {
             if (tick - forageSeen > (forageAction == 0 ? 12 : 23)) return false;
-            body.aim(foragePoint.add(0, forageAction == 0 ? 0.65 : 0.12, 0));
+            if (forageAction == 0) body.aim(foragePoint.add(0, 0.65, 0));
+            else body.pauseWork();
             status = forageAction == 0 ? "looking for the visible animal" : "looking for visible meat drops";
             return true;
         }

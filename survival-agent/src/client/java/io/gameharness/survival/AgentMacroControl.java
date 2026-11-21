@@ -35,6 +35,8 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.IntPredicate;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import net.minecraft.block.AbstractFurnaceBlock;
@@ -50,15 +52,12 @@ import net.minecraft.client.gui.screen.ingame.FurnaceScreen;
 import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
-import net.minecraft.enchantment.EnchantmentHelper;
-import net.minecraft.enchantment.Enchantments;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
-import net.minecraft.registry.RegistryKeys;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.registry.tag.ItemTags;
@@ -228,6 +227,7 @@ final class AgentMacroControl {
     private record PersonalCraft(AgentWorkOrder order, long untilTick, long untilNanos, boolean tableInReach) {}
     private record Inbox(boolean active, Intent intent, Handoff handoff, Planning planning, WorkMailbox work) {}
     private record Camera(float yaw, float pitch) {}
+    private record PickupDeferral(Vec3d feet, Vec3d drop, boolean grounded, float yaw, float pitch) {}
     private record Output(String file, String value) {}
 
     private static final class InventoryWitness {
@@ -242,10 +242,14 @@ final class AgentMacroControl {
         }
 
         Item gain(PlayerInventory inventory) {
+            return gain(inventory, null);
+        }
+
+        Item gain(PlayerInventory inventory, Item expected) {
             counts.forEach((item, tally) -> tally.remaining = tally.original);
             for (int i = 0; i < inventory.size(); ++i) {
                 ItemStack stack = inventory.getStack(i);
-                if (stack.isEmpty()) continue;
+                if (stack.isEmpty() || stack.getItem() == expected) continue;
                 Tally tally = counts.get(stack.getItem());
                 if (tally == null || (tally.remaining -= stack.getCount()) < 0) return stack.getItem();
             }
@@ -286,9 +290,10 @@ final class AgentMacroControl {
         AgentBody.OrdinaryGrade ordinaryGrade;
         long gradeLookUntil;
         boolean secondHop;
-        boolean timberWalk;
-        boolean timberApproached;
-        long timberDropSeen;
+        boolean timberApproached, timberWorkStance;
+        long dropSeen, pickupProgress;
+        Vec3d dropPosition, pickupFooting;
+        boolean dropGrounded, retryDropWhenVisible;
         TimberObstruction timberOpening;
         int timberLogsNeeded;
         AgentSurfaceTread tread;
@@ -318,7 +323,7 @@ final class AgentMacroControl {
             pathPitch = Float.isNaN(chosenWalkPitch) ? MathHelper.clamp(pitch, 12, 42) : chosenWalkPitch;
             if (offer.floor != null) distanceLeft = horizontalSquared(position, offer.floor.landing);
             if (offer.route != null) distanceLeft = horizontalSquared(position, Vec3d.ofBottomCenter(offer.route.endpoint()));
-            walkInventory = offer.key.verb == Verb.APPROACH || offer.key.verb == Verb.FOLLOW
+            walkInventory = offer.key.verb == Verb.APPROACH || offer.key.verb == Verb.FOLLOW || offer.drop != null
                 ? new InventoryWitness(client.player.getInventory()) : null;
             walkMotion = offer.key.verb == Verb.APPROACH || offer.key.verb == Verb.COLLECT
                 ? new AgentWalkedRoute.Motion() : null;
@@ -424,7 +429,7 @@ final class AgentMacroControl {
         final AgentWorkOrder.Budget budget;
         final SourceSearch sourceSearch;
         final Set<BlockPos> rejected = new HashSet<>();
-        final Set<Integer> rejectedDrops = new HashSet<>();
+        final Map<Integer, PickupDeferral> deferredDrops = new HashMap<>();
         final Set<BlockPos> horizonAttempts = new HashSet<>();
         final Set<BlockPos> caveSurveys = new HashSet<>();
         long deadline;
@@ -436,6 +441,7 @@ final class AgentMacroControl {
         boolean timberLookUsed;
         TimberObstruction admittedTimberOpening;
         TimberPursuit timberRecheck;
+        Face timberClosing;
         Face sourceLook;
         long sourceLookUntil;
         long lastEffectTick, completedTick;
@@ -486,7 +492,53 @@ final class AgentMacroControl {
 
     private record DiamondSpine(AgentSurfaceTread.Edge edge, Direction preferred, int refusedDown,
                                 int refusedLevel, int refusedUp, boolean glanced, boolean triedSpareFloor,
-                                String refusal, String levelRefusal) {}
+                                String refusal, String levelRefusal, DiamondGrantRefusals grantRefusals) {}
+
+    /** The exact effect that an otherwise witnessed option could not spend. Not a retained face or an actuator. */
+    private static final class DiamondGrantRefusal {
+        final BlockPos cell;
+        final BlockState state;
+        final Item placement; // null for a cover break
+        String detail;
+
+        DiamondGrantRefusal(BlockPos cell, BlockState state, Item placement, String detail) {
+            this.cell = cell.toImmutable();
+            this.state = state;
+            this.placement = placement;
+            this.detail = detail;
+        }
+
+        static String cover(AgentWorkOrder.Budget budget, BlockState state) {
+            if (!budget.policy.prospectCoverAllowed(state))
+                return "The selected passage exposes " + Registries.BLOCK.getId(state.getBlock())
+                    + "; the current grant does not allow clearing it.";
+            if (!budget.canBreak()) return "The authorized break grant is spent.";
+            if (!budget.canCutCover())
+                return "Keep the last break for diamond ore; cutting witnessed " + Registries.BLOCK.getId(state.getBlock())
+                    + " needs a new grant.";
+            return null;
+        }
+
+        static String placement(AgentWorkOrder.Budget budget, Item item, PlayerInventory inventory) {
+            if (item == Items.TORCH)
+                return budget.canPlaceProspectTorch(inventory) ? null
+                    : "The tread is too dark. Lighting needs place:minecraft:torch, a placement and torch cost left, and carried light above its floor.";
+            if (!budget.policy.placeProspectSupport())
+                return "The rendered landing ray found no full supporting top. No attached support is authorized; that needs place:minecraft:cobblestone.";
+            return budget.canPlaceProspectSupport(inventory) ? null
+                : "The rendered landing ray found no full supporting top. An attached support needs a usable placement and carried cobblestone above its reserve and within its exact cost.";
+        }
+    }
+
+    private static final class DiamondGrantRefusals {
+        private static final int DIRECTIONS = Direction.values().length;
+        final DiamondGrantRefusal[] lanes = new DiamondGrantRefusal[3 * DIRECTIONS];
+        AgentWorkOrder.Budget pricedAgainst;
+
+        static int lane(Direction bearing, int grade) {
+            return (Integer.signum(grade) + 1) * DIRECTIONS + bearing.ordinal();
+        }
+    }
 
     /** One positively observed build candidate. No input or stock is owned outside its work action. */
     static final class ProspectSupport {
@@ -565,6 +617,7 @@ final class AgentMacroControl {
         boolean glanced, cutting, tunnel, stairLip, triedSpareFloor, spareFloor, spareFloorBroken;
         boolean departing, departureTried, rayRetryUsed, freshRaysPending;
         String refusal, levelRefusal, supportRefusal;
+        private DiamondGrantRefusals grantRefusals;
 
         void arrive(BlockPos at, BlockState groundedSupport, Direction heading) {
             if (at.equals(foot) && groundedSupport == support) {
@@ -589,11 +642,13 @@ final class AgentMacroControl {
             departureTried = rayRetryUsed = freshRaysPending = false;
             glanced = cutting = tunnel = stairLip = triedSpareFloor = spareFloor = spareFloorBroken = false;
             refusal = levelRefusal = supportRefusal = null;
+            grantRefusals = null;
         }
 
         boolean open(Direction direction, int grade) {
             int refused = grade < 0 ? refusedDown : grade > 0 ? refusedUp : refusedLevel;
-            return (refused & directionBit(direction)) == 0;
+            return (refused & directionBit(direction)) == 0
+                && (grantRefusals == null || grantRefusals.lanes[DiamondGrantRefusals.lane(direction, grade)] == null);
         }
 
         boolean rollingDepartureAllowed() {
@@ -694,17 +749,20 @@ final class AgentMacroControl {
         }
 
         void refuseCurrent(String detail) {
-            if (spareFloor) {
-                if (spareFloorBroken) refuse(bearing, 0, detail);
-                spareFloor = spareFloorBroken = false;
-                spareExit = null;
-            }
+            if (spareFloor && spareFloorBroken) refuse(bearing, 0, detail);
             refuse(bearing, grade, detail);
+            releaseRefusedSelection();
+        }
+
+        private void releaseRefusedSelection() {
+            spareFloor = spareFloorBroken = false;
+            spareExit = null;
             lookPoint = null;
             cutting = tunnel = stairLip = false;
         }
 
         void refuse(Direction direction, int grade, String detail) {
+            if (grantRefusals != null) grantRefusals.lanes[DiamondGrantRefusals.lane(direction, grade)] = null;
             if (grade == 0) {
                 refusedLevel |= directionBit(direction);
                 levelRefusal = detail;
@@ -713,6 +771,63 @@ final class AgentMacroControl {
                 else refusedUp |= directionBit(direction);
                 if (refusal == null || detail.contains("minecraft:") && !refusal.contains("minecraft:")) refusal = detail;
             }
+        }
+
+        String cutGrantRefusal(AgentWorkOrder.Budget budget, BlockPos cell, BlockState state) {
+            String detail = DiamondGrantRefusal.cover(budget, state);
+            return detail == null ? null : refuseGrant(budget, cell, state, null, detail);
+        }
+
+        String placeGrantRefusal(AgentWorkOrder.Budget budget, BlockPos cell, BlockState state, Item item,
+                                 PlayerInventory inventory) {
+            String detail = DiamondGrantRefusal.placement(budget, item, inventory);
+            return detail == null ? null : refuseGrant(budget, cell, state, item, detail);
+        }
+
+        private String refuseGrant(AgentWorkOrder.Budget budget, BlockPos cell, BlockState state, Item placement, String detail) {
+            if (grantRefusals == null) grantRefusals = new DiamondGrantRefusals();
+            grantRefusals.pricedAgainst = budget;
+            grantRefusals.lanes[DiamondGrantRefusals.lane(bearing, grade)] = new DiamondGrantRefusal(cell, state, placement, detail);
+            releaseRefusedSelection();
+            return detail;
+        }
+
+        boolean needsGrantRecheck(AgentWorkOrder.Budget budget) {
+            // Renewing time replaces the order ID, but the actuator still owns the same spent budget.
+            return grantRefusals != null && grantRefusals.pricedAgainst != budget;
+        }
+
+        void recheckGrant(AgentWorkOrder.Budget budget, Function<BlockPos, BlockState> current, PlayerInventory inventory) {
+            if (!needsGrantRecheck(budget)) return;
+            grantRefusals.pricedAgainst = budget;
+            boolean stillRefused = false;
+            for (int height = -1; height <= 1; ++height) {
+                for (Direction direction : CARDINAL) {
+                    int lane = DiamondGrantRefusals.lane(direction, height);
+                    var blocked = grantRefusals.lanes[lane];
+                    if (blocked == null) continue;
+                    String detail = blocked.placement == null ? DiamondGrantRefusal.cover(budget, blocked.state)
+                        : DiamondGrantRefusal.placement(budget, blocked.placement, inventory);
+                    if (detail != null) {
+                        blocked.detail = detail;
+                        stillRefused = true;
+                    } else if (current.apply(blocked.cell) != blocked.state) {
+                        refuse(direction, height, "The previously witnessed prospect cell changed; no cut or placement was admitted.");
+                    } else {
+                        // State equality only vetoes a changed cell. Normal route selection must witness
+                        // a fresh face and prove dry stance, geometry, tooling and live costs again.
+                        grantRefusals.lanes[lane] = null;
+                    }
+                }
+            }
+            if (!stillRefused) grantRefusals = null;
+        }
+
+        String grantRefusalDetail() {
+            if (grantRefusals != null)
+                for (var blocked : grantRefusals.lanes)
+                    if (blocked != null) return " The current grant blocked a witnessed option: " + blocked.detail;
+            return "";
         }
 
         Direction sector(int index) {
@@ -730,7 +845,7 @@ final class AgentMacroControl {
             boolean continueTunnel = (tunnel || floorTread) && edge.upper().equals(foot) && edge.upperSupport() == support
                 && edge.down() == bearing && height == grade;
             spine.addLast(new DiamondSpine(edge, preferred, refusedDown, refusedLevel, refusedUp,
-                glanced, triedSpareFloor, refusal, levelRefusal));
+                glanced, triedSpareFloor, refusal, levelRefusal, grantRefusals));
             arrive(edge.lower(), edge.lowerSupport(), edge.down());
             if (continueTunnel) {
                 // The next forward column starts with its two level wall/head cells,
@@ -824,6 +939,7 @@ final class AgentMacroControl {
             triedSpareFloor = branch.triedSpareFloor;
             refusal = branch.refusal;
             levelRefusal = branch.levelRefusal;
+            grantRefusals = branch.grantRefusals;
         }
     }
 
@@ -861,6 +977,7 @@ final class AgentMacroControl {
     private ProspectLandmark prospectLandmark;
     private FurnaceFact furnaceFact;
     private final Predicate<ItemStack> safetySpend = this::canSpendSafetyStock;
+    private final Predicate<ItemEntity> stockPickupFooting = drop -> !dropInProspectOpening(drop) && roomFor(drop.getStack());
     private List<Offer> reservedOffers = List.of();
     private static final Offer[] NO_ANCHORS = {};
     private long reservationEpoch, reservationUntil;
@@ -874,6 +991,7 @@ final class AgentMacroControl {
     private Screen shown;
     private ClientWorld world;
     private ClientPlayerEntity player;
+    private final IntPredicate prospectEquip = slot -> hands.canEquipSlot(player.getInventory(), slot);
     private ItemStack scopedMainHand = ItemStack.EMPTY;
     private Vec3d anchor, idlePublishedPos;
     private float surveyYaw;
@@ -1665,6 +1783,11 @@ final class AgentMacroControl {
         claim("work_order");
         state("work_order_in_progress", work.detail);
         status = work.detail;
+        if (fungibleStockPickup()) {
+            if (grounded() && hazardClear && client.isWindowFocused() && client.getOverlay() == null)
+                body.visibleHorizon().keepPickupGround(work);
+            else body.visibleHorizon().clearPickupGround();
+        }
         if (action != null) {
             runWorkStep(progress);
             return;
@@ -1783,10 +1906,8 @@ final class AgentMacroControl {
                 runWorkStep(progress);
                 return;
             }
-            Vec3d basin = Vec3d.ofBottomCenter(work.lastHarvest).subtract(player.getEyePos()).add(0, -0.65, 0);
-            body.turnFine(heading(basin.x, basin.z),
-                (float) Math.toDegrees(Math.atan2(-basin.y, Math.hypot(basin.x, basin.z))));
             if (work.lowerHarvest || tick - work.lastHarvestTick <= 8) {
+                body.pauseWork();
                 enact("search", work.lowerHarvest
                     ? "Checking the confirmed harvest from the rim without entering the opening."
                     : "Checking beside the confirmed harvest for a visible drop; no pickup confirmed yet.");
@@ -1938,7 +2059,7 @@ final class AgentMacroControl {
 
     private boolean workPickup(Predicate<ItemStack> wanted) {
         if (!work.sourceSearch.stairs.isEmpty() || travelAnchorOutstanding()) return false;
-        var seen = body.visibleEntity(entity -> entity instanceof ItemEntity drop && !work.rejectedDrops.contains(drop.getId())
+        var seen = body.visibleEntity(entity -> entity instanceof ItemEntity drop && pickupEligible(drop)
             && (!deepWork() || drop.getBlockPos().getY() == player.getBlockY())
             && !dropInProspectOpening(drop) && wanted.test(drop.getStack()) && roomFor(drop.getStack()), 8.0).orElse(null);
         if (!(seen instanceof ItemEntity found)) return false;
@@ -1947,14 +2068,21 @@ final class AgentMacroControl {
 
     private boolean startWorkPickup(ItemEntity found) {
         Item item = found.getStack().getItem();
-        boolean timber = timberItem(item);
-        Vec3d destination = timber ? found.getPos() : Vec3d.ofBottomCenter(found.getBlockPos());
         startWorkStep(Verb.WORK_WALK, "Collect visible " + Registries.ITEM.getId(item), null, found, item, null);
-        action.destination = destination;
-        action.distanceLeft = horizontalSquared(player.getPos(), destination);
-        action.timberWalk = timber;
-        action.timberDropSeen = tick;
+        action.dropSeen = action.pickupProgress = tick;
+        action.dropPosition = found.getPos();
+        action.dropGrounded = found.isOnGround();
+        action.pickupFooting = player.getPos();
         return true;
+    }
+
+    /** Reconsider a blocked drop only when the currently visible item or the player's pose actually changes. */
+    private boolean pickupEligible(ItemEntity drop) {
+        PickupDeferral prior = work.deferredDrops.get(drop.getId());
+        return prior == null || drop.isOnGround() != prior.grounded
+            || drop.getPos().squaredDistanceTo(prior.drop) >= 0.0225
+            || player.getPos().squaredDistanceTo(prior.feet) >= 0.0625
+            || angle(player.getYaw(), player.getPitch(), prior.yaw, prior.pitch) >= 10;
     }
 
     private boolean collectOwnTimber() {
@@ -1968,12 +2096,12 @@ final class AgentMacroControl {
             return false;
         }
         Vec3d base = Vec3d.ofBottomCenter(cut.block);
-        var seen = body.visibleEntity(entity -> entity instanceof ItemEntity drop && !work.rejectedDrops.contains(drop.getId())
+        var seen = body.visibleEntity(entity -> entity instanceof ItemEntity drop && pickupEligible(drop)
             && drop.getStack().isOf(cut.item) && roomFor(drop.getStack())
             && horizontalSquared(drop.getPos(), base) <= 2.25 && !dropInProspectOpening(drop), 6).orElse(null);
         if (seen instanceof ItemEntity found) return startWorkPickup(found);
         if (tick - cut.tick <= 12) {
-            body.aim(new Vec3d(base.x, Math.min(cut.stance.y + 0.2, base.y), base.z));
+            body.pauseWork();
             enact("search", "Checking the last witnessed timber landing for its drop.");
             status = work.enactedStatus;
             return true;
@@ -1996,6 +2124,12 @@ final class AgentMacroControl {
         if (cap == null || cap.getY() >= work.sourceSearch.cutFrom.getY() || drop.getY() >= player.getBlockY()) return false;
         BlockPos cell = drop.getBlockPos();
         return cell.getX() == cap.getX() && cell.getZ() == cap.getZ();
+    }
+
+    private boolean fungibleStockPickup() {
+        var policy = work.budget.policy;
+        return policy.target().item() != null && !policy.preset() && !policy.smeltIron() && !policy.waterFill()
+            && !policy.diamondProspecting() && work.sourceSearch.stairs.isEmpty();
     }
 
     private boolean workGather(AgentProgress progress, Predicate<BlockState> matches, int required) {
@@ -2195,6 +2329,23 @@ final class AgentMacroControl {
         return horizontalSquared(feet, hit.getPos()) > TIMBER_ARRIVAL * TIMBER_ARRIVAL
             && horizontalSquared(feet, Vec3d.ofBottomCenter(hit.getBlockPos())) >= 0.80 * 0.80
             && dy * dy + TIMBER_ARRIVAL * TIMBER_ARRIVAL < reach * reach;
+    }
+
+    static double timberWorkArrival(Vec3d feet, Vec3d point, BlockPos trunk, double bodyWidth) {
+        // Back off from the footprint, not the selected pixel. An upper face
+        // can be near the middle of the trunk instead of on its near edge.
+        double dx = feet.x - point.x, dz = feet.z - point.z;
+        double clearance = bodyWidth * 0.5 + 0.40;
+        double x = dx > 0 ? (trunk.getX() + 1 + clearance - point.x) / dx
+            : dx < 0 ? (trunk.getX() - clearance - point.x) / dx : Double.POSITIVE_INFINITY;
+        double z = dz > 0 ? (trunk.getZ() + 1 + clearance - point.z) / dz
+            : dz < 0 ? (trunk.getZ() - clearance - point.z) / dz : Double.POSITIVE_INFINITY;
+        return dx == 0 && dz == 0 ? clearance : Math.min(x, z) * Math.hypot(dx, dz);
+    }
+
+    static boolean timberReadyToCut(boolean reachable, Vec3d feet, Vec3d goal, double arrival, boolean noCloserLane) {
+        double comfortable = arrival + 0.11; // Neutral braking may settle slightly short of the nominal stance.
+        return reachable && (noCloserLane || horizontalSquared(feet, goal) <= comfortable * comfortable);
     }
 
     static boolean woodlandTravelCue(BlockHitResult hit, Vec3d feet) {
@@ -2420,9 +2571,12 @@ final class AgentMacroControl {
         };
         startWorkStep(Verb.WORK_WALK, label, cue, null, null, null);
         Vec3d point = target.point();
+        double arrival = kind == CAVE_FRONTIER ? 0.77 : kind == WOODLAND_FRONTIER ? 1.1 : TIMBER_ARRIVAL;
+        action.timberWorkStance = timber && wantsFirstTimberStance(cue) && !nominated.window().contactOnly();
+        if (action.timberWorkStance)
+            arrival = timberWorkArrival(player.getPos(), point, cell, player.getWidth());
         action.horizonTravel = new AgentBody.HorizonTravel(target, new Vec3d(point.x, player.getY(), point.z),
-            kind == CAVE_FRONTIER ? 0.77 : kind == WOODLAND_FRONTIER ? 1.1 : TIMBER_ARRIVAL, allowWade,
-            nominated.window().contactOnly());
+            arrival, allowWade, nominated.window().contactOnly());
         action.horizonKind = kind;
         action.walkInventory = new InventoryWitness(player.getInventory());
         if (!nominated.window().contactOnly()) search.footholds.add(player.getBlockPos().down());
@@ -2431,9 +2585,32 @@ final class AgentMacroControl {
         return true;
     }
 
+    private boolean wantsFirstTimberStance(Face cue) {
+        Item item = work.order.policy().target().item();
+        return work.confirmedBreaks == 0 && AgentWorkOrder.woodlandLog(item) && AgentWorkOrder.harvest(cue.state) == item;
+    }
+
+    private boolean resumeTimberStance(Predicate<BlockState> wanted) {
+        Face cue = work.timberClosing;
+        work.timberClosing = null;
+        if (cue == null || !wanted.test(cue.state) || !wantsFirstTimberStance(cue) || !horizonStartAvailable()
+                || work.rejected.contains(cue.hit.getBlockPos()) || work.horizonAttempts.contains(cue.hit.getBlockPos())
+                || !roomFor(new ItemStack(AgentWorkOrder.harvest(cue.state)))) return false;
+        var horizon = body.visibleHorizon();
+        var target = horizon.target(cue.hit);
+        if (target == null || world.getBlockState(target.hit().getBlockPos()) != cue.state) return false;
+        Vec3d feet = player.getPos(), point = target.point();
+        double arrival = timberWorkArrival(feet, point, target.hit().getBlockPos(), player.getWidth());
+        if (timberReadyToCut(true, feet, point, arrival, false)) return false;
+        // A partial leg retains only its aim. A new dry window or no movement.
+        var window = horizon.window(target, false);
+        return usableHorizonWindow(window, false) && startHorizonSource(new OrdinaryTravelTarget(target, RESOURCE, window, null));
+    }
+
     private boolean workGatherTimber(AgentProgress progress, Predicate<BlockState> wanted,
                                     Predicate<BlockHitResult> eligible, int required) {
         rememberTimberView();
+        if (resumeTimberStance(wanted)) return true;
         Predicate<BlockState> timber = state -> timberBlock(state) && wanted.test(state);
         var recheck = work.timberRecheck;
         int floor = player.getBlockY();
@@ -2638,7 +2815,7 @@ final class AgentMacroControl {
         int current = inventory.selectedSlot;
         BlockPos pos = leaf.hit.getBlockPos();
         var held = inventory.getStack(current);
-        if (AgentMiningStock.maxLoss(held, leaf.state, world, pos) == 0 && workLootCompatible(held, leaf.state)) return current;
+        if (AgentMiningStock.maxLoss(held, leaf.state, world, pos) == 0 && AgentMiningStock.lootCompatible(held, leaf.state)) return current;
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; ++slot)
             if (inventory.getStack(slot).isEmpty() && hands.canEquipSlot(inventory, slot)) return slot;
         return -1;
@@ -2718,8 +2895,8 @@ final class AgentMacroControl {
     }
 
     private boolean startWorkBreak(Face face, Item item, boolean cover) {
-        boolean diamondCover = cover && deepWork();
-        int tool = workToolSlot(face.hit.getBlockPos(), face.state, diamondCover);
+        BlockPos cell = face.hit.getBlockPos();
+        int tool = cover && deepWork() ? prospectCoverToolSlot(cell, face.state, work.budget) : workToolSlot(cell, face.state);
         return startWorkBreak(face, item, cover, tool);
     }
 
@@ -2873,8 +3050,8 @@ final class AgentMacroControl {
                 return refuseProspectWall("cover_material_not_authorized");
             String refusal = diamondCoverSafetyRefusal(cell, state, debris, bearing, progress);
             if (refusal != null) return refuseProspectWall(refusal);
-            int slot = workToolSlot(cell, state, true, budget);
-            return slot < 0 ? refuseProspectWall("no_cover_tool") : new ProspectWall(hit, state, bearing, slot);
+            int slot = prospectCoverToolSlot(cell, state, budget);
+            return slot < 0 ? refuseProspectWall(prospectCoverToolRefusal(slot)) : new ProspectWall(hit, state, bearing, slot);
         });
     }
 
@@ -2899,10 +3076,14 @@ final class AgentMacroControl {
 
     private boolean prospectForDiamond(AgentProgress progress, Predicate<BlockState> wanted, BlockHitResult source) {
         BlockPos foot = player.getBlockPos();
-        if (!work.budget.policy.breakAllowed(Blocks.DIAMOND_ORE.getDefaultState())
-                && !work.budget.policy.breakAllowed(Blocks.DEEPSLATE_DIAMOND_ORE.getDefaultState())) return false;
-        if (!roomFor(new ItemStack(Items.DIAMOND)) || !diamondToolAvailable(-1, false)) {
-            work.sourceBlock = "Diamond search needs inventory room and a usable diamond-harvesting tool within the declared costs and reserves.";
+        var inventory = player.getInventory();
+        if (!AgentProspectTools.roomForDiamond(inventory)) {
+            work.sourceBlock = "The inventory has no room for a diamond drop.";
+            return false;
+        }
+        int harvest = AgentProspectTools.harvestSlot(inventory, null, world, foot, work.budget, prospectEquip);
+        if (harvest < 0) {
+            work.sourceBlock = diamondHarvestToolRefusal(harvest);
             return false;
         }
         if (!settled()) {
@@ -2941,6 +3122,8 @@ final class AgentMacroControl {
             return false;
         }
         boolean scoped = travelAnchorOutstanding();
+        if (!scoped && route.unjoined == null && route.needsGrantRecheck(work.budget))
+            route.recheckGrant(work.budget, world::getBlockState, inventory);
         boolean reserveWall = !scoped && !route.cutting && !route.spareFloor && route.unjoined == null
             && work.budget.canCutCover() && !client.options.attackKey.isUnbound();
         if (reserveWall) body.reserveLevelWallRays();
@@ -3296,7 +3479,7 @@ final class AgentMacroControl {
         BlockState state = world.getBlockState(floor);
         if (!route.spareFloorCoverCurrent(bearing, state, work.budget)
                 || !dryWorkBreakSafe(floor, state, AgentWorkOrder.prospectCoverDrop(state), progress)
-                || workToolSlot(floor, state, true) < 0 || !retainedDiamondReturn(foot)) return false;
+                || prospectCoverToolSlot(floor, state, work.budget) < 0 || !retainedDiamondReturn(foot)) return false;
         if (AgentSurfaceTread.reverseClear(client, foot, floor, bearing)) {
             route.selectSpareFloor(bearing, null);
             return prepareDiamondTread(progress, null);
@@ -3318,7 +3501,7 @@ final class AgentMacroControl {
         }
         BlockState lintel = world.getBlockState(lip);
         if (!work.budget.policy.prospectCoverAllowed(lintel) || !dryWorkBreakSafe(lip, lintel,
-                AgentWorkOrder.prospectCoverDrop(lintel), progress) || workToolSlot(lip, lintel, true) < 0) return false;
+                AgentWorkOrder.prospectCoverDrop(lintel), progress) || prospectCoverToolSlot(lip, lintel, work.budget) < 0) return false;
         route.stairLip = true;
         return cutDiamondLane(hit, floor, progress);
     }
@@ -3414,6 +3597,7 @@ final class AgentMacroControl {
         work.sourceBlock = (route.refusal == null ? "No lit dry lower shelf or returnable cut was verified in the visible sector." : route.refusal)
             + " " + (route.levelRefusal == null ? "No unvisited same-level floor or permitted side wall was witnessed."
                 : "Level alternative refused: " + route.levelRefusal)
+            + route.grantRefusalDetail()
             + (route.supportRefusal == null ? "" : " Attached support refused: " + route.supportRefusal)
             + " No further retained intersection to try.";
         return false;
@@ -3464,8 +3648,9 @@ final class AgentMacroControl {
             return refuseDiamondBearing("The lease cannot fit the floor break and rechecked tread.");
         if (!spareFloorEscapeCurrent(foot, true))
             return refuseDiamondBearing("The independent dry exit no longer holds.");
-        if (!startWorkBreak(face(hit), debris, true))
-            return refuseDiamondBearing("No permitted tool can cut the floor and still leave the diamond tool available.");
+        int tool = prospectCoverToolSlot(floor, state, work.budget);
+        if (tool < 0) return refuseDiamondBearing(prospectCoverToolRefusal(tool));
+        if (!startWorkBreak(face(hit), debris, true, tool)) return false;
         if (action.offer.key.verb == Verb.BREAK) {
             route.attemptedSpareFloors.add(floor);
             remember("Diamond spare floor: chose " + route.bearing + " at Y=" + foot.getY() + "; kept "
@@ -3613,23 +3798,34 @@ final class AgentMacroControl {
         if (station(block)) return refuseDiamondBearing("A workstation occupies the planned cut envelope.");
         String geometry = diamondCutRefusal(player.getBlockPos(), target);
         if (geometry != null) return refuseDiamondBearing(geometry);
-        if (AgentWorkOrder.harvest(block) == Items.DIAMOND && work.budget.policy.breakAllowed(block)
-                && work.budget.canBreak() && workResourceSafe(hit, block, progress)
-                && startWorkBreak(face(hit), Items.DIAMOND, false)) return true;
+        if (AgentProspectTools.isOre(block) && work.budget.policy.breakAllowed(block)) {
+            if (!workResourceSafe(hit, block, progress))
+                return refuseDiamondBearing(AgentProspectTools.roomForDiamond(player.getInventory())
+                    ? "The witnessed diamond face does not pass the safe harvest checks."
+                    : "The inventory has no room for a diamond drop.");
+            int tool = workToolSlot(target, block);
+            return tool < 0 ? refuseDiamondBearing(diamondHarvestToolRefusal(tool))
+                : startWorkBreak(face(hit), Items.DIAMOND, false, tool);
+        }
         Item debris = AgentWorkOrder.prospectCoverDrop(block);
-        String name = Registries.BLOCK.getId(block.getBlock()).toString();
         if (diamondRoute.grade < 0 && target.equals(landing) && (hit.getSide() == Direction.UP
                 || (diamondRoute.levelFloors & directionBit(diamondRoute.bearing)) != 0))
-            return refuseDiamondBearing("Preserving the witnessed same-level floor instead of cutting " + name + ".");
-        if (debris == Items.AIR || !work.budget.policy.prospectCoverAllowed(block))
-            return refuseDiamondBearing("The selected passage exposes " + name + "; the current grant does not allow clearing it.");
-        if (!work.budget.canCutCover())
-            return refuseDiamondBearing("Keep the last break for diamond ore; cutting witnessed " + name + " needs a new grant.");
+            return refuseDiamondBearing("Preserving the witnessed same-level floor instead of cutting "
+                + Registries.BLOCK.getId(block.getBlock()) + ".");
+        if (debris == Items.AIR)
+            return refuseDiamondBearing("The selected passage exposes " + Registries.BLOCK.getId(block.getBlock())
+                + "; it is not eligible diamond prospecting cover.");
         String unsafe = diamondCoverSafetyRefusal(target, block, debris, diamondRoute.bearing, progress);
         if (unsafe != null) return refuseDiamondBearing(unsafe);
-        int tool = sampledTool < 0 ? workToolSlot(target, block, true) : sampledTool;
+        String grantRefusal = diamondRoute.cutGrantRefusal(work.budget, target, block);
+        if (grantRefusal != null) {
+            enact("search", grantRefusal);
+            return true;
+        }
+        int tool = sampledTool < 0 ? prospectCoverToolSlot(target, block, work.budget) : sampledTool;
         if (tool < 0)
-            return refuseDiamondBearing("No tool can cut the witnessed " + name + " while preserving the diamond harvest tool and reserves.");
+            return refuseDiamondBearing(prospectCoverToolRefusal(tool) + " Witnessed cover: "
+                + Registries.BLOCK.getId(block.getBlock()) + ".");
         if (diamondCutOverlaps(player.getBoundingBox(), target)) {
             BlockPos foot = player.getBlockPos();
             if (!diamondRoute.cutInsetCurrent(tick) || !body.centerOnGroundedSupport(foot, diamondRoute.support))
@@ -3663,10 +3859,6 @@ final class AgentMacroControl {
 
     private boolean startProspectSupport(BlockPos foot, BlockPos to, Direction bearing, Vec3d emptyTop, AgentProgress progress) {
         String gap = "The rendered landing ray found no full supporting top.";
-        if (!work.budget.policy.placeProspectSupport()) return refuseDiamondBearing(gap
-            + " No attached support is authorized; that needs place:minecraft:cobblestone.");
-        if (!work.budget.canPlaceProspectSupport(player.getInventory()))
-            return refuseDiamondBearing(gap + " An attached support needs a usable placement and carried cobblestone above its reserve and within its exact cost.");
         BlockPos cell = to.down();
         if (diamondRoute.attemptedSupports.contains(cell) || diamondRoute.supports.contains(cell)
                 || surfaceSearch.footholds.contains(cell) || !progress.macroCanBreak(cell))
@@ -3677,6 +3869,12 @@ final class AgentMacroControl {
             return refuseDiamondBearing(gap + " The exact fill cell was not witnessed empty and dry.");
         if (client.options.useKey.isUnbound() || !player.getOffHandStack().isEmpty())
             return refuseDiamondBearing("An attached support needs a bound use control and an empty off hand.");
+        String grantRefusal = diamondRoute.placeGrantRefusal(work.budget, cell, world.getBlockState(cell),
+            Items.COBBLESTONE, player.getInventory());
+        if (grantRefusal != null) {
+            enact("search", grantRefusal);
+            return true;
+        }
         if (workTicksLeft() <= Verb.WORK_PLACE.maxTicks + AgentSurfaceTread.ACTION_TICKS) {
             enact("hold", "Renew the lease before starting a support placement and its proved crossing.");
             return true;
@@ -3721,10 +3919,17 @@ final class AgentMacroControl {
     }
 
     private boolean lightDiamondTread() {
-        if (world.getBlockState(player.getBlockPos()).isOf(Blocks.TORCH))
+        BlockPos foot = player.getBlockPos();
+        BlockState state = world.getBlockState(foot);
+        if (state.isOf(Blocks.TORCH))
             return refuseDiamondBearing("The placed light does not reveal a usable dry tread on this bearing.");
-        if (!work.budget.canPlaceProspectTorch(player.getInventory()) || client.options.useKey.isUnbound())
-            return refuseDiamondBearing("The tread is too dark. Lighting needs place:minecraft:torch, a placement and torch cost left, and carried light above its floor.");
+        if (client.options.useKey.isUnbound())
+            return refuseDiamondBearing("The tread is too dark and the use control is unbound.");
+        String grantRefusal = diamondRoute.placeGrantRefusal(work.budget, foot, state, Items.TORCH, player.getInventory());
+        if (grantRefusal != null) {
+            enact("search", grantRefusal);
+            return true;
+        }
         startWorkStep(Verb.WORK_PLACE, "Light the current dry foothold with one explicitly budgeted torch", null,
             null, Items.TORCH, null);
         action.diamondRoute = action.prospectLight = true;
@@ -4017,62 +4222,55 @@ final class AgentMacroControl {
     }
 
     private int workToolSlot(BlockPos pos, BlockState block) {
-        return workToolSlot(pos, block, false);
-    }
-
-    private int workToolSlot(BlockPos pos, BlockState block, boolean preserveDiamondTool) {
-        return workToolSlot(pos, block, preserveDiamondTool, work.budget);
-    }
-
-    private int workToolSlot(BlockPos pos, BlockState block, boolean preserveDiamondTool, AgentWorkOrder.Budget budget) {
         var inventory = player.getInventory();
-        int best = -1, bestLoss = Integer.MAX_VALUE;
+        if (deepWork() && AgentProspectTools.isOre(block))
+            return AgentProspectTools.harvestSlot(inventory, block, world, pos, work.budget, prospectEquip);
+        int best = -1;
         float speed = 0;
         for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
             ItemStack hand = inventory.getStack(i);
             if (block.isToolRequired() && !hand.isSuitableFor(block)) continue;
-            if (preserveDiamondTool && !hands.canEquipSlot(inventory, i)) continue;
-            if (!workLootCompatible(hand, block)) continue;
+            if (!AgentMiningStock.lootCompatible(hand, block)) continue;
             int loss = AgentMiningStock.maxLoss(hand, block, world, pos);
-            if (loss < 0 || loss > 0 && (budget == null
-                    ? count(hand.getItem()) - (work == null ? 0 : work.budget.floor(hand.getItem())) < loss
-                    : budget.limit(hand.getItem(), count(hand.getItem())) < loss)) continue;
-            if (loss > 0 && preserveDiamondTool && !diamondToolAvailable(budget, i, true)) continue;
+            if (loss < 0 || loss > 0 && work.budget.limit(hand.getItem(), count(hand.getItem())) < loss) continue;
             float candidate = hand.getMiningSpeedMultiplier(block);
-            if (budget == null && loss > bestLoss) continue;
-            if (budget == null && loss < bestLoss || candidate > speed || candidate == speed && i == inventory.selectedSlot) {
+            if (candidate > speed || candidate == speed && i == inventory.selectedSlot) {
                 best = i;
-                bestLoss = loss;
                 speed = candidate;
             }
         }
         return best;
     }
 
-    private boolean diamondToolAvailable(int excludedSlot, boolean lastUseDisallowed) {
-        return diamondToolAvailable(work.budget, excludedSlot, lastUseDisallowed);
+    private int prospectCoverToolSlot(BlockPos pos, BlockState cover, AgentWorkOrder.Budget budget) {
+        return AgentProspectTools.coverSlot(player.getInventory(), cover, world, pos, budget,
+            budget == null && work != null ? work.budget : null, prospectEquip);
     }
 
-    private boolean diamondToolAvailable(AgentWorkOrder.Budget budget, int excludedSlot, boolean lastUseDisallowed) {
-        var inventory = player.getInventory();
-        BlockState ore = (budget != null && budget.policy.breakAllowed(Blocks.DEEPSLATE_DIAMOND_ORE.getDefaultState())
-            ? Blocks.DEEPSLATE_DIAMOND_ORE : Blocks.DIAMOND_ORE).getDefaultState();
-        for (int i = 0; i < PlayerInventory.MAIN_SIZE; ++i) {
-            if (i == excludedSlot) continue;
-            ItemStack stack = inventory.getStack(i);
-            if (!stack.isSuitableFor(ore) || !hands.canEquipSlot(inventory, i) || !workLootCompatible(stack, ore)) continue;
-            int loss = AgentMiningStock.maxLoss(stack, ore, world, player.getBlockPos());
-            if (loss == 0 || loss > 0 && !lastUseDisallowed && budget != null
-                    && budget.limit(stack.getItem(), count(stack.getItem())) >= loss)
-                return true;
-        }
-        return false;
+    private static String diamondHarvestToolRefusal(int result) {
+        return switch (result) {
+            case AgentProspectTools.HARVEST_PROTECTED ->
+                "The remaining suitable diamond harvest would break a tool protected by its reserve floor.";
+            case AgentProspectTools.HARVEST_UNPRICED ->
+                "The remaining suitable diamond harvest would break a tool without enough remaining cost allowance.";
+            case AgentProspectTools.HARVEST_UNKNOWN_WEAR ->
+                "The wear of the suitable diamond-harvesting tool cannot be bounded.";
+            case AgentProspectTools.HARVEST_UNEQUIPPABLE ->
+                "No suitable diamond-harvesting tool can be equipped with the current controls.";
+            case AgentProspectTools.HARVEST_BREAKS_SPENT -> "The diamond ore break grant is spent.";
+            default -> "No carried tool can harvest a diamond drop from the permitted ore.";
+        };
     }
 
-    private boolean workLootCompatible(ItemStack hand, BlockState block) {
-        return !hand.hasEnchantments() || AgentWorkOrder.harvest(block) == block.getBlock().asItem()
-            || EnchantmentHelper.getLevel(world.getRegistryManager().getOrThrow(RegistryKeys.ENCHANTMENT)
-                .getOrThrow(Enchantments.SILK_TOUCH), hand) == 0;
+    private static String prospectCoverToolRefusal(int result) {
+        return switch (result) {
+            case AgentProspectTools.COVER_LOSES_HARVEST ->
+                "No suitable cover tool can take this wear and leave a policy-admissible diamond harvest.";
+            case AgentProspectTools.COVER_UNKNOWN_WEAR -> "The wear of the suitable cover tool cannot be bounded.";
+            case AgentProspectTools.COVER_STOCK_PROTECTED -> "Cutting this cover would break a tool protected by its reserve floor.";
+            case AgentProspectTools.COVER_UNPRICED -> "Cutting this cover would break a tool without enough remaining cost allowance.";
+            default -> "No equippable tool can harvest the expected drop from this cover.";
+        };
     }
 
     private Map.Entry<Item, Integer> missingWorkFloor() {
@@ -4248,18 +4446,28 @@ final class AgentMacroControl {
         } else if (verb == Verb.BREAK && !action.broken && !work.sourceSearch.stairs.isEmpty()
                 && !surfaceLeaseAllowsBreak(work.sourceSearch, Math.max(1, verb.maxTicks - (tick - action.started)))) {
             interrupt("The remaining lease is reserved for the verified stair return.", true);
-        } else switch (verb) {
-            case WORK_WALK -> advanceWorkWalk(progress);
-            case WORK_TREAD -> advanceSurfaceTread(progress);
-            case WORK_EQUIP -> advanceWorkEquip();
-            case WORK_PLACE -> {
-                if (action.prospectSupport != null) advanceProspectSupport();
-                else if (action.prospectLight) advanceProspectLight();
-                else advanceWorkPlacement();
+        } else {
+            BlockPos pickupGround = null;
+            if (fungibleStockPickup() && action.offer.face != null
+                    && (verb == Verb.WORK_WALK && action.horizonKind == RESOURCE
+                        || verb == Verb.BREAK && !action.prospectCover && action.tracked != null
+                            && action.offer.face.hit.getBlockPos().getY() >= player.getBlockY()))
+                pickupGround = action.offer.face.hit.getBlockPos();
+            switch (verb) {
+                case WORK_WALK -> advanceWorkWalk(progress);
+                case WORK_TREAD -> advanceSurfaceTread(progress);
+                case WORK_EQUIP -> advanceWorkEquip();
+                case WORK_PLACE -> {
+                    if (action.prospectSupport != null) advanceProspectSupport();
+                    else if (action.prospectLight) advanceProspectLight();
+                    else advanceWorkPlacement();
+                }
+                case WORK_SMELT -> advanceIronWork();
+                case WORK_FILL -> advanceWaterWork();
+                default -> step(progress);
             }
-            case WORK_SMELT -> advanceIronWork();
-            case WORK_FILL -> advanceWaterWork();
-            default -> step(progress);
+            // Do not steal terrain rays from the active approach or alter its look or contact.
+            if (pickupGround != null) body.visibleHorizon().witnessPickupGround(pickupGround);
         }
     }
 
@@ -4382,6 +4590,10 @@ final class AgentMacroControl {
             interrupt("A different screen replaced the working view.", false);
             return;
         }
+        if (action.offer.drop != null) {
+            advanceWorkPickup();
+            return;
+        }
         if (action.ordinaryGrade != null) {
             advanceOrdinaryGrade();
             return;
@@ -4392,44 +4604,83 @@ final class AgentMacroControl {
             advanceHorizonWork(progress);
             return;
         }
-        ItemEntity drop = action.offer.drop;
-        if (drop != null) {
-            if (count(action.offer.item) > action.itemCount && drop.isRemoved()) {
-                continuityWork = AgentPauseEpisodes.Work.NOVELTY;
-                complete("Vanilla confirmed a " + (count(action.offer.item) - action.itemCount) + " item gain of "
-                    + Registries.ITEM.getId(action.offer.item) + " after collecting its witnessed drop.");
-                return;
-            }
-            if (drop.isRemoved()) {
-                if (action.pickupDisappeared == 0) action.pickupDisappeared = tick;
-                if (tick - action.pickupDisappeared > 6)
-                    interrupt("The authorized drop disappeared without an inventory gain.", true);
-                return;
-            }
-            if (action.timberWalk && !updateTimberDrop(drop)) return;
-        }
-        if (action.timberWalk) rememberTimberView();
         double distance = horizontalSquared(player.getPos(), action.destination);
         if (action.drove && distance + 0.008 < action.distanceLeft) {
             action.distanceLeft = distance;
             continuityWork = AgentPauseEpisodes.Work.ROUTE;
         }
         if (!body.hasRecentView()) return;
-        if (drop == null && horizontalSquared(action.position, player.getPos()) >= 0.16
+        if (horizontalSquared(action.position, player.getPos()) >= 0.16
                 && (distance <= 1.35 * 1.35 || visibleFace(action.offer.face))) {
             if (settled()) complete("Reached a closer safe stance for the retained witnessed target.");
             return;
         }
-        if (drop != null && distance < (action.timberWalk ? 0.055 : 0.15) && action.settledAt == 0)
-            action.settledAt = tick;
-        if (action.timberWalk && drop != null && distance > 0.15) action.settledAt = 0;
-        if (drop != null && action.settledAt != 0 && tick - action.settledAt > (action.timberWalk ? 20 : 12)) {
-            interrupt("The witnessed drop did not enter inventory at its landing.", true);
-        } else if (action.timberWalk && drop != null && distance < 0.055) {
-            body.aim(action.destination.add(0, 0.10, 0));
-        } else if (!progress.macroWorkWalk(action.destination, pendingEntry() != null)) {
+        if (!progress.macroWorkWalk(action.destination, pendingEntry() != null)) {
             interrupt("No safe visible lane remains toward the retained target.", true);
         }
+    }
+
+    private void advanceWorkPickup() {
+        Offer offer = action.offer;
+        ItemEntity drop = offer.drop;
+        String mismatch = unexpectedPickup();
+        if (mismatch != null) {
+            interrupt(mismatch, true);
+            return;
+        }
+        boolean fungibleStock = fungibleStockPickup();
+        int gain = count(offer.item) - action.itemCount;
+        if (gain > 0 && (fungibleStock || drop.isRemoved())) {
+            body.visibleHorizon().reportPickupUnseen(drop, "inventory_gain");
+            body.pauseWork();
+            continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+            complete("Vanilla confirmed a " + gain + " item gain of " + Registries.ITEM.getId(offer.item)
+                + (fungibleStock ? " in authorized stock." : " after collecting its witnessed drop."));
+            return;
+        }
+        if (drop.isRemoved()) {
+            body.visibleHorizon().reportPickupUnseen(drop, "entity_removed");
+            body.pauseWork();
+            if (action.pickupDisappeared == 0) action.pickupDisappeared = tick;
+            if (tick - action.pickupDisappeared > 6)
+                interrupt("The authorized drop disappeared without an inventory gain.", true);
+            return;
+        }
+        if (!body.seesDrop(drop, 8)) {
+            body.visibleHorizon().reportPickupUnseen(drop, "not_rendered");
+            body.pauseWork();
+            if (tick - action.dropSeen > 23) {
+                action.retryDropWhenVisible = true;
+                interrupt("The witnessed drop left the rendered view.", true);
+            }
+            return;
+        }
+        action.dropSeen = tick;
+        if (!drop.getStack().isOf(offer.item) || !roomFor(drop.getStack()) || dropInProspectOpening(drop)
+                || deepWork() && drop.getBlockPos().getY() != player.getBlockY()) {
+            body.pauseWork();
+            interrupt("The witnessed item, available inventory space, or authorized footing changed.", true);
+            return;
+        }
+        if (drop.isOnGround() != action.dropGrounded || drop.getPos().squaredDistanceTo(action.dropPosition) > 0.0064
+                || player.getPos().squaredDistanceTo(action.pickupFooting) > 0.0064) {
+            action.dropGrounded = drop.isOnGround();
+            action.dropPosition = drop.getPos();
+            action.pickupFooting = player.getPos();
+            action.pickupProgress = tick;
+        }
+        if (tick - action.pickupProgress > 24) {
+            body.visibleHorizon().reportPickup(drop, "no_collection_progress", null);
+            body.pauseWork();
+            interrupt("No safe collection step or vanilla pickup was confirmed for the witnessed drop.", true);
+            return;
+        }
+        if (fungibleStock)
+            body.pickUpVisible(drop, null, AgentPickup.Scope.MATCHING_STOCK, stockPickupFooting);
+        else body.pickUpVisible(drop, null, true);
+        if (timberItem(offer.item)) rememberTimberView();
+        if (action.drove && player.getVelocity().horizontalLengthSquared() > SETTLED_SPEED_SQUARED)
+            continuityWork = AgentPauseEpisodes.Work.ROUTE;
     }
 
     private void advanceHorizonWork(AgentProgress progress) {
@@ -4443,8 +4694,8 @@ final class AgentMacroControl {
         var cue = action.offer.face;
         var kind = action.horizonKind;
         boolean timber = kind == RESOURCE && timberBlock(cue.state);
-        boolean ready = kind == RESOURCE && travel.moved() && grounded() && visibleFace(cue)
-            && workResourceSafe(cue.hit, cue.state, progress) && workToolSlot(cue.hit.getBlockPos(), cue.state) >= 0;
+        boolean ready = kind == RESOURCE && travel.moved() && (!action.timberWorkStance
+            || timberReadyToCut(true, player.getPos(), travel.goal, travel.arrival, false)) && harvestReachable(cue, progress);
         if (travel.moved()) work.travelAnchorUsed = true;
         if (travel.progressed()) continuityWork = AgentPauseEpisodes.Work.ROUTE;
         if (action.horizonBraking) {
@@ -4462,7 +4713,9 @@ final class AgentMacroControl {
                     : switch (kind) {
                         case CAVE_FRONTIER -> "Walked to a closer dry stance for the witnessed cave frontier.";
                         case WOODLAND_FRONTIER -> "Reached a closer dry stance at the witnessed woodland; no harvest yet.";
-                        case RESOURCE -> "Walked to a closer dry stance for the witnessed resource; no harvest yet.";
+                        case RESOURCE -> action.timberWorkStance
+                            ? "Settled at a comfortable dry stance for the witnessed timber; no harvest yet."
+                            : "Walked to a closer dry stance for the witnessed resource; no harvest yet.";
                     });
             }
             case BLOCKED -> {
@@ -4482,6 +4735,11 @@ final class AgentMacroControl {
                     finishShortHorizon();
                     return;
                 }
+                if (action.timberWorkStance && settled()
+                        && timberReadyToCut(harvestReachable(cue, progress), player.getPos(), travel.goal, travel.arrival, true)) {
+                    complete("No closer dry lane remains; the timber is still safely reachable from this stance.");
+                    return;
+                }
                 var grade = timber || kind == WOODLAND_FRONTIER ? null : sourceCaveLane(progress, cue.hit, true);
                 if (grade != null) {
                     // Only an already offered, goalward one-block route may take over.
@@ -4495,6 +4753,11 @@ final class AgentMacroControl {
                 interrupt("Stopped short of the witnessed target; no supported braking window or safe correction remains.", true);
             }
         }
+    }
+
+    private boolean harvestReachable(Face cue, AgentProgress progress) {
+        return grounded() && visibleFace(cue) && workResourceSafe(cue.hit, cue.state, progress)
+            && workToolSlot(cue.hit.getBlockPos(), cue.state) >= 0;
     }
 
     private void advanceOrdinaryGrade() {
@@ -4569,6 +4832,9 @@ final class AgentMacroControl {
         }
         recordHorizonLanding();
         work.horizonAttempts.remove(action.offer.face.hit.getBlockPos());
+        if (action.timberWorkStance && !timberReadyToCut(true, player.getPos(),
+                action.horizonTravel.goal, action.horizonTravel.arrival, false))
+            work.timberClosing = action.offer.face;
         complete("Walked closer and braked on dry footing; rechecking the witnessed target from a fresh view.");
     }
 
@@ -4579,32 +4845,6 @@ final class AgentMacroControl {
         if (deepWork() && !foot.equals(BlockPos.ofFloored(action.position))
                 && diamondRoute.arriveFromHorizon(foot, diamondRecoverySupport(foot), player.getHorizontalFacing()))
             walkedRoutes.recovery().clear();
-    }
-
-    private boolean updateTimberDrop(ItemEntity drop) {
-        if (body.visibleEntity(entity -> entity == drop && drop.getStack().isOf(action.offer.item), 8).isPresent()) {
-            Vec3d location = drop.getPos();
-            if (horizontalSquared(location, action.destination) > 0.04) {
-                action.distanceLeft = horizontalSquared(player.getPos(), location);
-                action.settledAt = 0;
-            }
-            action.destination = location;
-            action.timberDropSeen = tick;
-        }
-        if (tick - action.timberDropSeen > 8) {
-            if (tick - action.timberDropSeen > 23)
-                interrupt("The witnessed timber drop could not be reacquired near its last visible landing.", true);
-            else body.aim(action.destination.add(0, 0.10, 0));
-            return false;
-        }
-        double height = action.destination.y - player.getY();
-        if (height > 1 || height < -0.7) {
-            if (tick - action.started > 26)
-                interrupt("The witnessed timber drop did not settle at a reachable height.", true);
-            else body.aim(action.destination.add(0, 0.10, 0));
-            return false;
-        }
-        return true;
     }
 
     private void advanceWorkEquip() {
@@ -6648,7 +6888,7 @@ final class AgentMacroControl {
             + diamondRoute.spine.size() + " retained return edges)";
     }
 
-    private String diamondCoverLiveRefusal(Face face, BlockPos target, ItemStack hand, int loss, AgentProgress progress) {
+    private String diamondCoverLiveRefusal(Face face, BlockPos target, ItemStack hand, AgentProgress progress) {
         if (world.getBlockState(target) != face.state)
             return "The witnessed cover state changed without an observed own break.";
         if (!ItemStack.areItemsAndComponentsEqual(action.harvestTool, hand))
@@ -6666,14 +6906,11 @@ final class AgentMacroControl {
             return "The independent dry exit for the selected spare floor changed.";
         String unsafe = diamondCoverSafetyRefusal(target, face.state, action.tracked, diamondRoute.bearing, progress);
         if (unsafe != null) return unsafe;
-        if (face.state.isToolRequired() && !hand.isSuitableFor(face.state))
-            return "The selected harvest tool is not suitable for this block.";
-        if (!workLootCompatible(hand, face.state)) return "The selected harvest tool changes the expected drop.";
-        if (loss < 0) return "The selected harvest tool's stock loss cannot be bounded.";
-        if (loss > 0 && work.budget.limit(hand.getItem(), count(hand.getItem())) < loss)
-            return "This swing would spend the selected harvest tool beyond its cost or reserve.";
-        if (loss > 0 && !diamondToolAvailable(player.getInventory().selectedSlot, true))
-            return "This swing would leave no separately usable diamond harvest tool.";
+        var inventory = player.getInventory();
+        if (!AgentProspectTools.roomForDiamond(inventory)) return "The inventory has no room for a diamond drop.";
+        int loss = AgentProspectTools.coverLoss(inventory, inventory.selectedSlot, face.state, world, target, work.budget, prospectEquip);
+        if (loss < 0) return prospectCoverToolRefusal(loss);
+        action.handLoss = loss;
         return null;
     }
 
@@ -6684,13 +6921,15 @@ final class AgentMacroControl {
         if (!mayBreak) {
             if (action.durable) {
                 ItemStack hand = player.getMainHandStack();
-                int loss = AgentMiningStock.maxLoss(hand, face.state, world, target);
+                int loss = diamondCover ? 0 : deepWork() && AgentProspectTools.isOre(face.state)
+                    ? AgentProspectTools.harvestLoss(hand, face.state, world, target)
+                    : AgentMiningStock.maxLoss(hand, face.state, world, target);
                 if (action.timberOpening != null) {
                     mayBreak = work.budget.policy.timberClearAllowed(face.state)
                         && work.budget.canOpenTimber(action.timberLogsNeeded) && loss == 0
                         && safeTimberOpening(action.timberOpening.pursuit, face, progress);
                 } else if (diamondCover) {
-                    String refusal = diamondCoverLiveRefusal(face, target, hand, loss, progress);
+                    String refusal = diamondCoverLiveRefusal(face, target, hand, progress);
                     if (refusal != null) {
                         interrupt(refusal + " Target: " + blockName(face) + " at " + target.toShortString() + ".", true);
                         return;
@@ -6708,10 +6947,11 @@ final class AgentMacroControl {
                 }
                 if (!diamondCover) {
                     mayBreak = mayBreak && !client.options.attackKey.isUnbound()
-                        && (!face.state.isToolRequired() || hand.isSuitableFor(face.state)) && loss >= 0 && workLootCompatible(hand, face.state)
+                        && (!face.state.isToolRequired() || hand.isSuitableFor(face.state))
+                        && loss >= 0 && AgentMiningStock.lootCompatible(hand, face.state)
                         && (loss == 0 || work.budget.limit(hand.getItem(), count(hand.getItem())) >= loss);
+                    action.handLoss = loss;
                 }
-                action.handLoss = loss;
             } else {
                 mayBreak = action.prospectCover ? directCapCurrent(face, progress) : canBreak(face, progress);
             }
@@ -6776,7 +7016,6 @@ final class AgentMacroControl {
         }
         var player = client.player;
         Floor floor = action.secondHop ? offer.farther : offer.floor;
-        boolean collect = offer.drop != null;
         Vec3d position = player.getPos();
         if (!action.walkMotion.observe(position.x, position.y, position.z)) {
             interrupt("The exact checked approach lost contiguous body motion.", true);
@@ -6787,17 +7026,8 @@ final class AgentMacroControl {
             interrupt(pickup, true);
             return;
         }
-        if (collect && offer.drop.isRemoved()) {
-            if (action.pickupDisappeared == 0) action.pickupDisappeared = tick;
-            if (count(offer.item) > action.itemCount) {
-                if (settled()) {
-                    recordApproachLeg(floor);
-                    continuityWork = AgentPauseEpisodes.Work.NOVELTY;
-                    complete("The witnessed drop disappeared and the matching inventory count increased.");
-                }
-            } else if (tick - action.pickupDisappeared > 6) {
-                interrupt("The drop disappeared without a matching inventory gain.", true);
-            }
+        if (offer.drop != null) {
+            collectOnOfferedFloor(offer);
             return;
         }
         if (!body.hasRecentView()) return; // Do not issue another movement tick from a missing frame.
@@ -6806,13 +7036,12 @@ final class AgentMacroControl {
             interrupt("The witnessed dry workshop destination is no longer empty.", true);
             return;
         }
-        if (!collect && tick != action.started && !body.macroNoVisiblePickup(floor.landing)) {
+        if (tick != action.started && !body.macroNoVisiblePickup(floor.landing)) {
             interrupt("A visible pickup overlaps the walking lane, or the view cannot check it.", true);
             return;
         }
-        if (!body.macroFlatLane(floor.pos, floor.state, floor.landing) || (collect && (!dropVisible(offer)
-                || !dropNearLanding(offer.drop, floor)))) {
-            interrupt("The witnessed drop or flat walking lane is no longer safe.", true);
+        if (!body.macroFlatLane(floor.pos, floor.state, floor.landing)) {
+            interrupt("The witnessed flat walking lane is no longer safe.", true);
             return;
         }
         double remaining = horizontalSquared(position, floor.landing);
@@ -6822,26 +7051,24 @@ final class AgentMacroControl {
         }
         if (remaining <= 0.1225 && action.drove && horizontalSquared(action.walkFrom, position) >= 0.16
                 && player.getBlockPos().equals(floor.pos.up())) {
-            if (!collect) {
-                if (!settled()) action.settledAt = 0;
-                else if (action.settledAt == 0) action.settledAt = tick;
-                else if (tick - action.settledAt >= APPROACH_SETTLE_TICKS) {
-                    recordApproachLeg(floor);
-                    if (!action.secondHop && offer.farther != null) {
-                        if (!floorCurrent(offer.farther) || !body.macroNoVisiblePickup(offer.farther.landing)) {
-                            interrupt("Stopped on the first verified tile; the farther lane did not revalidate.", true);
-                            return;
-                        }
-                        surfaceSearch.footholds.add(floor.pos);
-                        action.secondHop = true;
-                        action.walkFrom = position;
-                        action.walkMotion.start(position.x, position.y, position.z);
-                        action.distanceLeft = horizontalSquared(position, offer.farther.landing);
-                        action.drove = false;
-                        action.settledAt = 0;
-                    } else complete(offer.farther == null ? "Reached the adjacent witnessed tile and stopped after actual displacement."
-                        : "Reached the distinct witnessed foothold after two separately revalidated dry hops.");
-                }
+            if (!settled()) action.settledAt = 0;
+            else if (action.settledAt == 0) action.settledAt = tick;
+            else if (tick - action.settledAt >= APPROACH_SETTLE_TICKS) {
+                recordApproachLeg(floor);
+                if (!action.secondHop && offer.farther != null) {
+                    if (!floorCurrent(offer.farther) || !body.macroNoVisiblePickup(offer.farther.landing)) {
+                        interrupt("Stopped on the first verified tile; the farther lane did not revalidate.", true);
+                        return;
+                    }
+                    surfaceSearch.footholds.add(floor.pos);
+                    action.secondHop = true;
+                    action.walkFrom = position;
+                    action.walkMotion.start(position.x, position.y, position.z);
+                    action.distanceLeft = horizontalSquared(position, offer.farther.landing);
+                    action.drove = false;
+                    action.settledAt = 0;
+                } else complete(offer.farther == null ? "Reached the adjacent witnessed tile and stopped after actual displacement."
+                    : "Reached the distinct witnessed foothold after two separately revalidated dry hops.");
             }
             return;
         }
@@ -6850,6 +7077,34 @@ final class AgentMacroControl {
             : action.pathYaw;
         float pitch = action.pathPitch;
         body.macroFlatWalk(floor.landing, yaw, pitch);
+    }
+
+    private void collectOnOfferedFloor(Offer offer) {
+        Floor floor = offer.floor;
+        ItemEntity drop = offer.drop;
+        if (drop.isRemoved()) {
+            body.pauseWork();
+            if (action.pickupDisappeared == 0) action.pickupDisappeared = tick;
+            if (count(offer.item) > action.itemCount) {
+                if (settled()) {
+                    if (player.getBlockPos().equals(floor.pos.up())) recordApproachLeg(floor);
+                    continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+                    complete("The witnessed drop disappeared and the matching inventory count increased.");
+                }
+            } else if (tick - action.pickupDisappeared > 6) {
+                interrupt("The drop disappeared without a matching inventory gain.", true);
+            }
+            return;
+        }
+        if (!body.hasRecentView()) return;
+        if (!dropVisible(offer) || !dropNearLanding(drop, floor) || !roomFor(drop.getStack())
+                || !body.macroFlatLane(floor.pos, floor.state, floor.landing)) {
+            body.pauseWork();
+            interrupt("The witnessed drop, available inventory space, or flat walking lane changed.", true);
+            return;
+        }
+        if (body.pickUpVisible(drop, floor.landing, true) == AgentBody.PickupResult.BLOCKED)
+            interrupt("No safe footstep remains on the offered pickup lane.", true);
     }
 
     private void walkHorizonApproach(Floor floor) {
@@ -7077,9 +7332,12 @@ final class AgentMacroControl {
             if (urgent) retireWork("needs_replan", "interrupted", reason);
         }
         if (action != null && (action.offer.key.verb == Verb.APPROACH || action.offer.key.verb == Verb.COLLECT
-                || action.offer.key.verb == Verb.FOLLOW || action.offer.key.verb == Verb.WORK_WALK))
-            action.drove = client.options.forwardKey.isPressed()
+                || action.offer.key.verb == Verb.FOLLOW || action.offer.key.verb == Verb.WORK_WALK)) {
+            var keys = client.options;
+            action.drove = keys.forwardKey.isPressed()
+                || action.offer.drop != null && (keys.backKey.isPressed() || keys.leftKey.isPressed() || keys.rightKey.isPressed())
                 || action.drove && (!action.durable || action.offer.key.verb == Verb.APPROACH);
+        }
         if (action != null && action.offer.key.verb == Verb.BREAK && (action.durable || owner.equals("terra")))
             action.fired |= client.options.attackKey.isPressed();
         float crack = advancingCrack();
@@ -7277,8 +7535,7 @@ final class AgentMacroControl {
     }
 
     private boolean dropVisible(Offer offer) {
-        return offer.drop != null && !offer.drop.isRemoved() && body.visibleEntity(entity -> entity == offer.drop, 3.25)
-            .filter(entity -> offer.drop.getStack().isOf(offer.item)).isPresent();
+        return offer.drop != null && body.seesDrop(offer.drop, 3.25) && offer.drop.getStack().isOf(offer.item);
     }
 
     private static boolean dropNearLanding(ItemEntity drop, Floor floor) {
@@ -7926,9 +8183,15 @@ final class AgentMacroControl {
     private String prospectOpeningRefusal(PlayerInventory inventory) {
         if (!prospectBodyUsable()) return "health_food_or_controls";
         if (work != null && work.budget.missingFloor(inventory) != null) return "inventory_floor_missing";
-        if (!roomFor(new ItemStack(Items.DIAMOND))) return "no_diamond_inventory_room";
-        if (!diamondToolAvailable(null, -1, true)) return "no_spare_diamond_tool";
-        return null;
+        if (!AgentProspectTools.roomForDiamond(inventory)) return "no_diamond_inventory_room";
+        int harvest = AgentProspectTools.harvestSlot(inventory, null, world, player.getBlockPos(), null, prospectEquip);
+        return switch (harvest) {
+            case AgentProspectTools.HARVEST_UNPRICED -> "diamond_tool_last_use_unpriced";
+            case AgentProspectTools.HARVEST_UNKNOWN_WEAR -> "diamond_tool_wear_unknown";
+            case AgentProspectTools.HARVEST_UNEQUIPPABLE -> "diamond_tool_not_equippable";
+            case AgentProspectTools.NO_HARVEST_TOOL -> "no_compatible_diamond_tool";
+            default -> null;
+        };
     }
 
     private JsonObject prospectOpening(AgentProgress progress, PlayerInventory inventory, String refusal) {
@@ -8504,6 +8767,7 @@ final class AgentMacroControl {
 
     private void finish(String result, String detail) {
         if (action.horizonTravel != null) body.stopHorizonTravel(action.horizonTravel);
+        if (action.offer.drop != null && !owner.equals("safety")) body.pauseWork();
         if (action.ordinaryGrade != null && !result.equals("completed") && !owner.equals("safety")) body.pauseWork();
         if (action.prospectSupport != null && action.prospectSupport.steered && owner.equals("work_order")) {
             body.pauseWork();
@@ -8606,7 +8870,10 @@ final class AgentMacroControl {
                     BlockPos refused = action.offer.face.hit.getBlockPos();
                     if (action.offer.key.verb == Verb.WORK_PLACE) refused = refused.up();
                     work.rejected.add(refused);
-                } else if (action.offer.drop != null) work.rejectedDrops.add(action.offer.drop.getId());
+                } else if (action.offer.drop != null && action.dropPosition != null && !action.retryDropWhenVisible) {
+                    work.deferredDrops.put(action.offer.drop.getId(), new PickupDeferral(player.getPos(),
+                        action.dropPosition, action.dropGrounded, player.getYaw(), player.getPitch()));
+                }
                 if (workshopWalk || action.offer.key.verb == Verb.CONTINUE || action.offer.key.verb == Verb.WORK_SMELT
                         || action.offer.key.verb == Verb.WORK_FILL
                         || action.offer.key.verb == Verb.WORK_PLACE && action.offer.item == Items.FURNACE
@@ -8642,7 +8909,7 @@ final class AgentMacroControl {
     private String unexpectedPickup() {
         if (action == null || action.walkInventory == null || client.player != player || client.world != world) return null;
         if (action.unexpectedPickup != null) return action.unexpectedPickup;
-        Item item = action.walkInventory.gain(player.getInventory());
+        Item item = action.walkInventory.gain(player.getInventory(), action.offer.drop == null ? null : action.offer.item);
         if (item != null) action.unexpectedPickup = "Unexpected inventory gain during " + action.offer.key.verb.id
             + ": " + Registries.ITEM.getId(item) + ".";
         return action.unexpectedPickup;

@@ -53,6 +53,37 @@ final class VisibleHorizonTest {
     }
 
     @Test
+    void steadyStrideUsesAClippedTopOnlyWhileItsExactNearSupportIsStillValid() {
+        Vec3d feet = new Vec3d(-48.802633457, 67, 23.430997897); // a1BHaY t414
+        var stance = new AgentVisibleHorizon.Stance(feet.x, feet.y, feet.z, 0.312,
+            new Vec3d(0, 0, 0.0535), 0.1, 0.546, false, new BlockPos(-49, 66, 23));
+        var left = BlockPos.ofFloored(feet).add(-1, -1, 0);
+        var top = AgentVisibleHorizon.Patch.dry(67, 0.6, left, Blocks.GRASS_BLOCK.getDefaultState());
+        var dry = AgentVisibleHorizon.Patch.dry(67, 0.6);
+        var recent = new AgentVisibleHorizon.RecentDryTops();
+        recent.witness(top, 413);
+        AgentVisibleHorizon.Support current = (x, z) -> x == left.getX() && z == left.getZ()
+            ? null : z <= 25 ? dry : null;
+        assertEquals(UNKNOWN, AgentVisibleHorizon.trace(current, stance, 0, 1).medium());
+
+        var continued = AgentVisibleHorizon.trace((x, z) -> {
+            var rendered = current.at(x, z);
+            return rendered != null ? rendered : recent.recheck(x, z, feet, 414, patch -> patch == top);
+        }, stance, 0, 1);
+        assertEquals(DRY, continued.medium());
+        assertEquals(AgentBody.HorizonPace.WALK,
+            AgentBody.horizonPace(continued.known(), continued.braking(), 5, false, false));
+        assertNull(recent.recheck(-50, 26, feet, 414, patch -> true), "an unseen tile beyond the lip is not inferred");
+        var lip = AgentVisibleHorizon.trace((x, z) -> x == -49 && z == 23 ? dry
+            : recent.recheck(x, z, feet, 414, patch -> true), stance, 0, 1);
+        assertTrue(lip.known() < lip.braking(), "a clipped side witness cannot fill in a missing forward tile");
+        assertNull(recent.recheck(-50, 23, feet, 422, patch -> true), "its last fresh ray aged out");
+        recent.witness(top, 430);
+        assertNull(recent.recheck(-50, 23, feet, 431, patch -> false), "the known top changed");
+        assertNull(recent.recheck(-50, 23, feet, 431, patch -> true), "a vetoed top cannot revive without a ray");
+    }
+
+    @Test
     void canStartOnTheVisibleNextTopWithoutProvingTheFartherOrReverseRoute() {
         var initiallyClipped = track((x, z) -> x == 0 && z == 0 ? STONE : null, 0.50, 0.50, Vec3d.ZERO);
         assertEquals(UNKNOWN, initiallyClipped.medium());

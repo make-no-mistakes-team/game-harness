@@ -106,7 +106,7 @@ public final class AgentClient implements ClientModInitializer {
     private long craftSequence;
     private int returnableDropSequence;
     private long stallSequence;
-    private int horizonEvidenceCount, wadeEvidenceCount;
+    private int horizonEvidenceCount, wadeEvidenceCount, pickupEvidenceCount;
     private boolean allowRespawn;
     private boolean initialDeathScreen;
     private LifePhase lifePhase = LifePhase.PLAYING;
@@ -231,6 +231,23 @@ public final class AgentClient implements ClientModInitializer {
         }
         // Local run journal only: never attach these reasons to progress or macro observations.
         append("horizon.jsonl", event + "\n");
+    }
+
+    private void recordPickup(AgentVisibleHorizon.PickupEvidence evidence) {
+        if (evidence == null || pickupEvidenceCount >= 64) return;
+        ++pickupEvidenceCount;
+        var event = new JsonObject();
+        event.addProperty("tick", tick);
+        event.addProperty("life", 1 + respawns);
+        event.addProperty("frame", evidence.frame());
+        event.addProperty("item_entity", evidence.item());
+        if (evidence.grounded() != null) event.addProperty("item_grounded", evidence.grounded());
+        event.addProperty("stage", evidence.stage());
+        var track = evidence.track();
+        if (track != null && Double.isFinite(track.known())) event.addProperty("offered_ground", track.known());
+        if (track != null && Double.isFinite(track.braking())) event.addProperty("braking_distance", track.braking());
+        if (evidence.retainedTops() > 0) event.addProperty("retained_tops", evidence.retainedTops());
+        append("pickups.jsonl", event + "\n");
     }
 
     private void recordMovement(MinecraftClient client, ClientPlayerEntity p, String activity) {
@@ -930,6 +947,7 @@ public final class AgentClient implements ClientModInitializer {
             recordHorizon(body.visibleHorizon().takeDriveEvidence());
         }
         recordHorizon(body.visibleHorizon().takeWadeEvidence());
+        recordPickup(body.visibleHorizon().takePickupEvidence());
         JsonObject surveyTransition = macro == null ? null : macro.takeSurveyTransition(tick);
         JsonObject wallTransition = macro == null ? null : macro.takeProspectWallTransition(tick);
         boolean privateTransition = surveyTransition != null || wallTransition != null;

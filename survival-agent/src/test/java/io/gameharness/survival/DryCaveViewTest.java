@@ -5,6 +5,8 @@ import java.util.Map;
 import java.util.Set;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
@@ -415,6 +417,115 @@ final class DryCaveViewTest {
             route.returnOne();
             assertEquals(SOURCE.east(i).west(), route.foot, "retain every exact reverse edge back to the entry");
         }
+    }
+
+    @Test
+    void aFreshDiamondLegCanResampleTheWallRetiredByTheOreBreakReserve() {
+        var deepslate = Blocks.DEEPSLATE.getDefaultState();
+        var original = diamondOrder("original", 2083, 3188, 7, 3);
+        var renewed = diamondOrder("renewed", 2480, 3500, 7, 3);
+        var replacement = diamondOrder("replacement", 2503, 3528, 6, 2);
+        assertTrue(AgentMacroControl.canRenewWork(original, original, renewed));
+        assertFalse(AgentMacroControl.canRenewWork(renewed, renewed, replacement));
+        var spent = new AgentWorkOrder.Budget(original.policy());
+        for (int i = 0; i < 47; i++) spent.broken(Items.IRON_PICKAXE, 0);
+        spent.placedProspectTorch();
+
+        var route = new AgentMacroControl.DiamondRoute();
+        var entry = new AgentSurfaceTread.Edge(SOURCE.west(), deepslate, SOURCE, deepslate, Direction.EAST);
+        route.arrive(entry.upper(), deepslate, Direction.EAST);
+        route.advance(entry);
+        route.refuse(Direction.NORTH, 0, "Visible fluid vetoed the selected level passage.");
+        route.refuse(Direction.EAST, -1, "No dry reverse edge remains for the descent.");
+        var wall = SOURCE.east().up();
+        var view = new ForwardView();
+        view.blocks.put(wall, deepslate);
+        assertEquals(wall, view.firstTerrainHit(Vec3d.ofCenter(wall)).getBlockPos());
+        route.select(Direction.EAST, 0, true);
+        assertTrue(route.cutGrantRefusal(spent, wall, deepslate).contains("Keep the last break"));
+        assertFalse(route.open(Direction.EAST, 0));
+        var inventory = new PlayerInventory(null);
+        assertFalse(route.needsGrantRecheck(spent), "a compatible renewal owns the same spent budget");
+        route.recheckGrant(spent, view::state, inventory);
+        assertEquals(1, spent.breaksLeft());
+        assertEquals(6, spent.placementsLeft());
+        assertFalse(route.open(Direction.EAST, 0));
+        assertTrue(route.grantRefusalDetail().contains("Keep the last break"));
+
+        var side = new AgentSurfaceTread.Edge(SOURCE, deepslate, SOURCE.south(), deepslate, Direction.SOUTH);
+        route.advance(side);
+        route.returnOne();
+        assertFalse(route.open(Direction.EAST, 0), "the refusal belongs to the exact retained intersection");
+        var oreOnly = new AgentWorkOrder.Budget(new AgentWorkOrder.Policy(false, replacement.policy().target(),
+            Set.of("prospect:minecraft:diamond", "break:minecraft:deepslate_diamond_ore"), Map.of(), Map.of(), 48, 0, 0));
+        route.recheckGrant(oreOnly, view::state, inventory);
+        assertFalse(route.open(Direction.EAST, 0), "48 breaks do not authorize an unlisted block");
+        assertTrue(route.grantRefusalDetail().contains("does not allow clearing"));
+        assertFalse(route.grantRefusalDetail().contains("Keep the last break"));
+
+        var fresh = new AgentWorkOrder.Budget(replacement.policy());
+        route.arrive(SOURCE, deepslate, Direction.NORTH);
+        route.recheckGrant(fresh, view::state, inventory);
+        assertTrue(route.open(Direction.EAST, 0));
+        assertFalse(route.open(Direction.NORTH, 0), "the new grant cannot cure visible fluid");
+        assertFalse(route.open(Direction.EAST, -1), "a level recheck does not reopen the refused descent");
+        assertEquals(1, route.spine.size());
+        assertTrue(route.grantRefusalDetail().isEmpty(), "a terminal report cannot still cite the spent break reserve");
+        assertFalse(route.cutCell(wall), "reopening an option is not permission to swing");
+        var current = view.firstTerrainHit(Vec3d.ofCenter(wall));
+        assertNotNull(current, "the next leg must witness the wall again");
+        route.select(Direction.EAST, 0, true);
+        assertTrue(route.cutCell(current.getBlockPos()));
+        assertNull(route.cutGrantRefusal(fresh, current.getBlockPos(), view.state(current.getBlockPos())));
+        assertEquals(48, fresh.breaksLeft(), "neither repricing nor selecting the face spends a break");
+        route.returnOne();
+        assertEquals(entry.upper(), route.foot, "the originally walked return remains available");
+    }
+
+    @Test
+    void aNewGrantRechecksExactCoverAndPlacementPriceWithoutErasingChangedTerrain() {
+        var deepslate = Blocks.DEEPSLATE.getDefaultState();
+        var cover = SOURCE.east().up();
+        var fill = SOURCE.south().down();
+        var air = Blocks.AIR.getDefaultState();
+        var route = new AgentMacroControl.DiamondRoute();
+        var view = new ForwardView();
+        view.blocks.put(cover, deepslate);
+        var inventory = new PlayerInventory(null);
+        inventory.setStack(0, new ItemStack(Items.COBBLESTONE, 2));
+        var targets = new AgentWorkOrder.Target(Items.DIAMOND, 1, null);
+        var effects = Set.of("prospect:minecraft:diamond", "break:minecraft:deepslate_diamond_ore", "place:minecraft:cobblestone");
+        var noCover = new AgentWorkOrder.Budget(new AgentWorkOrder.Policy(false, targets, effects,
+            Map.of(Items.COBBLESTONE, 1), Map.of(), 48, 0, 2));
+        noCover.placedProspectSupport();
+        route.arrive(SOURCE, deepslate, Direction.EAST);
+        route.select(Direction.EAST, 0, true);
+        assertTrue(route.cutGrantRefusal(noCover, cover, deepslate).contains("does not allow clearing"));
+        route.select(Direction.SOUTH, 0, true);
+        assertNotNull(route.placeGrantRefusal(noCover, fill, air, Items.COBBLESTONE, inventory));
+
+        var materialButNotCost = new AgentWorkOrder.Budget(new AgentWorkOrder.Policy(false, targets,
+            Set.of("prospect:minecraft:diamond", "break:minecraft:deepslate_diamond_ore", "break:minecraft:deepslate",
+                "place:minecraft:cobblestone", "place:minecraft:torch"),
+            Map.of(Items.TORCH, 1), Map.of(), 48, 0, 2));
+        view.blocks.put(cover, Blocks.LAVA.getDefaultState());
+        route.recheckGrant(materialButNotCost, view::state, inventory);
+        assertFalse(route.open(Direction.EAST, 0), "the previously witnessed wall changed");
+        assertFalse(route.open(Direction.SOUTH, 0), "a torch cost and spare placements do not pay for cobblestone");
+
+        var priced = new AgentWorkOrder.Budget(diamondOrder("priced", 2503, 3528, 6, 2).policy());
+        route.recheckGrant(priced, view::state, inventory);
+        assertFalse(route.open(Direction.EAST, 0), "a changed wall is not reopened even by a grant for both effects");
+        assertTrue(route.open(Direction.SOUTH, 0), "the exact cobblestone cost and count now fit");
+        assertEquals(6, priced.placementsLeft(), "no placement was issued");
+    }
+
+    private static AgentWorkOrder diamondOrder(String id, long basis, long expires, int placements, int torchCost) {
+        var policy = new AgentWorkOrder.Policy(false, new AgentWorkOrder.Target(Items.DIAMOND, 1, null),
+            Set.of("prospect:minecraft:diamond", "break:minecraft:deepslate_diamond_ore", "break:minecraft:deepslate",
+                "place:minecraft:cobblestone", "place:minecraft:torch"),
+            Map.of(Items.COBBLESTONE, 4, Items.TORCH, torchCost), Map.of(Items.IRON_PICKAXE, 1), 48, 0, placements);
+        return new AgentWorkOrder(id, 1, 20, basis, expires, 2, policy, null, null, null, null);
     }
 
     @Test

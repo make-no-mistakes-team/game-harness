@@ -1,6 +1,7 @@
 package io.gameharness.survival;
 
 import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
@@ -31,6 +32,7 @@ final class AgentSurfaceTread {
     private final long started;
     private long drivingSince = -1;
     private boolean floorSeen, chestSeen, headSeen;
+    private String refusal;
     private AgentSurfaceTread ahead;
 
     AgentSurfaceTread(Edge edge, boolean returning, long started) {
@@ -131,6 +133,27 @@ final class AgentSurfaceTread {
         return cell.equals(next.up()) && face == down.getOpposite() || cell.equals(next) && face == Direction.UP;
     }
 
+    /** Rebind only a positively confirmed standing contact, not the far landing or an unknown replacement floor. */
+    static Edge rebindSoilContact(Edge edge, BlockPos occupied, BlockState contact) {
+        if (edge.lower.equals(occupied) && edge.lower.equals(nextFoot(edge.upper, edge.down))
+                && surfaceSoilChange(edge.lowerSupport, contact))
+            return new Edge(edge.upper, edge.upperSupport, edge.lower, contact, edge.down);
+        return edge;
+    }
+
+    /** The returning camera must have positively witnessed the exact stable dry top. */
+    static Edge rebindSoilLanding(Edge edge, BlockHitResult top, BlockState witnessed) {
+        if (top != null && !top.isInsideBlock() && AgentBody.matchesDryRouteTop(top, edge.upper.down())
+                && surfaceSoilChange(edge.upperSupport, witnessed))
+            return new Edge(edge.upper, witnessed, edge.lower, edge.lowerSupport, edge.down);
+        return edge;
+    }
+
+    private static boolean surfaceSoilChange(BlockState before, BlockState after) {
+        return after != null && (before.isOf(Blocks.DIRT) && after.isOf(Blocks.GRASS_BLOCK)
+            || before.isOf(Blocks.GRASS_BLOCK) && after.isOf(Blocks.DIRT));
+    }
+
     static boolean returnLip(BlockPos foot, BlockPos cell, Direction down, Direction face) {
         return down != null && down.getAxis().isHorizontal() && face == down.getOpposite()
             && cell.equals(nextFoot(foot, down).up(2));
@@ -202,14 +225,20 @@ final class AgentSurfaceTread {
 
     Result step(MinecraftClient client, AgentBody body, long tick, AgentSurfaceTread successor) {
         var player = client.player;
-        if (!drySupport(client, body)) return Result.REFUSED;
-        if (drivingSince >= 0 && !motion.observe(player.getX(), player.getY(), player.getZ())) return Result.REFUSED;
-        if (drivingSince < 0 ? tick - started > PROOF_TICKS : tick - drivingSince > DRIVE_TICKS) return Result.REFUSED;
+        String support = supportRefusal(client, body);
+        if (support != null) return refuse(support);
+        if (drivingSince >= 0 && !motion.observe(player.getX(), player.getY(), player.getZ()))
+            return refuse("The body drifted off the exact dry tread.");
+        if (drivingSince < 0 && tick - started > PROOF_TICKS)
+            return refuse("The dry landing or passage could not be witnessed within the tread's view window.");
+        if (drivingSince >= 0 && tick - drivingSince > DRIVE_TICKS)
+            return refuse("The body did not ground on the dry landing within the tread's movement window.");
         if (!body.hasRecentView()) return drivingSince < 0 ? Result.CHECKING : Result.MOVING;
         if ((isolated || ordinaryGrade) && !body.macroNoVisiblePickup(center, Math.min(from.getY(), to.getY()),
-                Math.max(from.getY(), to.getY()) + 0.32)) return Result.REFUSED;
+                Math.max(from.getY(), to.getY()) + 0.32)) return refuse("The dry tread no longer has a pickup-free sweep.");
         if (drivingSince < 0) {
-            if (!player.isOnGround() || !player.getBlockPos().equals(from)) return Result.REFUSED;
+            if (!player.isOnGround() || !player.getBlockPos().equals(from))
+                return refuse("The body is not grounded on the exact dry takeoff tread.");
             if (!witnessedOutbound && !centered(player.getPos(), from, 0.17)) {
                 body.centerOnSupport(sourceSupport);
                 return Result.CHECKING;
@@ -218,16 +247,20 @@ final class AgentSurfaceTread {
             if (!witnessedOutbound && !sampleProof(body, null, 0)) {
                 if (levelProbe != null && (levelProbe.visiblyRefused()
                         || body.renderedDirection(travel.getPositiveHorizontalDegrees(), AgentBody.LEVEL_ROUTE_PITCH, 5)
-                            && !body.dryRouteRaysSpent())) return Result.REFUSED;
+                            && !body.dryRouteRaysSpent()))
+                    return refuse("The current view does not verify the exact level tread's floor and passage.");
                 lookThroughOpening(body, player.getEyePos(), tick);
                 return Result.CHECKING;
             }
         }
         boolean level = from.getY() == to.getY();
-        if (player.getY() < Math.min(from.getY(), to.getY()) - 0.055) return Result.REFUSED;
-        if (!level && !reverseClear(client, edge.upper, edge.lower, edge.down)
-                || !(ordinaryGrade ? body.ordinaryGradeSweep(from, to) : body.dryRouteSweep(from, to)))
-            return drivingSince >= 0 && tick - drivingSince < 5 ? Result.CHECKING : Result.REFUSED;
+        if (player.getY() < Math.min(from.getY(), to.getY()) - 0.055)
+            return refuse("The body is below the lowest verified dry tread.");
+        boolean reverse = level || reverseClear(client, edge.upper, edge.lower, edge.down);
+        if (!reverse || !(ordinaryGrade ? body.ordinaryGradeSweep(from, to) : body.dryRouteSweep(from, to)))
+            return drivingSince >= 0 && tick - drivingSince < 5 ? Result.CHECKING
+                : refuse(reverse ? "The live body sweep or support is no longer clear for the exact dry tread."
+                    : "The retained reverse jump no longer has dry headroom.");
         if (drivingSince < 0) beginDrive(player.getPos(), tick);
         boolean carry = successor != null && canCarry(client, body, successor, tick);
         boolean landed = player.isOnGround() && player.getBlockPos().equals(to)
@@ -235,7 +268,7 @@ final class AgentSurfaceTread {
         double remaining = (center.x - player.getX()) * travel.getOffsetX() + (center.z - player.getZ()) * travel.getOffsetZ();
         if (landed && (carry && AgentBody.dryStrideContact(remaining)
                 || player.getVelocity().horizontalLengthSquared() <= 0.0025)) {
-            if (!motion.traversed()) return Result.REFUSED;
+            if (!motion.traversed()) return refuse("The body did not traverse the exact dry tread.");
             if (carry) {
                 successor.beginDrive(player.getPos(), tick);
                 body.driveDryRoute(successor.from, successor.to, successor.travel);
@@ -248,14 +281,27 @@ final class AgentSurfaceTread {
 
     private BlockState sourceState() { return returning ? edge.lowerSupport : edge.upperSupport; }
     private BlockState landingState() { return returning ? edge.upperSupport : edge.lowerSupport; }
+    String refusal() { return refusal; }
+
+    private Result refuse(String reason) {
+        refusal = reason;
+        return Result.REFUSED;
+    }
 
     private boolean drySupport(MinecraftClient client, AgentBody body) {
+        return supportRefusal(client, body) == null;
+    }
+
+    private String supportRefusal(MinecraftClient client, AgentBody body) {
         var player = client.player;
         var world = client.world;
-        return !player.isTouchingWater() && !player.isInLava() && !player.isOnFire() && !player.hasVehicle()
-            && player.hurtTime == 0 && cardinalTread(edge.upper, edge.lower, edge.down)
-            && world.getBlockState(sourceSupport) == sourceState() && world.getBlockState(landingSupport) == landingState()
-            && (!(from.getY() == to.getY() || isolated || witnessedOutbound) || body.walkedLaneDry(from, to, travel));
+        if (player.isTouchingWater() || player.isInLava() || player.isOnFire() || player.hasVehicle() || player.hurtTime != 0)
+            return "The player's current body state is unsafe for the dry tread.";
+        if (!cardinalTread(edge.upper, edge.lower, edge.down)) return "The retained tread no longer has cardinal geometry.";
+        if (world.getBlockState(sourceSupport) != sourceState()) return "The exact takeoff support state changed.";
+        if (world.getBlockState(landingSupport) != landingState()) return "The exact landing support state changed.";
+        return (from.getY() == to.getY() || isolated || witnessedOutbound) && !body.walkedLaneDry(from, to, travel)
+            ? "A retained dry tread column is no longer safe." : null;
     }
 
     private void beginDrive(Vec3d feet, long tick) {

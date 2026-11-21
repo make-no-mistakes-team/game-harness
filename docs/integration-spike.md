@@ -189,11 +189,12 @@ break, the host rejects the whole policy before issuing it. The player keeps
 at least one break for the source.
 Cover breaks, grounded travel, and stock pickups are confirmed separately.
 
-`surfaceOpening` describes one visible, dry cap beside the player.
+`surfaceOpening` describes one visible, dry block beside the player:
+a cap at the surface or an exposed side wall in an existing excavation.
 Terra can choose to prospect there for cobblestone, coal, or raw iron
 without first seeing the buried resource. A work order must cover the
 exact surface material and the desired source, keep a break for that
-source, and protect the tools it needs. The cap is not evidence that
+source, and protect the tools it needs. The opening is not evidence that
 ore lies beneath it. If the player is too injured for a safe descent,
 the opening does not override that restriction.
 

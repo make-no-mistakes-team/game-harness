@@ -233,6 +233,36 @@ final class FootholdGeometryTest {
     }
 
     @Test
+    void shallowStairRebindsOnlyItsActualDrySoilContact() {
+        var upper = new BlockPos(-21, 62, 17);
+        var lower = upper.north().down();
+        var grass = Blocks.GRASS_BLOCK.getDefaultState();
+        var dirt = Blocks.DIRT.getDefaultState();
+        var edge = new AgentSurfaceTread.Edge(upper, grass, lower, dirt, Direction.NORTH);
+
+        assertEquals(new AgentSurfaceTread.Edge(upper, grass, lower, grass, Direction.NORTH),
+            AgentSurfaceTread.rebindSoilContact(edge, lower, grass));
+        assertEquals(edge, AgentSurfaceTread.rebindSoilContact(edge, lower, dirt), "no new material");
+        assertEquals(edge, AgentSurfaceTread.rebindSoilContact(edge, lower, null), "no grounded proof");
+        assertEquals(edge, AgentSurfaceTread.rebindSoilContact(edge, lower.north(), grass), "wrong column");
+        assertEquals(edge, AgentSurfaceTread.rebindSoilContact(edge, upper, dirt), "not the occupied lower endpoint");
+        for (var material : new net.minecraft.block.Block[] { Blocks.AIR, Blocks.WATER, Blocks.SAND, Blocks.STONE,
+                Blocks.OAK_LEAVES, Blocks.CRAFTING_TABLE }) {
+            assertEquals(edge, AgentSurfaceTread.rebindSoilContact(edge, lower, material.getDefaultState()),
+                "a different floor is not a soil refresh");
+        }
+        var top = new BlockHitResult(Vec3d.ofBottomCenter(upper), Direction.UP, upper.down(), false);
+        assertEquals(new AgentSurfaceTread.Edge(upper, dirt, lower, dirt, Direction.NORTH),
+            AgentSurfaceTread.rebindSoilLanding(edge, top, dirt));
+        assertEquals(edge, AgentSurfaceTread.rebindSoilLanding(edge,
+            new BlockHitResult(top.getPos(), Direction.NORTH, upper.down(), false), dirt),
+            "a faced riser is not an observed landing top");
+        assertEquals(edge, AgentSurfaceTread.rebindSoilLanding(edge,
+            new BlockHitResult(Vec3d.ofBottomCenter(lower), Direction.UP, lower.down(), false), dirt),
+            "the near top cannot bind the far landing");
+    }
+
+    @Test
     void aFlatDryShelfCanSpareOneAdjacentFloorForAStair() {
         var foot = new BlockPos(0, 30, 0);
         var east = foot.east();

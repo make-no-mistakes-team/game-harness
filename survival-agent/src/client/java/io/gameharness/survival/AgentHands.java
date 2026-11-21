@@ -315,15 +315,51 @@ final class AgentHands {
                 && (token != 'l' || planksFor(stack) != null && (recipe.equals("planks")
                     || Registries.ITEM.getId(planksFor(stack)).getPath().equals(recipe)));
         }
+
+        String ingredientName() {
+            if (exact != null) return Registries.ITEM.getId(exact).toString();
+            return switch (token) {
+                case 'l' -> "logs for the requested planks";
+                case 'p', 'w' -> "compatible planks";
+                case 's' -> "sticks";
+                case 'r' -> "stone-tool material";
+                case 'm' -> "furnace material";
+                case 'i' -> "iron ingots";
+                case 'd' -> "diamonds";
+                case 'f' -> "flint";
+                case 'c' -> "coal or charcoal";
+                default -> throw new IllegalStateException("Unknown recipe ingredient " + token);
+            };
+        }
     }
 
-    WorkNeed workNeed(String recipe, AgentWorkOrder.Budget budget) {
-        return workNeed(c.player.getInventory(), recipe, budget);
+    enum WorkCraftStep { CRAFT, BENCH, INPUTS, STORAGE, OUTSIDE_GRANT }
+
+    record WorkCraftStatus(WorkCraftStep step, WorkNeed need) {
+        private static final WorkCraftStatus CRAFT = new WorkCraftStatus(WorkCraftStep.CRAFT, null);
+        private static final WorkCraftStatus BENCH = new WorkCraftStatus(WorkCraftStep.BENCH, null);
+        private static final WorkCraftStatus STORAGE = new WorkCraftStatus(WorkCraftStep.STORAGE, null);
+        private static final WorkCraftStatus OUTSIDE_GRANT = new WorkCraftStatus(WorkCraftStep.OUTSIDE_GRANT, null);
+    }
+
+    static WorkCraftStatus workCraftStatus(PlayerInventory inventory, String recipe, AgentWorkOrder.Budget budget,
+                                           boolean tableInReach) {
+        CraftRequest request = authorizedWorkCraft(recipe, budget);
+        if (request == null) return WorkCraftStatus.OUTSIDE_GRANT;
+        if (craftPlan(inventory, request, 1, budget) != null)
+            return request.recipe.needsTable() && !tableInReach ? WorkCraftStatus.BENCH : WorkCraftStatus.CRAFT;
+        WorkNeed need = workNeed(inventory, request, budget);
+        return need == null ? WorkCraftStatus.STORAGE : new WorkCraftStatus(WorkCraftStep.INPUTS, need);
     }
 
     static WorkNeed workNeed(PlayerInventory inventory, String recipe, AgentWorkOrder.Budget budget) {
         CraftRequest request = craftRequest(recipe);
         if (request == null || budget.craftsLeft() <= 0) return null;
+        return workNeed(inventory, request, budget);
+    }
+
+    private static WorkNeed workNeed(PlayerInventory inventory, CraftRequest request, AgentWorkOrder.Budget budget) {
+        String recipe = request.key;
         Item exact = null;
         if (request.recipe == Recipe.BOAT) {
             if (recipe.equals("boat")) return null;
@@ -356,8 +392,14 @@ final class AgentHands {
     }
 
     boolean workCraftable(String recipe, AgentWorkOrder.Budget budget) {
-        return budget.craftsLeft() > 0 && workRecipe(recipe) && budget.policy.craftAllowed(recipe)
-            && findCraftPlan(new CraftRequest[] { craftRequest(recipe) }, 0, budget) != null;
+        CraftRequest request = authorizedWorkCraft(recipe, budget);
+        return request != null && craftPlan(c.player.getInventory(), request, 1, budget) != null;
+    }
+
+    private static CraftRequest authorizedWorkCraft(String recipe, AgentWorkOrder.Budget budget) {
+        if (budget.craftsLeft() <= 0 || recipe.indexOf(':') >= 0 || !budget.policy.craftAllowed(recipe)) return null;
+        CraftRequest request = craftRequest(recipe);
+        return request != null && request.key.equals(recipe) ? request : null;
     }
 
     boolean craftWork(String recipe, int executions, AgentWorkOrder.Budget budget) {
@@ -1824,20 +1866,22 @@ final class AgentHands {
         while (runs < limit && request.equals(requests[index + runs])) runs++;
         var inventory = c.player.getInventory();
         for (int executions = runs; executions > 0; executions--) {
-            if (request.recipe == Recipe.BOAT) {
-                CraftPlan plan = boatIngredients(inventory, request, executions, budget);
-                if (plan != null) return plan;
-            } else {
-                CraftPlan plan = ingredients(inventory, request, executions, null, request.recipe.output, budget);
-                if (plan != null && storageRoom(plan.result, plan.result.getCount() * executions, plan.used))
-                    return plan;
-            }
+            CraftPlan plan = craftPlan(inventory, request, executions, budget);
+            if (plan != null) return plan;
         }
         return null;
     }
 
-    private CraftPlan boatIngredients(PlayerInventory inventory, CraftRequest request, int executions,
-                                      AgentWorkOrder.Budget budget) {
+    private static CraftPlan craftPlan(PlayerInventory inventory, CraftRequest request, int executions,
+                                       AgentWorkOrder.Budget budget) {
+        if (request.recipe == Recipe.BOAT) return boatIngredients(inventory, request, executions, budget);
+        CraftPlan plan = ingredients(inventory, request, executions, null, request.recipe.output, budget);
+        return plan != null && storageRoom(inventory, plan.result, plan.result.getCount() * executions, plan.used)
+            ? plan : null;
+    }
+
+    private static CraftPlan boatIngredients(PlayerInventory inventory, CraftRequest request, int executions,
+                                             AgentWorkOrder.Budget budget) {
         Item requestedBoat = request.key.equals("boat") ? null : vanillaBoat(request.key);
         for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
             ItemStack stack = inventory.getStack(i);
@@ -1849,7 +1893,7 @@ final class AgentHands {
             Item boat = boatFor(planks);
             if (boat == null || requestedBoat != null && boat != requestedBoat) continue;
             CraftPlan plan = ingredients(inventory, request, executions, planks, boat, budget);
-            if (plan != null && storageRoom(plan.result, executions, plan.used)) return plan;
+            if (plan != null && storageRoom(inventory, plan.result, executions, plan.used)) return plan;
         }
         return null;
     }
@@ -1999,11 +2043,14 @@ final class AgentHands {
     }
 
     private boolean storageRoom(ItemStack result, int[] used) {
-        return storageRoom(result, result.getCount(), used);
+        return storageRoom(c.player.getInventory(), result, result.getCount(), used);
     }
 
     private boolean storageRoom(ItemStack result, int remaining, int[] used) {
-        var inv = c.player.getInventory();
+        return storageRoom(c.player.getInventory(), result, remaining, used);
+    }
+
+    private static boolean storageRoom(PlayerInventory inv, ItemStack result, int remaining, int[] used) {
         for (int i = 0; i < PlayerInventory.MAIN_SIZE; i++) {
             ItemStack stack = inv.getStack(i);
             int held = stack.getCount() - (used == null ? 0 : used[i]);

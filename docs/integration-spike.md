@@ -197,7 +197,11 @@ exact surface material and the desired source, keep a break for that
 source, and protect the tools it needs. That job can be the first stage
 of a program, for example gathering cobblestone before making a pickaxe.
 The crafting stage requires the real stock and never inherits the
-opening. Seeing a suitable wall proves neither buried ore nor a safe
+opening. With the ingredients in hand but no bench in view, the player
+can look for a nearby bench or a safe spot for a carried table. It may
+place the table only if the job has budgeted for it. Failure to find a
+spot is not a reason to mine more ingredients.
+Seeing a suitable wall proves neither buried ore nor a safe
 descent. If the player is too injured to descend, it must recover first.
 
 An injured player without food can choose a short foraging job when

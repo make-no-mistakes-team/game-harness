@@ -92,6 +92,8 @@ final class AgentMacroControl {
     private static final int WORKSHOP_SCAN_TICKS = 36;
     private static final int WORKSHOP_AIM_TICKS = 16;
     private static final int WORKSHOP_SUPPORTS = 8;
+    private static final int BENCH_SURVEY_VIEWS = 4;
+    private static final float BENCH_SURVEY_PITCH = 55;
     private static final String IRON_WORKSHOP_STEP = "iron_workshop";
     private static final int MAX_ROUTE_EDGES = 8;
     private static final int PENDING_RETURN_LEGS = 3;
@@ -532,6 +534,9 @@ final class AgentMacroControl {
         Face timberClosing;
         Face sourceLook;
         long sourceLookUntil;
+        BlockPos benchSurveyFrom;
+        float benchSurveyYaw;
+        int benchSurveyViews;
         String outwardTreadRefusal;
         AgentSurfaceTread.Edge refusedOutwardTread;
         SourceRefusal sourceRefusal;
@@ -2190,18 +2195,23 @@ final class AgentMacroControl {
             if (desired == Items.IRON_INGOT && work.budget.policy.smeltIron()) {
                 if (personal) releasePersonalCraft(true);
                 else if (startIronWork(required - count(desired), tableHit, progress)) runWorkStep(progress);
-            } else if (workTowardStock(desired, required - count(desired), tableHit, progress)) runWorkStep(progress);
-            else if (personal) releasePersonalCraft(true);
-            else searchWork(goalReached ? "The target is present, but no permitted witnessed source can fill the outstanding "
-                + Registries.ITEM.getId(desired) + " reserve."
-                : "No witnessed drop, harvest face, or reserve-safe recipe can advance the requested stock.");
+            } else {
+                String blocker = workTowardStock(desired, required - count(desired), tableHit, progress,
+                    goalReached ? "The target is present, but no permitted witnessed source can fill the outstanding "
+                        + Registries.ITEM.getId(desired) + " reserve."
+                        : "No witnessed drop, harvest face, or reserve-safe recipe can advance the requested stock.");
+                if (blocker == null) runWorkStep(progress);
+                else if (personal) releasePersonalCraft(true);
+                else searchWork(blocker);
+            }
             return;
         }
         if (goalReached) {
-            if (workTowardStock(missingFloor.getKey(), missingFloor.getValue() - count(missingFloor.getKey()), tableHit, progress))
-                runWorkStep(progress);
+            String blocker = workTowardStock(missingFloor.getKey(), missingFloor.getValue() - count(missingFloor.getKey()),
+                tableHit, progress, "The preset result is present, but a declared reserve is not yet fulfilled.");
+            if (blocker == null) runWorkStep(progress);
             else if (personal) releasePersonalCraft(true);
-            else searchWork("The preset result is present, but a declared reserve is not yet fulfilled.");
+            else searchWork(blocker);
             return;
         }
         // A clue can select a bench recipe for consideration, never supply its live face.
@@ -2222,38 +2232,43 @@ final class AgentMacroControl {
         }
     }
 
-    private boolean workTowardStock(Item desired, int quantity, BlockHitResult tableHit, AgentProgress progress) {
-        if (personalCraft == null && workPickup(stack -> stack.isOf(desired))) return true;
-        if (work.budget.policy.preset()) {
-            String recipe = Registries.ITEM.getId(desired).getPath();
-            if (AgentHands.workOutput(recipe) == desired
-                    && startStockRecipe(recipe, quantity, tableHit, progress, new HashSet<>(4))) return true;
-        }
-        for (String effect : work.budget.policy.effects()) {
-            if (!effect.startsWith("craft:")) continue;
-            String recipe = effect.substring("craft:".length());
-            if (recipe.equals("planks")) {
-                String exact = Registries.ITEM.getId(desired).getPath();
-                if (AgentHands.workSpecificPlanks(exact)) recipe = exact;
-            }
-            if (AgentHands.workOutput(recipe) == desired
-                    && startStockRecipe(recipe, quantity, tableHit, progress, new HashSet<>(4))) return true;
-        }
-        return personalCraft == null && workGather(progress, state -> AgentWorkOrder.harvest(state) == desired, quantity);
+    /** A null blocker means a step started, including preparation without a physical effect. */
+    private String workTowardStock(Item desired, int quantity, BlockHitResult tableHit, AgentProgress progress,
+                                   String noSource) {
+        if (personalCraft == null && workPickup(stack -> stack.isOf(desired))) return null;
+        String recipe = Registries.ITEM.getId(desired).getPath();
+        if (work.budget.policy.craftAllowed(recipe) && AgentHands.workOutput(recipe) == desired)
+            return startStockRecipe(recipe, quantity, tableHit, progress, null);
+        return personalCraft == null && workGather(progress, state -> AgentWorkOrder.harvest(state) == desired, quantity)
+            ? null : noSource;
     }
 
-    private boolean startStockRecipe(String recipe, int quantity, BlockHitResult bench, AgentProgress progress,
-                                     Set<String> visiting) {
-        if (visiting.size() >= 4 || !visiting.add(recipe)) return false;
+    private String startStockRecipe(String recipe, int quantity, BlockHitResult bench, AgentProgress progress,
+                                    Set<String> visiting) {
+        if (visiting != null && (visiting.size() >= 4 || visiting.contains(recipe)))
+            return "No further compatible ingredient recipe can be prepared within this work order.";
+        var check = AgentHands.workCraftStatus(player.getInventory(), recipe, work.budget, bench != null);
+        switch (check.step()) {
+            case OUTSIDE_GRANT -> { return "No authorized execution of " + recipe + " remains in the craft grant."; }
+            case STORAGE -> { return "There is no inventory room for the " + recipe + " output after its inputs are used."; }
+            case BENCH -> { return returnFromSurfaceStairs() ? null : findWorkTable(); }
+            case CRAFT -> {
+                int batch = AgentHands.workOutputCount(recipe);
+                return startReadyWorkRecipe(recipe, Math.ceilDiv(quantity, batch), bench);
+            }
+            case INPUTS -> { }
+        }
+        var need = check.need();
+        Predicate<ItemStack> matches = stack -> {
+            if (!need.matches(stack)) return false;
+            Item item = stack.getItem();
+            int cap = work.budget.remainingCost(item);
+            return cap > 0 && count(item) - work.budget.floor(item) < cap;
+        };
+        if (personalCraft == null && workPickup(matches)) return null;
+        if (visiting == null) visiting = new HashSet<>(4);
+        visiting.add(recipe);
         try {
-            if (!work.budget.policy.craftAllowed(recipe) || work.budget.craftsLeft() == 0) return false;
-            int batch = AgentHands.workOutputCount(recipe);
-            if (hands.workCraftable(recipe, work.budget))
-                return startWorkRecipe(recipe, (quantity + batch - 1) / batch, bench);
-            var need = hands.workNeed(recipe, work.budget);
-            if (need == null) return false;
-            Predicate<ItemStack> matches = stack -> work.budget.remainingCost(stack.getItem()) > 0 && need.matches(stack);
-            if (personalCraft == null && workPickup(matches)) return true;
             for (String effect : work.budget.policy.effects()) {
                 if (!effect.startsWith("craft:")) continue;
                 String supply = effect.substring("craft:".length());
@@ -2262,18 +2277,20 @@ final class AgentMacroControl {
                     for (Item candidate : work.budget.policy.caps().keySet()) {
                         String exact = Registries.ITEM.getId(candidate).getPath();
                         if (AgentHands.workSpecificPlanks(exact) && matches.test(new ItemStack(candidate))
-                                && startStockRecipe(exact, need.count(), bench, progress, visiting)) return true;
+                                && startStockRecipe(exact, need.count(), bench, progress, visiting) == null) return null;
                     }
                 } else {
                     Item output = AgentHands.workOutput(supply);
                     if (output != null && matches.test(new ItemStack(output))
-                            && startStockRecipe(supply, need.count(), bench, progress, visiting)) return true;
+                            && startStockRecipe(supply, need.count(), bench, progress, visiting) == null) return null;
                 }
             }
-            return personalCraft == null && workGather(progress, state -> {
+            if (personalCraft == null && work.budget.canBreak() && workGather(progress, state -> {
                 Item harvest = AgentWorkOrder.harvest(state);
                 return harvest != Items.AIR && matches.test(new ItemStack(harvest));
-            }, need.count());
+            }, need.count())) return null;
+            return "Crafting " + recipe + " needs " + need.count() + " more spendable units of "
+                + need.ingredientName() + " under the remaining costs and reserves.";
         } finally {
             visiting.remove(recipe);
         }
@@ -2298,11 +2315,16 @@ final class AgentMacroControl {
     }
 
     private Action startWorkStep(Verb verb, String label, Face face, ItemEntity drop, Item item, Recipe recipe) {
+        return startWorkStep(verb, label, face, drop, item, recipe, 0, 0);
+    }
+
+    private Action startWorkStep(Verb verb, String label, Face face, ItemEntity drop, Item item, Recipe recipe,
+                                 float yaw, float pitch) {
         if ((face != null && station(face.state))
                 || (verb == Verb.WORK_PLACE && (item == Items.CRAFTING_TABLE || item == Items.FURNACE)))
             rememberProspectLandmark();
         var key = face == null ? new Key(verb, null, 0, null) : faceKey(verb, face, null);
-        Offer offer = new Offer(null, key, label, "", 0, 0, null, face, drop, item, recipe);
+        Offer offer = new Offer(null, key, label, "", yaw, pitch, null, face, drop, item, recipe);
         action = new Action(null, offer, client, tick, now, body.renderedFrame(), item == null ? 0 : count(item),
             NO_ANCHORS, Float.NaN);
         action.durable = true;
@@ -2312,7 +2334,7 @@ final class AgentMacroControl {
             case WORK_TREAD -> "route";
             case WORK_WALK -> drop == null ? "route" : "collect";
             case CONTINUE -> "craft";
-            case STATION_REACQUIRE -> "search";
+            case STATION_REACQUIRE, SURVEY -> "search";
             case WORK_EQUIP -> "equip";
             case WORK_PLACE -> "place";
             case WORK_SMELT -> "smelt";
@@ -4684,47 +4706,81 @@ final class AgentMacroControl {
     }
 
     private boolean startWorkRecipe(String key, int executions, BlockHitResult bench) {
-        if (returnFromSurfaceStairs()) return true;
+        return hands.workCraftable(key, work.budget) && startReadyWorkRecipe(key, executions, bench) == null;
+    }
+
+    private String startReadyWorkRecipe(String key, int executions, BlockHitResult bench) {
+        if (returnFromSurfaceStairs()) return null;
         Face face = null;
         if (AgentHands.workTableRecipe(key)) {
-            if (personalCraft != null) return false;
-            if (bench == null) return findWorkTable(key);
+            if (personalCraft != null) return "The personal inventory must close before using a crafting table.";
+            if (bench == null) return findWorkTable();
             if (work.budget.policy.smeltIron() && (!ironFooting(player.getBlockPos().down())
-                    || bench.getBlockPos().getY() < player.getBlockY())) return false;
+                    || bench.getBlockPos().getY() < player.getBlockY())) return "The crafting table is outside the dry workshop stance.";
             face = face(bench);
         }
-        if (!hands.workCraftable(key, work.budget)) return false;
         startWorkStep(Verb.CONTINUE, "Craft " + key + " within the work budget", face, null, null,
             new Recipe(key, null, null, 0, 0));
         action.executions = executions;
         action.tableInReach = personalCraft != null ? personalCraft.tableInReach : bench != null;
-        return true;
+        return null;
     }
 
-    private boolean findWorkTable(String recipe) {
-        if (startStationRecall(personalTable)) return true;
-        var known = work.budget.policy.smeltIron() ? null : body.find(state -> state.isOf(Blocks.CRAFTING_TABLE), INSPECT_REACH,
+    private String findWorkTable() {
+        if (personalCraft != null) return "The personal inventory must close before using a crafting table.";
+        if (client.options.useKey.isUnbound()) return "The crafting table cannot be used while the vanilla use control is unbound.";
+        if (startStationRecall(personalTable)) return null;
+        var budget = work.budget;
+        boolean iron = budget.policy.smeltIron();
+        boolean placementGranted = budget.canPlace() && budget.policy.placeTable()
+            && budget.remainingCost(Items.CRAFTING_TABLE) > 0;
+        int tables = count(Items.CRAFTING_TABLE);
+        boolean carried = budget.limit(Items.CRAFTING_TABLE, tables) > 0;
+        boolean canMakeTable = !carried && placementGranted && tables == budget.floor(Items.CRAFTING_TABLE)
+            && budget.craftsLeft() >= 2 && hands.workCraftable("crafting_table", budget);
+        if (placementGranted && (carried || canMakeTable)) {
+            var support = stationSupport(iron ? this::furnaceSite : this::benchSite);
+            if (support != null && body.macroVisible(support, reach())) {
+                if (canMakeTable) return startReadyWorkRecipe("crafting_table", 1, null);
+                startWorkStep(Verb.WORK_PLACE, "Place the authorized crafting table on visible footing",
+                    face(support), null, Items.CRAFTING_TABLE, null);
+                return null;
+            }
+        }
+        var known = iron ? null : body.find(state -> state.isOf(Blocks.CRAFTING_TABLE), INSPECT_REACH,
             hit -> !work.rejected.contains(hit.getBlockPos())).orElse(null);
         if (known != null && horizontalSquared(player.getPos(), Vec3d.ofCenter(known.getBlockPos())) > 1.0) {
             startWorkStep(Verb.WORK_WALK, "Approach the witnessed crafting table", face(known), null, null, null);
             action.destination = Vec3d.ofBottomCenter(known.getBlockPos());
             action.distanceLeft = horizontalSquared(player.getPos(), action.destination);
+            return null;
+        }
+        if (!iron && startBenchSurvey()) return null;
+        if (!placementGranted) return "No usable crafting table is witnessed in reach, and no priced table placement remains.";
+        if (!carried && !canMakeTable)
+            return "No usable crafting table is witnessed in reach, and no table is available to place within the craft and reserve limits.";
+        return "No safe, reachable crafting-table placement site was witnessed from the current dry stance.";
+    }
+
+    private boolean startBenchSurvey() {
+        if (!stationaryWorldControls() || workTicksLeft() <= Verb.SURVEY.maxTicks) return false;
+        BlockPos feet = player.getBlockPos();
+        Direction cut = feet.equals(work.sourceSearch.cutFrom) ? work.sourceSearch.cutBearing : null;
+        if (!feet.equals(work.benchSurveyFrom)) {
+            work.benchSurveyFrom = feet;
+            // At the original quarry stance, look across the dry side rather than back down the opening.
+            work.benchSurveyYaw = cut == null ? player.getYaw() : heading(-cut.getOffsetX(), -cut.getOffsetZ()) - 90;
+            work.benchSurveyViews = 0;
+        }
+        int views = cut == null ? BENCH_SURVEY_VIEWS : BENCH_SURVEY_VIEWS - 1;
+        while (work.benchSurveyViews < views) {
+            float yaw = work.benchSurveyYaw + 90 * work.benchSurveyViews++;
+            if (angle(player.getYaw(), player.getPitch(), yaw, BENCH_SURVEY_PITCH) < 8) continue;
+            startWorkStep(Verb.SURVEY, "Check nearby dry footing for the crafting table",
+                null, null, null, null, yaw, BENCH_SURVEY_PITCH);
             return true;
         }
-        if (!work.budget.canPlace() || !work.budget.policy.placeTable()) return false;
-        int tables = count(Items.CRAFTING_TABLE);
-        if (tables == 0 || work.budget.policy.smeltIron() && tables == work.budget.floor(Items.CRAFTING_TABLE)) {
-            return !recipe.equals("crafting_table") && hands.workCraftable("crafting_table", work.budget)
-                && startWorkRecipe("crafting_table", 1, null);
-        }
-        if (work.budget.limit(Items.CRAFTING_TABLE, tables) < 1) return false;
-        var support = stationSupport(pos -> pos.getY() == player.getBlockY()
-            && !work.rejected.contains(pos) && client.world.getBlockState(pos).isAir()
-            && (!work.budget.policy.smeltIron() || furnaceSite(pos)));
-        if (support == null) return false;
-        startWorkStep(Verb.WORK_PLACE, "Place the authorized crafting table on visible footing",
-            face(support), null, Items.CRAFTING_TABLE, null);
-        return true;
+        return false;
     }
 
     private void searchWork(String reason) {
@@ -5794,9 +5850,9 @@ final class AgentMacroControl {
                 witnessStationPlacement();
                 ++work.confirmedPlacements;
                 continuityWork = AgentPauseEpisodes.Work.NOVELTY;
+                work.sourceSearch.freshAfter = body.renderedFrame();
                 if (furnace) {
                     work.placedFurnace = dest;
-                    work.sourceSearch.freshAfter = body.renderedFrame();
                     workshopMilestone("placement_confirmed", "Vanilla confirmed the furnace and its exact stock decrement.");
                 }
                 if (shop != null) {
@@ -5819,15 +5875,16 @@ final class AgentMacroControl {
             return;
         }
         if (!body.hasRecentView()) return;
-        if (!work.budget.canPlace() || (furnace ? !work.budget.canPlaceFurnace(player.getInventory())
-                : work.budget.limit(item, count(item)) < 1) || !cursorClear()
+        if (!work.budget.canPlace() || client.options.useKey.isUnbound() || (furnace
+                ? !work.budget.canPlaceFurnace(player.getInventory())
+                : !work.budget.policy.placeTable() || work.budget.limit(item, count(item)) < 1) || !cursorClear()
                 || shop != null && (!shop.foot.equals(player.getBlockPos()) || !ironFooting(shop.foot.down())
-                    || client.options.useKey.isUnbound() || player.isUsingItem() || client.interactionManager.isBreakingBlock())) {
+                    || player.isUsingItem() || client.interactionManager.isBreakingBlock())) {
             interrupt("The placement footing, cursor, control or material permission changed.", true);
             return;
         }
         boolean space = shop == null
-            ? world.getBlockState(dest).isAir() && !player.getBoundingBox().intersects(new Box(dest))
+            ? benchSite(dest) && !player.getBoundingBox().intersects(new Box(dest))
             : workshopSite(dest);
         if (!space || world.getBlockState(support.hit.getBlockPos()) != support.state || !visible(support)) {
             if (shop != null && space && world.getBlockState(support.hit.getBlockPos()) == support.state) {
@@ -5911,6 +5968,11 @@ final class AgentMacroControl {
     private boolean furnaceSite(BlockPos dest) {
         return dest.getY() == player.getBlockY() && !work.rejected.contains(dest)
             && world.getBlockState(dest).isAir() && dryWorkshopSupport(dest.down());
+    }
+
+    private boolean benchSite(BlockPos dest) {
+        BlockPos support = dest.down();
+        return furnaceSite(dest) && !work.sourceSearch.footholds.contains(support) && !pendingRouteSupport(support);
     }
 
     /** These checks can veto a sighted site; they do not supply a new site. */
@@ -6116,8 +6178,8 @@ final class AgentMacroControl {
             return true;
         }
         if (work.budget.limit(Items.CRAFTING_TABLE, count(Items.CRAFTING_TABLE)) == 0) {
-            if (!startStockRecipe("crafting_table", 1, null, progress, new HashSet<>(4)))
-                searchWork("The planned workshop still lacks a reserve-safe crafting table or its approved ingredients.");
+            String blocker = startStockRecipe("crafting_table", 1, null, progress, null);
+            if (blocker != null) searchWork(blocker);
             return true;
         }
         BlockHitResult support = liveWorkshopFace(shop.tableSite);
@@ -6268,10 +6330,10 @@ final class AgentMacroControl {
             } else if (hands.workCraftable("furnace", work.budget)) {
                 work.ironWorkshop = shop;
                 return prepareIronRecipe(shop, table, progress);
-            } else if (startStockRecipe("furnace", 1, table, progress, new HashSet<>(4))) {
-                return true;
             } else {
-                searchWork("Crafting the furnace lacks reserve-safe stone ingredients, a suitable work screen or output room.");
+                String blocker = startStockRecipe("furnace", 1, table, progress, null);
+                if (blocker == null) return true;
+                searchWork(blocker);
             }
         }
         return false;

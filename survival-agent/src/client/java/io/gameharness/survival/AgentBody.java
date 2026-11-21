@@ -3219,16 +3219,21 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         if (!hasView() || raysLeft <= 0 || !inView(point)) return FootholdSpace.VIEW;
         raysLeft--;
         BlockHitResult hit = raycast(point, Ray.FLUIDS);
-        BlockPos cell = BlockPos.ofFloored(point);
         if (hit.getType() != HitResult.Type.MISS) {
             if (!inView(hit.getPos())) return FootholdSpace.VIEW;
             if (!litFace(hit)) return FootholdSpace.DARK;
+        } else if (!lit(point.x, point.y, point.z)) return FootholdSpace.DARK;
+        return classifyFootholdSpace(client.world, BlockPos.ofFloored(point), hit);
+    }
+
+    /** Interpret a ray after it passed the rendered-view and light checks. */
+    static FootholdSpace classifyFootholdSpace(BlockView world, BlockPos cell, BlockHitResult hit) {
+        if (hit.getType() != HitResult.Type.MISS) {
             if (!hit.getBlockPos().equals(cell)) return FootholdSpace.OCCLUDED;
-            return client.world.getBlockState(hit.getBlockPos()).getFluidState().isEmpty()
+            return world.getBlockState(cell).getFluidState().isEmpty()
                 ? FootholdSpace.OCCUPIED : FootholdSpace.FLUID;
         }
-        if (!lit(point.x, point.y, point.z)) return FootholdSpace.DARK;
-        BlockState material = client.world.getBlockState(cell);
+        BlockState material = world.getBlockState(cell);
         return !material.getFluidState().isEmpty() ? FootholdSpace.FLUID
             : material.isAir() ? FootholdSpace.EMPTY : FootholdSpace.OCCUPIED;
     }

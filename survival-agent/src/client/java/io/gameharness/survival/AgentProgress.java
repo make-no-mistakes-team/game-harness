@@ -7146,6 +7146,16 @@ final class AgentProgress {
 
     int returnableToolUses() { return pickUses(RETURNABLE_PICKS); }
 
+    int returnableFootholdStock() { return hands.count(COBBLE_FOOTHOLD); }
+
+    boolean returnableFootholdProtected(BlockPos cell) { return !workshopPlacementSite(cell); }
+
+    boolean equipReturnableFoothold() {
+        boolean equipped = hands.equipForUse(COBBLE_FOOTHOLD);
+        if (!equipped && hands.busy()) returnableMine.awaitEquipment(hands.jobGeneration());
+        return equipped;
+    }
+
     void rememberReturnableMotion() { rememberMotion(); }
 
     void recordReturnableDrop(BlockPos from, BlockPos to, Direction bearing) {

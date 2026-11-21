@@ -3,6 +3,7 @@ package io.gameharness.survival;
 import java.util.Arrays;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.FallingBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
@@ -29,13 +30,19 @@ final class AgentReturnableMine {
     private static final int RELOCATION_HOPS = 10;
     private static final int DEPARTURE_VIEW_TICKS = 38;
     private static final int DRIFT_LIMIT = 2;
+    private static final int FOOTHOLD_LIMIT = 2, WORKSHOP_RESERVE = 8;
+    private static final int FOOTHOLD_CONTACT_TICKS = 34, FOOTHOLD_RECEIPT_TICKS = 26;
     private static final Direction[] CARDINALS = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
+    private static final Direction[] ADJACENT = Direction.values();
     // The tallest samples cover the lower tread's jump takeoff, not just standing room.
     private static final double[] CLEARANCE_HEIGHTS = {0.20, 0.97, 1.79, 2.86};
 
     enum Outcome { WORKING, REACHED, FAILED, DIVERTED, EXHAUSTED, SUPPLIES }
-    private enum Phase { ANCHOR, CHOOSE, OPEN, CUT, LIGHT, FORWARD, DRIVE, REVERSE, TRIM_RETURN, RELOCATE }
-    private record Refusal(BlockPos foot, Direction bearing, Face fact) {}
+    private enum Phase { ANCHOR, CHOOSE, OPEN, CUT, LIGHT, FORWARD, FOOTHOLD, FOOTHOLD_RECEIPT,
+        DRIVE, REVERSE, TRIM_RETURN, RELOCATE }
+    private record Refusal(BlockPos foot, Direction bearing, Face fact, String detail) {
+        String reason() { return detail == null ? fact.name() : detail; }
+    }
     enum Face { UNSEEN, NO_LANDING, NO_EXIT, DARK, OCCLUDED, FLUID, LAVA, FOOTPRINT, PROTECTED, MATERIAL, TOOL, FAILED, MINEABLE }
 
     /** Neighboring positions in the same worksite do not become fresh mine starts. */
@@ -67,11 +74,11 @@ final class AgentReturnableMine {
     static final class RouteWork {
         private final long[] cuts = new long[4]; // Three descending cells and one reverse trim.
         private int cutCount, lastProgress;
-        private boolean lit;
+        private boolean lit, supported;
 
         void reset() {
             cutCount = 0;
-            lit = false;
+            lit = supported = false;
         }
 
         void cut(BlockPos cell, int now) {
@@ -88,18 +95,81 @@ final class AgentReturnableMine {
             lastProgress = now;
         }
 
+        void support(int now) {
+            supported = true;
+            lastProgress = now;
+        }
+
         void proved(int now) {
             if (recent(now)) lastProgress = now;
         }
 
         boolean recent(int now) {
-            return (cutCount != 0 || lit) && now - lastProgress <= PROGRESS_LEASE_TICKS;
+            return (cutCount != 0 || lit || supported) && now - lastProgress <= PROGRESS_LEASE_TICKS;
+        }
+    }
+
+    /** A single stationary use can only complete with a new top at this exact stair support. */
+    static final class Foothold {
+        final BlockPos from, cell;
+        final BlockState source;
+        final Direction bearing;
+        final Box volume;
+        final Vec3d low, high;
+        final int unresolvedSlot;
+        BlockState anchorState;
+        BlockHitResult anchor;
+        private int countBefore;
+        private long issuedFrame = -1;
+
+        Foothold(BlockPos from, Direction bearing, BlockState source, int unresolvedSlot) {
+            this.from = from;
+            this.bearing = bearing;
+            this.source = source;
+            this.unresolvedSlot = unresolvedSlot;
+            cell = from.add(bearing.getOffsetX(), -2, bearing.getOffsetZ());
+            volume = new Box(cell);
+            low = AgentBody.footholdInterior(cell, bearing, false);
+            high = AgentBody.footholdInterior(cell, bearing, true);
+        }
+
+        String placementRefusal(Box hull, int stock, boolean occupied, AgentBody.FootholdSpace low,
+                                AgentBody.FootholdSpace high, BlockHitResult face) {
+            if (!insideFooting(from, hull) || hull.intersects(volume)) return "the player's body overlaps the footing margin";
+            if (stock <= WORKSHOP_RESERVE) return "keeping eight cobblestone for the workshop";
+            if (occupied) return "an entity occupies the support cell";
+            if (!empty(low, high)) return spaceRefusal(low, high);
+            return AgentBody.footholdFaceInEnvelope(face, cell, bearing)
+                ? null : "no visible reachable top or side attaches to this exact cell";
+        }
+
+        static boolean empty(AgentBody.FootholdSpace low, AgentBody.FootholdSpace high) {
+            return low == AgentBody.FootholdSpace.EMPTY && high == AgentBody.FootholdSpace.EMPTY;
+        }
+
+        static String spaceRefusal(AgentBody.FootholdSpace low, AgentBody.FootholdSpace high) {
+            return "the cell is not witnessed lit and empty (low " + low + ", high " + high + ")";
+        }
+
+        void issued(long frame, int stock) {
+            issuedFrame = frame;
+            countBefore = stock;
+        }
+
+        boolean debited(int stock) { return issuedFrame >= 0 && stock == countBefore - 1; }
+
+        boolean confirms(long frame, BlockHitResult top, BlockState shown, int stock) {
+            return frame > issuedFrame && debited(stock) && AgentBody.matchesDryRouteTop(top, cell)
+                && !top.isInsideBlock() && shown.isOf(Blocks.COBBLESTONE);
         }
     }
 
     private final MinecraftClient client;
     private final AgentBody body;
     private final Refusal[] retired = new Refusal[RETIRED_LIMIT];
+    // An interrupted or unconfirmed use must not be retried or masquerade as a natural landing.
+    private final BlockPos[] unresolvedFootholds = new BlockPos[RETIRED_LIMIT];
+    private final BlockPos.Mutable footholdProbe = new BlockPos.Mutable();
     private final Loci loci = new Loci();
     private final RouteWork routeWork = new RouteWork();
     private final BlockPos[] searchPath = new BlockPos[RELOCATION_HOPS + 1];
@@ -108,6 +178,7 @@ final class AgentReturnableMine {
     private ClientWorld world;
     private ClientPlayerEntity player;
     private int retiredCursor, lastTurn, started, phaseSince, optionSince, depth, limit, drops;
+    private int footholdUses;
     private int choice, cut, proof, cutSample, floorSample;
     private int progressAt, treadEvidence, lightIssuedAt;
     private int caveSince, caveMask, caveContacts;
@@ -122,10 +193,12 @@ final class AgentReturnableMine {
     private BlockHitResult departureTop;
     private BlockState departureSurface;
     private AgentSurfaceTread crossing;
+    private Foothold foothold;
     private Phase phase, afterLight;
     private boolean litHere, trimmed, cavePending, openTread, departureBacktrack, drift;
     private String relocationRefusal;
-    private final Face[] faceFacts = new Face[4];
+    private Face optionFact;
+    private final String[] bearingReasons = new String[4];
     private Outcome outcome = Outcome.DIVERTED;
     private String status = "";
 
@@ -139,7 +212,8 @@ final class AgentReturnableMine {
     }
 
     boolean settling() {
-        return active() && (drift || phase == Phase.DRIVE || phase == Phase.RELOCATE || checkingReturn());
+        return active() && (drift || phase == Phase.DRIVE || phase == Phase.RELOCATE
+            || buildingFoothold() || checkingReturn());
     }
 
     boolean surveyingCave() { return active() && cavePending; }
@@ -156,6 +230,7 @@ final class AgentReturnableMine {
         int now = body.actionTick();
         return continuing(now)
             && (phase == Phase.RELOCATE || phase == Phase.CHOOSE || phase == Phase.OPEN
+                || buildingFoothold()
                 || driftSetup(now)
                 || progressAt >= started && now - progressAt <= PROGRESS_LEASE_TICKS
                 || cavePending && now - caveSince <= CAVE_TURN_LIMIT
@@ -165,8 +240,11 @@ final class AgentReturnableMine {
 
     boolean hasRetryProgressLease() {
         int now = body.actionTick();
-        return continuing(now) && (phase == Phase.RELOCATE || driftSetup(now) || routeWork.recent(now));
+        return continuing(now)
+            && (phase == Phase.RELOCATE || buildingFoothold() || driftSetup(now) || routeWork.recent(now));
     }
+
+    private boolean buildingFoothold() { return phase == Phase.FOOTHOLD || phase == Phase.FOOTHOLD_RECEIPT; }
 
     // A newly witnessed side face gets a short setup window, not a route receipt.
     private boolean driftSetup(int now) { return drift && now - started <= PROGRESS_LEASE_TICKS; }
@@ -266,10 +344,10 @@ final class AgentReturnableMine {
             if (limit <= 0) return finish(Outcome.SUPPLIES, "keeping a light and tool reserve for the mine return");
             anchor = from = standing.toImmutable();
             bearing = null;
-            choice = drops = 0;
+            choice = drops = footholdUses = 0;
             caveMask = 0;
             caveSurveySpent = false;
-            Arrays.fill(faceFacts, null);
+            Arrays.fill(bearingReasons, null);
             started = now;
             progressAt = now - PROGRESS_LEASE_TICKS - 1;
             begin(Phase.ANCHOR, now);
@@ -285,6 +363,7 @@ final class AgentReturnableMine {
         if (player.isTouchingWater() || player.isInLava() || player.isOnFire()
                 || player.hasVehicle() || player.hurtTime > 0) {
             if (phase == Phase.RELOCATE) return finish(Outcome.DIVERTED, "unsafe conditions interrupted mine relocation");
+            if (buildingFoothold()) return fail(routeFailure("foothold", foothold.cell, "unsafe player conditions"));
             return fail("unsafe conditions interrupted the returnable mine leg");
         }
         if (cavePending) {
@@ -315,8 +394,10 @@ final class AgentReturnableMine {
             depart(host, now);
             return outcome;
         }
-        if (now - started >= LEG_TICKS) return fail("returnable mine leg reached its time limit");
-        if (phase != Phase.DRIVE && !dryGroundAt(checkingReturn() ? to : from))
+        if (now - started >= LEG_TICKS)
+            return fail(buildingFoothold() ? routeFailure("foothold", foothold.cell, "mine leg reached its time limit")
+                : "returnable mine leg reached its time limit");
+        if (phase != Phase.DRIVE && !buildingFoothold() && !dryGroundAt(checkingReturn() ? to : from))
             return fail("lost the committed dry mine stance");
         if ((!settling() || drift && phase != Phase.DRIVE) && bearing != null
                 && body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65))
@@ -324,10 +405,12 @@ final class AgentReturnableMine {
         switch (phase) {
             case ANCHOR -> anchor(now);
             case CHOOSE -> choose(host, now);
-            case OPEN -> open(host, now);
+            case OPEN -> open(now);
             case CUT -> cut(host, now);
             case LIGHT -> light(host, now);
             case FORWARD -> prove(host, now, false);
+            case FOOTHOLD -> placeFoothold(host, now);
+            case FOOTHOLD_RECEIPT -> confirmFoothold(host, now);
             case DRIVE -> drive(host, now);
             case REVERSE -> prove(host, now, true);
             case TRIM_RETURN -> trimReturn(host, now);
@@ -351,6 +434,7 @@ final class AgentReturnableMine {
             optionSince = now;
             cut = 2;
             cutSample = 0;
+            optionFact = null;
             begin(Phase.CHOOSE, now);
         } else {
             prepareCut(now);
@@ -360,14 +444,14 @@ final class AgentReturnableMine {
     private void choose(AgentProgress host, int now) {
         for (; choice < 4; choice++) {
             Direction candidate = option(choice);
-            Face prior = refusal(from, candidate);
-            if (prior != null) { faceFacts[choice] = prior; continue; }
+            Refusal prior = refusal(from, candidate);
+            if (prior != null) { bearingReasons[choice] = prior.reason(); continue; }
             if (body.hazardAhead(candidate.getPositiveHorizontalDegrees(), 1.65)) {
                 rejectChoice(candidate, now, Face.LAVA);
                 return;
             }
             if (now - optionSince >= 48) {
-                rejectChoice(candidate, now, faceFacts[choice] == null ? Face.UNSEEN : faceFacts[choice]);
+                rejectChoice(candidate, now, optionFact == null ? Face.UNSEEN : optionFact);
                 return;
             }
             if (aim == null) aimCut(nextTread(candidate), candidate);
@@ -375,7 +459,7 @@ final class AgentReturnableMine {
             switch (body.dryCaveSpace(aim)) {
                 case CLEAR -> lowerChoice(candidate, now);
                 case FLUID -> rejectChoice(candidate, now, Face.FLUID);
-                case DARK -> faceFacts[choice] = Face.DARK;
+                case DARK -> optionFact = Face.DARK;
                 case UNKNOWN -> {
                     if (cut == 0 && body.renderedAim(aim, 10)) nextCutSample();
                 }
@@ -384,7 +468,7 @@ final class AgentReturnableMine {
                     BlockHitResult face = body.terrain(aim, reach).orElse(null);
                     if (face == null || !face.getBlockPos().equals(workCell)
                             || cut == 0 && !witnessedCap(workCell, candidate, face)) {
-                        faceFacts[choice] = Face.OCCLUDED;
+                        optionFact = Face.OCCLUDED;
                         if (cut == 0 && body.renderedAim(aim, 10)) nextCutSample();
                         return;
                     }
@@ -404,7 +488,7 @@ final class AgentReturnableMine {
                         begin(Phase.CUT, now);
                         aim = contactAim;
                     } else {
-                        faceFacts[choice] = Face.OCCLUDED;
+                        optionFact = Face.OCCLUDED;
                         if (cut == 0 && body.renderedAim(aim, 10)) nextCutSample();
                     }
                 }
@@ -424,14 +508,24 @@ final class AgentReturnableMine {
     }
 
     private void rejectChoice(Direction candidate, int now, Face fact) {
-        retire(from, candidate, fact);
-        faceFacts[choice] = fact;
+        rejectChoice(candidate, now, fact, null);
+    }
+
+    private void rejectChoice(Direction candidate, int now, Face fact, String detail) {
+        retire(from, candidate, fact, detail);
+        bearingReasons[choice] = detail == null ? fact.name() : detail;
         begin(Phase.CHOOSE, now);
-        status = "returnable mine refused " + candidate + " down from " + from.toShortString() + ": " + fact;
+        status = detail == null ? "returnable mine refused " + candidate + " down from " + from.toShortString() + ": " + fact
+            : detail;
         bearing = null;
+        to = null;
+        foothold = null;
+        revealedFrame = -1;
+        routeWork.reset();
         choice++;
         cut = 2;
         cutSample = 0;
+        optionFact = null;
         optionSince = now;
     }
 
@@ -443,11 +537,13 @@ final class AgentReturnableMine {
         begin(Phase.OPEN, now);
     }
 
-    private void open(AgentProgress host, int now) {
+    private void open(int now) {
         // No obstructing block is a result about excavation, not a witness of flooring.
-        var top = lookAtTop(to, bearing);
+        if (aim == null) aim = proofFloorAim(to, bearing, floorSample);
+        body.aim(aim);
+        var top = body.dryRouteTop(aim, to.down(), true);
         if (top == AgentBody.DryRouteTop.FLUID) {
-            rejectChoice(bearing, now, Face.FLUID);
+            rejectChoice(bearing, now, Face.FLUID, routeFailure("landing floor", to.down(), "visible fluid"));
             return;
         }
         if (top == AgentBody.DryRouteTop.WITNESSED) {
@@ -456,16 +552,190 @@ final class AgentReturnableMine {
                 rejectChoice(bearing, now, Face.NO_EXIT);
                 return;
             }
-            if (body.dryRouteSweep(from, to)) {
+            if (!body.dryRouteSweep(from, to)) {
+                if (now - phaseSince >= 28) rejectChoice(bearing, now, Face.NO_EXIT);
+                return;
+            }
+        } else if (floorSample == 0 || top != AgentBody.DryRouteTop.NO_FULL_TOP || !body.renderedAim(aim, 8)) {
+            if (now - phaseSince >= 28) {
+                rejectChoice(bearing, now, Face.NO_LANDING, routeFailure("landing floor", to.down(), failedFloor(top)));
+            } else if (floorSample == 0 && body.renderedAim(aim, 8)) {
+                floorSample = 1;
+                aim = null;
+            }
+            return;
+        }
+        openTread = true;
+        treadEvidence = 0;
+        trimmed = false;
+        begin(Phase.FORWARD, now);
+    }
+
+    private void startFoothold(int now, BlockPos cell) {
+        if (footholdUses >= FOOTHOLD_LIMIT) {
+            refuseFoothold(now, cell, "the mine leg has used its two placement attempts");
+            return;
+        }
+        BlockState source = body.dryCaveContact(from);
+        if (source == null || !insideFooting(from, player.getBoundingBox())) {
+            refuseFoothold(now, cell, "no independently stable source footing");
+            return;
+        }
+        int slot = 0;
+        while (slot < unresolvedFootholds.length && unresolvedFootholds[slot] != null) slot++;
+        if (slot == unresolvedFootholds.length) {
+            refuseFoothold(now, cell, "too many earlier uses lack a confirmed placement");
+            return;
+        }
+        foothold = new Foothold(from, bearing, source, slot);
+        begin(Phase.FOOTHOLD, now);
+    }
+
+    private void placeFoothold(AgentProgress host, int now) {
+        Foothold build = foothold;
+        if (!footholdStance(build)) return;
+        int stock = host.returnableFootholdStock();
+        var options = client.options;
+        if (stock <= WORKSHOP_RESERVE) {
+            refuseFoothold(now, build.cell, "keeping eight cobblestone for the workshop");
+            return;
+        }
+        if (options.useKey.isUnbound() || options.sneakKey.isUnbound() || options.forwardKey.isUnbound()
+                || options.jumpKey.isUnbound() || !player.getOffHandStack().isEmpty() || player.isUsingItem()) {
+            refuseFoothold(now, build.cell, "use or return controls unavailable, off hand occupied, or another item in use");
+            return;
+        }
+        if (host.returnableFootholdProtected(build.cell) || protectedCutAttachment(world, build.cell)) {
+            refuseFoothold(now, build.cell, "the support cell intersects a station, light, or retained return passage");
+            return;
+        }
+        if (body.lavaEmergency() || body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65)) {
+            refuseFoothold(now, build.cell, "visible lava vetoes the selected bearing");
+            return;
+        }
+        boolean expired = now - phaseSince >= FOOTHOLD_CONTACT_TICKS;
+        Vec3d view = build.anchor == null ? build.low : build.anchor.getPos();
+        body.aimFine(view);
+        if (!body.hasRecentView() || !body.footholdRaysAvailable()) {
+            if (expired) refuseFoothold(now, build.cell, "not enough current rendered view to prove the air and attachment");
+            return;
+        }
+        var low = body.footholdSpace(build.low);
+        var high = body.footholdSpace(build.high);
+        if (!Foothold.empty(low, high)) {
+            if (expired || low != AgentBody.FootholdSpace.VIEW && high != AgentBody.FootholdSpace.VIEW
+                    && body.renderedAim(view, 8))
+                refuseFoothold(now, build.cell, Foothold.spaceRefusal(low, high));
+            return;
+        }
+        if (build.anchor == null) {
+            build.anchor = body.visibleFootholdAttachment(build.cell, bearing, build.low, build.high,
+                player.getBlockInteractionRange());
+            if (build.anchor == null) {
+                if (expired || body.renderedAim(view, 8))
+                    refuseFoothold(now, build.cell, "no visible reachable stable top or side can attach to it");
+                return;
+            }
+            build.anchorState = world.getBlockState(build.anchor.getBlockPos());
+            body.aimFine(build.anchor.getPos());
+            status = "aligning one witnessed cobblestone attachment for " + build.cell.toShortString();
+            return;
+        }
+        String refusal = build.placementRefusal(player.getBoundingBox(), stock,
+            !world.getOtherEntities(player, build.volume).isEmpty(), low, high, build.anchor);
+        if (refusal == null) refusal = footholdHazard(build.cell);
+        if (refusal == null && (!body.dryRouteBuildClear(from, to)
+                || !AgentSurfaceTread.reverseClear(client, from, to, bearing)))
+            refusal = "the exact tread lacks a clear body sweep or reverse jump";
+        if (refusal != null) {
+            refuseFoothold(now, build.cell, refusal);
+            return;
+        }
+        if (world.getBlockState(build.anchor.getBlockPos()) != build.anchorState) {
+            refuseFoothold(now, build.cell, "the witnessed attaching face changed before use");
+            return;
+        }
+        if (expired) {
+            refuseFoothold(now, build.cell, "the witnessed attaching face did not settle for vanilla use");
+            return;
+        }
+        if (LEG_TICKS - (now - started) <= FOOTHOLD_RECEIPT_TICKS + PROGRESS_LEASE_TICKS) {
+            refuseFoothold(now, build.cell, "not enough time remains to recheck the placement and return");
+            return;
+        }
+        boolean ready = host.equipReturnableFoothold();
+        body.sneak();
+        var preparation = ready && !player.isSneaking() ? AgentBody.Preparation.STANCE : AgentBody.Preparation.equipment(ready);
+        if (body.placeFoothold(build.anchor, build.cell, preparation)) {
+            footholdUses++;
+            build.issued(body.renderedFrame(), stock);
+            unresolvedFootholds[build.unresolvedSlot] = build.cell;
+            begin(Phase.FOOTHOLD_RECEIPT, now);
+        }
+    }
+
+    private void confirmFoothold(AgentProgress host, int now) {
+        Foothold build = foothold;
+        if (!footholdStance(build)) return;
+        int stock = host.returnableFootholdStock();
+        long frame = body.renderedFrame();
+        if (aim == null) aim = proofFloorAim(to, bearing, 0);
+        body.aim(aim);
+        if (build.debited(stock) && frame > build.issuedFrame) {
+            BlockHitResult top = body.dryRouteFloor(aim, build.cell);
+            if (top == null) top = body.dryRouteFloor(proofFloorAim(to, bearing, 1), build.cell);
+            if (top != null && build.confirms(frame, top, world.getBlockState(build.cell), stock)) {
+                unresolvedFootholds[build.unresolvedSlot] = null;
+                routeWork.support(now);
+                progressAt = now;
                 openTread = true;
-                treadEvidence = 0;
-                trimmed = false;
                 begin(Phase.FORWARD, now);
+                status = "confirmed one attached cobblestone at " + build.cell.toShortString()
+                    + "; rechecking the dry tread before moving";
                 return;
             }
         }
-        if (top == AgentBody.DryRouteTop.NO_FULL_TOP && offerCave(host, to, bearing, now)) return;
-        if (now - phaseSince >= 28) rejectChoice(bearing, now, Face.NO_LANDING);
+        if (now - phaseSince >= FOOTHOLD_RECEIPT_TICKS)
+            refuseFoothold(now, build.cell, !build.debited(stock)
+                ? "one use did not show an exact one-block debit"
+                : "one debit was seen, but no fresh full cobblestone top at that cell");
+    }
+
+    private boolean footholdStance(Foothold build) {
+        if (dryGroundAt(build.from) && !player.getAbilities().flying
+                && player.getVelocity().horizontalLengthSquared() <= 0.0025
+                && insideFooting(build.from, player.getBoundingBox()) && body.dryCaveContact(build.from) == build.source)
+            return true;
+        fail(routeFailure("foothold", build.cell, "lost the independent settled dry stance"));
+        return false;
+    }
+
+    /** Negative-only checks of the selected cell's neighbors and the exact two tread columns. */
+    private String footholdHazard(BlockPos cell) {
+        for (Direction side : ADJACENT) {
+            var neighbor = footholdProbe.set(cell).move(side);
+            if (unsafeFootholdNeighbor(world.getBlockState(neighbor)))
+                return "fluid, falling material, or hazardous block beside the support at " + neighbor.toShortString();
+        }
+        for (int y = 0; y <= 2; y++) {
+            if (unsafeFootholdNeighbor(world.getBlockState(footholdProbe.set(from).move(Direction.UP, y)))
+                    || unsafeFootholdNeighbor(world.getBlockState(footholdProbe.set(to).move(Direction.UP, y))))
+                return "fluid, falling material, or a hazardous block in the exact tread at " + footholdProbe.toShortString();
+        }
+        return null;
+    }
+
+    private static boolean unsafeFootholdNeighbor(BlockState shown) {
+        return AgentBody.dryCaveDanger(shown) || shown.getBlock() instanceof FallingBlock;
+    }
+
+    private void refuseFoothold(int now, BlockPos cell, String why) {
+        rejectChoice(bearing, now, Face.NO_LANDING, routeFailure("foothold", cell, why));
+    }
+
+    private boolean unresolvedFoothold(BlockPos cell) {
+        for (BlockPos unresolved : unresolvedFootholds) if (cell.equals(unresolved)) return true;
+        return false;
     }
 
     private boolean offerCave(AgentProgress host, BlockPos planned, Direction direction, int now) {
@@ -622,8 +892,9 @@ final class AgentReturnableMine {
             if (sample != AgentBody.DryRouteSample.CLEAR && (expired || sample == AgentBody.DryRouteSample.FLUID
                     || cannotLight)) {
                 String side = (proof & 1) == 0 ? "right" : "left";
-                fail(routeFailure("clearance " + CLEARANCE_HEIGHTS[proof / 2] + "m " + side, BlockPos.ofFloored(aim),
-                    sample == AgentBody.DryRouteSample.UNKNOWN ? unknownSample(aim) : sample.name(), reverse));
+                refuseTread(now, reverse, routeFailure("clearance " + CLEARANCE_HEIGHTS[proof / 2] + "m " + side,
+                    BlockPos.ofFloored(aim), sample == AgentBody.DryRouteSample.UNKNOWN ? unknownSample(aim) : sample.name(),
+                    reverse));
                 return;
             }
             if (sample == AgentBody.DryRouteSample.CLEAR) {
@@ -640,10 +911,14 @@ final class AgentReturnableMine {
         if (aim == null) aim = proofFloorAim(target, direction, floorSample);
         body.aim(aim);
         BlockPos floor = target.down();
+        if (!reverse && !drift && unresolvedFoothold(floor)) {
+            refuseFoothold(now, floor, "an earlier use at this cell never produced a confirmed placement");
+            return;
+        }
         var top = body.dryRouteTop(aim, floor, true);
         if (top != AgentBody.DryRouteTop.WITNESSED) {
             if (top == AgentBody.DryRouteTop.FLUID) {
-                fail(routeFailure("landing floor", floor, "visible fluid", reverse));
+                refuseTread(now, reverse, routeFailure("landing floor", floor, "visible fluid", reverse));
             } else if (top == AgentBody.DryRouteTop.DARK && !expired && !litHere
                     && body.renderedAim(aim, 14) && host.returnableTorches() > TORCH_RESERVE) {
                 needLight(host, now);
@@ -654,12 +929,19 @@ final class AgentReturnableMine {
                     aim = null;
                 } else if (expired || body.renderedAim(aim, 8)) {
                     if (!reverse && !drift && !expired && top == AgentBody.DryRouteTop.NO_FULL_TOP
-                            && offerCave(host, to, bearing, now)) return;
-                    fail(routeFailure("landing floor", floor, failedFloor(top), reverse));
+                            && foothold == null) {
+                        startFoothold(now, floor);
+                    } else {
+                        refuseTread(now, reverse, routeFailure("landing floor", floor, failedFloor(top), reverse));
+                    }
                 }
             } else if (expired) {
-                fail(routeFailure("landing floor", floor, failedFloor(top), reverse));
+                refuseTread(now, reverse, routeFailure("landing floor", floor, failedFloor(top), reverse));
             }
+            return;
+        }
+        if (!reverse && foothold != null && !world.getBlockState(floor).isOf(Blocks.COBBLESTONE)) {
+            refuseFoothold(now, floor, "the installed cobblestone changed before the tread recheck");
             return;
         }
         var veto = body.dryRouteVeto(source, target);
@@ -673,12 +955,13 @@ final class AgentReturnableMine {
                     case SWEEP -> "collision in the exact tread volume";
                     case CLEAR -> throw new IllegalStateException("clear sweep cannot be refused");
                 };
-                fail(routeFailure("body sweep", target, reason, reverse));
+                refuseTread(now, reverse, routeFailure("body sweep", target, reason, reverse));
             }
             return;
         }
-        if (!body.walkedLaneDry(source, target, direction)) {
-            fail(routeFailure("dry columns", target, "unsafe block or changed support", reverse));
+        if (!body.walkedLaneDry(source, target, direction)
+                || !reverse && openTread && !AgentSurfaceTread.retainedLaneClear(client, source, target, direction)) {
+            refuseTread(now, reverse, routeFailure("dry columns", target, "unsafe block or changed return lane", reverse));
             return;
         }
         if (drift) {
@@ -710,6 +993,11 @@ final class AgentReturnableMine {
             return;
         }
         completeTread(host, now);
+    }
+
+    private void refuseTread(int now, boolean reverse, String reason) {
+        if (!reverse && !drift && openTread) rejectChoice(bearing, now, Face.NO_LANDING, reason);
+        else fail(reason);
     }
 
     private String failedFloor(AgentBody.DryRouteTop top) {
@@ -810,6 +1098,9 @@ final class AgentReturnableMine {
         } else {
             from = to;
             to = null;
+            preferred = bearing;
+            choice = 0;
+            Arrays.fill(bearingReasons, null);
             caveMask = 0;
             caveSurveySpent = false;
             begin(Phase.ANCHOR, now);
@@ -830,9 +1121,9 @@ final class AgentReturnableMine {
                     bearing = null;
                     crossing = null;
                     drift = false;
-                    choice = drops = caveMask = 0;
+                    choice = drops = caveMask = footholdUses = 0;
                     caveSurveySpent = false;
-                    Arrays.fill(faceFacts, null);
+                    Arrays.fill(bearingReasons, null);
                     limit = Math.min(LEG_LIMIT, Math.min(from.getY() - depth, suppliedSteps(host)));
                     if (limit <= 0) {
                         finish(Outcome.SUPPLIES, "reached a new level mine footing; keeping the return supplies");
@@ -1011,8 +1302,8 @@ final class AgentReturnableMine {
     private void noteDriftFace(AgentProgress host, Direction lane) {
         if (unjoined() || driftAttempts == DRIFT_LIMIT || departureBacktrack || departureTo.getY() != from.getY()
                 || host.returnableRetainedStep(from) == null || triedDrift(departureTo)) return;
-        Face prior = refusal(from, lane);
-        if (prior == Face.FLUID || prior == Face.LAVA) return;
+        Refusal prior = refusal(from, lane);
+        if (prior != null && (prior.fact == Face.FLUID || prior.fact == Face.LAVA)) return;
         Vec3d point = driftCutAim(departureTo, lane, false);
         BlockHitResult hit = body.perceive(point, player.getEyePos().distanceTo(point) + 0.04).orElse(null);
         if (stationaryDriftCut(world, from, departureTo, lane, hit, player.getBoundingBox())
@@ -1127,12 +1418,6 @@ final class AgentReturnableMine {
             : AgentSurfaceTread.witnessedGradeEdge(from, source, lane, top, landing, clear);
     }
 
-    private AgentBody.DryRouteTop lookAtTop(BlockPos foot, Direction lane) {
-        Vec3d floor = floorAim(foot, lane);
-        body.aim(floor);
-        return body.dryRouteTop(floor, foot.down(), true);
-    }
-
     private static Vec3d floorAim(BlockPos foot, Direction lane) {
         return offset(Vec3d.ofBottomCenter(foot), lane, 0.42).add(0, -0.032, 0);
     }
@@ -1181,6 +1466,7 @@ final class AgentReturnableMine {
         if (next == Phase.ANCHOR) {
             litHere = false;
             pendingLight = null;
+            foothold = null;
             routeWork.reset();
         }
         status = switch (next) {
@@ -1192,6 +1478,8 @@ final class AgentReturnableMine {
             case LIGHT -> "lighting the dry mine tread from stable support";
             case FORWARD -> drift ? "checking the opened level passage, landing and return"
                 : "checking the next dry mine tread and its jump clearance";
+            case FOOTHOLD -> "checking lit air and a reachable attachment at " + foothold.cell.toShortString();
+            case FOOTHOLD_RECEIPT -> "checking the actual cobblestone top and one-block debit at " + foothold.cell.toShortString();
             case DRIVE -> drift ? "walking onto the witnessed level mine footing"
                 : "walking onto the witnessed dry mine tread";
             case REVERSE -> "checking the reverse climb from the grounded mine tread";
@@ -1242,6 +1530,7 @@ final class AgentReturnableMine {
         drift = false;
         anchor = from = to = workCell = null;
         crossing = null;
+        foothold = null;
         clearDeparture(body.actionTick());
         pendingLight = null;
         equipmentJob = 0;
@@ -1262,29 +1551,35 @@ final class AgentReturnableMine {
         detachedRim = reverseCeiling = relocationRefused = null;
         relocationRefusal = null;
         pendingLight = null;
+        foothold = null;
         equipmentJob = 0;
         revealedFrame = -1;
         Arrays.fill(retired, null);
+        Arrays.fill(unresolvedFootholds, null);
         retiredCursor = 0;
         loci.clear();
     }
 
-    private Face refusal(BlockPos foot, Direction direction) {
+    private Refusal refusal(BlockPos foot, Direction direction) {
         for (Refusal refusal : retired)
-            if (refusal != null && refusal.bearing == direction && refusal.foot.equals(foot)) return refusal.fact;
+            if (refusal != null && refusal.bearing == direction && refusal.foot.equals(foot)) return refusal;
         return null;
     }
 
     private void retire(BlockPos foot, Direction direction, Face fact) {
+        retire(foot, direction, fact, null);
+    }
+
+    private void retire(BlockPos foot, Direction direction, Face fact, String detail) {
         if (foot != null && refusal(foot, direction) == null)
-            retired[retiredCursor++ % retired.length] = new Refusal(foot, direction, fact);
+            retired[retiredCursor++ % retired.length] = new Refusal(foot, direction, fact, detail);
     }
 
     private String refusalSummary() {
         StringBuilder summary = new StringBuilder("no verified descending bearing: ");
-        for (int i = 0; i < faceFacts.length; i++) {
+        for (int i = 0; i < bearingReasons.length; i++) {
             if (i > 0) summary.append(", ");
-            summary.append(option(i)).append('=').append(faceFacts[i]);
+            summary.append(option(i)).append('=').append(bearingReasons[i]);
         }
         return summary.toString();
     }

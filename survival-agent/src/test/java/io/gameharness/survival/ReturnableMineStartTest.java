@@ -8,6 +8,7 @@ import net.minecraft.block.ShapeContext;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
@@ -17,6 +18,7 @@ import net.minecraft.world.RaycastContext;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -188,6 +190,85 @@ final class ReturnableMineStartTest {
     }
 
     @Test
+    void oneMissingStairSupportCanUseARealAdjacentFaceWithoutAuthorizingTheDescent() {
+        var terrain = new Terrain(new HashMap<>());
+        BlockState stone = Blocks.STONE.getDefaultState(), cobble = Blocks.COBBLESTONE.getDefaultState();
+        BlockPos tread = new BlockPos(1, 63, 0), cell = new BlockPos(1, 62, 0);
+        BlockPos anchor = new BlockPos(2, 62, 0);
+        terrain.blocks.put(RIM.down(), stone);
+        terrain.blocks.put(anchor, stone);
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        var build = new AgentReturnableMine.Foothold(RIM, EAST, stone, 0);
+        assertEquals(cell, build.cell);
+        Vec3d floor = AgentReturnableMine.proofFloorAim(tread, EAST, 1);
+        assertEquals(HitResult.Type.MISS, terrain.ray(eye, floor).getType());
+
+        var hit = terrain.ray(eye, AgentBody.footholdAttachmentAim(anchor, EAST, EAST));
+        assertEquals(Direction.WEST, hit.getSide());
+        assertEquals(cell, hit.getBlockPos().offset(hit.getSide()));
+        var low = terrain.footholdSpace(eye, build.low, cell);
+        var high = terrain.footholdSpace(eye, build.high, cell);
+        assertNull(build.placementRefusal(hull, 9, false, low, high, hit));
+        assertFalse(build.confirms(20, top(cell), cobble, 8), "a proposal alone has no placement receipt");
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, tread, EAST, terrain.ray(eye, floor),
+            stone, cobble, true), "an admitted use cannot act as floor evidence");
+
+        build.issued(20, 9);
+        terrain.blocks.put(cell, cobble);
+        BlockHitResult actualTop = terrain.ray(eye, floor);
+        assertFalse(build.confirms(20, actualTop, cobble, 8), "pre-use render is not evidence");
+        assertFalse(build.confirms(21, actualTop, cobble, 9), "block appearance without the debit");
+        assertFalse(build.confirms(21, actualTop, cobble, 7), "two fewer is not the exact debit");
+        assertFalse(build.confirms(21, null, cobble, 8), "debit without a witnessed top");
+        assertFalse(build.confirms(21, top(cell.down()), cobble, 8), "wrong support cell");
+        assertFalse(build.confirms(21, actualTop, stone, 8), "wrong placed material");
+        assertTrue(build.confirms(21, actualTop, cobble, 8));
+        Box treadSweep = AgentSurfaceTread.retainedTreadSweep(RIM, tread, 0.60);
+        Box reverseSweep = AgentSurfaceTread.reverseJumpSweep(RIM, tread, EAST, 0.60);
+        assertNotNull(AgentReturnableMine.witnessedTransit(RIM, tread, EAST, actualTop, stone, cobble,
+            terrain.clear(treadSweep) && terrain.clear(reverseSweep)));
+        terrain.blocks.put(tread.up(3), stone);
+        assertTrue(terrain.clear(treadSweep), "the walking envelope still fits under the obstructed jump");
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, tread, EAST, actualTop, stone, cobble,
+            terrain.clear(treadSweep) && terrain.clear(reverseSweep)),
+            "a placement receipt cannot waive the reverse clearance");
+    }
+
+    @Test
+    void anExactFootholdRefusesOcclusionWaterOccupiedCellsAndTheWorkshopReserve() {
+        var terrain = new Terrain(new HashMap<>());
+        BlockState stone = Blocks.STONE.getDefaultState();
+        var build = new AgentReturnableMine.Foothold(RIM, EAST, stone, 0);
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        BlockPos cell = build.cell, anchor = cell.east();
+        terrain.blocks.put(RIM.down(), stone);
+        terrain.blocks.put(anchor, stone);
+        BlockHitResult face = terrain.ray(eye, AgentBody.footholdAttachmentAim(anchor, EAST, EAST));
+        var empty = AgentBody.FootholdSpace.EMPTY;
+        assertNotNull(build.placementRefusal(hull, 8, false, empty, empty, face));
+        assertNotNull(build.placementRefusal(hull, 9, true, empty, empty, face), "occupied by an entity");
+        assertNotNull(build.placementRefusal(hull.offset(0.3, 0, 0), 9, false, empty, empty, face));
+        assertNotNull(build.placementRefusal(hull, 9, false, empty, empty, top(anchor)), "wrong attaching side");
+        assertNotNull(build.placementRefusal(hull, 9, false, AgentBody.FootholdSpace.DARK, empty, face));
+
+        terrain.blocks.put(cell.up(), stone);
+        var occluded = terrain.footholdSpace(eye, build.high, cell);
+        assertEquals(AgentBody.FootholdSpace.OCCLUDED, occluded);
+        assertNotNull(build.placementRefusal(hull, 9, false, empty, occluded, face));
+        terrain.blocks.remove(cell.up());
+        terrain.blocks.put(cell, Blocks.WATER.getDefaultState());
+        var water = terrain.footholdSpace(eye, build.low, cell);
+        assertEquals(AgentBody.FootholdSpace.FLUID, water);
+        assertNotNull(build.placementRefusal(hull, 9, false, water, empty, face));
+        terrain.blocks.put(cell, stone);
+        var occupied = terrain.footholdSpace(eye, build.high, cell);
+        assertEquals(AgentBody.FootholdSpace.OCCUPIED, occupied);
+        assertNotNull(build.placementRefusal(hull, 9, false, empty, occupied, face));
+    }
+
+    @Test
     void theHollowCanBeLeftByAWitnessedRiseButAirLavaAndHeadObstructionCannotAdmitIt() {
         BlockPos hollow = RIM.west().down(), riser = RIM.down();
         BlockState dirt = Blocks.DIRT.getDefaultState(), grass = Blocks.GRASS_BLOCK.getDefaultState();
@@ -228,6 +309,11 @@ final class ReturnableMineStartTest {
         BlockHitResult ray(Vec3d eye, Vec3d point) {
             return raycast(new RaycastContext(eye, point, RaycastContext.ShapeType.COLLIDER,
                 RaycastContext.FluidHandling.ANY, ShapeContext.absent()));
+        }
+
+        AgentBody.FootholdSpace footholdSpace(Vec3d eye, Vec3d point, BlockPos cell) {
+            return AgentBody.classifyFootholdSpace(this, cell, raycast(new RaycastContext(eye, point,
+                RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.ANY, ShapeContext.absent())));
         }
 
         boolean clear(Box sweep) {

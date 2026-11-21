@@ -1065,7 +1065,7 @@ final class AgentMacroControl {
     private final Map<BlockPos, Integer> inspectedVantageSectors = new HashMap<>();
     private String lastDryLandingEvidence;
     private AgentBody.GroundSight lastGroundSight;
-    private int lastDryLandingStance, dryLandingTransitions;
+    private int lastDryLandingStance;
     private boolean firstOutlookPending, startupInputsClear;
     private boolean suspended, visited, owned, hazardClear, lastHazard, quiescent, urgent, blocked, deadlineMeasured;
     private boolean urgentInput;
@@ -8972,13 +8972,11 @@ final class AgentMacroControl {
     }
 
     private void noteDryLandingEvidence(String evidence) {
-        if (dryLandingTransitions >= 32) return;
         var sight = body.groundSight();
         if (lastDryLandingStance == surveyOrigin && evidence.equals(lastDryLandingEvidence) && sight.equals(lastGroundSight)) return;
         lastDryLandingEvidence = evidence;
         lastGroundSight = sight;
         lastDryLandingStance = surveyOrigin;
-        ++dryLandingTransitions;
         var value = header(run);
         value.addProperty("life", life);
         value.addProperty("tick", tick);
@@ -8997,7 +8995,7 @@ final class AgentMacroControl {
         sectors.add("center", groundHeightBands(sight.centerHeights()));
         sectors.add("right", groundHeightBands(sight.rightHeights()));
         value.add("visible_top_heights_relative_to_feet", sectors);
-        ipc.evidence("dry-landing-last.json", value.toString());
+        ipc.landingSnapshot(value.toString());
     }
 
     private static JsonArray groundHeightBands(int mask) {
@@ -9863,7 +9861,7 @@ final class AgentMacroControl {
     }
 
     /** Single bounded worker: no filesystem access from gameplay ticks. */
-    private static final class Ipc {
+    static final class Ipc {
         private static final Set<String> MARKER_FIELDS = Set.of("v", "run");
         private static final Set<String> WORK_MARKER_FIELDS = Set.of("v", "run", "workMode");
         private static final String LEGACY = "";
@@ -9881,6 +9879,7 @@ final class AgentMacroControl {
         private final ScheduledExecutorService worker;
         private final ScheduledFuture<?> poll;
         private final AtomicReference<String> observation = new AtomicReference<>();
+        private final AtomicReference<String> latestLanding = new AtomicReference<>();
         private final ArrayBlockingQueue<Output> evidence = new ArrayBlockingQueue<>(32);
         private volatile Inbox inbox;
         private volatile boolean retired, markerRevoked;
@@ -9904,6 +9903,9 @@ final class AgentMacroControl {
         void receipt(String receipt) {
             evidence("receipt.json", receipt);
         }
+
+        // This gauge describes the current view. It is not a write-once work receipt.
+        void landingSnapshot(String value) { latestLanding.set(value); }
 
         boolean evidence(String file, String value) {
             if (!worker.isShutdown() && evidence.offer(new Output(file, value))) return true;
@@ -9969,6 +9971,8 @@ final class AgentMacroControl {
                 }
                 String latest = observation.getAndSet(null);
                 if (latest != null) atomic("observation.json", latest);
+                String landing = latestLanding.getAndSet(null);
+                if (landing != null) atomic("dry-landing-last.json", landing);
             } catch (IOException e) {
                 retired = true;
                 inbox = OFF;

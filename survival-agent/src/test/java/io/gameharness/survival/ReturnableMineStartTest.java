@@ -90,6 +90,104 @@ final class ReturnableMineStartTest {
     }
 
     @Test
+    void aLevelPassageNeedsRealSideFacesAndASeparateDryReturnableTread() {
+        var terrain = new Terrain(new HashMap<>());
+        BlockPos side = RIM.east();
+        BlockState stone = Blocks.STONE.getDefaultState(), dirt = Blocks.DIRT.getDefaultState();
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        terrain.blocks.put(RIM.down(), stone);
+        terrain.blocks.put(side, stone);
+        terrain.blocks.put(side.up(), dirt);
+        Vec3d floorAim = AgentReturnableMine.proofFloorAim(side, EAST, 0);
+        Vec3d footAim = AgentReturnableMine.driftCutAim(side, EAST, false);
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, Vec3d.ofCenter(side)), hull), "a standing ray to the center first hits the solid head");
+        assertTrue(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull));
+        assertTrue(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side.up(), EAST,
+            terrain.ray(eye, AgentReturnableMine.driftCutAim(side.up(), EAST, true)), hull));
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, side, EAST, terrain.ray(eye, floorAim),
+            stone, dirt, true), "a rock wall does not witness its floor");
+
+        terrain.blocks.remove(side.up());
+        terrain.blocks.remove(side);
+        terrain.blocks.put(side.down(2), dirt);
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull), "an open gap is not a cuttable side");
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, side, EAST, terrain.ray(eye, floorAim),
+            stone, dirt, true), "a cut and clear passage still cannot authorize a step over a gap");
+
+        terrain.blocks.put(side.down(), dirt);
+        Box sweep = AgentSurfaceTread.retainedTreadSweep(RIM, side, 0.60);
+        assertTrue(terrain.clear(sweep));
+        assertNotNull(AgentReturnableMine.witnessedTransit(RIM, side, EAST, terrain.ray(eye, floorAim),
+            stone, dirt, terrain.clear(sweep)));
+        Vec3d newEye = Vec3d.ofBottomCenter(side).add(0, 1.62, 0);
+        BlockHitResult returnTop = terrain.ray(newEye, AgentReturnableMine.proofFloorAim(RIM, Direction.WEST, 0));
+        Box reverse = AgentSurfaceTread.retainedTreadSweep(side, RIM, 0.60);
+        assertNotNull(AgentReturnableMine.witnessedTransit(side, RIM, Direction.WEST, returnTop, dirt, stone,
+            terrain.clear(reverse)));
+        terrain.blocks.put(RIM.up(), stone);
+        assertNull(AgentReturnableMine.witnessedTransit(side, RIM, Direction.WEST, returnTop, dirt, stone,
+            terrain.clear(reverse)), "a changed source ceiling blocks the exact return passage");
+    }
+
+    @Test
+    void aLevelSideCannotCutItsFloorAnAttachedLightOrAnUnsafeFace() {
+        var terrain = new Terrain(new HashMap<>());
+        BlockPos side = RIM.east();
+        BlockState stone = Blocks.STONE.getDefaultState();
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        terrain.blocks.put(RIM.down(), stone);
+        terrain.blocks.put(side, stone);
+        terrain.blocks.put(side.down(), stone);
+        Vec3d footAim = AgentReturnableMine.driftCutAim(side, EAST, false);
+        terrain.blocks.put(side.east(), Blocks.WALL_TORCH.getDefaultState().with(Properties.HORIZONTAL_FACING, EAST));
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull));
+        terrain.blocks.remove(side.east());
+        terrain.blocks.put(side.up(), Blocks.FURNACE.getDefaultState());
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull));
+        terrain.blocks.remove(side.up());
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side.down(), EAST, top(side.down()), hull));
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull.offset(0.3, 0, 0)));
+        terrain.blocks.put(side, Blocks.LAVA.getDefaultState());
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull));
+        terrain.blocks.put(side, Blocks.GRAVEL.getDefaultState());
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull));
+    }
+
+    @Test
+    void aFloorResampleStillRequiresTheSameFullTopAndDoesNotReplaceTheSweep() {
+        var terrain = new Terrain(new HashMap<>());
+        BlockPos lower = RIM.east().down();
+        BlockState stone = Blocks.STONE.getDefaultState();
+        terrain.blocks.put(RIM.down(), stone);
+        terrain.blocks.put(lower.down(), stone);
+        // Select the vanilla trapdoor orientation occupying the far strip of
+        // this column. It masks the first top sample, not the inner one.
+        BlockState trapdoor = Blocks.OAK_TRAPDOOR.getDefaultState().with(Properties.OPEN, true);
+        BlockState farStrip = java.util.stream.Stream.of(EAST, Direction.WEST)
+            .map(direction -> trapdoor.with(Properties.HORIZONTAL_FACING, direction))
+            .filter(state -> state.getCollisionShape(terrain, lower).getBoundingBox().minX > 0.8)
+            .findFirst().orElseThrow();
+        terrain.blocks.put(lower, farStrip);
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        assertTrue(terrain.ray(eye, AgentReturnableMine.proofFloorAim(lower, EAST, 0)).getBlockPos().equals(lower));
+        BlockHitResult alternate = terrain.ray(eye, AgentReturnableMine.proofFloorAim(lower, EAST, 1));
+        assertNotNull(AgentReturnableMine.witnessedTransit(RIM, lower, EAST, alternate, stone, stone, true));
+        Box lowerBody = AgentSurfaceTread.retainedTreadSweep(lower, lower, 0.60);
+        assertFalse(terrain.clear(lowerBody));
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, lower, EAST, alternate, stone, stone, terrain.clear(lowerBody)));
+    }
+
+    @Test
     void theHollowCanBeLeftByAWitnessedRiseButAirLavaAndHeadObstructionCannotAdmitIt() {
         BlockPos hollow = RIM.west().down(), riser = RIM.down();
         BlockState dirt = Blocks.DIRT.getDefaultState(), grass = Blocks.GRASS_BLOCK.getDefaultState();
@@ -130,6 +228,16 @@ final class ReturnableMineStartTest {
         BlockHitResult ray(Vec3d eye, Vec3d point) {
             return raycast(new RaycastContext(eye, point, RaycastContext.ShapeType.COLLIDER,
                 RaycastContext.FluidHandling.ANY, ShapeContext.absent()));
+        }
+
+        boolean clear(Box sweep) {
+            for (var entry : blocks.entrySet()) {
+                BlockPos pos = entry.getKey();
+                for (Box box : entry.getValue().getCollisionShape(this, pos).getBoundingBoxes()) {
+                    if (box.offset(pos.getX(), pos.getY(), pos.getZ()).intersects(sweep)) return false;
+                }
+            }
+            return true;
         }
 
         @Override public BlockState getBlockState(BlockPos pos) { return blocks.getOrDefault(pos, Blocks.AIR.getDefaultState()); }

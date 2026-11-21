@@ -6,10 +6,12 @@ import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.BlockView;
@@ -26,6 +28,7 @@ final class AgentReturnableMine {
     private static final int RELOCATION_TICKS = 620;
     private static final int RELOCATION_HOPS = 10;
     private static final int DEPARTURE_VIEW_TICKS = 38;
+    private static final int DRIFT_LIMIT = 2;
     private static final Direction[] CARDINALS = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
     // The tallest samples cover the lower tread's jump takeoff, not just standing room.
     private static final double[] CLEARANCE_HEIGHTS = {0.20, 0.97, 1.79, 2.86};
@@ -101,14 +104,16 @@ final class AgentReturnableMine {
     private final RouteWork routeWork = new RouteWork();
     private final BlockPos[] searchPath = new BlockPos[RELOCATION_HOPS + 1];
     private final BlockPos[] searched = new BlockPos[RELOCATION_HOPS + 1];
+    private final long[] driftTargets = new long[DRIFT_LIMIT];
     private ClientWorld world;
     private ClientPlayerEntity player;
     private int retiredCursor, lastTurn, started, phaseSince, optionSince, depth, limit, drops;
-    private int choice, cut, proof, cutSample;
+    private int choice, cut, proof, cutSample, floorSample;
     private int progressAt, treadEvidence, lightIssuedAt;
     private int caveSince, caveMask, caveContacts;
     private int departureChoice, departureSince, hopCount, pathSize, searchedCount;
-    private boolean caveSurveySpent;
+    private int driftAttempts, driftFaces, driftSearchStarted;
+    private boolean caveSurveySpent, detachedLevel;
     private long revealedFrame = -1, equipmentJob;
     private BlockPos anchor, from, to, detachedRim, workCell, reverseCeiling, pendingLight;
     private BlockPos departureTo, relocationRefused;
@@ -118,7 +123,7 @@ final class AgentReturnableMine {
     private BlockState departureSurface;
     private AgentSurfaceTread crossing;
     private Phase phase, afterLight;
-    private boolean litHere, trimmed, cavePending, openTread, departureBacktrack;
+    private boolean litHere, trimmed, cavePending, openTread, departureBacktrack, drift;
     private String relocationRefusal;
     private final Face[] faceFacts = new Face[4];
     private Outcome outcome = Outcome.DIVERTED;
@@ -134,7 +139,7 @@ final class AgentReturnableMine {
     }
 
     boolean settling() {
-        return active() && (phase == Phase.DRIVE || phase == Phase.RELOCATE || checkingReturn());
+        return active() && (drift || phase == Phase.DRIVE || phase == Phase.RELOCATE || checkingReturn());
     }
 
     boolean surveyingCave() { return active() && cavePending; }
@@ -151,6 +156,7 @@ final class AgentReturnableMine {
         int now = body.actionTick();
         return continuing(now)
             && (phase == Phase.RELOCATE || phase == Phase.CHOOSE || phase == Phase.OPEN
+                || driftSetup(now)
                 || progressAt >= started && now - progressAt <= PROGRESS_LEASE_TICKS
                 || cavePending && now - caveSince <= CAVE_TURN_LIMIT
                 || caveSurveySpent && (phase == Phase.ANCHOR || phase == Phase.CHOOSE)
@@ -159,8 +165,11 @@ final class AgentReturnableMine {
 
     boolean hasRetryProgressLease() {
         int now = body.actionTick();
-        return continuing(now) && (phase == Phase.RELOCATE || routeWork.recent(now));
+        return continuing(now) && (phase == Phase.RELOCATE || driftSetup(now) || routeWork.recent(now));
     }
+
+    // A newly witnessed side face gets a short setup window, not a route receipt.
+    private boolean driftSetup(int now) { return drift && now - started <= PROGRESS_LEASE_TICKS; }
 
     private boolean continuing(int now) {
         return active() && now - lastTurn <= 1 && now - started < timeLimit();
@@ -244,6 +253,10 @@ final class AgentReturnableMine {
         equipmentJob = 0;
         if (!active()) {
             if (!dryGroundAt(standing)) return finish(Outcome.DIVERTED, "waiting for dry mine footing");
+            if (standing.equals(detachedRim) && body.dryCaveContact(standing) != null) {
+                detachedRim = null;
+                detachedLevel = false;
+            }
             this.depth = depth;
             preferred = preference;
             if (standing.equals(relocationRefused)) return finish(Outcome.EXHAUSTED, relocationRefusal);
@@ -305,9 +318,9 @@ final class AgentReturnableMine {
         if (now - started >= LEG_TICKS) return fail("returnable mine leg reached its time limit");
         if (phase != Phase.DRIVE && !dryGroundAt(checkingReturn() ? to : from))
             return fail("lost the committed dry mine stance");
-        if (!settling() && bearing != null
+        if ((!settling() || drift && phase != Phase.DRIVE) && bearing != null
                 && body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65))
-            return fail("visible lava vetoed the mine bearing");
+            return fail(routeFailure("bearing", to, "visible lava", checkingReturn()));
         switch (phase) {
             case ANCHOR -> anchor(now);
             case CHOOSE -> choose(host, now);
@@ -482,10 +495,15 @@ final class AgentReturnableMine {
 
     private void cut(AgentProgress host, int now) {
         if (now - phaseSince >= 150) {
-            fail("could not clear the next returnable mine tread");
+            fail(drift ? routeFailure("side cut", workCell, "contact was not confirmed")
+                : "could not clear the next returnable mine tread");
             return;
         }
         if (!center(from)) return;
+        if (drift && body.dryCaveContact(from) == null) {
+            fail("lost independent dry footing for the side cut");
+            return;
+        }
         boolean revealed = revealedFrame >= 0;
         if (revealed) {
             if (revealedFrame == body.renderedFrame() || !body.hasRecentView()) return;
@@ -503,7 +521,7 @@ final class AgentReturnableMine {
             }
             aimCut(to, bearing);
         }
-        if (cut == 0) {
+        if (cut == 0 && !drift) {
             body.aim(aim);
             switch (body.dryCaveSpace(aim)) {
                 case CLEAR -> { begin(Phase.FORWARD, now); return; }
@@ -532,13 +550,18 @@ final class AgentReturnableMine {
                 }
             }
         }
-        switch (host.clearReturnable(workCell, aim)) {
+        switch (drift ? host.clearReturnableSide(from, workCell, bearing, aim) : host.clearReturnable(workCell, aim)) {
             case CLEAR -> {
                 aim = null;
-                if (--cut < 0) begin(Phase.FORWARD, now);
+                if (--cut < 0) {
+                    if (drift && (treadEvidence & 1) == 0)
+                        fail(routeFailure("side cut", workCell, "no confirmed cut of the natural foot block"));
+                    else begin(Phase.FORWARD, now);
+                }
             }
             case DARK -> needLight(host, now);
-            case BLOCKED, LIP -> fail("a witnessed obstruction refused the returnable mine cut");
+            case BLOCKED, LIP -> fail(drift ? routeFailure("side cut", workCell, "unsafe or protected face")
+                : "a witnessed obstruction refused the returnable mine cut");
             case RESOURCE -> finish(Outcome.DIVERTED, "taking exposed ore before cutting further");
             case LOOKING -> {}
         }
@@ -572,17 +595,17 @@ final class AgentReturnableMine {
     private void prove(AgentProgress host, int now, boolean reverse) {
         BlockPos source = reverse ? to : from, target = reverse ? from : to;
         Direction direction = reverse ? bearing.getOpposite() : bearing;
-        if (now - phaseSince >= 83) {
-            fail(reverse ? "could not verify a usable reverse edge from the landing"
-                : "could not verify dry clearance and a supported landing");
+        boolean expired = now - phaseSince >= 83;
+        if (!center(source)) {
+            if (expired) fail(routeFailure("settled stance", source, "body did not center", reverse));
             return;
         }
-        if (!center(source)) return;
         if (reverse && trimmed && proof > CLEARANCE_HEIGHTS.length * 2) {
-            recheckForward(host, now);
+            if (expired) fail(routeFailure("repaired passage", to, "recheck did not complete", true));
+            else recheckForward(host, now);
             return;
         }
-        int samples = CLEARANCE_HEIGHTS.length * 2;
+        int samples = (drift ? CLEARANCE_HEIGHTS.length - 1 : CLEARANCE_HEIGHTS.length) * 2;
         if (proof < samples) {
             if (aim == null) {
                 double height = CLEARANCE_HEIGHTS[proof / 2];
@@ -593,31 +616,88 @@ final class AgentReturnableMine {
                     flank * (player.getWidth() * 0.5 + 0.035));
             }
             body.aim(aim);
-            switch (body.dryRouteClear(aim)) {
-                case CLEAR -> {
-                    checkedEvidence((reverse ? 12 : 3) + proof, now);
-                    proof++;
-                    aim = null;
-                }
-                case DARK -> {
-                    if (body.renderedAim(aim, 14)) needLight(host, now);
-                }
-                case FLUID -> fail("a visible fluid interrupted the dry mine route");
-                case OBSTRUCTION, UNKNOWN -> {
-                    if (reverse && !openTread && proof >= 4 && body.renderedAim(aim, 14))
-                        considerReturnTrim(host, now);
-                }
+            var sample = drift ? body.dryCaveSpace(aim) : body.dryRouteClear(aim);
+            boolean cannotLight = sample == AgentBody.DryRouteSample.DARK
+                && (litHere || host.returnableTorches() <= TORCH_RESERVE) && body.renderedAim(aim, 14);
+            if (sample != AgentBody.DryRouteSample.CLEAR && (expired || sample == AgentBody.DryRouteSample.FLUID
+                    || cannotLight)) {
+                String side = (proof & 1) == 0 ? "right" : "left";
+                fail(routeFailure("clearance " + CLEARANCE_HEIGHTS[proof / 2] + "m " + side, BlockPos.ofFloored(aim),
+                    sample == AgentBody.DryRouteSample.UNKNOWN ? unknownSample(aim) : sample.name(), reverse));
+                return;
+            }
+            if (sample == AgentBody.DryRouteSample.CLEAR) {
+                checkedEvidence((reverse ? 12 : 3) + proof, now);
+                proof++;
+                aim = null;
+            } else if (sample == AgentBody.DryRouteSample.DARK) {
+                if (body.renderedAim(aim, 14)) needLight(host, now);
+            } else if (reverse && !openTread && proof >= 4 && body.renderedAim(aim, 14)) {
+                considerReturnTrim(host, now);
             }
             return;
         }
-        if (aim == null) aim = offset(Vec3d.ofBottomCenter(target), direction, 0.34).add(0, -0.035, 0);
+        if (aim == null) aim = proofFloorAim(target, direction, floorSample);
         body.aim(aim);
-        var top = body.dryRouteTop(aim, target.down());
+        BlockPos floor = target.down();
+        var top = body.dryRouteTop(aim, floor, true);
         if (top != AgentBody.DryRouteTop.WITNESSED) {
-            if (!reverse && top == AgentBody.DryRouteTop.NO_FULL_TOP) offerCave(host, to, bearing, now);
+            if (top == AgentBody.DryRouteTop.FLUID) {
+                fail(routeFailure("landing floor", floor, "visible fluid", reverse));
+            } else if (top == AgentBody.DryRouteTop.DARK && !expired && !litHere
+                    && body.renderedAim(aim, 14) && host.returnableTorches() > TORCH_RESERVE) {
+                needLight(host, now);
+            } else if (top == AgentBody.DryRouteTop.OCCLUDED || top == AgentBody.DryRouteTop.NO_FULL_TOP
+                    || top == AgentBody.DryRouteTop.UNSUITABLE_TOP || top == AgentBody.DryRouteTop.DARK) {
+                if (floorSample == 0 && !expired && body.renderedAim(aim, 8)) {
+                    floorSample = 1;
+                    aim = null;
+                } else if (expired || body.renderedAim(aim, 8)) {
+                    if (!reverse && !drift && !expired && top == AgentBody.DryRouteTop.NO_FULL_TOP
+                            && offerCave(host, to, bearing, now)) return;
+                    fail(routeFailure("landing floor", floor, failedFloor(top), reverse));
+                }
+            } else if (expired) {
+                fail(routeFailure("landing floor", floor, failedFloor(top), reverse));
+            }
             return;
         }
-        if (!body.dryRouteSweep(source, target)) return;
+        var veto = body.dryRouteVeto(source, target);
+        if (veto != AgentBody.DryRouteVeto.CLEAR) {
+            if (expired || veto == AgentBody.DryRouteVeto.HAZARD || veto == AgentBody.DryRouteVeto.SUPPORT) {
+                String reason = switch (veto) {
+                    case VIEW -> "no recent first-person frame";
+                    case HAZARD -> "live hazard veto";
+                    case DRIFT -> "body was outside the tread bounds";
+                    case SUPPORT -> "source or landing lost load-bearing contact";
+                    case SWEEP -> "collision in the exact tread volume";
+                    case CLEAR -> throw new IllegalStateException("clear sweep cannot be refused");
+                };
+                fail(routeFailure("body sweep", target, reason, reverse));
+            }
+            return;
+        }
+        if (!body.walkedLaneDry(source, target, direction)) {
+            fail(routeFailure("dry columns", target, "unsafe block or changed support", reverse));
+            return;
+        }
+        if (drift) {
+            var floorHit = body.dryRouteFloor(aim, floor);
+            if (floorHit != null) {
+                // Same-level standing clearance is symmetric. The grounded source
+                // and freshly seen destination supply the exact two return supports.
+                var edge = witnessedTransit(source, target, direction, floorHit, body.dryCaveContact(source),
+                    world.getBlockState(floor), AgentSurfaceTread.retainedLaneClear(client, source, target, direction));
+                if (edge != null) {
+                    crossing = AgentSurfaceTread.witnessedOutbound(edge, now);
+                    checkedEvidence(11, now);
+                    begin(Phase.DRIVE, now);
+                    return;
+                }
+            }
+            if (expired) fail(routeFailure("level return", target, "exact supports or reverse passage no longer hold"));
+            return;
+        }
         if (!reverse) {
             checkedEvidence(11, now);
             begin(Phase.DRIVE, now);
@@ -630,6 +710,32 @@ final class AgentReturnableMine {
             return;
         }
         completeTread(host, now);
+    }
+
+    private String failedFloor(AgentBody.DryRouteTop top) {
+        return (floorSample == 0 ? "far sample: " : "inner sample: ") + top
+            + (top == AgentBody.DryRouteTop.OCCLUDED || top == AgentBody.DryRouteTop.UNSUITABLE_TOP
+                || top == AgentBody.DryRouteTop.OUT_OF_VIEW
+                ? " (" + unknownSample(aim) + ")" : "");
+    }
+
+    private String unknownSample(Vec3d point) {
+        if (!body.hasRecentView()) return "no recent first-person frame";
+        if (!body.dryRoutePointInView(point)) return "outside the rendered view";
+        if (body.dryRouteRaysSpent()) return "no view-ray budget remaining";
+        BlockHitResult hit = body.terrain(point, player.getEyePos().distanceTo(point) + 0.04).orElse(null);
+        return hit == null ? "no lit clearance witness"
+            : "first hit " + hit.getBlockPos().toShortString() + " (" + hit.getSide() + ")";
+    }
+
+    private String routeFailure(String sample, BlockPos cell, String reason) {
+        return routeFailure(sample, cell, reason, false);
+    }
+
+    private String routeFailure(String sample, BlockPos cell, String reason, boolean reverse) {
+        return (drift ? "level drift" : reverse ? "mine return" : "mine descent") + " "
+            + (reverse ? bearing.getOpposite() : bearing) + " refused " + sample + " at "
+            + (cell == null ? "unselected cell" : cell.toShortString()) + ": " + reason;
     }
 
     private void considerReturnTrim(AgentProgress host, int now) {
@@ -698,6 +804,7 @@ final class AgentReturnableMine {
 
     private void completeTread(AgentProgress host, int now) {
         host.recordReturnableDrop(from, to, bearing);
+        driftAttempts = 0;
         if (++drops == limit) {
             finish(Outcome.REACHED, "reached " + drops + " lower dry mine treads with verified return edges");
         } else {
@@ -710,6 +817,34 @@ final class AgentReturnableMine {
     }
 
     private void drive(AgentProgress host, int now) {
+        if (drift) {
+            switch (crossing.step(client, body, now)) {
+                case CHECKING -> { }
+                case MOVING -> host.rememberReturnableMotion();
+                case REFUSED -> fail(routeFailure("level crossing", to, crossing.refusal()));
+                case LANDED -> {
+                    host.recordReturnableRelocation(from, to, bearing);
+                    preferred = bearing;
+                    anchor = from = to;
+                    to = null;
+                    bearing = null;
+                    crossing = null;
+                    drift = false;
+                    choice = drops = caveMask = 0;
+                    caveSurveySpent = false;
+                    Arrays.fill(faceFacts, null);
+                    limit = Math.min(LEG_LIMIT, Math.min(from.getY() - depth, suppliedSteps(host)));
+                    if (limit <= 0) {
+                        finish(Outcome.SUPPLIES, "reached a new level mine footing; keeping the return supplies");
+                        return;
+                    }
+                    started = progressAt = now;
+                    begin(Phase.ANCHOR, now);
+                    status = "reached a new level mine footing; checking a fresh descending bearing";
+                }
+            }
+            return;
+        }
         if (dryGroundAt(to)) {
             checkedEvidence(21, now);
             begin(Phase.REVERSE, now);
@@ -740,6 +875,7 @@ final class AgentReturnableMine {
         pathSize = searchedCount = 1;
         hopCount = caveMask = 0;
         crossing = null;
+        drift = false;
         bearing = null;
         cavePending = false;
         started = now;
@@ -761,6 +897,7 @@ final class AgentReturnableMine {
     private void resetDeparture(int now) {
         departureChoice = 0;
         departureBacktrack = false;
+        driftFaces = 0;
         clearDeparture(now);
     }
 
@@ -779,7 +916,11 @@ final class AgentReturnableMine {
                 case LANDED -> {
                     BlockPos landing = crossing.to;
                     host.recordReturnableRelocation(from, landing, departureBearing);
-                    if (detachedRim != null && landing.getY() >= detachedRim.getY()) detachedRim = null;
+                    if (detachedRim != null && (landing.equals(detachedRim)
+                            || !detachedLevel && landing.getY() >= detachedRim.getY())) {
+                        detachedRim = null;
+                        detachedLevel = false;
+                    }
                     from = landing;
                     hopCount++;
                     if (departureBacktrack) pathSize--;
@@ -816,6 +957,12 @@ final class AgentReturnableMine {
         }
         if (!center(from)) return;
         if (departureTo == null && !nextDeparture(host, now)) {
+            if (driftAttempts < DRIFT_LIMIT && !unjoined() && host.returnableRetainedStep(from) != null
+                    && startDrift(host, now)) return;
+            if (pathSize > 1 && selectDeparture(searchPath[pathSize - 2], now)) {
+                departureBacktrack = true;
+                return;
+            }
             relocationFailed("no further safe opening, grounded level tread, or one-block rise was proved");
             return;
         }
@@ -830,11 +977,12 @@ final class AgentReturnableMine {
                 return;
             }
             if (now - departureSince < DEPARTURE_VIEW_TICKS) return;
+            noteDriftFace(host, lane);
             // Upward or level travel wins over a sky/air cue. Offer a cave only
             // when this bearing really exposes space below the retained footing.
             BlockPos lower = from.offset(lane).down();
             Vec3d opening = offset(Vec3d.ofCenter(lower, 0.83), lane, 0.37);
-            if (!unjoined() && !departureBacktrack
+            if (!unjoined() && !departureBacktrack && driftFaces == 0
                     && body.dryCaveSpace(opening) == AgentBody.DryRouteSample.CLEAR
                     && offerCave(host, lower, lane, now)) return;
         }
@@ -857,10 +1005,56 @@ final class AgentReturnableMine {
             if (seenDuringRelocation(candidate)) continue;
             if (selectDeparture(candidate, now)) return true;
         }
-        if (pathSize > 1 && selectDeparture(searchPath[pathSize - 2], now)) {
-            departureBacktrack = true;
+        return false;
+    }
+
+    private void noteDriftFace(AgentProgress host, Direction lane) {
+        if (unjoined() || driftAttempts == DRIFT_LIMIT || departureBacktrack || departureTo.getY() != from.getY()
+                || host.returnableRetainedStep(from) == null || triedDrift(departureTo)) return;
+        Face prior = refusal(from, lane);
+        if (prior == Face.FLUID || prior == Face.LAVA) return;
+        Vec3d point = driftCutAim(departureTo, lane, false);
+        BlockHitResult hit = body.perceive(point, player.getEyePos().distanceTo(point) + 0.04).orElse(null);
+        if (stationaryDriftCut(world, from, departureTo, lane, hit, player.getBoundingBox())
+                && host.returnableCutAllowed(hit))
+            driftFaces |= 1 << lane.ordinal();
+    }
+
+    private boolean startDrift(AgentProgress host, int now) {
+        for (int i = 0; i < 4; i++) {
+            Direction lane = option(i);
+            int bit = 1 << lane.ordinal();
+            if ((driftFaces & bit) == 0) continue;
+            driftFaces &= ~bit;
+            BlockPos target = from.offset(lane);
+            if (triedDrift(target) || body.hazardAhead(lane.getPositiveHorizontalDegrees(), 1.65)
+                    || body.dryCaveContact(from) == null) continue;
+            if (suppliedSteps(host) <= 0) {
+                finish(Outcome.SUPPLIES, "keeping the light and tool reserve before opening a level mine passage");
+                return true;
+            }
+            driftTargets[driftAttempts++] = target.asLong();
+            driftSearchStarted = started;
+            started = now;
+            anchor = from;
+            drift = true;
+            crossing = null;
+            bearing = lane;
+            to = target;
+            cut = 1;
+            treadEvidence = 0;
+            litHere = trimmed = openTread = false;
+            pendingLight = null;
+            routeWork.reset();
+            begin(Phase.CUT, now);
             return true;
         }
+        return false;
+    }
+
+    private boolean triedDrift(BlockPos target) {
+        long packed = target.asLong();
+        for (int i = 0; i < driftAttempts; i++) if (driftTargets[i] == packed) return true;
         return false;
     }
 
@@ -943,6 +1137,11 @@ final class AgentReturnableMine {
         return offset(Vec3d.ofBottomCenter(foot), lane, 0.42).add(0, -0.032, 0);
     }
 
+    static Vec3d proofFloorAim(BlockPos foot, Direction lane, int sample) {
+        // A different ray to the same expected full top, never a different support.
+        return offset(Vec3d.ofBottomCenter(foot), lane, sample == 0 ? 0.34 : 0.12).add(0, -0.035, 0);
+    }
+
     private void checkedEvidence(int evidence, int now) {
         if (advanceEvidence(evidence, now)) routeWork.proved(now);
     }
@@ -977,7 +1176,7 @@ final class AgentReturnableMine {
         outcome = Outcome.WORKING;
         phase = next;
         phaseSince = now;
-        proof = 0;
+        proof = floorSample = 0;
         aim = null;
         if (next == Phase.ANCHOR) {
             litHere = false;
@@ -988,10 +1187,13 @@ final class AgentReturnableMine {
             case ANCHOR -> "checking the stable dry anchor for a returnable mine leg";
             case CHOOSE -> "looking for a witnessed mine face on a safe bearing";
             case OPEN -> "no obstruction to cut; looking for the exact dry landing of the opening";
-            case CUT -> "clearing one witnessed cell of the returnable mine stair";
+            case CUT -> drift ? "opening one witnessed face of a level mine passage"
+                : "clearing one witnessed cell of the returnable mine stair";
             case LIGHT -> "lighting the dry mine tread from stable support";
-            case FORWARD -> "checking the next dry mine tread and its jump clearance";
-            case DRIVE -> "walking onto the witnessed dry mine tread";
+            case FORWARD -> drift ? "checking the opened level passage, landing and return"
+                : "checking the next dry mine tread and its jump clearance";
+            case DRIVE -> drift ? "walking onto the witnessed level mine footing"
+                : "walking onto the witnessed dry mine tread";
             case REVERSE -> "checking the reverse climb from the grounded mine tread";
             case TRIM_RETURN -> "clearing one witnessed block from the known reverse climb";
             case RELOCATE -> "looking for a distinct dry mine start";
@@ -1001,7 +1203,19 @@ final class AgentReturnableMine {
     private Outcome fail(String detail) {
         int now = body.actionTick();
         markUnjoined();
-        if (bearing != null) {
+        if (drift && dryGroundAt(from) && !unjoined() && player.hurtTime == 0
+                && !player.isOnFire() && !player.hasVehicle()) {
+            drift = false;
+            started = driftSearchStarted;
+            bearing = null;
+            crossing = null;
+            pendingLight = null;
+            revealedFrame = -1;
+            begin(Phase.RELOCATE, now);
+            status = detail;
+            return outcome;
+        }
+        if (!drift && bearing != null) {
             retire(anchor, bearing, Face.FAILED);
             if (!from.equals(anchor)) retire(from, bearing, Face.FAILED);
             if (checkingReturn()) retire(to, bearing.getOpposite(), Face.FAILED);
@@ -1015,13 +1229,17 @@ final class AgentReturnableMine {
     }
 
     private void markUnjoined() {
-        if (active() && (phase == Phase.DRIVE || checkingReturn()) && player.getY() < from.getY() - 0.055)
+        if (active() && (phase == Phase.DRIVE || checkingReturn()) && (player.getY() < from.getY() - 0.055
+                || drift && phase == Phase.DRIVE && crossing.inFlight() && !player.getBlockPos().equals(from))) {
             detachedRim = from;
+            detachedLevel = drift;
+        }
     }
 
     private Outcome finish(Outcome result, String detail) {
         phase = null;
         cavePending = false;
+        drift = false;
         anchor = from = to = workCell = null;
         crossing = null;
         clearDeparture(body.actionTick());
@@ -1038,6 +1256,9 @@ final class AgentReturnableMine {
         player = client.player;
         phase = null;
         cavePending = false;
+        drift = false;
+        driftAttempts = 0;
+        detachedLevel = false;
         detachedRim = reverseCeiling = relocationRefused = null;
         relocationRefusal = null;
         pendingLight = null;
@@ -1070,7 +1291,14 @@ final class AgentReturnableMine {
 
     private void aimCut(BlockPos foot, Direction direction) {
         workCell = foot.up(cut);
-        aim = cut == 0 ? capAim(workCell, direction, cutSample) : Vec3d.ofCenter(workCell);
+        aim = drift ? driftCutAim(workCell, direction, cut == 1)
+            : cut == 0 ? capAim(workCell, direction, cutSample) : Vec3d.ofCenter(workCell);
+    }
+
+    static Vec3d driftCutAim(BlockPos cell, Direction bearing, boolean head) {
+        // Aim low and near the front of the foot block: from standing eye
+        // height a ray to its center can first intercept the solid head block.
+        return head ? Vec3d.ofCenter(cell) : offset(Vec3d.ofCenter(cell, 0.26), bearing, -0.28);
     }
 
     static Vec3d capAim(BlockPos cell, Direction direction, int sample) {
@@ -1096,10 +1324,24 @@ final class AgentReturnableMine {
     }
 
     /** Opening the adjacent column is stationary; FORWARD must separately prove a tread before any step. */
-    static boolean stationaryCap(BlockPos foot, BlockPos cap, Direction bearing, net.minecraft.util.math.Box hull) {
+    static boolean stationaryCap(BlockPos foot, BlockPos cap, Direction bearing, Box hull) {
         return bearing.getOffsetY() == 0 && cap.getX() == foot.getX() + bearing.getOffsetX()
             && cap.getZ() == foot.getZ() + bearing.getOffsetZ() && cap.getY() == foot.getY() - 1
-            && hull.minX >= foot.getX() && hull.maxX <= foot.getX() + 1.0
+            && insideFooting(foot, hull);
+    }
+
+    static boolean stationaryDriftCut(BlockView world, BlockPos foot, BlockPos cell, Direction bearing,
+                                      BlockHitResult hit, Box hull) {
+        if (!AgentSurfaceTread.prospectLevelCell(foot, cell, bearing) || !insideFooting(foot, hull)
+                || hit == null || hit.getType() != HitResult.Type.BLOCK || hit.isInsideBlock()
+                || !cell.equals(hit.getBlockPos()) || hit.getSide() != bearing.getOpposite()) return false;
+        BlockState shown = world.getBlockState(cell); // The exact witnessed face, never beyond it.
+        return !AgentBody.dryCaveDanger(shown) && (shown.isIn(BlockTags.BASE_STONE_OVERWORLD)
+            || shown.isIn(BlockTags.DIRT)) && !protectedCutAttachment(world, cell);
+    }
+
+    private static boolean insideFooting(BlockPos foot, Box hull) {
+        return hull.minX >= foot.getX() && hull.maxX <= foot.getX() + 1.0
             && hull.minZ >= foot.getZ() && hull.maxZ <= foot.getZ() + 1.0;
     }
 

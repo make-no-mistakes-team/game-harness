@@ -7014,18 +7014,24 @@ final class AgentProgress {
     }
 
     private Dig clear(BlockPos position, Vec3d point, BlockPos lip) {
-        return clear(position, point, lip, false, false);
+        return clear(position, point, lip, false, false, null);
     }
 
     Dig clearReturnable(BlockPos position, Vec3d point) {
-        return clear(position, point, null, true, true);
+        return clear(position, point, null, true, true, null);
     }
 
     Dig clearReturnableHeadroom(BlockPos position, Vec3d point) {
-        return clear(position, point, null, true, false);
+        return clear(position, point, null, true, false, null);
     }
 
-    private Dig clear(BlockPos position, Vec3d point, BlockPos lip, boolean returnable, boolean resourceHandoff) {
+    Dig clearReturnableSide(BlockPos foot, BlockPos position, Direction bearing, Vec3d point) {
+        if (!foot.equals(c.player.getBlockPos())) return Dig.BLOCKED;
+        return clear(position, point, null, true, true, bearing);
+    }
+
+    private Dig clear(BlockPos position, Vec3d point, BlockPos lip, boolean returnable, boolean resourceHandoff,
+                      Direction sideBearing) {
         if (returnable && underMineFootprint(position)) return Dig.BLOCKED;
         body.aim(point);
         double length = c.player.getEyePos().distanceTo(point);
@@ -7069,7 +7075,12 @@ final class AgentProgress {
             if (state.getFluidState().isEmpty() && !AgentBody.dryCaveDanger(state)
                     && state.getCollisionShape(c.world, position).isEmpty())
                 return returnableClearance(point);
-            if (!returnableCutAllowed(hit)) return Dig.BLOCKED;
+            if (sideBearing == null) {
+                if (!returnableCutAllowed(hit)) return Dig.BLOCKED;
+            } else if (!AgentReturnableMine.stationaryDriftCut(c.world, c.player.getBlockPos(), position, sideBearing,
+                    hit, c.player.getBoundingBox()) || returnableFace(position, state) != AgentReturnableMine.Face.MINEABLE) {
+                return Dig.BLOCKED;
+            }
             Vec3d above = Vec3d.ofCenter(position.up(), 0.20);
             BlockHitResult cover = perceive(above, c.player.getEyePos().distanceTo(above) + 0.04);
             if (cover != null && cover.getBlockPos().equals(position.up())

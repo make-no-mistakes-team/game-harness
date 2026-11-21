@@ -490,7 +490,7 @@ final class AgentProgress {
     private boolean forcedLight;
     private BlockPos darkAttemptFoot;
     private BlockPos pendingStairLight;
-    private int pendingStairLightSince, pendingStairTorchCount;
+    private int pendingStairLightSince, pendingStairTorchCount, observedStairLightUse;
     private BlockPos witnessedStairCut;
     private int witnessedStairCutTick;
 
@@ -962,7 +962,10 @@ final class AgentProgress {
             status = macro.status();
             return;
         }
-        if (hands.busy()) return;
+        if (hands.busy()) {
+            returnableMine.waitForEquipment(hands.jobGeneration());
+            return;
+        }
         if (handleScreen()) return;
         if (dropReclaim != null) {
             dropReclaim.step();
@@ -1011,7 +1014,8 @@ final class AgentProgress {
             return;
         }
         if (caveRetreat.step()) return;
-        if (!returnableMine.surveyingCave() && stallGuard.caveSurveyStalled()) {
+        boolean mineRetryLease = returnableMine.hasRetryProgressLease();
+        if (!returnableMine.surveyingCave() && stallGuard.caveSurveyStalled(mineRetryLease)) {
             AgentCaves.Opening opening = caves.drySurveyOpening();
             if (opening != null && caveRetreat.begin(opening)) {
                 caves.leaveDrySurvey(tick);
@@ -1019,7 +1023,7 @@ final class AgentProgress {
             }
         }
         if (stallGuard.takeTurn(stallReplan, stallChoose, stallStep, stallRelease,
-                returnableMine.hasProgressLease(), returnableMine.witnessedLowCeiling())) {
+                mineRetryLease, returnableMine.witnessedLowCeiling())) {
             body.prioritizeMovement();
             status = stallGuard.status();
             return;
@@ -6551,14 +6555,16 @@ final class AgentProgress {
             Vec3d point = Vec3d.ofCenter(pendingStairLight, 0.31);
             BlockHitResult hit = perceive(point, c.player.getEyePos().distanceTo(point) + 0.05);
             if (hit != null && hit.getBlockPos().equals(pendingStairLight) && state(hit).isOf(Blocks.TORCH)) {
+                observedStairLightUse = pendingStairLightSince;
                 stallGuard.stairLightReceipt(pendingStairLight);
+                returnableMine.observeLight(pendingStairLight);
                 pendingStairLight = null;
             }
         }
     }
 
     private boolean lightStair(BlockPos current) {
-        return lightStair(current, digDirection);
+        return lightStair(current, digDirection, false);
     }
 
     void startReturnableLight() {
@@ -6567,14 +6573,23 @@ final class AgentProgress {
     }
 
     Dig lightReturnableStair(BlockPos foot, Direction bearing) {
-        if (lightStair(foot, bearing)) return Dig.LOOKING;
+        if (lightStair(foot, bearing, true)) {
+            if (hands.busy()) returnableMine.awaitEquipment(hands.jobGeneration());
+            if (torchUsed == tick) returnableMine.issuedLight(foot);
+            return Dig.LOOKING;
+        }
         return torchPlacedTick == tick ? Dig.CLEAR : Dig.BLOCKED;
     }
 
-    private boolean lightStair(BlockPos current, Direction bearing) {
+    private boolean lightStair(BlockPos current, Direction bearing, boolean returnable) {
         status = "lighting the current stair before cutting further";
         if (torchUsed != 0) {
             if (hands.count(TORCH) < torchBefore) {
+                if (returnable && observedStairLightUse != torchUsed) {
+                    if (tick - torchUsed <= 8) return true; // Wait for the rendered placement, not just the debit.
+                    torchAttempt = torchFace = torchUsed = 0;
+                    return false;
+                }
                 torchAttempt = torchFace = torchUsed = 0;
                 litIndex = trail.size();
                 torchPlacedTick = tick;
@@ -6744,7 +6759,10 @@ final class AgentProgress {
             || state.isOf(Blocks.FURNACE)) return Dig.BLOCKED;
         if (!tools.canHarvest(state)) return Dig.BLOCKED;
         body.aimContact(hit, AgentBody.Contact.MINE);
-        if (!readyForMine(state)) return Dig.LOOKING;
+        if (!readyForMine(state)) {
+            if (returnable && hands.busy()) returnableMine.awaitEquipment(hands.jobGeneration());
+            return Dig.LOOKING;
+        }
         if (body.mine(hit) && stair) {
             witnessedStairCut = position;
             witnessedStairCutTick = tick;

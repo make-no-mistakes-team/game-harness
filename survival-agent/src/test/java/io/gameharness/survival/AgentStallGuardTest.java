@@ -16,6 +16,49 @@ final class AgentStallGuardTest {
     }
 
     @Test
+    void confirmedStairCutsKeepTheMinerThroughTheTorchEquipAndPlacement() {
+        var work = new AgentReturnableMine.RouteWork();
+        var retryStart = 3128;
+        work.cut(new BlockPos(-22, 59, 15), 3236);
+        work.cut(new BlockPos(-22, 58, 15), 3256);
+
+        assertTrue(AgentStallGuard.retryWindowOpen(3277 - retryStart, false, work.recent(3277)),
+            "a just-cleared stair can resume after equipment closes, without counting the equipment");
+        assertTrue(AgentStallGuard.retryWindowOpen(3290 - retryStart, false, work.recent(3290)),
+            "the second confirmed cell extends the working window beyond the first");
+
+        work.light(3294);
+        assertTrue(AgentStallGuard.retryWindowOpen(3305 - retryStart, false, work.recent(3305)));
+        work.proved(3335);
+        assertTrue(AgentStallGuard.retryWindowOpen(3345 - retryStart, false, work.recent(3345)),
+            "fresh proof of the changed route can finish the tread");
+        work.proved(3375);
+        assertFalse(AgentStallGuard.retryWindowOpen(3393 - retryStart, false, work.recent(3393)),
+            "verified work does not remove the retry ceiling");
+    }
+
+    @Test
+    void stationaryPrepAndRepeatedReceiptsCannotRenewAnOrdinaryRetry() {
+        var work = new AgentReturnableMine.RouteWork();
+        var cell = new BlockPos(-22, 58, 15);
+        work.proved(144);
+        assertFalse(AgentStallGuard.retryWindowOpen(145, false, work.recent(145)),
+            "looking, changing equipment, or proof without a route effect cannot buy another turn");
+
+        work.cut(cell, 100);
+        work.cut(cell, 144);
+        work.proved(150);
+        assertFalse(AgentStallGuard.retryWindowOpen(150, false, work.recent(150)),
+            "the same cut and a proof loop cannot revive an expired window");
+
+        work.light(205);
+        work.light(252);
+        assertTrue(AgentStallGuard.retryWindowOpen(230, true, work.recent(230)));
+        assertFalse(AgentStallGuard.retryWindowOpen(254, true, work.recent(254)),
+            "a repeated report of the same stair light cannot keep the handback alive");
+    }
+
+    @Test
     void refusedRiseDoesNotVetoAnotherGroundedLaneOrItsReverse() {
         var exits = new AgentStallGuard.Departures();
         var foot = new BlockPos(0, 64, 0);

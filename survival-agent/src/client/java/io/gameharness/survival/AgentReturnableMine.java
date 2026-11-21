@@ -26,18 +26,53 @@ final class AgentReturnableMine {
     private record Refusal(BlockPos foot, Direction bearing, boolean level, Face fact) {}
     enum Face { UNSEEN, OPEN, DARK, OCCLUDED, FLUID, LAVA, FOOTPRINT, PROTECTED, MATERIAL, TOOL, FAILED, MINEABLE }
 
+    /** Per tread: only a confirmed edit starts the quiet window; new proofs can then renew it. */
+    static final class RouteWork {
+        private final long[] cuts = new long[4]; // Three descending cells and one reverse trim.
+        private int cutCount, lastProgress;
+        private boolean lit;
+
+        void reset() {
+            cutCount = 0;
+            lit = false;
+        }
+
+        void cut(BlockPos cell, int now) {
+            long packed = cell.asLong();
+            for (int i = 0; i < cutCount; i++) if (cuts[i] == packed) return;
+            if (cutCount == cuts.length) return;
+            cuts[cutCount++] = packed;
+            lastProgress = now;
+        }
+
+        void light(int now) {
+            if (lit) return;
+            lit = true;
+            lastProgress = now;
+        }
+
+        void proved(int now) {
+            if (recent(now)) lastProgress = now;
+        }
+
+        boolean recent(int now) {
+            return (cutCount != 0 || lit) && now - lastProgress <= PROGRESS_LEASE_TICKS;
+        }
+    }
+
     private final MinecraftClient client;
     private final AgentBody body;
     private final Refusal[] retired = new Refusal[RETIRED_LIMIT];
+    private final RouteWork routeWork = new RouteWork();
     private ClientWorld world;
     private ClientPlayerEntity player;
     private int retiredCursor, lastTurn, started, phaseSince, optionSince, depth, limit, drops;
     private int choice, cut, proof;
-    private int progressAt, treadEvidence;
+    private int progressAt, treadEvidence, lightIssuedAt;
     private int caveSince, caveMask, caveContacts;
     private boolean caveSurveySpent;
-    private long revealedFrame = -1;
-    private BlockPos anchor, from, to, unjoined, levelFoot, workCell, reverseCeiling;
+    private long revealedFrame = -1, equipmentJob;
+    private BlockPos anchor, from, to, unjoined, levelFoot, workCell, reverseCeiling, pendingLight;
     private Vec3d aim;
     private Direction preferred, bearing, caveBearing;
     private Phase phase, afterLight;
@@ -71,11 +106,20 @@ final class AgentReturnableMine {
 
     boolean hasProgressLease() {
         int now = body.actionTick();
-        return active() && now - lastTurn <= 1 && now - started < LEG_TICKS
+        return continuing(now)
             && (progressAt >= started && now - progressAt <= PROGRESS_LEASE_TICKS
                 || cavePending && now - caveSince <= CAVE_TURN_LIMIT
                 || caveSurveySpent && (phase == Phase.ANCHOR || phase == Phase.CHOOSE)
                     && now - phaseSince < CAVE_TURN_LIMIT);
+    }
+
+    boolean hasRetryProgressLease() {
+        int now = body.actionTick();
+        return continuing(now) && routeWork.recent(now);
+    }
+
+    private boolean continuing(int now) {
+        return active() && now - lastTurn <= 1 && now - started < LEG_TICKS;
     }
 
     boolean stockedForNewLeg(AgentProgress host) {
@@ -88,11 +132,17 @@ final class AgentReturnableMine {
 
     void observeBreak(BlockPos position) {
         if (witnessedLowCeiling() != null && reverseCeiling.up(2).equals(position)) reverseCeiling = null;
-        if (active() && position.equals(workCell)) {
+        int now = body.actionTick();
+        if (active() && !cavePending && lastTurn == now && position.equals(workCell)
+                && position.equals(body.continuityMiningTarget())) {
             if (phase == Phase.CUT) {
-                advanceEvidence(cut, body.actionTick());
+                routeWork.cut(position, now);
+                advanceEvidence(cut, now);
                 revealedFrame = body.renderedFrame();
-            } else if (phase == Phase.TRIM_RETURN) advanceEvidence(22, body.actionTick());
+            } else if (phase == Phase.TRIM_RETURN) {
+                routeWork.cut(position, now);
+                advanceEvidence(22, now);
+            }
         }
         for (int i = 0; i < retired.length; i++) {
             Refusal old = retired[i];
@@ -102,6 +152,30 @@ final class AgentReturnableMine {
                     && position.getY() >= lane.getY() - 2 && position.getY() <= lane.getY() + 2)
                 retired[i] = null;
         }
+    }
+
+    void issuedLight(BlockPos foot) {
+        pendingLight = foot;
+        lightIssuedAt = body.actionTick();
+    }
+
+    void observeLight(BlockPos foot) {
+        int now = body.actionTick();
+        if (!continuing(now) || !foot.equals(pendingLight) || now - lightIssuedAt > 8) return;
+        pendingLight = null;
+        routeWork.light(now);
+        progressAt = now;
+    }
+
+    void awaitEquipment(long job) { equipmentJob = job; }
+
+    /** Hands keeps physical ownership; only this mine's own safe equipment job preserves its phase. */
+    void waitForEquipment(long job) {
+        int now = body.actionTick();
+        if (job == 0 || job != equipmentJob || !continuing(now) || body.lavaEmergency()
+                || player.hurtTime != 0 || player.isOnFire() || player.hasVehicle()
+                || !dryGroundAt(checkingReturn() ? to : from)) return;
+        lastTurn = now;
     }
 
     void interruptIfSkipped() {
@@ -119,6 +193,7 @@ final class AgentReturnableMine {
         int now = body.actionTick();
         if (active() && lastTurn != now - 1) interrupt();
         lastTurn = now;
+        equipmentJob = 0;
         if (!active()) {
             levelOnly = unjoined(standing);
             if (levelOnly && levelSpent)
@@ -416,7 +491,7 @@ final class AgentReturnableMine {
             body.aim(aim);
             switch (body.dryRouteClear(aim)) {
                 case CLEAR -> {
-                    advanceEvidence((reverse ? 12 : 3) + proof, now);
+                    checkedEvidence((reverse ? 12 : 3) + proof, now);
                     proof++;
                     aim = null;
                 }
@@ -435,12 +510,12 @@ final class AgentReturnableMine {
         body.aim(aim);
         if (body.dryRouteFloor(aim, target.down()) == null || !body.dryRouteSweep(source, target)) return;
         if (!reverse) {
-            advanceEvidence(11, now);
+            checkedEvidence(11, now);
             begin(Phase.DRIVE, now);
             return;
         }
         if (trimmed) {
-            advanceEvidence(23, now);
+            checkedEvidence(23, now);
             proof++;
             aim = null;
             return;
@@ -497,7 +572,11 @@ final class AgentReturnableMine {
             if (aim == null) aim = offset(base, bearing, 0.33).add(0, CLEARANCE_HEIGHTS[sample], 0);
             body.aim(aim);
             switch (body.dryRouteClear(aim)) {
-                case CLEAR -> { proof++; aim = null; }
+                case CLEAR -> {
+                    checkedEvidence(25 + sample, now);
+                    proof++;
+                    aim = null;
+                }
                 case FLUID -> fail("fluid entered the repaired mine tread");
                 case UNKNOWN, DARK, OBSTRUCTION -> {}
             }
@@ -535,7 +614,7 @@ final class AgentReturnableMine {
 
     private void drive(AgentProgress host, int now) {
         if (dryGroundAt(to)) {
-            advanceEvidence(21, now);
+            checkedEvidence(21, now);
             begin(Phase.REVERSE, now);
             return;
         }
@@ -546,18 +625,22 @@ final class AgentReturnableMine {
         if (body.dryRouteSweep(from, to)) {
             double along = (player.getX() - from.getX() - 0.5) * bearing.getOffsetX()
                 + (player.getZ() - from.getZ() - 0.5) * bearing.getOffsetZ();
-            if (along >= 0.55) advanceEvidence(20, now);
+            if (along >= 0.55) checkedEvidence(20, now);
             body.driveDryRoute(from, to, bearing);
             host.rememberReturnableMotion();
         }
     }
 
-    private void advanceEvidence(int evidence, int now) {
+    private void checkedEvidence(int evidence, int now) {
+        if (advanceEvidence(evidence, now)) routeWork.proved(now);
+    }
+
+    private boolean advanceEvidence(int evidence, int now) {
         int bit = 1 << evidence;
-        if ((treadEvidence & bit) == 0) {
-            treadEvidence |= bit;
-            progressAt = now;
-        }
+        if ((treadEvidence & bit) != 0) return false;
+        treadEvidence |= bit;
+        progressAt = now;
+        return true;
     }
 
     private boolean dryGroundAt(BlockPos foot) {
@@ -584,7 +667,11 @@ final class AgentReturnableMine {
         phaseSince = now;
         proof = 0;
         aim = null;
-        if (next == Phase.ANCHOR) litHere = false;
+        if (next == Phase.ANCHOR) {
+            litHere = false;
+            pendingLight = null;
+            routeWork.reset();
+        }
         status = switch (next) {
             case ANCHOR -> "checking the stable dry anchor for a returnable mine leg";
             case CHOOSE -> "looking for a witnessed mine face on a safe bearing";
@@ -641,6 +728,8 @@ final class AgentReturnableMine {
         phase = null;
         cavePending = false;
         anchor = from = to = workCell = null;
+        pendingLight = null;
+        equipmentJob = 0;
         revealedFrame = -1;
         status = detail;
         return outcome = result;
@@ -653,6 +742,8 @@ final class AgentReturnableMine {
         phase = null;
         cavePending = false;
         unjoined = levelFoot = reverseCeiling = null;
+        pendingLight = null;
+        equipmentJob = 0;
         levelSpent = false;
         revealedFrame = -1;
         Arrays.fill(retired, null);

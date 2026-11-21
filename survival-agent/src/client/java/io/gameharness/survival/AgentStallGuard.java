@@ -39,6 +39,7 @@ final class AgentStallGuard {
     private static final int PROBE_TICKS = 46;
     private static final int RETRY_TICKS = 145;
     private static final int HANDBACK_TICKS = 230;
+    private static final int MINE_RETRY_GRACE_TICKS = 120;
     private static final int ORDINARY_SETUP_TICKS = 75;
     private static final int ANGLE_WINDOW = 64;
     private static final int SPIN_TICKS = 96;
@@ -171,7 +172,7 @@ final class AgentStallGuard {
     private Phase phase = Phase.WATCH;
     private Report report = new Report(0, 0, 0, 0, "watch", "", 0, 0);
     private int incidents, attempts, recoveries, failures, tick, incidentTick, entered, lastUseful;
-    private int walkedCount, footprintCount, creditCount, brokenCount, novelCells, movedCells, retryCuts;
+    private int walkedCount, footprintCount, creditCount, brokenCount, novelCells, movedCells;
     private int stairLightCount, retryRouteCells;
     private int navigationFootCount;
     private int frameBlocks, meals, mineSince, lastCrackTick, crackStage, furnaceSince, furnaceSeen;
@@ -256,9 +257,9 @@ final class AgentStallGuard {
             ordinarySetupUntil = tick + ORDINARY_SETUP_TICKS;
     }
 
-    boolean caveSurveyStalled() {
+    boolean caveSurveyStalled(boolean mineRetryLease) {
         return phase == Phase.PENDING && !tookControl && !explicitRefusal
-            || phase == Phase.RETRY && tick - entered >= retryTicks();
+            || phase == Phase.RETRY && !retryWindowOpen(tick - entered, blockedReason != null, mineRetryLease);
     }
 
     /** The miner physically returned to an old shaft and witnessed a different mineable branch. */
@@ -473,7 +474,6 @@ final class AgentStallGuard {
         boolean normal = phase == Phase.WATCH;
         boolean navigation = navigationTurn || phase == Phase.RETRY && navigationRetry;
         int gain = inventoryGain(navigation && !normal);
-        if (phase == Phase.RETRY && workBroke && !navigation) retryCuts++;
         double distance = feet.squaredDistanceTo(anchor);
         boolean newTravel = grounded && novelCells >= 2 && distance >= 4.0;
         boolean knownTravel = grounded && movedCells >= 4 && distance >= 25.0 && awayFromCredits(feet);
@@ -489,13 +489,13 @@ final class AgentStallGuard {
             markUseful(feet);
             if (!normal) transition(Phase.WATCH, "ordinary play advanced before recovery took control");
         } else if (phase == Phase.RETRY) {
-            // A recovery step, its dropped dirt, or walking back to the old locus is not a success.
+            // Cuts can keep the miner working, but only settled work or a real departure recovers the incident.
             boolean sustained = tick - entered >= 45 && grounded && movedCells >= 3 && novelCells >= 2
                 && distance >= 10.0 && feet.squaredDistanceTo(Vec3d.ofBottomCenter(incidentFrom)) >= 12.0;
             boolean continuedRoute = grounded && retryRouteCells >= 5 && movedCells >= 5 && distance >= 25.0
                 && feet.squaredDistanceTo(Vec3d.ofBottomCenter(incidentFrom)) >= 25.0;
             if (settledWork || tick - entered >= 25 && gain == 2
-                    || !navigation && tick - entered >= 45 && (sustained || continuedRoute || retryCuts >= 3
+                    || !navigation && tick - entered >= 45 && (sustained || continuedRoute
                         || surveySequence - retrySurvey >= 3)) {
                 recoveries++;
                 markUseful(feet);
@@ -629,7 +629,7 @@ final class AgentStallGuard {
 
     /** Called only after the existing danger, hands, screen and food owners have declined this tick. */
     boolean takeTurn(Runnable replan, Supplier<String> chooseAlternative, Supplier<Alternative> workAlternative,
-                     Runnable releaseAlternative, boolean navigationLease, BlockPos witnessedLowCeiling) {
+                     Runnable releaseAlternative, boolean mineRetryLease, BlockPos witnessedLowCeiling) {
         navigationLowCeiling = witnessedLowCeiling;
         if (phase == Phase.WATCH || client.player.isTouchingWater() || client.player.hasVehicle()) return false;
         if (phase == Phase.ASSESS || phase == Phase.DEPART || phase == Phase.ALTERNATIVE || phase == Phase.BLOCKED) {
@@ -640,7 +640,8 @@ final class AgentStallGuard {
             return assessAlternative(chooseAlternative, workAlternative, releaseAlternative);
         }
         if (phase == Phase.RETRY && blockedReason != null) {
-            if (tick - entered < retryTicks() || navigationLease || verifiedMining(entered) || verifiedFurnace()) return false;
+            if (retryWindowOpen(tick - entered, true, mineRetryLease)
+                    || verifiedMining(entered) || verifiedFurnace()) return false;
             replan.run();
             assessAgain("ordinary replan did not produce settled progress");
             return true;
@@ -650,7 +651,8 @@ final class AgentStallGuard {
             return true;
         }
         if (phase == Phase.RETRY) {
-            if (tick - entered < RETRY_TICKS || navigationLease || verifiedMining(entered) || verifiedFurnace()) return false;
+            if (retryWindowOpen(tick - entered, false, mineRetryLease)
+                    || verifiedMining(entered) || verifiedFurnace()) return false;
             if (mineHandedBack) {
                 fail("ordinary miner handback made no settled progress (" + report.detail() + ")");
                 return true;
@@ -1714,7 +1716,10 @@ final class AgentStallGuard {
         fail("temporary step at " + from.toShortString() + ": " + reason);
     }
 
-    private int retryTicks() { return blockedReason == null ? RETRY_TICKS : HANDBACK_TICKS; }
+    static boolean retryWindowOpen(int elapsed, boolean replanning, boolean mineRetryLease) {
+        int baseline = replanning ? HANDBACK_TICKS : RETRY_TICKS;
+        return elapsed < baseline || mineRetryLease && elapsed < baseline + MINE_RETRY_GRACE_TICKS;
+    }
 
     private void retry(String reason) {
         anchor = client.player.getPos();
@@ -1726,7 +1731,7 @@ final class AgentStallGuard {
                 lastAssessedFeet = anchor;
             }
         }
-        novelCells = movedCells = retryCuts = retryRouteCells = 0;
+        novelCells = movedCells = retryRouteCells = 0;
         navigationRetry = false;
         retrySurvey = surveySequence;
         mineSince = 0;

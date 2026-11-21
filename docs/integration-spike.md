@@ -49,7 +49,9 @@ On a supply trip, connected dry ground under a canopy can be a usable
 exit; seeing open sky is not required. If a low ceiling rules out a
 climb, the player can still collect a reachable resource or leave over
 a different, visibly supported level path. A fall or lava blocks that
-handoff until the emergency is over.
+handoff until the emergency is over. When the player equips a torch
+to light a mine tread, the mine stays active through that inventory
+transaction. Equipping it alone does not count as lighting the tread.
 Vanilla inventory or dimension evidence verifies the goal separately.
 Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.

@@ -5,6 +5,7 @@ import java.util.BitSet;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -3778,7 +3779,6 @@ final class AgentProgress {
             sought = resource;
             soughtSince = tick;
         }
-        watchExpeditionOreRoute(resource);
         status = "seeking " + resource.label;
         if (returnableOre != null) {
             if (target != null && miningResource == returnableOre) {
@@ -3816,6 +3816,7 @@ final class AgentProgress {
         if (resource != Resource.STONE && hands.count(TORCH) + 4 * hands.count(FUEL) < LOCAL_LIGHT
             && affordsWood(localTableWood(), 3) && workOre(Resource.COAL, range, false)) return;
         target = null;
+        watchExpeditionOreRoute(resource, depth);
         if (workExpeditionOreRoute(resource, depth)) return;
         if ((activeTrail() > 1 || resumeIndex >= 0 || tick - soughtSince > onSurfaceTicks)
             && tick >= nextDigStart && (c.player.isOnGround() || activeTrail() > 0) && !c.player.isTouchingWater()) {
@@ -3825,11 +3826,15 @@ final class AgentProgress {
         }
     }
 
-    private void watchExpeditionOreRoute(Resource resource) {
+    private void watchExpeditionOreRoute(Resource resource, int depth) {
         if (expedition == null || prospectingOre == resource || resource != Resource.IRON && resource != Resource.DIAMOND)
             return;
         int bit = 1 << resource.ordinal();
         if ((prospected & bit) != 0) return;
+        // Stocking a dark mine can take longer than a strategy's lifetime.
+        // Offer the actual route choice, not the eventual ore objective at spawn.
+        BlockPos standing = c.player.getBlockPos();
+        if (returnableMine.unjoined(standing) || standing.getY() > depth && !returnableMine.stockedForNewLeg(this)) return;
         prospected |= bit;
         prospectingOre = resource;
         // An offer is passive: no view, movement, supplies or timing changes
@@ -4364,7 +4369,7 @@ final class AgentProgress {
         return true;
     }
 
-    /** The supply caller retains its job until outside, at reachable wood, or at a physical refusal. */
+    /** The supply caller retains its job only until an ordinary alternative or a physical refusal. */
     private final class SupplyEgress {
         private enum Proof {
             OPENING, LIP, CROWN, HEAD, FOOT, REVERSE_CROWN, LANDING,
@@ -4376,21 +4381,26 @@ final class AgentProgress {
         private static final int MAX_CONNECTORS = 2, MAX_FOOTHOLDS = 2, FOOTHOLD_RESERVE = 8, ANCHOR_TICKS = 24;
         private static final float SURVEY_PITCH = -42;
         private final List<BlockPos> walked = new ArrayList<>();
-        private BlockPos openFoot, unknownFoot, from, to, armedCut, packedBench;
+        private final AgentSupplyEgress order = new AgentSupplyEgress();
+        private final BiPredicate<BlockPos, Direction> woodlandLane = this::woodlandLaneClear;
+        private ClientWorld world;
+        private BlockPos openFoot, unknownFoot, to, armedCut, packedBench;
         private Vec3d floor, alternateFloor, aim, buildLow, buildHigh, reverseLeft, reverseRight;
         private Direction bearing, lane;
         private Proof proof;
-        private String supplies, surveyActivity, crossingActivity, blocked, firstRefusal, lastRefusal;
-        private int deadline, since, view, views, openViews, roofViews, wallViews;
+        private String surveyActivity, crossingActivity, firstRefusal, lastRefusal;
+        private int deadline, since, view, views, openViews, roofViews, wallViews, handoffAfter;
         private int choice, flatBearings, driving, back, backEnd, rises, levels, cuts, laneCuts;
         private int benchBefore, benchCollectUntil, connectors, builds, buildBefore, anchorChoice;
         private long revealedFrame;
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
         private boolean triedLower, built;
 
-        boolean active() { return from != null; }
+        boolean active() { return world == c.world && order.active(); }
 
         void observeBreak(BlockPos position, BlockState material) {
+            if (world != c.world) return;
+            order.observeBreak(position);
             if (!position.equals(armedCut)) return;
             armedCut = null;
             revealedFrame = body.renderedFrame();
@@ -4406,59 +4416,81 @@ final class AgentProgress {
         }
 
         boolean outdoors() {
-            return dryFieldFooting() && c.player.getBlockPos().equals(openFoot);
+            return world == c.world && dryFieldFooting() && c.player.getBlockPos().equals(openFoot);
         }
 
         boolean seek(String need) {
-            if (!dryFieldFooting() || c.player.hasVehicle()) return false;
+            if (c.player.hasVehicle()) return false;
+            boolean grounded = dryFieldFooting();
+            if (world != c.world) {
+                world = c.world;
+                order.reset();
+                openFoot = unknownFoot = null;
+            }
             BlockPos standing = c.player.getBlockPos();
             // Continue the ordinary timber traversal across a few recently walked tiles.
             // Only the stance itself, not this short excursion, counts as an outdoor departure.
             if (outdoors() || standing.equals(unknownFoot)) return false;
-            if (openFoot != null && Math.abs(standing.getY() - openFoot.getY()) <= 1
+            if (grounded && openFoot != null && Math.abs(standing.getY() - openFoot.getY()) <= 1
                     && standing.getSquaredDistance(openFoot) <= 16) {
                 int view = body.supplyPerspective(c.player.getYaw());
                 if ((view & (AgentBody.SUPPLY_ROOF | AgentBody.SUPPLY_WALL))
                         != (AgentBody.SUPPLY_ROOF | AgentBody.SUPPLY_WALL)) return false;
             }
-            from = standing;
-            supplies = need;
-            surveyActivity = "supply egress: surveying the rendered roof and opening for " + supplies;
+            if (!order.begin(standing, grounded)) return false;
+            surveyActivity = "supply egress: surveying the rendered roof and opening for " + need;
             deadline = tick + JOB_TICKS;
             bearing = c.player.getHorizontalFacing();
             walked.clear();
-            walked.add(from);
-            blocked = firstRefusal = lastRefusal = null;
-            armedCut = packedBench = null;
+            walked.add(standing);
+            firstRefusal = lastRefusal = null;
+            to = armedCut = packedBench = null;
+            driving = 0;
+            handoffAfter = tick;
             revealedFrame = -1;
             rises = levels = cuts = connectors = builds = 0;
             sourceProved = walkedReturn = lighting = triedLight = triedCraftLight = false;
             returning = findReturn();
-            enclosed = returning && trail.get(backEnd).getY() >= from.getY() + 2;
+            enclosed = returning && trail.get(backEnd).getY() >= standing.getY() + 2;
             survey(4);
             return step();
         }
 
         boolean step() {
-            if (!active() || c.player.hasVehicle()) return false;
-            if (c.player.isTouchingWater()) {
-                seekTimber(supplies);
+            if (!active()) {
+                if (world != c.world || !order.holdOrdinary(airborne())) return false;
+                body.pauseWork();
                 return true;
             }
-            stallGuard.navigationWork();
-            if (blocked != null) {
-                status = blocked;
-                return true;
-            }
+            boolean consumed = workStep();
+            if (active()) stallGuard.navigationWork();
+            return consumed;
+        }
+
+        private boolean airborne() {
+            return !c.player.isOnGround() && !c.player.isTouchingWater() && !c.player.isInLava()
+                && !c.player.hasVehicle();
+        }
+
+        private boolean workStep() {
+            BlockPos from = order.foot();
             if (tick >= deadline) return stop("finite exit search exhausted");
+            if (c.player.isTouchingWater() || c.player.isInLava() || c.player.hasVehicle())
+                return stop("lost dry on-foot contact");
+            if (driving == 0) {
+                // Only a still-witnessed crossing may keep an airborne movement turn.
+                if (!dryFieldFooting()) return stop("lost ground contact outside a witnessed crossing");
+                if (!from.equals(c.player.getBlockPos()))
+                    return stop("left the connected footing before the next crossing");
+            }
             if (!body.hasRecentView()) {
+                body.pauseWork();
+                if (driving != 0 && tick - driving >= 45)
+                    return stop("lost the rendered crossing before a settled landing");
                 if (!surveying && to == null) status = "supply egress: waiting for a rendered view";
                 return true;
             }
             if (driving != 0) return drive();
-            if (!dryFieldFooting()) return true; // An existing fall or combat owner can interrupt the job.
-            if (!from.equals(c.player.getBlockPos()))
-                return stop("left the connected footing before the next crossing");
             if (packedBench != null && has(table.item, benchBefore + 1)) {
                 packedBench = null;
                 status = "supply egress: recovered the obstructing portable crafting table";
@@ -4470,6 +4502,7 @@ final class AgentProgress {
                 body.centerOnSupport(from.down());
                 return true;
             }
+            if (packedBench == null && ordinaryHandoff(from)) return true;
             if (surveying) return look();
             if (packedBench != null && tick < benchCollectUntil) {
                 body.aim(Vec3d.ofBottomCenter(packedBench));
@@ -4513,6 +4546,38 @@ final class AgentProgress {
             };
         }
 
+        private boolean ordinaryHandoff(BlockPos from) {
+            if (body.lavaEmergency() || body.macroLavaNear()) return false;
+            if (tick < handoffAfter) return handoffTimber(false);
+            handoffAfter = tick + 5;
+            float yaw = body.defensiveViewYaw();
+            if (body.dryCaveContact(from) != null && order.handoffWoodland(body.dryCaveProbeView(),
+                    Direction.fromHorizontalDegrees(yaw), woodlandLane))
+                return surfaceReady(from, yaw, "confirmed walkable woodland");
+            if (collectLocalDrop(LOG) || collectLocalDrop(PLANK))
+                return ready("ordinary pickup from connected footing");
+            return handoffTimber(true);
+        }
+
+        private boolean handoffTimber(boolean searchView) {
+            if (!startReachableTimber(searchView)) return false;
+            body.pauseWork();
+            return ready("reachable timber from connected footing");
+        }
+
+        private boolean woodlandLaneClear(BlockPos next, Direction bearing) {
+            BlockPos from = order.foot();
+            return body.walkedLaneDry(from, next, bearing)
+                && body.dryRouteVeto(from, next) == AgentBody.DryRouteVeto.CLEAR;
+        }
+
+        private boolean collectLocalDrop(Predicate<ItemStack> drop) {
+            if (tick < pickupBlockedUntil && pickupBlockedItem == drop) return false;
+            ItemEntity entity = body.dropped(drop, 3.25).orElse(null);
+            return entity != null && Math.abs(entity.getY() - c.player.getY()) <= 0.55
+                && collectObserved(drop, entity, true);
+        }
+
         private boolean tryLight() {
             if (triedLight) return false;
             if (!has(TORCH, 1)) {
@@ -4528,6 +4593,7 @@ final class AgentProgress {
         }
 
         private boolean findReturn() {
+            BlockPos from = order.foot();
             back = trail.lastIndexOf(from);
             if (back < 1 || back >= activeTrail()) return false;
             backEnd = back;
@@ -4552,6 +4618,7 @@ final class AgentProgress {
 
         private boolean look() {
             if (outdoors()) return ready("confirmed open ground");
+            BlockPos from = order.foot();
             Direction direction = option(view);
             float yaw = direction.getPositiveHorizontalDegrees();
             int age = tick - since;
@@ -4559,20 +4626,13 @@ final class AgentProgress {
             body.turn(yaw, pitch);
             status = surveyActivity;
             boolean aligned = body.renderedDirection(yaw, pitch, 8);
-            if (startReachableTimber(aligned)) return ready("reachable timber from connected footing");
             if (!aligned && age < 3 * LOOK_TICKS) return true;
             int scene = body.supplyPerspective(yaw);
             int bit = 1 << view;
             if ((scene & AgentBody.SUPPLY_OPEN) != 0) openViews |= bit;
             if ((scene & AgentBody.SUPPLY_ROOF) != 0) roofViews |= bit;
             if ((scene & AgentBody.SUPPLY_WALL) != 0) wallViews |= bit;
-            if (Integer.bitCount(openViews) >= 2) {
-                openFoot = from;
-                heading = yaw;
-                headingUntil = tick + 125;
-                approachGoal = null;
-                return ready("confirmed open ground");
-            }
+            if (Integer.bitCount(openViews) >= 2) return surfaceReady(from, yaw, "confirmed open ground");
             // A single open sector may be the mouth of a shaft. Corroborate it across bearings.
             if (views == 1 && openViews != 0) views = 4;
             if ((openViews & bit) == 0 && age < 3 * LOOK_TICKS
@@ -4610,6 +4670,7 @@ final class AgentProgress {
         }
 
         private boolean choose() {
+            BlockPos from = order.foot();
             laneCuts = 0;
             triedLower = built = false;
             if (returning) {
@@ -4645,6 +4706,13 @@ final class AgentProgress {
         }
 
         private void setCrossing() {
+            BlockPos from = order.foot();
+            order.considered(from.up(2));
+            order.considered(from.offset(lane).up());
+            order.considered(to.down());
+            order.considered(to);
+            order.considered(to.up());
+            order.considered(to.up(2));
             Vec3d center = Vec3d.ofBottomCenter(to).add(0, -0.025, 0);
             floor = center.add(lane.getOffsetX() * 0.35, 0, lane.getOffsetZ() * 0.35);
             alternateFloor = center.add(lane.getOffsetX() * 0.14, 0, lane.getOffsetZ() * 0.14);
@@ -4660,6 +4728,7 @@ final class AgentProgress {
         }
 
         private boolean proveTop() {
+            BlockPos from = order.foot();
             boolean risingLip = proof == Proof.LIP;
             // This is sampled after the visible side face has opened. A previous
             // obstruction or an opaque face is not evidence of what's behind it.
@@ -4731,7 +4800,7 @@ final class AgentProgress {
         }
 
         private boolean tryFootholdAfterLower() {
-            if (!triedLower || returning || to.getY() >= from.getY()) return false;
+            if (!triedLower || returning || to.getY() >= order.foot().getY()) return false;
             to = to.up();
             setCrossing();
             return beginFoothold();
@@ -4844,6 +4913,7 @@ final class AgentProgress {
         }
 
         private boolean clearance() {
+            BlockPos from = order.foot();
             int rise = to.getY() - from.getY();
             BlockPos cell;
             switch (proof) {
@@ -4894,6 +4964,7 @@ final class AgentProgress {
                 if (armedCut != null && body.continueMine(armedCut)) return true;
                 if (tick - since < LOOK_TICKS) return true;
                 if (tryFootholdAfterLower()) return true;
+                if (hit != null) order.considered(hit.getBlockPos());
                 return refuse(hit == null ? "could not witness " + area() + " at " + cell.toShortString()
                     : "occluded " + area() + " behind " + hit.getBlockPos().toShortString());
             }
@@ -4947,8 +5018,10 @@ final class AgentProgress {
             BlockHitResult cover = perceive(above, c.player.getEyePos().distanceTo(above) + 0.035);
             if (cover != null && cover.getBlockPos().getY() > cell.getY()
                     && (state(cover).getBlock() instanceof net.minecraft.block.FallingBlock || dangerous(state(cover))
-                        || !state(cover).getFluidState().isEmpty()))
+                        || !state(cover).getFluidState().isEmpty())) {
+                order.considered(cover.getBlockPos());
                 return refuse("visible falling material or fluid over " + cell.toShortString());
+            }
             body.aimContact(hit, AgentBody.Contact.MINE);
             if (ownBench) {
                 status = "supply egress: packing our own obstructing crafting table";
@@ -4961,11 +5034,13 @@ final class AgentProgress {
         }
 
         private boolean drive() {
+            BlockPos from = order.foot();
             var veto = body.dryRouteVeto(from, to);
             if (veto != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(veto));
             if (settled(to)) {
                 BlockPos old = from;
                 from = to;
+                order.landed(from);
                 walked.add(from);
                 caves.walkedDry(old, from);
                 caves.witnessedDry(from, old);
@@ -4989,6 +5064,7 @@ final class AgentProgress {
                 sourceProved = true;
                 triedLight = false;
                 bearing = lane;
+                handoffAfter = tick;
                 survey(reachedReturnEnd ? 4 : 1);
                 return true;
             }
@@ -5032,7 +5108,8 @@ final class AgentProgress {
         private boolean refuse(String why) {
             lastRefusal = lane + ": " + why;
             if (firstRefusal == null) firstRefusal = lastRefusal;
-            if (!settled(from) && driving != 0) return stop(lastRefusal);
+            if (driving != 0 && !settled(order.foot())) return stop(lastRefusal);
+            body.pauseWork();
             to = null;
             armedCut = null;
             driving = 0;
@@ -5041,7 +5118,20 @@ final class AgentProgress {
             return true;
         }
 
+        private boolean surfaceReady(BlockPos from, float yaw, String why) {
+            body.pauseWork();
+            openFoot = from;
+            heading = yaw;
+            headingUntil = tick + 125;
+            approachGoal = null;
+            return ready(from, why);
+        }
+
         private boolean ready(String why) {
+            return ready(order.foot(), why);
+        }
+
+        private boolean ready(BlockPos from, String why) {
             int index = trail.lastIndexOf(from);
             if (walkedReturn && index >= 0 && index + 1 < trail.size()) {
                 resumeIndex = index + 1;
@@ -5049,15 +5139,18 @@ final class AgentProgress {
                 supplyExcursion.reset();
             }
             status = "supply egress: " + why + " at " + from.toShortString();
-            from = to = null;
+            if (order.active()) order.finish();
+            to = armedCut = null;
+            driving = 0;
             return true;
         }
 
         private boolean stop(String why) {
             body.pauseWork();
-            armedCut = null;
-            blocked = status = "supply egress blocked at " + from.toShortString() + ": " + why
-                + (packedBench == null ? "" : "; no safe pickup reached for the portable crafting table");
+            to = armedCut = null;
+            driving = 0;
+            status = order.refuse(why
+                + (packedBench == null ? "" : "; no safe pickup reached for the portable crafting table"), airborne());
             return true;
         }
     }
@@ -5596,6 +5689,10 @@ final class AgentProgress {
     }
 
     private boolean collectObserved(Predicate<ItemStack> drop, ItemEntity entity) {
+        return collectObserved(drop, entity, false);
+    }
+
+    private boolean collectObserved(Predicate<ItemStack> drop, ItemEntity entity, boolean requireSupportedApproach) {
         if (pickupItem == drop && hands.count(drop) > pickupCount) {
             clearPickup();
             if (entity == null) return false;
@@ -5618,8 +5715,16 @@ final class AgentProgress {
             case BLOCKED -> {
                 abandonPickup(drop, 45);
                 status = "leaving the visible drop until there is a supported approach";
+                return !requireSupportedApproach;
             }
-            case WAITING -> status = "waiting for vanilla to collect a nearby drop";
+            case WAITING -> {
+                if (requireSupportedApproach
+                        && (entity == null || !AgentPickup.passiveOverlap(c.player.getBoundingBox(), entity.getBoundingBox()))) {
+                    clearPickup();
+                    return false;
+                }
+                status = "waiting for vanilla to collect a nearby drop";
+            }
             case MOVING -> {
                 rememberMotion();
                 status = "collecting visible drops on supported ground";

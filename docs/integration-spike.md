@@ -44,6 +44,9 @@ bun run play:agent --strategy terra --macro-requests 8 diamond 1800
 Advice changes a method at a safe decision point. It cannot authorize a
 click, spend an item, or make the player stop. A native acknowledgment
 means the player used the suggested method, not that it found the resource.
+The player gathers missing supplies before asking how to mine an ore.
+On a supply trip, connected dry ground under a canopy can be a usable
+exit; seeing open sky is not required.
 Vanilla inventory or dimension evidence verifies the goal separately.
 Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.

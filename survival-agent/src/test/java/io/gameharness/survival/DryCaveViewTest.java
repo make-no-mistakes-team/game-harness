@@ -34,6 +34,75 @@ final class DryCaveViewTest {
     }
 
     @Test
+    void aConnectedGrassTreadUnderCanopyHandsOffSupplyEgressWithoutOpenSky() {
+        var view = new ForwardView(40);
+        var landing = SOURCE.east();
+        view.blocks.put(SOURCE.down(), Blocks.GRASS_BLOCK.getDefaultState());
+        view.blocks.put(landing.down(), Blocks.GRASS_BLOCK.getDefaultState());
+        view.blocks.put(SOURCE.up(2), Blocks.OAK_LEAVES.getDefaultState());
+        view.blocks.put(landing.up(2), Blocks.OAK_LEAVES.getDefaultState());
+        var egress = new AgentSupplyEgress();
+        assertTrue(egress.begin(SOURCE, true));
+        assertTrue(egress.handoffWoodland(view, Direction.EAST, (foot, bearing) ->
+            view.sweepClear(AgentSurfaceTread.retainedTreadSweep(SOURCE, foot, 0.6))));
+        assertFalse(egress.active(), "ordinary forestry and overland no longer wait for an inclined exit");
+    }
+
+    @Test
+    void exhaustedSupplyEgressReleasesItsLeaseUntilTheFailedFootingPremiseChanges() {
+        var egress = new AgentSupplyEgress();
+        var refusedSupport = SOURCE.east().down();
+        assertTrue(egress.begin(SOURCE, true));
+        egress.considered(refusedSupport);
+        String reason = egress.refuse("east: visible lava near the selected crossing", false);
+        assertEquals("supply egress blocked at 0, 32, 0: east: visible lava near the selected crossing", reason);
+        assertFalse(egress.active(), "the stall watchdog may now assess or turn control back to ordinary work");
+        assertEquals(reason, egress.refusal(SOURCE));
+        assertFalse(egress.begin(SOURCE, true));
+        egress.observeBreak(SOURCE.east(2).up());
+        assertFalse(egress.begin(SOURCE, true), "unrelated work or another look at the same stance does not re-arm it");
+        assertTrue(egress.begin(SOURCE.west(), true), "a different actual grounded footing is a different premise");
+        egress.finish();
+        assertFalse(egress.begin(SOURCE, true), "returning to the exact failed footing does not erase its refusal");
+        egress.observeBreak(refusedSupport);
+        assertTrue(egress.begin(SOURCE, true), "a confirmed break inside the refused crossing permits a fresh proof");
+    }
+
+    @Test
+    void aCrossingVetoWhileAirborneSuppressesOrdinaryMovementWithoutLeasingProgress() {
+        var egress = new AgentSupplyEgress();
+        assertFalse(egress.begin(SOURCE, false));
+        assertTrue(egress.begin(SOURCE, true));
+        egress.considered(SOURCE.east().down());
+        assertEquals("supply egress blocked at 0, 32, 0: east: one of the two supporting footprints no longer holds",
+            egress.refuse("east: one of the two supporting footprints no longer holds", true));
+        assertFalse(egress.active());
+        assertFalse(egress.begin(SOURCE.east(), false), "a new air cell is not changed footing");
+        assertTrue(egress.holdOrdinary(true));
+        assertFalse(egress.holdOrdinary(false));
+    }
+
+    @Test
+    void grassBeyondALavaEdgeOrInAnUnwitnessedGapDoesNotReleaseSupplyEgressAsReady() {
+        var view = new ForwardView(40);
+        var landing = SOURCE.east();
+        view.blocks.put(SOURCE.down(), Blocks.GRASS_BLOCK.getDefaultState());
+        view.blocks.put(landing.down(), Blocks.LAVA.getDefaultState());
+        view.blocks.put(landing.east().down(), Blocks.GRASS_BLOCK.getDefaultState());
+        var egress = new AgentSupplyEgress();
+        assertTrue(egress.begin(SOURCE, true));
+        assertFalse(egress.handoffWoodland(view, Direction.EAST, (foot, bearing) ->
+            view.sweepClear(AgentSurfaceTread.retainedTreadSweep(SOURCE, foot, 0.6))));
+        assertTrue(egress.active());
+        view.blocks.remove(landing.down());
+        assertFalse(egress.handoffWoodland(view, Direction.EAST, (foot, bearing) -> true));
+        view.blocks.put(landing.down(), Blocks.GRASS_BLOCK.getDefaultState());
+        assertFalse(egress.handoffWoodland(view, Direction.EAST, (foot, bearing) -> false),
+            "visible grass cannot override the physical hazard veto");
+        assertTrue(egress.active());
+    }
+
+    @Test
     void oneForwardViewWitnessesThreeReversibleEdgesWithoutAiming() {
         var view = new ForwardView();
         var graph = new AgentRouteGraph();

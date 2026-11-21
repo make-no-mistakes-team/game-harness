@@ -30,8 +30,15 @@
 
 ## Gameplay delivery
 
-The product goal is purposeful, human-like play driven by model-authored
-behavior. Infrastructure milestones support that outcome; they do not replace it.
+The product priority is continuous, purposeful, human-like play. Terra
+chooses the strategy for a gameplay goal. The local player owns ordinary
+movement, tools, terrain clearance, workstations, crafting and immediate
+threat response. It keeps pursuing the goal while Terra thinks, abstains
+or is unavailable, and adopts useful advice at a safe transition. If model
+permissions or round trips interrupt ordinary play, reduce the model's
+authority rather than adding another per-action approval. Preserve local
+safety checks and explicit user prohibitions. Natural waits, including a
+single item cooking, need no substitute motion.
 
 - Keep a small end-to-end gameplay slice on the critical path. Within authorized
   budgets and working safety boundaries, exercise it with a real model early,

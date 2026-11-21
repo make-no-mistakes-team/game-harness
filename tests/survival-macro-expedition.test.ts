@@ -52,7 +52,7 @@ const token = `local.${Buffer.from(JSON.stringify({
   "https://api.openai.com/auth": { chatgpt_account_id: account },
 })).toString("base64url")}.not-a-real-signature`;
 
-async function fixture(assertDisplay: () => void = () => {}) {
+async function fixture(assertDisplay: () => void = () => {}, maxRequests = 1) {
   const dir = await mkdtemp(join(tmpdir(), "expedition-auth-"));
   const authDir = join(dir, "auth");
   const db = join(authDir, "gameharness.sqlite");
@@ -98,7 +98,7 @@ async function fixture(assertDisplay: () => void = () => {}) {
   const adviceFile = join(directory, "advice.json");
   const advisor = composeExpeditionAdvisor({
     dir, goal: visible.goal, objective: "Preserve the stone pickaxe.", authDirectory: dir,
-    signal: new AbortController().signal, maxRequests: 1, maxRuntimeMs: 8_000, assertDisplay,
+    signal: new AbortController().signal, maxRequests, maxRuntimeMs: maxRequests === 1 ? 8_000 : 20_000, assertDisplay,
   });
   return {
     advisor, run, directory, adviceFile, requests,
@@ -123,6 +123,25 @@ async function fixture(assertDisplay: () => void = () => {}) {
     },
   };
 }
+
+test("carrying more mined rock does not spend the request for a different strategic choice", async () => {
+  const f = await fixture(undefined, 2);
+  try {
+    await f.advisor.start();
+    await f.publish();
+    f.openDiscovery();
+    await f.received();
+    f.answer({ option: "abstain", reason: "Continue the local route." });
+    await until(async () => (await f.journal()).includes('"disposition":"abstained"'));
+    await Bun.sleep(8_050); // Both a repeat request and a new need are now eligible for the normal cooldown.
+    await f.publish({ tick: 300, inventory: { "minecraft:cobblestone": 32 } });
+    await Bun.sleep(650);
+    await f.publish({ tick: 320, need: "fuel_supply" });
+    await until(() => f.requests.length === 2);
+    expect(f.requests.map(r => JSON.parse(r.body.input.find(m => m.role === "user")!.content[0]!.text).need))
+      .toEqual(["iron_supply", "fuel_supply"]);
+  } finally { await f.close(); }
+}, 18_000);
 
 test("ordinary Terra sends just its visible strategy choice and counts only an exact native application", async () => {
   const f = await fixture();

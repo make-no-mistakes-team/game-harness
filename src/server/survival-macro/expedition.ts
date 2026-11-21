@@ -145,9 +145,9 @@ function actionable(publication: Publication | undefined): publication is Public
 
 function decisionKey(state: ExpeditionState) {
   const offers = state.options.slice().sort((a, b) => a.id < b.id ? -1 : a.id === b.id ? 0 : 1);
-  // Changing a stack count by one should not usually trigger another request.
-  const material = Object.keys(state.inventory).sort().map(item => [item, Math.floor(Math.log2(state.inventory[item]!))]);
-  return JSON.stringify([state.life, state.need, offers, material]);
+  // Inventory informs the decision. Mining spoil, using a torch, or moving a stack
+  // through the GUI does not reopen the same strategic choice.
+  return JSON.stringify([state.life, state.need, offers]);
 }
 
 function sameNeed(state: ExpeditionState, basis: Basis) {

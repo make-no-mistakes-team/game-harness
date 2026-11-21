@@ -2375,23 +2375,48 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     private static final float[] GROUND_U = {0, -0.32f, 0.32f, -0.63f, 0.63f};
     private static final float[] GROUND_V = {-0.72f, -0.38f, -0.05f};
-    private final BlockHitResult[] nearGroundTops = new BlockHitResult[GROUND_U.length * GROUND_V.length];
+    private static final int GROUND_FAN_RAYS = GROUND_U.length * GROUND_V.length;
+    // Six bounded adjacent lip checks and room to veto pickups after the fan.
+    private static final int GROUND_PROOF_RAYS = 8;
+    private final BlockHitResult[] nearGroundTops = new BlockHitResult[GROUND_FAN_RAYS];
     private final int[] nearGroundSectors = new int[3];
     private long nearGroundFrame = -1;
+    private int nearGroundExamined, nearGroundFromY;
     private int nearGroundCount, nearGroundClipped, nearGroundOccluded, nearGroundDark, nearGroundMissed, nearGroundUnsafe;
     private int landingProbeClipped, landingProbeOccluded;
+
+    int reserveGroundScoutRays() {
+        int examined = nearGroundFrame == frameSequence && nearGroundFromY == client.player.getBlockY() ? nearGroundExamined : 0;
+        int reserved = groundScoutRayReserve(raysLeft, examined);
+        raysLeft -= reserved;
+        return reserved;
+    }
+
+    static int groundScoutRayReserve(int available, int examined) {
+        return Math.min(available, GROUND_FAN_RAYS - examined + GROUND_PROOF_RAYS);
+    }
+
+    static int groundFanEnd(int available, int examined) {
+        return examined + Math.min(available, GROUND_FAN_RAYS - examined);
+    }
+
+    void releaseGroundScoutRays(int reserved) { raysLeft += reserved; }
 
     /** Actual first hits through one bounded lower-frustum fan, never a scan behind a surface. */
     int sampleNearGround() {
         if (!hasView()) return 0;
-        if (nearGroundFrame == frameSequence) return nearGroundCount;
-        nearGroundFrame = frameSequence;
-        nearGroundCount = nearGroundClipped = nearGroundOccluded = nearGroundDark = nearGroundMissed = nearGroundUnsafe = 0;
-        landingProbeClipped = landingProbeOccluded = 0;
-        Arrays.fill(nearGroundSectors, 0);
         int fromY = client.player.getBlockY();
-        for (float v : GROUND_V) for (float u : GROUND_U) {
-            if (raysLeft <= 0) return nearGroundCount;
+        if (nearGroundFrame != frameSequence || nearGroundFromY != fromY) {
+            nearGroundFrame = frameSequence;
+            nearGroundFromY = fromY;
+            nearGroundExamined = nearGroundCount = nearGroundClipped = nearGroundOccluded = nearGroundDark = nearGroundMissed = nearGroundUnsafe = 0;
+            landingProbeClipped = landingProbeOccluded = 0;
+            Arrays.fill(nearGroundSectors, 0);
+        }
+        int endRay = groundFanEnd(raysLeft, nearGroundExamined);
+        while (nearGroundExamined < endRay) {
+            int iRay = nearGroundExamined++;
+            float u = GROUND_U[iRay % GROUND_U.length], v = GROUND_V[iRay / GROUND_U.length];
             inverseViewProjection.transform(clip.set(u, v, 0.9f, 1));
             double x = clip.x / (double) clip.w, y = clip.y / (double) clip.w, z = clip.z / (double) clip.w;
             double scale = Math.min(5, range(5)) / Math.sqrt(x * x + y * y + z * z);
@@ -2418,11 +2443,12 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     BlockHitResult nearGroundTop(int index) { return nearGroundTops[index]; }
 
-    record GroundSight(int dryTops, int clipped, int occluded, int dark, int missed, int unsafe,
+    record GroundSight(int raysTaken, int unexamined, int dryTops, int clipped, int occluded, int dark, int missed, int unsafe,
                        int leftHeights, int centerHeights, int rightHeights, int lipClipped, int lipOccluded) {}
 
     GroundSight groundSight() {
-        return new GroundSight(nearGroundCount, nearGroundClipped, nearGroundOccluded, nearGroundDark, nearGroundMissed,
+        return new GroundSight(nearGroundExamined, GROUND_FAN_RAYS - nearGroundExamined,
+            nearGroundCount, nearGroundClipped, nearGroundOccluded, nearGroundDark, nearGroundMissed,
             nearGroundUnsafe, nearGroundSectors[0], nearGroundSectors[1], nearGroundSectors[2],
             landingProbeClipped, landingProbeOccluded);
     }

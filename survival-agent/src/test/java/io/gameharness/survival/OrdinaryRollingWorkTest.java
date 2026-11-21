@@ -122,6 +122,18 @@ final class OrdinaryRollingWorkTest {
     }
 
     @Test
+    void aGroundFanRetainsSharedBudgetAndResumesOnlyItsUnexaminedRays() {
+        assertEquals(23, AgentBody.groundScoutRayReserve(90, 0));
+        assertEquals(5, AgentBody.groundScoutRayReserve(5, 0));
+        assertEquals(8, AgentBody.groundScoutRayReserve(90, 15), "a sampled frame only needs proof rays");
+        assertEquals(0, AgentBody.groundFanEnd(0, 0), "no available rays does not scan a single point");
+        assertEquals(5, AgentBody.groundFanEnd(5, 0));
+        assertEquals(5, AgentBody.groundFanEnd(0, 5));
+        assertEquals(15, AgentBody.groundFanEnd(23, 5), "resume ten remaining rays, not the whole fan");
+        assertEquals(15, AgentBody.groundFanEnd(23, 15), "never scan a point twice in the same render");
+    }
+
+    @Test
     void paidDiamondCanStartAVisibleCaveLegOrAnApproachToActualOreWithoutASpine() {
         var paid = order("diamond", "\"prospect:minecraft:diamond\",\"break:minecraft:deepslate_diamond_ore\"",
             ",\"duringWaitFor\":\"9d0ad30c-b85c-4261-baff-f071c8e5ebc1\"");

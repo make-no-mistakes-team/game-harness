@@ -9021,8 +9021,14 @@ final class AgentMacroControl {
                 noteDryLandingEvidence("ONE_BLOCK_CLIMB_OFFERED");
                 return;
             }
-            noteDryLandingEvidence(addSameTopVantage(offers, source, tops) ? "SAME_TOP_VANTAGE_OFFERED"
-                : rise != null ? "ONE_BLOCK_CLIMB_" + rise.name() : body.dryLandingEvidence().name() + "_NO_SAFE_VANTAGE");
+            if (addSameTopVantage(offers, source, tops)) {
+                noteDryLandingEvidence("SAME_TOP_VANTAGE_OFFERED");
+            } else {
+                var sight = body.groundSight();
+                noteDryLandingEvidence(sight.raysTaken() == 0 ? "GROUND_FAN_UNEXAMINED"
+                    : sight.unexamined() > 0 ? "GROUND_FAN_PARTIAL"
+                    : rise != null ? "ONE_BLOCK_CLIMB_" + rise.name() : body.dryLandingEvidence().name() + "_NO_SAFE_VANTAGE");
+            }
             return;
         }
         noteDryLandingEvidence(body.dryLandingEvidence().name());
@@ -9056,6 +9062,8 @@ final class AgentMacroControl {
         value.addProperty("tick", tick);
         value.addProperty("stance", surveyOrigin);
         value.addProperty("stage", evidence);
+        value.addProperty("fan_rays_taken", sight.raysTaken());
+        value.addProperty("fan_rays_unexamined", sight.unexamined());
         value.addProperty("unique_lit_dry_tops", sight.dryTops());
         value.addProperty("clipped", sight.clipped());
         value.addProperty("occluded_or_side", sight.occluded());
@@ -9340,6 +9348,10 @@ final class AgentMacroControl {
         var ticket = pendingEntry();
         boolean idleView = idlePublicationPremise();
         String viewBlocker = progress == null ? null : worldViewBlocker();
+        // Safety and control have already run. Keep this idle scout's existing
+        // fan allotment out of optional material scans until offers begin.
+        int scoutRays = progress != null && viewBlocker == null && idleView && groundScoutReady()
+            ? body.reserveGroundScoutRays() : 0;
         boolean trackProspect = progress != null && ipc.workMode != null && surveyOrigin > 0
             && action == null && !hasActiveWorkOrder();
         boolean checkProspect = trackProspect && idleView && viewBlocker == null;
@@ -9374,6 +9386,7 @@ final class AgentMacroControl {
                 pendingRecheckedUntil = 0;
             }
         }
+        body.releaseGroundScoutRays(scoutRays);
         if (progress != null && viewBlocker == null) {
             if (action == null || yieldable) {
                 visible = offers(progress, travel);

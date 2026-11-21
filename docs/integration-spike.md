@@ -215,6 +215,12 @@ that log in reach or to a safe approach to it; another trunk or a
 woodland cue does not count. The host then issues the priced work
 without another model request.
 
+If that inspection disappears before it runs, a newly visible approach
+to a different source of the requested stock can prompt one fresh
+decision. Terra still receives the original objective. The other tree
+does not satisfy an instruction to harvest a particular block, and the
+old inspection grants no action on the replacement.
+
 The first constrained observation waits for a safe, settled first-person
 render. If that view points almost straight up at a nearby lit ceiling and
 shows no better work evidence, the actor offers one forward view instead of

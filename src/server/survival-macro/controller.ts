@@ -29,6 +29,7 @@ import {
 import { StrategicEpisodeLedger } from "./episode-memory.ts";
 import type { NativeGapReview } from "./gap-review.ts";
 import type { MacroSkillProposal, SurvivalMacroSkills } from "./skills.ts";
+import { VANILLA_HARVEST } from "./vanilla-harvest.ts";
 import { preflightVanillaWork, type VanillaWorkDiagnostic } from "./vanilla-work.ts";
 
 export interface MacroLimits {
@@ -232,7 +233,7 @@ interface IntentRecoveryScope {
 type IntentRecovery = IntentRecoveryScope & (
   | { readonly kind: "restored-survey"; gapSeen?: true }
   | { readonly kind: "superseded-opening"; readonly source: MacroObservation;
-      readonly policy: MacroWorkPolicy; readonly wall: ProspectOpening; readonly proposalExpiresTick: number }
+      readonly policy: MacroWorkPolicy; readonly replacement: ProspectOpening | MacroTravelHint; readonly proposalExpiresTick: number }
   | { readonly kind: "alternative"; readonly opening?: { readonly source: MacroObservation; readonly policy: MacroWorkPolicy } }
 );
 
@@ -690,6 +691,33 @@ function openingWorkWitness(observation: MacroObservation, policy: MacroWorkPoli
   if (!anchor) return;
   const travel = matchingTravelHint(observation, policy);
   if (travel && sameTravelTarget(anchor, travel)) return travel;
+}
+
+function replacementOpeningWitness(observation: MacroObservation, policy: MacroWorkPolicy,
+  camera: Omit<MacroOpportunity, "id">): ProspectOpening | MacroTravelHint | undefined {
+  const { anchor, verb } = camera;
+  if (!anchor) return verb === "survey" && !offersAffordance(observation, camera)
+    ? pricedProspectOpening(observation, policy) : undefined;
+  if (verb !== "inspect") return;
+  const travel = matchingTravelHint(observation, policy);
+  if (travel?.kind !== "resource") return;
+  if (sameTravelTarget(anchor, travel)) return travel;
+  // A fresh, different face can inform another decision, but never answer the
+  // old inspect. A permitted cover break alone is not a source of the stock.
+  if (travel.target !== anchor.target && !offersAffordance(observation, camera) && policy.target.kind === "stock" &&
+      VANILLA_HARVEST.get(travel.subject.slice("block:".length))?.item === policy.target.item) return travel;
+}
+
+function openingSupersessionFeedback(recovery: Extract<IntentRecovery, { kind: "superseded-opening" }>): MacroFeedback {
+  const { replacement, offer } = recovery;
+  const observed = "footing" in replacement
+    ? offer.anchor && sameTravelTarget(offer.anchor, replacement)
+      ? "A fresh approach now names the same resource."
+      : `A fresh approach names a different stock source, not the inspected block (${offer.anchor?.target}). ` +
+        "If the objective requires the original target, do not substitute it."
+    : "A fresh wall now fits the quoted prospecting policy.";
+  return { kind: "failed_intent", detail: "The opening view could not be issued. No camera read or work started. " +
+    `${observed} Decide from this observation whether to authorize ordinary work without an opening view, choose a supported alternative, or abstain.` };
 }
 
 function workPolicyKey(policy: MacroWorkPolicy): string {
@@ -1446,10 +1474,10 @@ export class SurvivalMacroController {
 
   private supersededOpeningWitnessCurrent(recovery: Extract<IntentRecovery, { kind: "superseded-opening" }>,
     current: MacroObservation, evidence = this.workQueryEvidence(current)): boolean {
-    return current.tick < recovery.proposalExpiresTick && current.health === recovery.health &&
-      evidence === recovery.evidence &&
-      sameOpeningStance(recovery.source, current) && !offersAffordance(current, recovery.offer) &&
-      sameProspectOpening(recovery.wall, pricedProspectOpening(current, recovery.policy));
+    if (current.tick >= recovery.proposalExpiresTick || current.health !== recovery.health || evidence !== recovery.evidence ||
+        !sameOpeningStance(recovery.source, current)) return false;
+    const fresh = replacementOpeningWitness(current, recovery.policy, recovery.offer);
+    return !!fresh && sameOpeningWitness(recovery.replacement, fresh);
   }
 
   private supersededOpeningCurrent(recovery: Extract<IntentRecovery, { kind: "superseded-opening" }>,
@@ -2530,10 +2558,8 @@ export class SurvivalMacroController {
       maxResponseBytes: this.limits.maxResponseBytes, maxIntentTtlTicks: this.limits.maxIntentTtlTicks,
       maxPlanTtlTicks: this.limits.maxPlanTtlTicks,
       lastReceipt: this.lastReceipt?.life === observation.life ? this.lastReceipt : null,
-      feedback: reconsideration?.kind === "superseded-opening" ? {
-        kind: "failed_intent",
-        detail: "The opening view disappeared before issuance. No camera read or work started. A fresh wall now fits the quoted prospecting policy. Decide from this observation whether to authorize ordinary work without an opening view, choose a supported alternative, or abstain.",
-      } : reconsideration?.kind === "alternative" ? {
+      feedback: reconsideration?.kind === "superseded-opening" ? openingSupersessionFeedback(reconsideration) :
+        reconsideration?.kind === "alternative" ? {
         kind: "failed_intent",
         detail: reconsideration.opening
           ? "The opening view lost its witness before issuance. No camera read or work started. If the fresh physical clue already supports the job, use ordinary work without an opening view. Otherwise choose a distinct supported alternative or abstain."
@@ -2590,7 +2616,7 @@ export class SurvivalMacroController {
           if (reconsideration?.kind === "superseded-opening") {
             const latest = await this.ipc!.read("observation.json", parseMacroObservation);
             if (!latest || !this.supersededOpeningWitnessCurrent(reconsideration, latest))
-              throw new FrameRejected("stale", "The prospect wall no longer supersedes the unissued opening view.");
+              throw new FrameRejected("stale", "The fresh physical start no longer supersedes the unissued opening view.");
           }
         } catch (error) {
           if (sample) await discardFrame(sample);
@@ -3539,19 +3565,20 @@ export class SurvivalMacroController {
     } else if (current.opportunities.some(offer => offer.id === lost.id) || offersAffordance(current, lost)) return;
     const evidence = this.workQueryEvidence(current);
     const shared = { requestId: plan.requestId, basis: basis(witnessed), health: current.health, offer: lost, evidence };
-    if (opening && !lost.anchor) {
-      // A contextual camera check is not an alternative in itself. Only the
-      // first physical answer to its quoted job can supersede the unissued read.
-      if (lost.verb !== "survey" || offersAffordance(current, lost) ||
-          workEvidence(witnessed, this.lastWorkQueryReceipt) !== workEvidence(current, this.lastWorkQueryReceipt)) return;
-      const wall = pricedProspectOpening(current, opening.policy);
-      if (!wall || witnessed.prospectOpening?.target === wall.target) return;
-      const key = digest(["superseded-opening", current.epoch, evidence, wall]);
-      if (!this.recoveredIntents.has(key)) this.intentRecovery = { ...shared, kind: "superseded-opening",
-        ...opening, wall, key, proposalExpiresTick: plan.proposal.expiresTick,
-        expiresTick: Math.min(plan.proposal.expiresTick, current.tick + ALTERNATIVE_RECOVERY_TICKS),
-        until: performance.now() + ALTERNATIVE_RECOVERY_MS };
-      return;
+    if (opening) {
+      const replacement = replacementOpeningWitness(current, opening.policy, lost);
+      const newPhysicalWitness = replacement && ("footing" in replacement
+        ? !openingWorkWitness(witnessed, opening.policy, { anchor: replacement })
+        : witnessed.prospectOpening?.target !== replacement.target);
+      if (newPhysicalWitness && workEvidence(witnessed, this.lastWorkQueryReceipt) === workEvidence(current, this.lastWorkQueryReceipt)) {
+        const key = digest(["superseded-opening", current.epoch, evidence]);
+        if (!this.recoveredIntents.has(key)) this.intentRecovery = { ...shared, kind: "superseded-opening",
+          ...opening, replacement, key, proposalExpiresTick: plan.proposal.expiresTick,
+          expiresTick: Math.min(plan.proposal.expiresTick, current.tick + ALTERNATIVE_RECOVERY_TICKS),
+          until: performance.now() + ALTERNATIVE_RECOVERY_MS };
+        return;
+      }
+      if (!lost.anchor) return; // A contextual survey alone is never a recovery.
     }
     if ((opening || lost.risk !== "guarded" && meaningfulPrimitive(lost)) &&
         workEvidence(witnessed, this.lastWorkQueryReceipt) === workEvidence(current, this.lastWorkQueryReceipt)) {

@@ -1334,6 +1334,78 @@ test.each(["exact ore", "distinct approach", "reissued look", "different ore", "
   },
 );
 
+test.each(["same source", "distinct source", "specific source only", "only a rekeyed look", "unrelated stock", "lost route"] as const)(
+  "The tick-11 anchored oak inspection reopens only on useful new physical evidence (%s)", async result => {
+    const anchor = { subject: "block:minecraft:oak_log", target: "m-2" };
+    const inspect = { id: "o-5", verb: "inspect", risk: "read", summary: "Center the visible minecraft:oak_log",
+      evidence: "A lit face is visible away from the current crosshair.", anchor } as const;
+    const distinct = result === "distinct source" || result === "specific source only";
+    const objective = result === "specific source only"
+      ? "Only harvest the specific oak block originally offered for inspection; do not substitute a different tree."
+      : "Gather enough wood to carry six logs for travel and continue toward a diamond.";
+    const base = { goal: "diamond", stance: 1, epoch: 3, safety: { clear: true, revision: 2 },
+      inventory: { "minecraft:oak_log": 4, "minecraft:crafting_table": 1 } } as const;
+    const policy = { ...timberPolicy, target: { kind: "stock", item: "minecraft:oak_log", count: 8 }, maxBreaks: 4 } as const;
+    // The horizon log confirms the window, not its target ID. Replay both possible identities.
+    const travelHint = { ...visibleTimber, ...anchor, bearingDegrees: -46, windowBlocks: 1.6,
+      ...(distinct ? { target: "m-3" } :
+        result === "unrelated stock" ? { subject: "block:minecraft:spruce_log", target: "m-3" } : {}) };
+    const current = { ...base,
+      opportunities: result === "only a rekeyed look" ? [{ ...inspect, id: "o-9" }] : [],
+      travelHint: result === "only a rekeyed look" ? undefined : travelHint };
+    const quote = Promise.withResolvers<void>();
+    const fresh = Promise.withResolvers<void>();
+    const requests: MacroRequest[] = [];
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      if (requests.length === 1) {
+        await quote.promise;
+        return workReply(request, { kind: "work", policy, openingViewId: inspect.id }, 1200);
+      }
+      await fresh.promise;
+      return workReply(request, result === "specific source only" ? { kind: "abstain" } : { kind: "work", policy });
+    }, objective, 24);
+    try {
+      await f.observe(11, { ...base, opportunities: [inspect] });
+      await f.observe(16, current);
+      await f.observe(21, current);
+      quote.resolve();
+      await f.observe(141, current);
+      await f.actor.poll();
+      const recovers = result === "same source" || distinct || result === "lost route";
+      expect(requests.map(request => request.observation.tick)).toEqual(recovers ? [11, 141] : [11]);
+      await expect(access(f.file("intent.json"))).rejects.toThrow();
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+      if (recovers) {
+        expect(requests[1]).toMatchObject({ objective, observation: { travelHint }, lastReceipt: null,
+          work: { protectedReserves: [] }, feedback: { kind: "failed_intent",
+            detail: expect.stringContaining(distinct ? "different stock source" : "same resource") } });
+        fresh.resolve();
+        if (result === "lost route") await f.observe(146, base);
+        else await f.actor.poll();
+      }
+      const issued = result === "same source" || result === "distinct source";
+      if (issued) {
+        expect(await f.order()).toMatchObject({ target: policy.target, basisTick: 141,
+          travelAnchor: { subject: travelHint.subject, target: travelHint.target }, origin: "model" });
+      } else {
+        await f.observe(225, current);
+        await f.observe(325, current);
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+      }
+      expect(requests).toHaveLength(recovers ? 2 : 1);
+      expect(f.actor.status()).toMatchObject({ staleDecisions: result === "lost route" ? 2 : 1,
+        issued: 0, issuedWorkOrders: issued ? 1 : 0, completedModelWorkOrders: 0 });
+      expect(await readFile(f.file("receipts.jsonl"), "utf8")).toBe("");
+    } finally {
+      quote.resolve();
+      fresh.resolve();
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test("A spent unanchored survey stays unavailable after waiting and rekeying, but a new exact face is usable", async () => {
   const requests: MacroRequest[] = [];
   const opposite = { ...caveSurvey, id: "right-new-id", summary: "Survey right from this stance" };

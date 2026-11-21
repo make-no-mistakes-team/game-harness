@@ -1248,8 +1248,7 @@ final class AgentReturnableMine {
         }
         if (!center(from)) return;
         if (departureTo == null && !nextDeparture(host, now)) {
-            if (driftAttempts < DRIFT_LIMIT && !unjoined() && host.returnableRetainedStep(from) != null
-                    && startDrift(host, now)) return;
+            if (driftAttempts < DRIFT_LIMIT && !unjoined() && startDrift(host, now)) return;
             if (pathSize > 1 && selectDeparture(searchPath[pathSize - 2], now)) {
                 departureBacktrack = true;
                 return;
@@ -1301,14 +1300,21 @@ final class AgentReturnableMine {
 
     private void noteDriftFace(AgentProgress host, Direction lane) {
         if (unjoined() || driftAttempts == DRIFT_LIMIT || departureBacktrack || departureTo.getY() != from.getY()
-                || host.returnableRetainedStep(from) == null || triedDrift(departureTo)) return;
+                || triedDrift(departureTo) || body.dryCaveContact(from) == null) return;
         Refusal prior = refusal(from, lane);
         if (prior != null && (prior.fact == Face.FLUID || prior.fact == Face.LAVA)) return;
-        Vec3d point = driftCutAim(departureTo, lane, false);
-        BlockHitResult hit = body.perceive(point, player.getEyePos().distanceTo(point) + 0.04).orElse(null);
-        if (stationaryDriftCut(world, from, departureTo, lane, hit, player.getBoundingBox())
-                && host.returnableCutAllowed(hit))
-            driftFaces |= 1 << lane.ordinal();
+        // A player standing on independent ground can open a side wall at either
+        // height. The old trail is not the floor of the proposed new passage.
+        for (int height = 0; height <= 1; height++) {
+            BlockPos cell = height == 0 ? departureTo : departureTo.up();
+            Vec3d point = driftCutAim(cell, lane, height == 1);
+            BlockHitResult hit = body.perceive(point, player.getEyePos().distanceTo(point) + 0.04).orElse(null);
+            if (stationaryDriftCut(world, from, cell, lane, hit, player.getBoundingBox())
+                    && host.returnableCutAllowed(hit)) {
+                driftFaces |= 1 << lane.ordinal();
+                break;
+            }
+        }
     }
 
     private boolean startDrift(AgentProgress host, int now) {

@@ -81,6 +81,12 @@ can hold the unissued job for up to 10 ticks or 600 ms, whichever comes
 first. The same target and footing must reappear from the same stance.
 A different tree cannot take the old one's place.
 
+Losing the target while capturing the model's input is different: no
+provider call may have gone out. On an ordinary run the host can try once
+more if it sees the same target again within five seconds and 100 ticks.
+Both attempts count against the run limit. An already dispatched call
+does not get this retry.
+
 If a requested survey disappears before the player turns, Terra can report
 the missing view. Its return under the same safe conditions permits one
 fresh decision. The player never executes the old turn on a stale view.

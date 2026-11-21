@@ -805,6 +805,116 @@ test.each(["frontier", "ore", "after inspection", "lost reserve"] as const)(
   },
 );
 
+test.each(["regained", "second stale", "paid stale", "different target", "unsafe", "expired", "request budget"] as const)(
+  "The ordinary tick-10 unpaid oak dispatch recovers at most once (%s)",
+  async result => {
+    const log = "minecraft:oak_log";
+    const anchor = { subject: `block:${log}`, target: "m-1" };
+    const travelHint = { ...anchor, kind: "resource", bearingDegrees: -46.756905, footing: "dry", windowBlocks: 1.6 } as const;
+    const still: Partial<MacroObservation> = { goal: "diamond", epoch: 3, stance: 1, safety: { clear: true, revision: 2 },
+      inventory: { [log]: 4, "minecraft:crafting_table": 1 },
+      recent: ["dry route: The grounded pose is outside the facing lane's support envelope."],
+      opportunities: [
+        { id: "o-1", verb: "continue", summary: "Craft planks in the inventory grid", risk: "guarded",
+          evidence: "The visible inventory holds the ingredients for this vanilla recipe.",
+          material: { subject: "recipe:planks", target: "recipe-planks", spends: { [log]: 1 } } },
+        { id: "o-2", verb: "survey", summary: "Survey left from this stance", risk: "read",
+          evidence: "A bounded first-person turn over nearby terrain." },
+        { id: "o-3", verb: "survey", summary: "Survey right from this stance", risk: "read",
+          evidence: "A bounded first-person turn over nearby terrain." },
+      ],
+    };
+    const visible = { ...still, travelHint, opportunities: [...still.opportunities!,
+      { id: "o-4", verb: "inspect", summary: `Center the visible ${log}`, risk: "read",
+        evidence: "A lit face is visible away from the current crosshair.", anchor } as const] };
+    const policy = {
+      target: { kind: "stock", item: log, count: 8 }, allowedEffects: [`break:${log}`], costCaps: [],
+      reserves: [], maxBreaks: 4, maxCrafts: 0, maxPlacements: 0,
+    } as const;
+    const requests: MacroRequest[] = [];
+    let frames = 0;
+    let publishGap: () => Promise<void>;
+    const f = await durableFixture(async request => {
+      requests.push(request);
+      const reply = workReply(request, { kind: "work", policy });
+      return requests.length === 1 || result === "second stale"
+        ? { ...reply, outcome: "stale", proposal: null, dispatched: result === "paid stale" }
+        : { ...reply, frameSha256: captureHash };
+    }, "Gather enough wood to carry six logs for travel and continue toward a diamond.", result === "request budget" ? 1 : 24,
+    dir => createTrustedFrameCapture({
+      dir, width: 1, height: 1, signal: new AbortController().signal, assertDisplay: () => {},
+      readJpeg: async () => {
+        if (++frames === 1) await publishGap();
+        return { bytes: captureJpeg };
+      },
+    }));
+    publishGap = () => f.publishObservation(15, still);
+    async function settleRequests(count: number) {
+      const deadline = performance.now() + 1_000;
+      do {
+        await f.actor.poll();
+        const { requests, unreportedDispatches } = f.actor.status();
+        if (requests >= count && unreportedDispatches === 0) return;
+        await delay(5);
+      } while (performance.now() < deadline);
+      throw new Error(`Expected ${count} settled controller attempts.`);
+    }
+    try {
+      await mkdir(f.file("../macro-frames"), { mode: 0o700 });
+      await f.observe(10, visible);
+      await settleRequests(1);
+      await f.observe(25, still);
+      await f.actor.poll();
+      expect(f.actor.status()).toMatchObject({ requests: 1, providerDispatches: result === "paid stale" ? 1 : 0,
+        unreportedDispatches: 0, staleDecisions: 1, issuedWorkOrders: 0, lastProviderOutcome: "stale" });
+      expect(requests[0]).toMatchObject({ observation: { tick: 10, travelHint }, work: { mode: "constrained", demand: "first" } });
+      expect(requests[0]?.frame).toBeUndefined();
+      await expect(access(f.file("work.json"))).rejects.toThrow();
+
+      if (result === "unsafe") {
+        await f.observe(30, { ...visible, epoch: 4, safety: { clear: false, revision: 3 } });
+      } else if (result === "different target") {
+        await f.observe(30, { ...still, travelHint: { ...travelHint, target: "m-2" } });
+        await f.observe(40, visible);
+      } else {
+        await f.observe(result === "expired" ? 120 : 30, visible);
+      }
+      const retried = result === "regained" || result === "second stale";
+      await settleRequests(retried ? 2 : 1);
+      if (result === "regained") {
+        expect(await f.order()).toMatchObject({ ...policy, basisTick: 30, travelAnchor: anchor, origin: "model" });
+      } else {
+        if (result === "second stale") {
+          for (const tick of [35, 45, 125]) {
+            await f.observe(tick, still);
+            await f.observe(tick + 5, { ...visible, opportunities: visible.opportunities.map((offer, index) =>
+              ({ ...offer, id: `rekeyed-${index}` })) });
+          }
+        }
+        await expect(access(f.file("work.json"))).rejects.toThrow();
+      }
+      const proposals = (await readFile(f.file("proposals.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      const history = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+      expect(proposals[0]).toMatchObject({ basis: { tick: 10 }, disposition: "stale", dispatched: result === "paid stale",
+        providerOutcome: "stale", proposal: null, frameSha256: null });
+      expect(history).toContainEqual(expect.objectContaining({ event: "request_frame_omitted", requestId: proposals[0].requestId,
+        cause: "basis_changed" }));
+      if (retried) {
+        expect(requests[1]?.frame).toMatchObject({ tick: 30, data: captureJpeg });
+        expect(proposals[1]).toMatchObject({ basis: { tick: 30 }, reacquiredTravelOf: proposals[0].requestId });
+      }
+      expect(requests.map(request => request.observation.tick)).toEqual(retried ? [10, 30] : [10]);
+      expect(f.actor.status()).toMatchObject({ requests: retried ? 2 : 1, unreportedDispatches: 0,
+        providerDispatches: result === "regained" || result === "paid stale" ? 1 : 0,
+        completedModelWorkOrders: 0, issued: 0, issuedWorkOrders: result === "regained" ? 1 : 0 });
+      expect(await readFile(f.file("receipts.jsonl"), "utf8")).toBe("");
+    } finally {
+      await f.actor.stop();
+      await f.clean();
+    }
+  },
+);
+
 test.each(["same target", "different target", "never returned", "unsafe"] as const)(
   "The ordinary tick-817 oak ray dropout keeps only the same live grant (%s)",
   async result => {

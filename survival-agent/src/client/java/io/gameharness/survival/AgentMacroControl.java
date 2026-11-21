@@ -381,6 +381,7 @@ final class AgentMacroControl {
         TimberObstruction timberOpening;
         int timberLogsNeeded;
         AgentSurfaceTread tread;
+        AgentSurfaceHeadroom headroomRepair;
         ProspectSupport prospectSupport;
         ItemEntity stairDrop;
         double distanceLeft;
@@ -539,6 +540,7 @@ final class AgentMacroControl {
         int benchSurveyViews;
         String outwardTreadRefusal;
         AgentSurfaceTread.Edge refusedOutwardTread;
+        AgentSurfaceHeadroom headroomRepair;
         SourceRefusal sourceRefusal;
         long lastEffectTick, completedTick;
         long recoveryProof;
@@ -576,6 +578,7 @@ final class AgentMacroControl {
         final Set<BlockPos> footholds = new HashSet<>();
         final Set<BlockPos> attempted = new HashSet<>();
         final Set<BlockPos> looked = new HashSet<>();
+        final Set<BlockPos> headroomAttempts = new HashSet<>();
         final ArrayDeque<AgentSurfaceTread.Edge> stairs = new ArrayDeque<>();
         BlockPos lookedFrom, cutFrom, firstCover, lastCover, blockedAt;
         BlockState cutSupport;
@@ -2117,6 +2120,10 @@ final class AgentMacroControl {
             searchWork(work.sourceBlock);
             return;
         }
+        if (!personal && !goalReached && work.headroomRepair != null && advanceSurfaceHeadroom(progress)) {
+            runWorkStep(progress);
+            return;
+        }
         if (work.harvestOpening != null) {
             Face opening = work.harvestOpening;
             Item item = AgentWorkOrder.harvest(opening.state);
@@ -2482,7 +2489,7 @@ final class AgentMacroControl {
         }
         var search = work.sourceSearch;
         if (work.order.surfaceAnchor() != null && !search.stairUsed && search.lastCover != null
-                && player.getBlockPos().equals(search.cutFrom))
+                && player.getBlockPos().equals(search.cutFrom) && !refusedShallowBearing(search, player.getBlockPos()))
             return prospectForSource(progress, wanted);
         found = work.sourceSearch.stairs.isEmpty()
             ? body.find(state -> wanted.test(state) && !timberBlock(state), INSPECT_REACH,
@@ -2521,7 +2528,7 @@ final class AgentMacroControl {
         Direction bearing = null;
         for (Direction candidate : CARDINAL)
             if (AgentSurfaceTread.nextFoot(from, candidate).equals(opening)) { bearing = candidate; break; }
-        if (bearing == null || !body.witnessedStockTread(from, opening, bearing)) return false;
+        if (bearing == null || refusedQuarryEdge(from, opening, 0) || !body.witnessedStockTread(from, opening, bearing)) return false;
         var edge = stockTreadEdge(from, opening, bearing);
         if (edge.equals(work.refusedOutwardTread) || !body.macroNoVisiblePickup(Vec3d.ofBottomCenter(opening),
                 opening.getY(), from.getY())) return false;
@@ -2574,6 +2581,7 @@ final class AgentMacroControl {
         return route != null && (!oneGrade || route.edges() == 1 && Math.abs(route.heightChange()) == 1)
             && route.edges() <= MAX_SOURCE_FOOTHOLDS - search.steps
             && workTicksLeft() > AgentSurfaceTread.returnTicks(route.edges())
+            && !refusedQuarryEdge(from, route.next(), 0)
             && (source == null || routeTowardSource(from, route.endpoint(), source))
             && !search.footholds.contains(route.endpoint().down()) && !search.attempted.contains(route.endpoint().down())
             ? route : null;
@@ -2854,6 +2862,7 @@ final class AgentMacroControl {
     private boolean ordinaryGradeAvailable(AgentBody.OrdinaryGrade grade) {
         var search = work.sourceSearch;
         return grounded() && settled() && workTicksLeft() > MIN_GRADE_LEASE_TICKS
+            && !refusedQuarryEdge(grade.from(), grade.floor(), 1)
             && !search.footholds.contains(grade.floor())
             && !search.attempted.contains(grade.floor());
     }
@@ -4339,6 +4348,11 @@ final class AgentMacroControl {
             enact("search", status);
             return true;
         }
+        if (refusedShallowBearing(search, foot)) {
+            work.sourceBlock = work.outwardTreadRefusal != null ? work.outwardTreadRefusal
+                : "The quarry's one headroom repair attempt from this footing is spent.";
+            return false;
+        }
         if (search.stairUsed) {
             if (search.stairs.isEmpty()) {
                 work.sourceBlock = "The prior staircase was already examined and exited. Use another witnessed route.";
@@ -4543,6 +4557,131 @@ final class AgentMacroControl {
 
     private boolean surfaceLeaseAllowsBreak(SourceSearch search, long actionTicks) {
         return workTicksLeft() > actionTicks + AgentSurfaceTread.returnTicks(search.stairs.size());
+    }
+
+    private boolean refusedShallowBearing(SourceSearch search, BlockPos foot) {
+        if (!AgentWorkOrder.earlySurfaceStock(work.budget.policy.target().item())) return false;
+        var refused = work.refusedOutwardTread;
+        return search.headroomAttempts.contains(foot) || refused != null
+            && refused.upper().equals(foot) && isShallowEdge(search, refused);
+    }
+
+    private boolean refusedQuarryEdge(BlockPos from, BlockPos to, int footAbove) {
+        var search = work.sourceSearch;
+        Direction bearing = search.cutBearing;
+        return bearing != null && refusedShallowBearing(search, from) && to.getY() + footAbove == from.getY() - 1
+            && to.getX() - from.getX() == bearing.getOffsetX() && to.getZ() - from.getZ() == bearing.getOffsetZ();
+    }
+
+    private boolean headroomLeaseAllows(long remainingActionTicks) {
+        return AgentSurfaceTread.canExtend(workTicksLeft() - remainingActionTicks - Verb.BREAK.maxTicks,
+            work.sourceSearch.stairs.size());
+    }
+
+    private boolean headroomStanceCurrent(AgentSurfaceTread.Edge edge) {
+        return hazardClear && !urgent && grounded() && settled() && prospectBodyUsable()
+            && !player.isInLava() && !player.isOnFire() && player.hurtTime == 0 && !player.getAbilities().flying
+            && edge.upper().equals(player.getBlockPos()) && body.dryCaveContact(edge.upper()) == edge.upperSupport()
+            && world.getBlockState(edge.lower().down()) == edge.lowerSupport()
+            && body.walkedLaneDry(edge.upper(), edge.lower(), edge.down());
+    }
+
+    private String headroomCutRefusal(AgentSurfaceHeadroom repair, BlockHitResult hit, BlockState state,
+                                      AgentProgress progress) {
+        var edge = repair.edge;
+        BlockPos cell = hit.getBlockPos();
+        double width = player.getWidth();
+        if (!headroomStanceCurrent(edge)) return "The exact upper footing or lower support changed.";
+        if (!repair.crownHit(hit, width) || world.getBlockState(cell) != state)
+            return "The exact visible roof contact changed.";
+        if (!state.getFluidState().isEmpty()) return "The witnessed roof contains fluid.";
+        if (state.getBlock() instanceof FallingBlock || AgentBody.dryCaveDanger(state)
+                || AgentWorkOrder.prospectCoverDrop(state) == Items.AIR)
+            return "The witnessed obstruction is not eligible stable natural cover.";
+        if (!AgentSurfaceHeadroom.licensed(work.budget, state))
+            return "No spare break with an exact grant for " + Registries.BLOCK.getId(state.getBlock()) + " roof.";
+        if (!Block.isShapeFullCube(state.getCollisionShape(world, cell)) || work.rejected.contains(cell)
+                || work.sourceSearch.footholds.contains(cell) || cell.equals(edge.upper().down()) || cell.equals(edge.lower().down())
+                || player.getBoundingBox().expand(0.14, 0, 0.14).intersects(new Box(cell)))
+            return "The roof is not an independently removable natural block outside the retained footing.";
+        if (!world.isSpaceEmpty(player, AgentSurfaceTread.retainedTreadSweep(edge.upper(), edge.lower(), width))
+                || !world.isSpaceEmpty(player, repair.otherCrown(cell, width)))
+            return "Another obstruction still vetoes the exact tread or reverse jump.";
+        return dryWorkBreakRefusal(cell, state, AgentWorkOrder.prospectCoverDrop(state), progress);
+    }
+
+    private boolean advanceSurfaceHeadroom(AgentProgress progress) {
+        var repair = work.headroomRepair;
+        var edge = repair.edge;
+        if (!headroomStanceCurrent(edge))
+            return abandonSurfaceHeadroom("The exact dry quarry supports or upper stance changed; no descent.");
+        if (repair.broken()) {
+            var roof = world.getBlockState(repair.target().getBlockPos());
+            var tread = repair.retry(body.renderedFrame(), tick, roof, body.dryCaveContact(edge.upper()),
+                world.getBlockState(edge.lower().down()), headroomLeaseAllows(0) && shallowReturnClear(edge));
+            work.headroomRepair = null;
+            if (tread == null)
+                return abandonSurfaceHeadroom("Vanilla confirmed the roof cut, but the exact reverse tread no longer verifies.");
+            work.sourceSearch.stairAim = null;
+            startSurfaceTread(edge, false, tread); // Fresh floor/passage rays still precede any downhill input.
+            return true;
+        }
+        if (!headroomLeaseAllows(Verb.BREAK.maxTicks) || !work.budget.canCutCover())
+            return abandonSurfaceHeadroom("The remaining grant is reserved for the source and verified return.");
+
+        BlockHitResult target = repair.target();
+        boolean fresh = target == null;
+        if (fresh) {
+            if (!repair.canLook(body.renderedFrame(), tick))
+                return abandonSurfaceHeadroom("No lit, exact overhead contact was verified within the one reframe.");
+            Vec3d near = repair.crownRay(true), far = repair.crownRay(false);
+            target = surfaceRoofRay(near);
+            if (!repair.crownHit(target, player.getWidth()))
+                target = surfaceRoofRay(far);
+            if (!repair.crownHit(target, player.getWidth())) {
+                Vec3d aim = near.lerp(far, 0.5);
+                if (body.renderedAim(aim, 5) && body.generalRaysRemaining() > 0)
+                    return abandonSurfaceHeadroom("The rendered reframe showed no exact roof or lintel in the reverse jump.");
+                body.pauseWork();
+                body.aim(aim);
+                enact("search", "Look once above the exact quarry tread without stepping or jumping.");
+                return true;
+            }
+        }
+        // The state read is restricted to the first lit ray hit, or the same exact
+        // face already admitted before equipping. Never look up collision cells to find a cut.
+        BlockState state = repair.material();
+        if (state == null) state = world.getBlockState(target.getBlockPos());
+        var live = fresh ? target : surfaceRoofRay(target.getPos());
+        if (live == null || !target.getBlockPos().equals(live.getBlockPos()) || target.getSide() != live.getSide()
+                || body.macroMineWitness(live, reach()) == null)
+            return abandonSurfaceHeadroom("The exact roof face could not be re-witnessed in dry attack reach.");
+        String refusal = headroomCutRefusal(repair, live, state, progress);
+        if (refusal != null) return abandonSurfaceHeadroom(refusal);
+        int tool = workToolSlot(live.getBlockPos(), state);
+        if (tool < 0 || client.options.attackKey.isUnbound())
+            return abandonSurfaceHeadroom("No suitable priced tool or bound attack control is available for the roof.");
+        boolean equip = tool != player.getInventory().selectedSlot;
+        if (!headroomLeaseAllows(Verb.BREAK.maxTicks + (equip ? Verb.WORK_EQUIP.maxTicks : 0)))
+            return abandonSurfaceHeadroom("No lease remains for a roof cut, a source break and the verified return.");
+        boolean exact = repair.target() == null ? repair.witness(live, state, player.getWidth(), work.budget, true)
+            : repair.matches(live, state);
+        if (!exact || !(equip ? repair.beginEquip() : repair.beginCut()))
+            return abandonSurfaceHeadroom("The one exact roof cut is no longer admitted.");
+        if (!startWorkBreak(face(live), AgentWorkOrder.prospectCoverDrop(state), true, tool))
+            return abandonSurfaceHeadroom("The exact roof cut did not admit ordinary mining controls.");
+        action.headroomRepair = repair;
+        return true;
+    }
+
+    private BlockHitResult surfaceRoofRay(Vec3d point) {
+        return body.perceive(point, Math.min(reach(), player.getEyePos().distanceTo(point) + 0.045)).orElse(null);
+    }
+
+    private boolean abandonSurfaceHeadroom(String detail) {
+        work.headroomRepair = null;
+        work.outwardTreadRefusal = "No descent was authorized at the quarry. " + detail;
+        return false; // The normal search can still select a different, independently witnessed route.
     }
 
     private boolean surfaceLeaseAllowsExtension(SourceSearch search) {
@@ -4928,7 +5067,8 @@ final class AgentMacroControl {
 
     private static boolean isShallowEdge(SourceSearch search, AgentSurfaceTread.Edge edge) {
         return search.cutBearing != null && edge.down() == search.cutBearing
-            && edge.lower().equals(AgentSurfaceTread.nextFoot(edge.upper(), edge.down()));
+            && edge.lower().getY() == edge.upper().getY() - 1
+            && AgentSurfaceTread.cardinalTread(edge.upper(), edge.lower(), edge.down());
     }
 
     private boolean shallowReturnClear(AgentSurfaceTread.Edge edge) {
@@ -5375,7 +5515,7 @@ final class AgentMacroControl {
     private AgentSurfaceTread.Edge pickupAccessEdge(ItemEntity drop) {
         BlockPos from = player.getBlockPos();
         var access = AgentPickup.dryAccess(player.getBoundingBox(), drop.getBoundingBox(), from,
-            (to, bearing) -> body.witnessedStockTread(from, to, bearing));
+            (to, bearing) -> !refusedQuarryEdge(from, to, 0) && body.witnessedStockTread(from, to, bearing));
         return access == null ? null : stockTreadEdge(from, access.foot(), access.bearing());
     }
 
@@ -7830,6 +7970,14 @@ final class AgentMacroControl {
                         return;
                     }
                     mayBreak = true;
+                } else if (action.headroomRepair != null) {
+                    var repair = action.headroomRepair;
+                    if (repair != work.headroomRepair || !repair.matches(face.hit, face.state))
+                        refusal = "The admitted roof contact no longer matches the one quarry repair.";
+                    else if (!headroomLeaseAllows(Math.max(1, Verb.BREAK.maxTicks - (tick - action.started))))
+                        refusal = "The remaining lease is reserved for the source and verified return.";
+                    else refusal = headroomCutRefusal(repair, face.hit, face.state, progress);
+                    mayBreak = refusal == null;
                 } else if (action.prospectCover) {
                     BlockPos foot = player.getBlockPos();
                     var search = work.sourceSearch;
@@ -7889,6 +8037,7 @@ final class AgentMacroControl {
             complete("Vanilla reported this player's break of the witnessed " + blockName(face)
                 + (action.timberOpening != null ? " obstruction. No timber, route or closer footing was confirmed by this break."
                     : action.diamondRoute && diamondRoute.spareFloor ? " spare floor. The lower tread is not yet proved."
+                    : action.headroomRepair != null ? " roof. The lower tread must still verify with its return."
                     : action.prospectCover ? " cover. No source or pickup is confirmed by this cut." : "."));
         } else if (!mayBreak || !action.durable && !diamondCover
                 && !ItemStack.areItemsAndComponentsEqual(action.harvestTool, client.player.getMainHandStack())) {
@@ -8723,7 +8872,14 @@ final class AgentMacroControl {
                     work.timberLook = null;
                 }
             }
-            if (action.prospectCover && action.diamondRoute) {
+            if (action.headroomRepair != null) {
+                var repair = action.headroomRepair;
+                if (repair.confirmBreak(pos, state, body.renderedFrame())) {
+                    work.sourceSearch.freshAfter = body.renderedFrame();
+                    noteShallowTread("headroom_cut", repair.edge,
+                        "Vanilla confirmed the roof break at " + pos.toShortString() + ": " + state + ".");
+                }
+            } else if (action.prospectCover && action.diamondRoute) {
                 work.sourceSearch.freshAfter = body.renderedFrame();
                 diamondRoute.lookPoint = null;
                 if (pos.equals(diamondRoute.foot.offset(diamondRoute.bearing).down()))
@@ -10953,6 +11109,8 @@ final class AgentMacroControl {
             if (result.equals("completed") && verb == Verb.FOLLOW && work.timberRecheck != null
                     && !player.getBlockPos().equals(work.timberRecheck.stance)) work.timberRecheck = null;
             remember("work " + action.offer.key.verb.id + " " + result + ": " + detail);
+            if (!result.equals("completed") && action.headroomRepair != null && action.headroomRepair == work.headroomRepair)
+                abandonSurfaceHeadroom(detail);
             boolean workshopWalk = verb == Verb.APPROACH && IRON_WORKSHOP_STEP.equals(action.offer.key.activity);
             if (action.diamondRoute && diamondRoute.spareFloor && (verb == Verb.BREAK || verb == Verb.WORK_EQUIP)) {
                 if (!result.equals("completed")) diamondRoute.refuseCurrent(detail);
@@ -10993,6 +11151,16 @@ final class AgentMacroControl {
                     if (action.tread.refusedOnTakeoff(player.getBlockPos(), grounded())) {
                         work.refusedOutwardTread = action.tread.edge;
                         work.outwardTreadRefusal = detail;
+                        var search = work.sourceSearch;
+                        var edge = action.tread.edge;
+                        if (pickup == null && !action.rimSourceAccess && isShallowEdge(search, edge)
+                                && (search.stairs.isEmpty() ? edge.upper().equals(search.cutFrom)
+                                    : edge.upper().equals(search.stairs.getLast().lower()))
+                                && headroomLeaseAllows(AgentSurfaceHeadroom.LOOK_TICKS + Verb.BREAK.maxTicks)) {
+                            work.headroomRepair = AgentSurfaceHeadroom.begin(search.headroomAttempts, edge,
+                                action.tread.returnRefusal(), !action.tread.inFlight(), work.budget, body.renderedFrame(), tick);
+                            if (work.headroomRepair != null) search.freshAfter = body.renderedFrame();
+                        }
                     } else {
                         retireWork("blocked", "interrupted", detail);
                     }

@@ -1,6 +1,7 @@
 package io.gameharness.survival;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import net.minecraft.block.BlockState;
@@ -143,6 +144,36 @@ final class DryCaveViewTest {
         fullView.blocks.put(to.down(), stone);
         step.sample(fullView, 31, 2, stone, 31);
         assertTrue(step.complete(31), step::evidence);
+    }
+
+    @Test
+    void aQuarryRoofNeedsTheActualReframedFirstHitNotJustAReverseSweepCollision() {
+        var lower = SOURCE.east().down();
+        var stone = Blocks.STONE.getDefaultState();
+        var edge = new AgentSurfaceTread.Edge(SOURCE, stone, lower, stone, Direction.EAST);
+        var budget = new AgentWorkOrder.Budget(new AgentWorkOrder.Policy(false,
+            new AgentWorkOrder.Target(Items.COBBLESTONE, 3, null), Set.of("break:minecraft:stone"),
+            Map.of(), Map.of(), 3, 0, 0));
+        var repair = AgentSurfaceHeadroom.begin(new HashSet<>(), edge,
+            AgentSurfaceTread.ReturnClearance.OVERHEAD, true, budget, 20, 30);
+        assertNotNull(repair);
+        var roof = lower.up(3);
+        var view = new ForwardView(43);
+        view.blocks.remove(lower);
+        view.blocks.put(lower.down(), stone);
+        view.blocks.put(roof, stone);
+        assertFalse(view.sweepClear(AgentSurfaceTread.reverseJumpSweep(SOURCE, lower, Direction.EAST, 0.6)));
+        assertTrue(view.sweepClear(AgentSurfaceTread.retainedTreadSweep(SOURCE, lower, 0.6)));
+        assertNull(view.firstTerrainHit(repair.crownRay(false)), "collision alone supplies no visible roof contact");
+
+        var reframed = new ForwardView(-42);
+        reframed.blocks.remove(lower);
+        reframed.blocks.putAll(view.blocks);
+        var litRoof = reframed.firstTerrainHit(repair.crownRay(false));
+        assertNotNull(litRoof);
+        assertEquals(roof, litRoof.getBlockPos());
+        assertTrue(reframed.sweepClear(repair.otherCrown(roof, 0.6)), "the other side of the exact envelope is clear");
+        assertTrue(repair.witness(litRoof, stone, 0.6, budget, true));
     }
 
     @Test

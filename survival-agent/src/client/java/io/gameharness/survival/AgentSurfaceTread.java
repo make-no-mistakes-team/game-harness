@@ -19,6 +19,7 @@ final class AgentSurfaceTread {
     static final int ACTION_TICKS = PROOF_TICKS + DRIVE_TICKS + 4;
     record Edge(BlockPos upper, BlockState upperSupport, BlockPos lower, BlockState lowerSupport, Direction down) {}
     enum Result { CHECKING, MOVING, LANDED, REFUSED }
+    enum ReturnClearance { CLEAR, DAMP, OVERHEAD, OBSTRUCTION }
 
     final Edge edge;
     final boolean returning;
@@ -33,6 +34,7 @@ final class AgentSurfaceTread {
     private long drivingSince = -1;
     private boolean floorSeen, chestSeen, headSeen;
     private String refusal;
+    private ReturnClearance returnRefusal = ReturnClearance.CLEAR;
     private AgentSurfaceTread ahead;
 
     AgentSurfaceTread(Edge edge, boolean returning, long started) {
@@ -260,11 +262,22 @@ final class AgentSurfaceTread {
         boolean level = from.getY() == to.getY();
         if (player.getY() < Math.min(from.getY(), to.getY()) - 0.055)
             return refuse("The body is below the lowest verified dry tread.");
-        boolean reverse = level || reverseClear(client, edge.upper, edge.lower, edge.down);
-        if (!reverse || !(ordinaryGrade ? body.ordinaryGradeSweep(from, to) : body.dryRouteSweep(from, to)))
-            return drivingSince >= 0 && tick - drivingSince < 5 ? Result.CHECKING
-                : refuse(reverse ? "The live body sweep or support is no longer clear for the exact dry tread."
-                    : "The retained reverse jump no longer has dry headroom.");
+        ReturnClearance reverse = level ? ReturnClearance.CLEAR : reverseClearance(client, edge.upper, edge.lower, edge.down);
+        if (reverse != ReturnClearance.CLEAR
+                || !(ordinaryGrade ? body.ordinaryGradeSweep(from, to) : body.dryRouteSweep(from, to))) {
+            if (drivingSince >= 0 && tick - drivingSince < 5) return Result.CHECKING;
+            // A collision alone does not identify a block. If the ordinary body
+            // lane is also unusable, don't treat this as an isolated overhead veto.
+            returnRefusal = reverse == ReturnClearance.DAMP ? reverse
+                : reverse == ReturnClearance.OVERHEAD && !ordinaryGrade && drivingSince < 0
+                    && body.walkedLaneDry(from, to, travel) && body.dryRouteSweep(from, to) ? reverse
+                : ReturnClearance.OBSTRUCTION;
+            return refuse(switch (returnRefusal) {
+                case DAMP -> "Fluid vetoes the retained reverse tread.";
+                case OVERHEAD -> "The retained reverse jump intersects an overhead obstruction above the clear walking lane.";
+                default -> "The live body sweep, reverse passage, or support is obstructed for the exact dry tread.";
+            });
+        }
         if (drivingSince < 0) beginDrive(player.getPos(), tick);
         boolean carry = successor != null && canCarry(client, body, successor, tick);
         boolean landed = player.isOnGround() && player.getBlockPos().equals(to)
@@ -286,6 +299,7 @@ final class AgentSurfaceTread {
     private BlockState sourceState() { return returning ? edge.lowerSupport : edge.upperSupport; }
     private BlockState landingState() { return returning ? edge.upperSupport : edge.lowerSupport; }
     String refusal() { return refusal; }
+    ReturnClearance returnRefusal() { return returnRefusal; }
 
     private Result refuse(String reason) {
         refusal = reason;
@@ -359,14 +373,23 @@ final class AgentSurfaceTread {
 
     /** Veto only on the two positively identified columns; never use collision to discover a tread. */
     static boolean reverseClear(MinecraftClient client, BlockPos upper, BlockPos lower, Direction travel) {
+        return reverseClearance(client, upper, lower, travel) == ReturnClearance.CLEAR;
+    }
+
+    private static ReturnClearance reverseClearance(MinecraftClient client, BlockPos upper, BlockPos lower, Direction travel) {
         boolean level = upper.getY() == lower.getY();
         for (int i = 0; i <= (level ? 1 : 2); ++i) {
             if (!client.world.getBlockState(lower.up(i)).getFluidState().isEmpty()
-                    || !client.world.getBlockState(upper.up(i)).getFluidState().isEmpty()) return false;
+                    || !client.world.getBlockState(upper.up(i)).getFluidState().isEmpty()) return ReturnClearance.DAMP;
         }
-        if (level) return true; // The same two-block-high sweep serves both walking directions.
-        Box jumpHeadroom = reverseJumpHeadroom(upper.up(Math.max(0, lower.getY() - upper.getY())), client.player.getWidth());
-        return client.world.isSpaceEmpty(client.player, jumpHeadroom.stretch(travel.getOffsetX(), 0, travel.getOffsetZ()));
+        if (level) return ReturnClearance.CLEAR; // The standing sweep serves both walking directions.
+        return client.world.isSpaceEmpty(client.player,
+            reverseJumpSweep(upper, lower, travel, client.player.getWidth())) ? ReturnClearance.CLEAR : ReturnClearance.OVERHEAD;
+    }
+
+    static Box reverseJumpSweep(BlockPos upper, BlockPos lower, Direction travel, double width) {
+        return reverseJumpHeadroom(upper.withY(Math.max(upper.getY(), lower.getY())), width)
+            .stretch(travel.getOffsetX(), 0, travel.getOffsetZ());
     }
 
     static Box reverseJumpHeadroom(BlockPos upper, double width) {

@@ -77,7 +77,7 @@ public final class AgentClient implements ClientModInitializer {
     private Vec3d continuityLanding;
     private final Vec3d[] recentContinuityLandings = new Vec3d[16];
     private float continuityCrack, continuityYaw, continuityPitch;
-    private double continuityX, continuityY, continuityZ, continuityRouteStart, continuityRouteBest;
+    private double continuityRouteStart, continuityRouteBest;
     private long continuityGui;
     private int continuityRouteSteps, continuityLandingCursor;
     private boolean continuityBreak, revisitingContinuityLanding, creditedContinuityLanding;
@@ -647,10 +647,12 @@ public final class AgentClient implements ClientModInitializer {
             && access.agent$cursorDragging() ? access.agent$cursorDragSlots().size() : 0;
         String planningAtCheck = fuse == null || macro == null ? null : macro.planningState();
         long planningDeadlineNs = fuse == null || macro == null ? 0 : macro.planningIdleDeadlineNanos();
-        boolean fleeing = ears.escape(body, hands);
-        if (fleeing) body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
-        if (fleeing && macro != null) macro.urgent("evading a primed creeper");
-        if (!fleeing) {
+        boolean fleeing = ears.interruptForFuse(hands);
+        if (fleeing) {
+            body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
+            if (macro != null) macro.urgent("evading a primed creeper");
+            ears.escape(body);
+        } else {
             if (macro == null || !macro.engaged()) hands.tick();
             progress.tick(ears, macro);
         }
@@ -707,8 +709,7 @@ public final class AgentClient implements ClientModInitializer {
         }
         if (macro != null) macro.end(progress, fleeing ? "A primed creeper owns emergency movement." :
             "The local safety or completion controller owns this tick.");
-        observeContinuity(client, fleeing, fuse == null ? fuseOrigin : fuse.origin(),
-            macro == null ? null : macro.continuityWork());
+        observeContinuity(client, fleeing && ears.advancedOnFuse(), macro == null ? null : macro.continuityWork());
         boolean won = progress.won() && !hands.busy() && client.currentScreen == null && renderedScreen == null;
         if (won) {
             hands.cancel();
@@ -717,7 +718,7 @@ public final class AgentClient implements ClientModInitializer {
             stopMacro("goal_completed", "The Survival goal was reached.");
         }
         progress.saveMemory(ended);
-        publish(client, fleeing ? "evading a primed creeper" : progress.status(), won, null,
+        publish(client, fleeing ? "evading a primed creeper: " + ears.fuseStatus() : progress.status(), won, null,
             false, 0);
     }
 
@@ -746,7 +747,7 @@ public final class AgentClient implements ClientModInitializer {
             // The previous input may have genuinely advanced through this
             // tick. Do not reuse a prior macro classification or run policy.
             if (playing(client) && client.interactionManager != null)
-                observeContinuity(client, false, null, null);
+                observeContinuity(client, false, null);
             else observeContinuityIdle();
         }
         ended = true;
@@ -767,10 +768,10 @@ public final class AgentClient implements ClientModInitializer {
         client.scheduleStop();
     }
 
-    private void observeContinuity(MinecraftClient client, boolean fleeing, Vec3d danger, AgentPauseEpisodes.Work work) {
+    private void observeContinuity(MinecraftClient client, boolean fuseAdvance, AgentPauseEpisodes.Work work) {
         if (pauses == null) return;
         var player = client.player;
-        double x = player.getX(), y = player.getY(), z = player.getZ();
+        double x = player.getX(), z = player.getZ();
         float yaw = player.getYaw(), pitch = player.getPitch();
         long gui = hands.workEvidence();
         boolean same = continuityPlayer == player;
@@ -841,17 +842,12 @@ public final class AgentClient implements ClientModInitializer {
                 continuityRouteSteps = 0;
             }
         }
-        if (work == null && same && fleeing && keys && danger != null
-                && danger.squaredDistanceTo(x, y, z) > danger.squaredDistanceTo(continuityX, continuityY, continuityZ) + 0.04)
-            work = AgentPauseEpisodes.Work.SAFETY;
+        if (work == null && same && fuseAdvance) work = AgentPauseEpisodes.Work.SAFETY;
         if (work == null && guiChanged) work = AgentPauseEpisodes.Work.GUI;
         if (work == null && progress.continuityMechanicalWait()) work = AgentPauseEpisodes.Work.MECHANICAL_WAIT;
         pauses.sample(tick, work, keys || camera || guiChanged, camera,
             macro != null && macro.planningState().equals("blocked/no_safe_action"));
         continuityPlayer = player;
-        continuityX = x;
-        continuityY = y;
-        continuityZ = z;
         continuityYaw = yaw;
         continuityPitch = pitch;
         continuityGui = gui;

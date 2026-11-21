@@ -56,7 +56,7 @@ import org.joml.Matrix4f;
 import org.joml.Vector4f;
 
 /** First-person observations and vanilla input, on the client thread only. */
-final class AgentBody {
+final class AgentBody implements AgentFuseEscape.Terrain {
     private static final int COLUMNS = 13;
     private static final int ROWS = 9;
     private static final int RAY_BUDGET = 256;
@@ -78,6 +78,8 @@ final class AgentBody {
     private static final double GAIT_PITCH_TIME = 0.20;
     private static final int FOOTING_AGE = 100;
     private static final int ESCAPE_TICKS = 44;
+    private static final double[] FUSE_ROWS = {0.42, 0.78, 1.25, 1.9, 2.55, 3.04};
+    private static final Predicate<BlockState> FUSE_DANGER = AgentBody::dryCaveDanger;
     private static final String SUPPORTING_FOOTPRINT = "supporting_footprint";
     private static final double[] MACRO_FLOOR_OFFSETS = {0, -0.36, 0.36};
     static final int SUPPLY_OPEN = 1, SUPPLY_ROOF = 2, SUPPLY_WALL = 4;
@@ -171,6 +173,8 @@ final class AgentBody {
     private Vec3d previousDryFooting;
     private int previousDryFootingTick;
     private boolean lavaEmergency;
+    private boolean fuseWalking;
+    private int fuseDriveTick = -1;
     private Predicate<ItemStack> safetySpend;
     private int stableDryTicks;
     private Vec3d escapeLanding;
@@ -329,6 +333,7 @@ final class AgentBody {
             hazards.clear();
             headroom.reset();
             stepSupport = null;
+            fuseDriveTick = -1;
             dryFooting = previousDryFooting = null;
             lavaEmergency = false;
             horizonApplied = null;
@@ -382,6 +387,7 @@ final class AgentBody {
         pickupTarget = null;
         forward = backward = fast = verifiedDescent = flatWalk = jumping = sneaking = swimmingDown = eating = false;
         emergencyWalk = false;
+        fuseWalking = false;
         dryRouteWalk = false;
         wetEscapeWalk = false;
         horizonIntent = null;
@@ -577,7 +583,8 @@ final class AgentBody {
             double distance = Math.hypot(dryLanding.x - player.getX(), dryLanding.z - player.getZ());
             advance = hasView() && player.isOnGround() && (emergencyWalk || !player.horizontalCollision)
                 && distance > Math.max(0.12, 2.6 * Math.sqrt(player.getVelocity().horizontalLengthSquared()))
-                && Math.abs(MathHelper.wrapDegrees(goalYaw(player, player.getEyePos()) - player.getYaw())) <= 6;
+                && Math.abs(MathHelper.wrapDegrees(goalYaw(player, player.getEyePos()) - player.getYaw()))
+                    <= (fuseWalking ? AgentFuseEscape.DRIVE_ALIGNMENT : 6);
         } else if (!dryRouteWalk && !wetEscapeWalk && controlledBoat == null && advance
                 && player.isOnGround() && !player.isTouchingWater()) {
             ground = terrainAhead(player);
@@ -758,6 +765,7 @@ final class AgentBody {
         }
         if (jump && stepJump) lastStepJump = tick;
         ownsKeys = true;
+        if (advance && fuseWalking && !options.forwardKey.isUnbound()) fuseDriveTick = tick;
         options.forwardKey.setPressed(advance);
         options.backKey.setPressed(retreat);
         if (pickupWalk) visibleHorizon.reportPickup(pickupTarget,
@@ -2443,7 +2451,7 @@ final class AgentBody {
     }
 
     Vec3d continuityLanding() {
-        if (!client.options.forwardKey.isPressed()) return null;
+        if (fuseWalking || !client.options.forwardKey.isPressed()) return null;
         return dryLanding != null ? dryLanding : stepDriveTick == tick && stepSupport != null ? stepLanding : null;
     }
 
@@ -3099,6 +3107,102 @@ final class AgentBody {
     /** Own recent grounded contact selects a look direction, not permission to move. */
     Vec3d recentEmergencyFooting() {
         return tick - previousDryFootingTick <= 35 ? previousDryFooting : null;
+    }
+
+    boolean appliedFuseForward() {
+        return fuseDriveTick == tick - 1 && client.options.forwardKey.isPressed();
+    }
+
+    float fuseViewYaw() { return hasView() ? observedYaw : Float.NaN; }
+    float fuseViewPitch() { return hasView() ? observedPitch : Float.NaN; }
+
+    @Override public boolean obstructed(float bearing) {
+        if (!hasView() || lavaEmergency || Math.abs(MathHelper.wrapDegrees(bearing - client.player.getYaw())) > 35)
+            return false;
+        var player = client.player;
+        double angle = Math.toRadians(bearing);
+        // Immediate body-space veto, never a source of a path behind the camera.
+        return !client.world.isSpaceEmpty(player, player.getBoundingBox().offset(0, 0.01, 0)
+            .stretch(-0.23 * Math.sin(angle), 0, 0.23 * Math.cos(angle)));
+    }
+
+    @Override public Vec3d dryLanding(float bearing) {
+        var player = client.player;
+        if (!hasView() || lavaEmergency || !player.isOnGround() || player.hasVehicle()
+                || player.isTouchingWater() || client.options.forwardKey.isUnbound()) return null;
+        int y = MathHelper.floor(player.getY() + 0.055);
+        if (Math.abs(player.getY() - y) > 0.055) return null;
+
+        float actual = player.getYaw();
+        if (Math.abs(MathHelper.wrapDegrees(bearing - actual)) <= AgentFuseEscape.DRIVE_ALIGNMENT) bearing = actual;
+        double angle = Math.toRadians(bearing), dx = -Math.sin(angle), dz = Math.cos(angle);
+        Vec3d velocity = player.getVelocity();
+        double across = velocity.x * dz - velocity.z * dx;
+        if (Math.abs(across) > 0.045) return null;
+        double minimum = Math.max(FUSE_ROWS[0], 2.65 * Math.sqrt(velocity.horizontalLengthSquared()) + 0.14);
+        Direction travel = Direction.fromHorizontalDegrees(bearing);
+        double back = Math.min(0, velocity.x * dx + velocity.z * dz);
+        Box box = player.getBoundingBox().offset(0, 0.01, 0)
+            .stretch(2.65 * (back * dx + across * dz), 0, 2.65 * (back * dz - across * dx));
+        double reach = FUSE_ROWS[FUSE_ROWS.length - 1];
+        Box far = box.stretch(reach * dx, 0, reach * dz);
+        int startX = MathHelper.floor(far.minX + 1e-5);
+        int startZ = MathHelper.floor(far.minZ + 1e-5);
+        int columnsZ = MathHelper.floor(far.maxZ - 1e-5) - startZ + 1;
+        int columnsX = MathHelper.floor(far.maxX - 1e-5) - startX + 1;
+        if (columnsX * columnsZ > Long.SIZE) return null;
+        int sourceX = player.getBlockX(), sourceZ = player.getBlockZ();
+        long witnessed = 0;
+        double safeReach = 0;
+        lanes: for (double distance : FUSE_ROWS) {
+            Box sweep = box.stretch(dx * distance, 0, dz * distance);
+            if (hazardAhead(bearing, distance + 0.16)) break;
+            for (int x = MathHelper.floor(sweep.minX + 1e-5); x <= MathHelper.floor(sweep.maxX - 1e-5); ++x) {
+                for (int z = MathHelper.floor(sweep.minZ + 1e-5); z <= MathHelper.floor(sweep.maxZ - 1e-5); ++z) {
+                    long bit = 1L << ((x - startX) * columnsZ + z - startZ);
+                    if ((witnessed & bit) != 0) continue;
+                    if (!fuseColumn(x, y, z, travel, x == sourceX && z == sourceZ)) break lanes;
+                    witnessed |= bit;
+                }
+            }
+            if (!client.world.isSpaceEmpty(player, sweep)) break;
+            safeReach = distance;
+        }
+        return safeReach >= minimum ? player.getPos().add(dx * safeReach, 0, dz * safeReach) : null;
+    }
+
+    private boolean fuseColumn(int x, int y, int z, Direction travel, boolean standing) {
+        BlockPos floor = walkedProbe.set(x, y - 1, z);
+        if (!standing && emergencyFloor(new Vec3d(x + 0.5, y - 0.032, z + 0.5), travel, FUSE_DANGER)
+                != DryRouteTop.WITNESSED) return false;
+        // Recheck just the witnessed support (or own contact) and its swept body column.
+        BlockState state = client.world.getBlockState(floor);
+        return !dryCaveDanger(state) && fullStepSupport(floor, state)
+            && overlandLoadHolds(client.world, floor, state, overlandProbe)
+            && !dryCaveDanger(client.world.getBlockState(walkedProbe.move(Direction.UP)))
+            && !dryCaveDanger(client.world.getBlockState(walkedProbe.move(Direction.UP)));
+    }
+
+    void driveFuseLane(Vec3d landing, float bearing) {
+        var player = client.player;
+        Vec3d velocity = player.getVelocity();
+        double shown = Math.sqrt(landing.squaredDistanceTo(player.getPos()));
+        boolean sprint = AgentDefense.MeleeRecovery.canSprint(shown, Math.sqrt(velocity.horizontalLengthSquared()),
+            player.getHungerManager().getFoodLevel(), player.isSprinting());
+        driveEmergencyLane(landing, bearing, AgentFuseEscape.PITCH, sprint);
+        fuseWalking = true;
+    }
+
+    void braceForFuse(float toward) {
+        steering = gaitSteering = fallSteering = fixedSteering = false;
+        var player = client.player;
+        if (lavaEmergency || player.hasVehicle() || player.isTouchingWater()) return;
+        if (player.isOnGround()) sneak();
+        ItemStack main = player.getMainHandStack();
+        if (main.isOf(Items.SHIELD) || player.getOffHandStack().isOf(Items.SHIELD) && shieldSafeMainHand(main)) {
+            turnUrgent(toward, 15);
+            guardRangedBearing(toward);
+        }
     }
 
     /** Negative collision veto over an already camera-witnessed short corridor. */

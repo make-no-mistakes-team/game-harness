@@ -29,7 +29,9 @@ final class AgentEars implements SoundInstanceListener {
 
     private final MinecraftClient client;
     private final Supplier<Screen> renderedScreen;
+    private final AgentFuseEscape fuseEscape = new AgentFuseEscape();
     private int escapeTicks;
+    private boolean newFuse;
     private float away;
     record SoundCue(long wallMs, long monotonicNs, Vec3d origin, Vec3d player, float health,
                     Screen screen, boolean shown) {}
@@ -78,6 +80,7 @@ final class AgentEars implements SoundInstanceListener {
             }
             away = coarseBearing(dx, dz);
             escapeTicks = 36;
+            newFuse = true;
             zombieCue = null;
             rangedCue = null;
             meleeCue = null;
@@ -146,14 +149,39 @@ final class AgentEars implements SoundInstanceListener {
             && System.nanoTime() - cue.heardAt() <= FRESH_SHOT_NANOS ? cue : null;
     }
 
-    boolean escape(AgentBody body, AgentHands hands) {
+    boolean interruptForFuse(AgentHands hands) {
         if (escapeTicks <= 0) return false;
         --escapeTicks;
         hands.cancel();
         if (client.currentScreen instanceof net.minecraft.client.gui.screen.ingame.HandledScreen<?> screen) screen.close();
-        body.turnUrgent(away, 5f);
-        if (Math.abs(MathHelper.wrapDegrees(away - client.player.getYaw())) < 68) body.walk(true);
-        else body.back();
         return true;
     }
+
+    void escape(AgentBody body) {
+        if (newFuse) {
+            newFuse = false;
+            fuseEscape.start(away);
+            body.pauseWork();
+        }
+        body.prioritizeMovement();
+        var player = client.player;
+        Vec3d feet = player.getPos();
+        Vec3d walked = body.recentEmergencyFooting();
+        double dx = walked == null ? 0 : walked.x - feet.x, dz = walked == null ? 0 : walked.z - feet.z;
+        float walkedBearing = walked != null && Math.abs(feet.y - walked.y) <= 0.055 && dx * dx + dz * dz >= 0.04
+            ? (float) Math.toDegrees(Math.atan2(-dx, dz)) : Float.NaN;
+        boolean lava = body.lavaEmergency();
+        var action = fuseEscape.step(feet, body.fuseViewYaw(), body.fuseViewPitch(),
+            player.isOnGround() && !lava, body.appliedFuseForward() && player.hurtTime == 0 && !lava,
+            explosionCue != null && explosionCue.monotonicNs() >= lastFuseNs, body, walkedBearing);
+        if (lava) return; // The separate lava egress remains the final motor owner.
+        switch (action) {
+            case ALIGN -> body.turnUrgent(fuseEscape.bearing(), AgentFuseEscape.PITCH);
+            case DRIVE -> body.driveFuseLane(fuseEscape.landing(), fuseEscape.bearing());
+            case BRACE -> body.braceForFuse(away + 180);
+        }
+    }
+
+    boolean advancedOnFuse() { return fuseEscape.advanced(); }
+    String fuseStatus() { return fuseEscape.status(); }
 }

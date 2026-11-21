@@ -327,6 +327,12 @@ interval may extend beyond the last observation. A provider timeout is a
 separate limit. An audible creeper fuse can interrupt either planning or a
 drag in the crafting grid before that limit matters.
 
+On a creeper fuse, a jump in place is not an escape. If the current
+bearing hits a wall or produces no horizontal progress, the player
+stops retrying it. A side step needs visible dry support and a clear
+path for the player's body. Blast knockback does not count as a
+successful retreat.
+
 For the rhythm of the whole run, inspect `outcome.json` → `pauseEvidence`.
 It flags long stops and clusters of shorter ones and gives their times in
 the recording. The provider overlap is reported separately: a pending

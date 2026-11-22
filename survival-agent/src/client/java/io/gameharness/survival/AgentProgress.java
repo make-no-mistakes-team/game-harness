@@ -62,6 +62,9 @@ final class AgentProgress {
     private static final int IRON_LIGHT = 24;
     private static final int DEEP_LIGHT = 32;
     private static final int LOCAL_LIGHT = 12;
+    private static final int DARK_STAIR_MAX_LIGHT = 3;
+    private static final int DARK_STAIR_TICKS = 72;
+    private static final int STAIR_LIGHT_RECEIPT_TICKS = 8;
     private static final int KIT_WOOD_PICK = 1, KIT_STONE_PICK = 1 << 1, KIT_DEEP_PICK = 1 << 2;
     private static final int KIT_LIGHT = 1 << 3, KIT_IRON = 1 << 4, KIT_STONE = 1 << 5, KIT_WOOD = 1 << 6;
     private static final int KIT_WORKBENCH = 1 << 7, KIT_FURNACE = 1 << 8;
@@ -528,6 +531,8 @@ final class AgentProgress {
     private BlockPos refusedCharcoalFoot;
     private boolean forcedLight;
     private BlockPos darkAttemptFoot;
+    private BlockPos darkStairFoot;
+    private int darkStairSince, darkStairUse;
     private BlockPos pendingStairLight;
     private int pendingStairLightSince, pendingStairTorchCount, observedStairLightUse;
     private BlockPos witnessedStairCut;
@@ -8186,8 +8191,9 @@ final class AgentProgress {
         }
         if (current.getY() > depth) status = "descending a mined staircase";
         else status = "branch mining at y=" + current.getY();
+        if (ordinaryCaveDrops && !forcedLight && !caves.active() && lightDarkStair(current)) return;
         if (nextFoot == null) {
-            if (shouldLight(false)) return;
+            if (!current.equals(darkStairFoot) && shouldLight(false)) return;
             if (!planStep(current, depth, toward)) return;
             clearIndex = nextFoot.getY() < current.getY() ? 2 : 1;
             nextStepProved = false;
@@ -8499,6 +8505,70 @@ final class AgentProgress {
         trail.add(position);
     }
 
+    private boolean lightDarkStair(BlockPos current) {
+        boolean sameFoot = current.equals(darkStairFoot);
+        var player = c.player;
+        boolean atFoot = current.equals(player.getBlockPos());
+        if (darkStairSince == 0 && (sameFoot || current.equals(darkAttemptFoot) || torchAttempt != 0
+                || !atFoot || !body.hasRecentView() || c.world.getLightLevel(current) > DARK_STAIR_MAX_LIGHT
+                || c.options.useKey.isUnbound() || c.options.sneakKey.isUnbound())) return false;
+        Direction bearing = digDirection == null ? player.getHorizontalFacing() : digDirection;
+        boolean settled = atFoot && hands.stableCraftFooting() && safePickupStance() && c.currentScreen == null
+            && current.down().equals(player.supportingBlockPos.orElse(null))
+            && !player.isUsingItem() && !c.options.attackKey.isPressed() && !c.interactionManager.isBreakingBlock()
+            && motionTick != tick - 1 && (nextFoot == null || !nextStepProved)
+            && !body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65);
+        if (darkStairSince != 0) {
+            boolean issued = darkStairUse != 0;
+            boolean placed = issued && observedStairLightUse == darkStairUse;
+            boolean expired = issued ? tick - darkStairUse > STAIR_LIGHT_RECEIPT_TICKS
+                : tick - darkStairSince >= DARK_STAIR_TICKS;
+            if (placed || !sameFoot || !settled || expired || !issued
+                    && (c.world.getLightLevel(current) > DARK_STAIR_MAX_LIGHT || !has(TORCH, 1))) {
+                finishDarkStair(sameFoot, placed);
+                return false;
+            }
+            if (issued) status = "checking for an actual stair torch";
+            else aimDarkStair(current, bearing);
+            return true;
+        }
+        if (!settled) return false;
+        BlockHitResult shown = body.selectedFace();
+        if (shown != null && shown.getPos().squaredDistanceTo(player.getEyePos()) <= 3.2 * 3.2
+                && body.observedFaceLight(shown) >= 11) return false;
+
+        boolean hasTorch = has(TORCH, 1);
+        if (!hasTorch && (!has(FUEL, 1) || !has(STICK, 1))) return false;
+        darkStairFoot = darkAttemptFoot = current;
+        if (!hasTorch) {
+            if (!hands.craftBatch(List.of("torch"))) return false;
+            body.pauseWork();
+            status = "crafting one batch of torches on a dark stair";
+        } else aimDarkStair(current, bearing);
+        darkStairSince = tick;
+        return true;
+    }
+
+    private void aimDarkStair(BlockPos current, Direction bearing) {
+        status = "lighting the current dark stair before cutting further";
+        if (issueStairLight(current, bearing, true)) darkStairUse = tick;
+    }
+
+    private void finishDarkStair(boolean sameFoot, boolean placed) {
+        if (sameFoot) {
+            if (nextFoot != null && digAge <= darkStairSince) {
+                int paused = Math.min(tick - darkStairSince, DARK_STAIR_TICKS + STAIR_LIGHT_RECEIPT_TICKS);
+                digAge += paused;
+                if (nextFoot.equals(cavePeek) && caveLookUntil >= darkStairSince) caveLookUntil += paused;
+            }
+            if (placed) {
+                litIndex = trail.size();
+                torchPlacedTick = tick;
+            }
+        }
+        darkStairSince = darkStairUse = 0;
+    }
+
     private boolean lightDigOnce(BlockPos current) {
         if (current.equals(darkAttemptFoot) || !has(TORCH, 1)) return false;
         darkAttemptFoot = current;
@@ -8510,7 +8580,7 @@ final class AgentProgress {
 
     private void observeStairLight() {
         if (pendingStairLight == null) return;
-        if (tick - pendingStairLightSince > 8) {
+        if (tick - pendingStairLightSince > STAIR_LIGHT_RECEIPT_TICKS) {
             pendingStairLight = null;
         } else if (hands.count(TORCH) < pendingStairTorchCount) {
             Vec3d point = Vec3d.ofCenter(pendingStairLight, 0.31);
@@ -8547,7 +8617,7 @@ final class AgentProgress {
         if (torchUsed != 0) {
             if (hands.count(TORCH) < torchBefore) {
                 if (returnable && observedStairLightUse != torchUsed) {
-                    if (tick - torchUsed <= 8) return true; // Wait for the rendered placement, not just the debit.
+                    if (tick - torchUsed <= STAIR_LIGHT_RECEIPT_TICKS) return true; // Wait for the rendered placement, not just the debit.
                     torchAttempt = torchFace = torchUsed = 0;
                     return false;
                 }
@@ -8556,14 +8626,22 @@ final class AgentProgress {
                 torchPlacedTick = tick;
                 return false;
             }
-            if (tick - torchUsed < 8) return true;
+            if (tick - torchUsed < STAIR_LIGHT_RECEIPT_TICKS) return true;
             torchUsed = 0;
         }
         if (tick - torchAttempt >= 50 || !has(TORCH, 1)) {
             torchAttempt = torchFace = 0;
             return false;
         }
-        if (!c.player.isOnGround() || !hands.equipForUse(TORCH)) return true;
+        if (issueStairLight(current, bearing, false)) {
+            torchBefore = pendingStairTorchCount;
+            torchUsed = tick;
+        }
+        return true;
+    }
+
+    private boolean issueStairLight(BlockPos current, Direction bearing, boolean checkedSupport) {
+        if (!c.player.isOnGround() || !hands.equipForUse(TORCH)) return false;
         Vec3d point = Vec3d.ofBottomCenter(current).add(
             0.36 * bearing.getOffsetX(), -0.06, 0.36 * bearing.getOffsetZ());
         body.aim(point);
@@ -8574,16 +8652,16 @@ final class AgentProgress {
             hit = body.selectedFace();
             mode = AgentBody.Contact.OUTLINE;
         }
-        if (hit != null && hit.getSide() == Direction.UP && hit.getBlockPos().equals(current.down())) {
-            // Ground contact proves this support; the rendered outline proves the usable face.
-            body.aimContact(hit, mode);
-            if (!c.player.isSneaking() || !body.useContact(hit, mode)) return true;
-            torchBefore = hands.count(TORCH);
-            torchUsed = tick;
-            pendingStairLight = current;
-            pendingStairLightSince = tick;
-            pendingStairTorchCount = torchBefore;
-        }
+        if (hit == null || hit.getSide() != Direction.UP || !hit.getBlockPos().equals(current.down())) return false;
+        // In complete darkness, the actual supporting foot and its rendered top prove contact;
+        // an outline alone never reveals the identity of a block.
+        if (checkedSupport && (mode == AgentBody.Contact.PRECISE && !safeSupport(hit)
+                || !torchSiteOutsideStep(hit))) return false;
+        body.aimContact(hit, mode);
+        if (!c.player.isSneaking() || !body.useContact(hit, mode)) return false;
+        pendingStairLight = current;
+        pendingStairLightSince = tick;
+        pendingStairTorchCount = hands.count(TORCH);
         return true;
     }
 

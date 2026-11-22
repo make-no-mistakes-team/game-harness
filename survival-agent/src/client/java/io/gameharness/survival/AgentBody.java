@@ -5071,11 +5071,24 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     /** A vertical swim stroke beside a witnessed lip must also fit before any forward input. */
     boolean wetEscapeRise(double rise) {
+        return wetEscapeRise(0, 0, rise);
+    }
+
+    /** Veto an already witnessed air target when there is no room to rise after reaching it. */
+    boolean wetEscapeRiseAt(Vec3d landing, double rise) {
         var player = client.player;
-        return hasView() && !lavaEmergency && player.isTouchingWater() && !player.hasVehicle()
-            && !hazards.lavaNear(player.getBoundingBox(), 0.32, tick)
-            && client.world.isSpaceEmpty(player, player.getBoundingBox().contract(1e-5, 0, 1e-5)
-                .stretch(0, Math.max(0.16, rise + 0.05), 0));
+        return wetEscapeRise(landing.x - player.getX(), landing.z - player.getZ(), rise);
+    }
+
+    private boolean wetEscapeRise(double dx, double dz, double rise) {
+        var player = client.player;
+        if (!hasView() || lavaEmergency || !player.isTouchingWater() || player.hasVehicle()
+                || player.isInLava() || player.isOnFire()) return false;
+        Box current = player.getBoundingBox();
+        Box column = (dx == 0 && dz == 0 ? current : current.offset(dx, 0, dz))
+            .stretch(0, Math.max(0.16, rise + 0.05), 0);
+        return !hazards.lavaNear(column, 0.32, tick)
+            && client.world.isSpaceEmpty(player, column.contract(1e-5, 0, 1e-5));
     }
 
     /** Prevent automatic buoyancy input even while turning to recheck an exit. */

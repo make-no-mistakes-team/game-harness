@@ -37,7 +37,7 @@ final class DryCaveViewTest {
     void aLogAndDaylightAboveAShaftDoNotFinishTheAscent() {
         var view = new ForwardView(40);
         var egress = new AgentSupplyEgress();
-        assertTrue(egress.begin(SOURCE, true));
+        assertTrue(egress.begin(SOURCE, true, 1));
         view.blocks.remove(SOURCE.east().down());
         view.blocks.put(SOURCE.down(), Blocks.DIRT.getDefaultState());
         view.blocks.put(SOURCE.east().up(3), Blocks.OAK_LOG.getDefaultState());
@@ -59,7 +59,7 @@ final class DryCaveViewTest {
         view.blocks.put(SOURCE.up(2), Blocks.OAK_LEAVES.getDefaultState());
         view.blocks.put(landing.up(2), Blocks.OAK_LEAVES.getDefaultState());
         var egress = new AgentSupplyEgress();
-        assertTrue(egress.begin(SOURCE, true));
+        assertTrue(egress.begin(SOURCE, true, 1));
         assertTrue(egress.handoffWoodland(view, Direction.EAST, (foot, bearing) ->
             view.sweepClear(AgentSurfaceTread.retainedTreadSweep(SOURCE, foot, 0.6))));
         assertFalse(egress.active(), "ordinary forestry and overland no longer wait for an inclined exit");
@@ -69,32 +69,32 @@ final class DryCaveViewTest {
     void exhaustedSupplyEgressReleasesItsLeaseUntilTheFailedFootingPremiseChanges() {
         var egress = new AgentSupplyEgress();
         var refusedSupport = SOURCE.east().down();
-        assertTrue(egress.begin(SOURCE, true));
+        assertTrue(egress.begin(SOURCE, true, 1));
         egress.considered(refusedSupport);
         String reason = egress.refuse("east: visible lava near the selected crossing", false);
         assertEquals("supply egress blocked at 0, 32, 0: east: visible lava near the selected crossing", reason);
         assertFalse(egress.active(), "the stall watchdog may now assess or turn control back to ordinary work");
-        assertEquals(reason, egress.refusal(SOURCE));
-        assertFalse(egress.begin(SOURCE, true));
+        assertEquals(reason, egress.refusal(SOURCE, 2));
+        assertFalse(egress.begin(SOURCE, true, 2));
         egress.observeBreak(SOURCE.east(2).up());
-        assertFalse(egress.begin(SOURCE, true), "unrelated work or another look at the same stance does not re-arm it");
-        assertTrue(egress.begin(SOURCE.west(), true), "a different actual grounded footing is a different premise");
+        assertFalse(egress.begin(SOURCE, true, 3), "unrelated work or another look at the same stance does not re-arm it");
+        assertTrue(egress.begin(SOURCE.west(), true, 4), "a different actual grounded footing is a different premise");
         egress.finish();
-        assertFalse(egress.begin(SOURCE, true), "returning to the exact failed footing does not erase its refusal");
+        assertFalse(egress.begin(SOURCE, true, 5), "returning to the exact failed footing does not erase its refusal");
         egress.observeBreak(refusedSupport);
-        assertTrue(egress.begin(SOURCE, true), "a confirmed break inside the refused crossing permits a fresh proof");
+        assertTrue(egress.begin(SOURCE, true, 6), "a confirmed break inside the refused crossing permits a fresh proof");
     }
 
     @Test
     void aCrossingVetoWhileAirborneSuppressesOrdinaryMovementWithoutLeasingProgress() {
         var egress = new AgentSupplyEgress();
-        assertFalse(egress.begin(SOURCE, false));
-        assertTrue(egress.begin(SOURCE, true));
+        assertFalse(egress.begin(SOURCE, false, 1));
+        assertTrue(egress.begin(SOURCE, true, 2));
         egress.considered(SOURCE.east().down());
         assertEquals("supply egress blocked at 0, 32, 0: east: one of the two supporting footprints no longer holds",
             egress.refuse("east: one of the two supporting footprints no longer holds", true));
         assertFalse(egress.active());
-        assertFalse(egress.begin(SOURCE.east(), false), "a new air cell is not changed footing");
+        assertFalse(egress.begin(SOURCE.east(), false, 3), "a new air cell is not changed footing");
         assertTrue(egress.holdOrdinary(true));
         assertFalse(egress.holdOrdinary(false));
     }
@@ -107,7 +107,7 @@ final class DryCaveViewTest {
         view.blocks.put(landing.down(), Blocks.LAVA.getDefaultState());
         view.blocks.put(landing.east().down(), Blocks.GRASS_BLOCK.getDefaultState());
         var egress = new AgentSupplyEgress();
-        assertTrue(egress.begin(SOURCE, true));
+        assertTrue(egress.begin(SOURCE, true, 1));
         assertFalse(egress.handoffWoodland(view, Direction.EAST, (foot, bearing) ->
             view.sweepClear(AgentSurfaceTread.retainedTreadSweep(SOURCE, foot, 0.6))));
         assertTrue(egress.active());

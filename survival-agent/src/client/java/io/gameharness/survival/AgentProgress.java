@@ -5840,8 +5840,10 @@ final class AgentProgress {
         private final List<BlockPos> walked = new ArrayList<>();
         private final AgentSupplyEgress order = new AgentSupplyEgress();
         private final BiPredicate<BlockPos, Direction> woodlandLane = this::woodlandLaneClear;
+        private final Predicate<BlockPos> witnessedDryFlood = this::witnessedDryFloodCell;
         private ClientWorld world;
         private BlockPos openFoot, unknownFoot, to, armedCut, packedBench;
+        private BlockPos floodOpening, floodWater;
         private Vec3d floor, alternateFloor, aim, buildLow, buildHigh, reverseLeft, reverseRight;
         private Direction bearing, lane;
         private Proof proof;
@@ -5851,7 +5853,7 @@ final class AgentProgress {
         private int benchBefore, benchCollectUntil, connectors, builds, buildBefore, anchorChoice;
         private long revealedFrame;
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
-        private boolean triedLower, built, mineDeparture, floodWarning, checkingExit;
+        private boolean triedLower, built, mineDeparture, floodSource, checkingExit;
 
         boolean active() { return world == c.world && order.active(); }
 
@@ -5873,7 +5875,8 @@ final class AgentProgress {
         }
 
         boolean outdoors() {
-            return world == c.world && dryFieldFooting() && c.player.getBlockPos().equals(openFoot);
+            return world == c.world && dryFieldFooting() && c.player.getBlockPos().equals(openFoot)
+                && !order.blocksFloodWork(openFoot, tick);
         }
 
         void observeOpenFoot(BlockPos foot) {
@@ -5882,7 +5885,7 @@ final class AgentProgress {
                 order.reset();
                 unknownFoot = null;
             }
-            openFoot = foot;
+            if (!order.blocksFloodWork(foot, tick)) openFoot = foot;
         }
 
         boolean seek(String need) {
@@ -5903,7 +5906,8 @@ final class AgentProgress {
                 if ((view & (AgentBody.SUPPLY_ROOF | AgentBody.SUPPLY_WALL))
                         != (AgentBody.SUPPLY_ROOF | AgentBody.SUPPLY_WALL)) return false;
             }
-            if (!order.begin(standing, grounded)) return false;
+            if (grounded) order.recheckFloods(standing, tick, witnessedDryFlood);
+            if (!order.begin(standing, grounded, tick)) return false;
             start(c.player.getHorizontalFacing(), tick + JOB_TICKS, false);
             surveyActivity = "supply egress: surveying the rendered roof and opening for " + need;
             return step();
@@ -5915,7 +5919,9 @@ final class AgentProgress {
                 order.reset();
                 openFoot = unknownFoot = null;
             }
-            if (!order.begin(standing, dryFieldFooting())) return false;
+            boolean grounded = dryFieldFooting();
+            if (grounded) order.recheckFloods(standing, tick, witnessedDryFlood);
+            if (!order.begin(standing, grounded, tick)) return false;
             start(direction, end, true);
             surveyActivity = "mine departure: checking for a supported ascent out of the enclosed area";
             return true;
@@ -5945,13 +5951,14 @@ final class AgentProgress {
             bearing = direction;
             walked.clear();
             walked.add(order.foot());
-            floodWarning = false;
+            floodOpening = floodWater = null;
+            floodSource = false;
             firstRefusal = lastRefusal = null;
             to = armedCut = packedBench = null;
             driving = 0;
             handoffAfter = tick;
             revealedFrame = -1;
-            rises = levels = cuts = connectors = builds = 0;
+            rises = levels = cuts = laneCuts = connectors = builds = 0;
             sourceProved = walkedReturn = lighting = triedLight = triedCraftLight = false;
             returning = !mineDeparture && findReturn();
             enclosed = returning && trail.get(backEnd).getY() >= order.foot().getY() + 2;
@@ -5972,14 +5979,30 @@ final class AgentProgress {
         boolean retreatFlood() {
             if (!active() || c.player.isInLava() || c.player.hasVehicle()) return false;
             boolean wet = c.player.isTouchingWater();
-            if (!wet && !floodWarning) return false;
-            stop(wet ? "flood reached the last walked footing" : "water opened above the crossing");
+            if (!wet && floodWater == null) return false;
+            BlockPos lip = order.foot();
+            var retreat = order.flood(to, floodOpening, floodWater, floodSource, tick);
+            if (openFoot != null && order.blocksFloodWork(openFoot, tick)) openFoot = null;
+            if (unknownFoot != null && order.blocksFloodWork(unknownFoot, tick)) unknownFoot = null;
+            to = armedCut = packedBench = floodOpening = floodWater = null;
+            floodSource = false;
+            driving = 0;
+            status = "supply egress: " + (wet ? "flood reached the last walked footing at "
+                : "water opened over the crossing from ") + lip.toShortString();
+            body.pauseWork();
             interruptHands();
-            boolean retreat = walked.size() >= 2
-                ? stallGuard.takeWalkedWaterReturn(walked, stallReplan, stallRelease)
+            boolean handedOff = retreat != null
+                ? stallGuard.takeWalkedWaterReturn(retreat, stallReplan, stallRelease)
                 : wet && stallGuard.takeAirTurn(stallReplan, stallRelease);
-            if (retreat) status = stallGuard.status();
+            if (handedOff) status = stallGuard.status();
             return true;
+        }
+
+        private boolean witnessedDryFloodCell(BlockPos cell) {
+            var low = body.dryRouteClear(Vec3d.ofCenter(cell, 0.04));
+            if (low != AgentBody.DryRouteSample.CLEAR && low != AgentBody.DryRouteSample.OBSTRUCTION) return false;
+            var high = body.dryRouteClear(Vec3d.ofCenter(cell, 0.86));
+            return high == AgentBody.DryRouteSample.CLEAR || high == AgentBody.DryRouteSample.OBSTRUCTION;
         }
 
         private boolean airborne() {
@@ -6038,7 +6061,8 @@ final class AgentProgress {
                     case DARK -> {
                         if (!tryLight()) return stop("takeoff top is too dark to verify");
                     }
-                    case FLUID, NO_FULL_TOP -> { return stop("takeoff has no stable, dry full top"); }
+                    case FLUID -> { return refuseFluid(from.down(), aim, "takeoff has no stable, dry full top"); }
+                    case NO_FULL_TOP -> { return stop("takeoff has no stable, dry full top"); }
                     default -> { }
                 }
                 if (!sourceProved && !lighting && tick - since >= LOOK_TICKS)
@@ -6047,6 +6071,7 @@ final class AgentProgress {
                 return true;
             }
             if (to == null && !choose()) return true;
+            if (order.avoidFlood(to, tick)) return refuse("crossing leads into the recent flood");
             status = crossingActivity;
             if (mineDeparture && !mineResite.eligibleReturn(from, to)) return refuse("the directed tread was already refused");
             if (body.hazardAhead(lane.getPositiveHorizontalDegrees(), 1.5))
@@ -6088,7 +6113,7 @@ final class AgentProgress {
 
         private boolean woodlandLaneClear(BlockPos next, Direction bearing) {
             BlockPos from = order.foot();
-            return body.walkedLaneDry(from, next, bearing)
+            return !order.blocksFloodWork(next, tick) && body.walkedLaneDry(from, next, bearing)
                 && body.dryRouteVeto(from, next) == AgentBody.DryRouteVeto.CLEAR;
         }
 
@@ -6230,7 +6255,7 @@ final class AgentProgress {
                     boolean flat = choice++ >= 4;
                     if (flat && (flatBearings & 1 << lane.ordinal()) != 0) continue;
                     BlockPos candidate = from.offset(lane).up(flat ? 0 : 1);
-                    if (!walked.contains(candidate)) {
+                    if (!walked.contains(candidate) && !order.avoidFlood(candidate, tick)) {
                         if (flat) flatBearings |= 1 << lane.ordinal();
                         to = candidate;
                         break;
@@ -6277,11 +6302,15 @@ final class AgentProgress {
             // obstruction or an opaque face is not evidence of what's behind it.
             body.aim(floor);
             BlockPos support = to.down();
+            Vec3d sample = floor;
             AgentBody.DryRouteTop top = body.dryRouteTop(floor, support);
             if (top != AgentBody.DryRouteTop.WITNESSED && top != AgentBody.DryRouteTop.FLUID) {
                 AgentBody.DryRouteTop other = body.dryRouteTop(alternateFloor, support);
                 if (other == AgentBody.DryRouteTop.WITNESSED || other == AgentBody.DryRouteTop.FLUID
-                        || top == AgentBody.DryRouteTop.OUT_OF_VIEW) top = other;
+                        || top == AgentBody.DryRouteTop.OUT_OF_VIEW) {
+                    top = other;
+                    sample = alternateFloor;
+                }
             }
             switch (top) {
                 case WITNESSED -> {
@@ -6298,7 +6327,9 @@ final class AgentProgress {
                     driving = tick;
                     return drive();
                 }
-                case FLUID -> { return refuse("fluid covers the observed supporting top at " + support.toShortString()); }
+                case FLUID -> {
+                    return refuseFluid(support, sample, "fluid covers the observed supporting top at " + support.toShortString());
+                }
                 case NO_FULL_TOP -> {
                     if (!body.renderedAim(floor, 10) && tick - since < LOOK_TICKS) return true;
                     // The missed lip can be an ordinary flat stretch. Do not cut
@@ -6350,6 +6381,7 @@ final class AgentProgress {
         }
 
         private boolean beginFoothold() {
+            if (order.avoidFlood(to.down(), tick)) return refuse("foothold would occupy the recent flood neighborhood");
             if (builds >= MAX_FOOTHOLDS || hands.count(COBBLE_FOOTHOLD) <= FOOTHOLD_RESERVE)
                 return refuse("no stable landing and no spare foothold block within the placement limit");
             if (walked.contains(to) || protectRecoveryBlock(to.down()) || !offWorkshopPassage(to.down()))
@@ -6492,7 +6524,7 @@ final class AgentProgress {
                     });
                     return true;
                 }
-                case FLUID -> { return refuse("fluid in " + area() + " at " + cell.toShortString()); }
+                case FLUID -> { return refuseFluid(cell, aim, "fluid in " + area() + " at " + cell.toShortString()); }
                 case DARK -> {
                     if (body.renderedAim(aim, 8) && !tryLight()) {
                         if (tryFootholdAfterLower()) return true;
@@ -6528,6 +6560,7 @@ final class AgentProgress {
         }
 
         private boolean cutFace(BlockPos cell, BlockHitResult hit) {
+            if (order.avoidFlood(cell, tick)) return refuse("will not cut into the recent flood neighborhood");
             BlockState material = state(hit);
             boolean ownBench = material.isOf(table.block) && memory.ownsWorkbench(c.world, cell);
             if (ownBench && mineDeparture) return refuse("the ascent would disturb the existing portable workshop");
@@ -6560,12 +6593,14 @@ final class AgentProgress {
             Vec3d edge = hit.getPos().add(hit.getSide().getOffsetX() * 0.08, 0, hit.getSide().getOffsetZ() * 0.08);
             Vec3d above = new Vec3d(edge.x, cell.getY() + 1.20, edge.z);
             BlockHitResult cover = perceive(above, c.player.getEyePos().distanceTo(above) + 0.035);
-            if (cover != null && cover.getBlockPos().getY() > cell.getY()
-                    && (state(cover).getBlock() instanceof net.minecraft.block.FallingBlock || dangerous(state(cover))
-                        || !state(cover).getFluidState().isEmpty())) {
-                order.considered(cover.getBlockPos());
-                floodWarning = state(cover).isOf(Blocks.WATER);
-                return refuse("visible falling material or fluid over " + cell.toShortString());
+            if (cover != null && cover.getBlockPos().getY() > cell.getY()) {
+                BlockState shown = state(cover);
+                var fluid = shown.getFluidState();
+                if (fluid.isIn(FluidTags.WATER)) return warnFlood(cell, cover.getBlockPos(), fluid.isStill());
+                if (shown.getBlock() instanceof FallingBlock || dangerous(shown) || !fluid.isEmpty()) {
+                    order.considered(cover.getBlockPos());
+                    return refuse("visible falling material or fluid over " + cell.toShortString());
+                }
             }
             body.aimContact(hit, AgentBody.Contact.MINE);
             if (ownBench) {
@@ -6575,6 +6610,26 @@ final class AgentProgress {
             }
             if ((ownBench || readyForMine(material)) && body.mine(hit)) armedCut = cell;
             if (body.miningFootingRefused(cell)) return refuse("cut would remove actual supporting footprint");
+            return true;
+        }
+
+        private boolean refuseFluid(BlockPos cell, Vec3d sample, String why) {
+            if (laneCuts > 0) {
+                BlockHitResult hit = perceive(sample, c.player.getEyePos().distanceTo(sample) + 0.035);
+                if (hit != null) {
+                    var fluid = state(hit).getFluidState();
+                    if (fluid.isIn(FluidTags.WATER)) return warnFlood(cell, hit.getBlockPos(), fluid.isStill());
+                }
+            }
+            return to == null ? stop(why) : refuse(why);
+        }
+
+        private boolean warnFlood(BlockPos opening, BlockPos water, boolean source) {
+            floodOpening = opening;
+            floodWater = water;
+            floodSource = source;
+            body.pauseWork();
+            status = "supply egress: witnessed water over the crossing at " + water.toShortString();
             return true;
         }
 

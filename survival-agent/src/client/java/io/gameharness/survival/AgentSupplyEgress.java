@@ -1,11 +1,16 @@
 package io.gameharness.survival;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiPredicate;
+import java.util.function.Predicate;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.LeavesBlock;
@@ -16,13 +21,46 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 
-/** Owns the ordinary-work exclusion and the exact physical premises of refused exits. */
+/** Owns the work exclusion, walked retreat legs, and physical premises of refused exits. */
 final class AgentSupplyEgress {
-    private record Refusal(String detail, Set<BlockPos> cells) {}
+    private static final int MAX_WALKED_LEGS = 96, MAX_RETURN_LEGS = 8, MAX_REFUSALS = 32;
+    private static final int MAX_FLOODS = 6, FLOOD_TICKS = 1200;
 
-    private final Map<BlockPos, Refusal> refusals = new HashMap<>();
+    private record Refusal(String detail, Set<BlockPos> cells, BlockPos floodPremise) {}
+    private record Leg(BlockPos from, BlockPos to) {
+        BlockPos other(BlockPos end) {
+            return from.equals(end) ? to : to.equals(end) ? from : null;
+        }
+    }
+    private record ReturnNode(BlockPos foot, ReturnNode nearerLip, int depth) {}
+    private record Flood(BlockPos lip, BlockPos opening, BlockPos water, boolean source, int tick) {
+        boolean near(BlockPos cell) {
+            return near(lip, cell) || near(opening, cell) || near(water, cell);
+        }
+
+        private static boolean near(BlockPos origin, BlockPos cell) {
+            return origin != null && Math.abs(origin.getX() - cell.getX()) <= 2
+                && Math.abs(origin.getY() - cell.getY()) <= 2 && Math.abs(origin.getZ() - cell.getZ()) <= 2;
+        }
+    }
+
+    /** Oldest to newest; an arrival inside the flood neighborhood is not the end of the retreat. */
+    record FloodRetreat(List<BlockPos> walked, Flood flood) {
+        boolean outsideFlood(BlockPos standing) { return !flood.near(standing); }
+
+        FloodRetreat afterDryLanding(BlockPos standing) {
+            if (outsideFlood(standing)) return null;
+            int index = walked.lastIndexOf(standing);
+            return index > 0 && index < walked.size() - 1
+                ? new FloodRetreat(walked.subList(0, index + 1), flood) : null;
+        }
+    }
+
+    private final LinkedHashMap<BlockPos, Refusal> refusals = new LinkedHashMap<>();
     private final Set<BlockPos> checked = new HashSet<>();
-    private BlockPos foot;
+    private final ArrayDeque<Leg> walked = new ArrayDeque<>();
+    private final ArrayDeque<Flood> floods = new ArrayDeque<>();
+    private BlockPos foot, floodPremise;
     private boolean airborneHold;
 
     BlockPos foot() { return foot; }
@@ -38,19 +76,33 @@ final class AgentSupplyEgress {
         return airborneHold;
     }
 
-    String refusal(BlockPos standing) {
+    String refusal(BlockPos standing, int tick) {
         var refusal = refusals.get(standing);
-        return refusal == null ? null : refusal.detail();
+        if (refusal == null) return null;
+        if (refusal.floodPremise() != null && !blocksFloodWork(refusal.floodPremise(), tick)) {
+            refusals.remove(standing);
+            return null;
+        }
+        return refusal.detail();
     }
 
-    boolean begin(BlockPos standing, boolean grounded) {
-        if (!grounded || active() || refusal(standing) != null) return false;
+    boolean begin(BlockPos standing, boolean grounded, int tick) {
+        if (!grounded || active() || refusal(standing, tick) != null || blocksFloodWork(standing, tick)) return false;
         landed(standing);
         return true;
     }
 
     void landed(BlockPos standing) {
+        standing = standing.toImmutable();
+        if (foot != null && Math.abs(foot.getX() - standing.getX()) + Math.abs(foot.getZ() - standing.getZ()) == 1
+                && Math.abs(foot.getY() - standing.getY()) <= 1) {
+            Leg leg = new Leg(foot, standing);
+            walked.removeIf(prior -> leg.to().equals(prior.other(leg.from())));
+            if (walked.size() == MAX_WALKED_LEGS) walked.removeFirst();
+            walked.addLast(leg);
+        }
         foot = standing;
+        floodPremise = null;
         checked.clear();
         checked.add(standing.down());
     }
@@ -59,18 +111,87 @@ final class AgentSupplyEgress {
 
     void observeBreak(BlockPos cell) {
         if (!refusals.isEmpty()) refusals.values().removeIf(refusal -> refusal.cells().contains(cell));
+        if (!walked.isEmpty()) {
+            BlockPos above = cell.up();
+            walked.removeIf(leg -> leg.other(above) != null);
+        }
+    }
+
+    boolean blocksFloodWork(BlockPos standing, int tick) {
+        expireFloods(tick);
+        for (Flood flood : floods) if (flood.near(standing)) return true;
+        return false;
+    }
+
+    boolean avoidFlood(BlockPos cell, int tick) {
+        if (!blocksFloodWork(cell, tick)) return false;
+        if (floodPremise == null) floodPremise = cell;
+        return true;
+    }
+
+    void recheckFloods(BlockPos standing, int tick, Predicate<BlockPos> witnessedDry) {
+        expireFloods(tick);
+        if (floods.isEmpty()) return;
+        // A departed flow front, ordinary block break, or momentarily dry foot is not changed source evidence.
+        var refusal = refusals.get(standing);
+        BlockPos next = refusal == null ? null : refusal.floodPremise();
+        floods.removeIf(flood -> flood.source() && flood.opening() != null
+            && (flood.near(standing) || next != null && flood.near(next))
+            && witnessedDry.test(flood.water()) && witnessedDry.test(flood.opening()));
+    }
+
+    private void expireFloods(int tick) {
+        while (!floods.isEmpty() && tick - floods.getFirst().tick() >= FLOOD_TICKS) floods.removeFirst();
+    }
+
+    FloodRetreat flood(BlockPos approach, BlockPos opening, BlockPos water, boolean source, int tick) {
+        var flood = new Flood(foot, opening != null ? opening : approach, water, source, tick);
+        expireFloods(tick);
+        if (floods.size() == MAX_FLOODS) floods.removeFirst();
+        floods.addLast(flood);
+        finish();
+
+        // A new order, or a visit to an unrelated site, never creates a bridging edge.
+        // Search actual receipts only, preferring a corridor out of the wet neighborhood.
+        var pending = new ArrayDeque<ReturnNode>();
+        var reached = new HashSet<BlockPos>();
+        var newestFirst = walked.reversed();
+        var best = new ReturnNode(flood.lip(), null, 0);
+        pending.addLast(best);
+        reached.add(best.foot());
+        boolean bestNear = true;
+        while (!pending.isEmpty()) {
+            var node = pending.removeFirst();
+            boolean near = flood.near(node.foot());
+            if (bestNear && !near || bestNear == near && node.depth() > best.depth()) {
+                best = node;
+                bestNear = near;
+            }
+            if (node.depth() == MAX_RETURN_LEGS) continue;
+            for (Leg leg : newestFirst) {
+                BlockPos next = leg.other(node.foot());
+                if (next != null && !next.equals(approach) && !next.equals(opening)
+                        && !next.equals(water) && reached.add(next))
+                    pending.addLast(new ReturnNode(next, node, node.depth() + 1));
+            }
+        }
+        if (best.depth() == 0) return null;
+        var path = new ArrayList<BlockPos>(best.depth() + 1);
+        for (var node = best; node != null; node = node.nearerLip()) path.add(node.foot());
+        return new FloodRetreat(List.copyOf(path), flood);
     }
 
     String refuse(String why, boolean airborne) {
         String reason = "supply egress blocked at " + foot.toShortString() + ": " + why;
-        refusals.put(foot, new Refusal(reason, Set.copyOf(checked)));
+        refusals.put(foot, new Refusal(reason, Set.copyOf(checked), floodPremise));
+        if (refusals.size() > MAX_REFUSALS) refusals.pollFirstEntry();
         finish();
         airborneHold = airborne;
         return reason;
     }
 
     void finish() {
-        foot = null;
+        foot = floodPremise = null;
         airborneHold = false;
         checked.clear();
     }
@@ -78,6 +199,8 @@ final class AgentSupplyEgress {
     void reset() {
         finish();
         refusals.clear();
+        walked.clear();
+        floods.clear();
     }
 
     static boolean naturalDryLeaf(BlockState state) {

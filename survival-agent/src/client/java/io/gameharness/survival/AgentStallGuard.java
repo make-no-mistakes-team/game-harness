@@ -225,6 +225,7 @@ final class AgentStallGuard {
     private boolean glanceTried, glancing, explicitRefusal;
     private boolean waterBlockedReported, emergencyWater;
     private int waterAttempts;
+    private AgentSupplyEgress.FloodRetreat supplyFloodRetreat;
     private boolean mineHandedBack;
     private boolean workBroke, resourceBroke, stairLit, surfaceStep;
     private boolean navigationTurn, navigationRetry, navigationArrival;
@@ -608,11 +609,12 @@ final class AgentStallGuard {
     /** Incidental immersion is not a failed dry stance and must not enter the dry-only assessment. */
     boolean controlsWaterRecovery() { return phase == Phase.WATER; }
 
-    boolean takeWalkedWaterReturn(List<BlockPos> walked, Runnable replan, Runnable releaseAlternative) {
+    boolean takeWalkedWaterReturn(AgentSupplyEgress.FloodRetreat retreat, Runnable replan, Runnable releaseAlternative) {
         if (client.player.hasVehicle()) return false;
         prepareOrdinaryWater(replan, releaseAlternative);
-        water.startReturn(walked);
+        water.startReturn(retreat.walked());
         beginWaterRecovery(false);
+        supplyFloodRetreat = retreat;
         return stepWaterRecovery() != AgentWaterEscape.Result.INTERRUPTED;
     }
 
@@ -636,6 +638,7 @@ final class AgentStallGuard {
     AgentWaterEscape.Result takeEmergencyWaterTurn(Runnable replan, Runnable releaseAlternative) {
         if (client.player.hasVehicle() || !client.player.isTouchingWater() && phase != Phase.WATER)
             return AgentWaterEscape.Result.INTERRUPTED;
+        if (phase == Phase.WATER && supplyFloodRetreat != null && water.retracing()) return stepWaterRecovery();
         if (phase != Phase.WATER || !emergencyWater) {
             if (phase == Phase.ALTERNATIVE) releaseAlternative.run();
             tookControl = true;
@@ -672,6 +675,7 @@ final class AgentStallGuard {
         emergencyWater = emergency;
         waterAttempts = 0;
         waterBlockedReported = false;
+        supplyFloodRetreat = null;
         transition(Phase.WATER, water.status());
     }
 
@@ -680,6 +684,23 @@ final class AgentStallGuard {
         if (!emergencyWater) attempts += water.attempts() - waterAttempts;
         waterAttempts = water.attempts();
         if (result == AgentWaterEscape.Result.LANDED) {
+            if (supplyFloodRetreat != null) {
+                BlockPos landed = client.player.getBlockPos();
+                var remaining = supplyFloodRetreat.afterDryLanding(landed);
+                if (remaining != null) {
+                    supplyFloodRetreat = remaining;
+                    water.startReturn(remaining.walked());
+                    waterAttempts = 0;
+                    waterBlockedReported = false;
+                    transition(Phase.WATER, water.status());
+                    return AgentWaterEscape.Result.WORKING;
+                }
+                if (!supplyFloodRetreat.outsideFlood(landed)) {
+                    water.clearEpisode();
+                    transition(Phase.PENDING, "water recovery: dry contact within the recent flood; no older walked exit");
+                    return AgentWaterEscape.Result.INTERRUPTED;
+                }
+            }
             if (!emergencyWater) recoveries++;
             markUseful(client.player.getPos());
             water.clearEpisode();
@@ -1575,6 +1596,7 @@ final class AgentStallGuard {
         resetSituational();
         world = client.world;
         water.clearEpisode();
+        supplyFloodRetreat = null;
         departures.clear();
         triedEdgeSupports.clear();
         edgeStance = null;
@@ -2517,6 +2539,7 @@ final class AgentStallGuard {
             departureRise = null;
             departureTread = null;
         }
+        if (next != Phase.WATER) supplyFloodRetreat = null;
         phase = next;
         if (next == Phase.WATCH) {
             blockedReason = null;

@@ -84,7 +84,10 @@ rechecks the whole jump space before placing a step. It does not dig
 through rock or clear leaves above the height needed for the jump.
 When gathering cobblestone, the player chooses a face close enough to
 collect the drop. If it breaks stone but cannot pick up the drop, it
-must change footing before quarrying another face. It can clear
+changes footing before quarrying another face. Andesite and similar rock
+do not count toward a pickaxe. If a short prospect yields only those
+blocks, the miner tries different ground with uses left on its pick.
+It can clear
 settled gravel from beside the column, not from underneath it, and
 waits for falling material to settle. Under a low ceiling with no open
 exit, it can cut a short passage sideways from stable ground. It checks

@@ -545,12 +545,12 @@ final class AgentReturnableMine {
             }
             if (aim == null) aimCut(nextTread(candidate), candidate);
             body.aim(aim);
-            switch (body.dryCaveSpace(aim)) {
+            switch (cut == 0 ? capSpace() : body.dryCaveSpace(aim)) {
                 case CLEAR -> lowerChoice(candidate, now);
                 case FLUID -> rejectChoice(candidate, now, Face.FLUID);
                 case DARK -> optionFact = Face.DARK;
                 case UNKNOWN -> {
-                    if (cut == 0 && body.renderedAim(aim, 10)) nextCutSample();
+                    if (cut == 0) nextCapSample(candidate, now);
                 }
                 case OBSTRUCTION -> {
                     double reach = player.getEyePos().distanceTo(aim) + 0.04;
@@ -558,7 +558,7 @@ final class AgentReturnableMine {
                     if (face == null || !face.getBlockPos().equals(workCell)
                             || cut == 0 && !witnessedCap(workCell, candidate, face)) {
                         optionFact = Face.OCCLUDED;
-                        if (cut == 0 && body.renderedAim(aim, 10)) nextCutSample();
+                        if (cut == 0) nextCapSample(candidate, now);
                         return;
                     }
                     BlockHitResult contact = body.perceive(aim, reach).orElse(null);
@@ -585,7 +585,7 @@ final class AgentReturnableMine {
                         aim = contactAim;
                     } else {
                         optionFact = Face.OCCLUDED;
-                        if (cut == 0 && body.renderedAim(aim, 10)) nextCutSample();
+                        if (cut == 0) nextCapSample(candidate, now);
                     }
                 }
             }
@@ -1055,18 +1055,30 @@ final class AgentReturnableMine {
             }
             aimCut(to, bearing);
         }
+        BlockHitResult cap = null;
         if (cut == 0 && !drift) {
-            body.aim(aim);
-            switch (body.dryCaveSpace(aim)) {
+            switch (capSpace()) {
                 case CLEAR -> { begin(Phase.FORWARD, now); return; }
-                case DARK -> { if (body.renderedAim(aim, 14)) needLight(host, now); return; }
-                case FLUID -> { fail("visible fluid blocked the cut"); return; }
-                case UNKNOWN -> { if (body.renderedAim(aim, 10)) nextCutSample(); return; }
+                case DARK -> {
+                    body.aim(aim);
+                    if (body.renderedAim(aim, 14)) needLight(host, now);
+                    return;
+                }
+                case FLUID -> {
+                    rejectChoice(bearing, now, Face.FLUID, routeFailure("cut", workCell, "visible fluid"));
+                    return;
+                }
+                case UNKNOWN -> {
+                    body.aim(aim);
+                    nextCapSample(bearing, now);
+                    return;
+                }
                 case OBSTRUCTION -> {
                     double reach = player.getEyePos().distanceTo(aim) + 0.04;
-                    BlockHitResult cap = body.perceive(aim, reach).orElse(null);
+                    cap = body.perceive(aim, reach).orElse(null);
                     if (!witnessedCap(workCell, bearing, cap)) {
-                        if (body.renderedAim(aim, 10)) nextCutSample();
+                        body.aim(aim);
+                        nextCapSample(bearing, now);
                         return;
                     }
                     if (body.dryCaveContact(from) == null ||
@@ -1077,7 +1089,7 @@ final class AgentReturnableMine {
                 }
             }
         }
-        switch (host.clearReturnableLane(from, workCell, bearing, aim, drift)) {
+        switch (host.clearReturnableLane(from, workCell, bearing, aim, drift, cap)) {
             case CLEAR -> {
                 aim = null;
                 if (--cut < 0) {
@@ -1931,13 +1943,28 @@ final class AgentReturnableMine {
     static Vec3d capAim(BlockPos cell, Direction direction, int sample) {
         // A high ray on the far half sees over the retained lip. A flank can
         // reach the same natural face around a grass outline without breaking it.
+        if (sample >= 3) return null;
         double flank = sample == 0 ? 0 : sample == 1 ? 0.34 : -0.34;
         return offset(offset(Vec3d.ofCenter(cell, 0.95), direction, 0.40), direction.rotateYClockwise(), flank);
     }
 
-    private void nextCutSample() {
-        cutSample = (cutSample + 1) % 3;
-        aim = null;
+    private AgentBody.DryRouteSample capSpace() {
+        return capSpace(world, workCell, body.dryRouteClear(aim));
+    }
+
+    static AgentBody.DryRouteSample capSpace(BlockView world, BlockPos cell, AgentBody.DryRouteSample ray) {
+        if (ray != AgentBody.DryRouteSample.CLEAR) return ray;
+        // The high ray can end above a shallow fluid surface in this lit, unoccluded cell.
+        BlockState seen = world.getBlockState(cell);
+        if (!seen.getFluidState().isEmpty()) return AgentBody.DryRouteSample.FLUID;
+        return AgentBody.dryCaveDanger(seen) ? AgentBody.DryRouteSample.OBSTRUCTION : ray;
+    }
+
+    private void nextCapSample(Direction direction, int now) {
+        if (body.dryRouteRaysSpent() || !body.dryRoutePointInView(aim) || !body.renderedAim(aim, 10)) return;
+        aim = capAim(workCell, direction, ++cutSample);
+        if (aim == null) rejectChoice(direction, now, Face.OCCLUDED,
+            "returnable mine refused " + direction + " cap at " + workCell.toShortString() + ": no reachable rendered face");
     }
 
     private BlockPos nextTread(Direction direction) {

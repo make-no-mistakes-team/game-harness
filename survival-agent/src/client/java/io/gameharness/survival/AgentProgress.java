@@ -8833,24 +8833,30 @@ final class AgentProgress {
     }
 
     private Dig clear(BlockPos position, Vec3d point, BlockPos lip) {
-        return clear(position, point, lip, false, null, null, false);
+        return clear(position, point, lip, false, null, null, false, null);
     }
 
-    Dig clearReturnableLane(BlockPos foot, BlockPos position, Direction bearing, Vec3d point, boolean drift) {
-        return clear(position, point, null, true, foot, bearing, drift);
+    Dig clearReturnableLane(BlockPos foot, BlockPos position, Direction bearing, Vec3d point, boolean drift,
+                           BlockHitResult capContact) {
+        return clear(position, point, null, true, foot, bearing, drift, capContact);
     }
 
     Dig clearReturnableHeadroom(BlockPos position, Vec3d point) {
-        return clear(position, point, null, true, null, null, false);
+        return clear(position, point, null, true, null, null, false, null);
     }
 
     private Dig clear(BlockPos position, Vec3d point, BlockPos lip, boolean returnable,
-                      BlockPos foot, Direction bearing, boolean drift) {
+                      BlockPos foot, Direction bearing, boolean drift, BlockHitResult capContact) {
         if (returnable && underMineFootprint(position)) return Dig.BLOCKED;
         if (foot != null && !foot.equals(c.player.getBlockPos())) return Dig.BLOCKED;
-        body.aim(point);
-        double length = c.player.getEyePos().distanceTo(point);
-        BlockHitResult hit = perceive(point, length + 0.18);
+        double length = 0;
+        // The cap probe already admitted this exact face. Let mine contact own the look.
+        BlockHitResult hit = capContact;
+        if (hit == null) {
+            body.aim(point);
+            length = c.player.getEyePos().distanceTo(point);
+            hit = perceive(point, length + 0.18);
+        }
         boolean stair = returnable || nextFoot != null;
         if (hit == null) {
             if (stair && position.equals(witnessedStairCut) && tick - witnessedStairCutTick <= 3

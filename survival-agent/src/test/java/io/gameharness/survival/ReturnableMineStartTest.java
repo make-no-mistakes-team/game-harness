@@ -1,9 +1,11 @@
 package io.gameharness.survival;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.FluidBlock;
 import net.minecraft.block.ShapeContext;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.state.property.Properties;
@@ -71,6 +73,44 @@ final class ReturnableMineStartTest {
             BlockHitResult.createMissed(top(cap).getPos(), Direction.UP, cap)));
         assertFalse(AgentReturnableMine.witnessedCap(cap, EAST,
             new BlockHitResult(top(cap).getPos(), Direction.DOWN, cap, false)));
+    }
+
+    @Test
+    void aHighCapRayCanMissShallowWaterWithoutMakingTheCutDry() {
+        BlockPos cap = RIM.north().down();
+        var terrain = new Terrain(new HashMap<>());
+        var eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Vec3d point = AgentReturnableMine.capAim(cap, Direction.NORTH, 0);
+        terrain.blocks.put(cap, Blocks.WATER.getDefaultState().with(FluidBlock.LEVEL, 5));
+        assertEquals(HitResult.Type.MISS, terrain.ray(eye, point).getType(),
+            "the cap-height ray passes above the visible shallow flow");
+        assertEquals(AgentBody.DryRouteSample.FLUID,
+            AgentReturnableMine.capSpace(terrain, cap, AgentBody.DryRouteSample.CLEAR),
+            "the lit endpoint distinguishes a flooded cut from an occluded or dry cap");
+        assertEquals(AgentBody.DryRouteSample.UNKNOWN,
+            AgentReturnableMine.capSpace(terrain, cap, AgentBody.DryRouteSample.UNKNOWN),
+            "an unseen or occluded endpoint does not expose its block state");
+        terrain.blocks.remove(cap);
+        assertEquals(AgentBody.DryRouteSample.CLEAR,
+            AgentReturnableMine.capSpace(terrain, cap, AgentBody.DryRouteSample.CLEAR));
+    }
+
+    @Test
+    void anOccludedCapUsesEachAimOnceAndThenOffersNoFurtherTarget() {
+        BlockPos cap = RIM.east().down();
+        var terrain = new Terrain(new HashMap<>());
+        terrain.blocks.put(cap.up(), Blocks.STONE.getDefaultState());
+        terrain.blocks.put(cap.up(2), Blocks.STONE.getDefaultState());
+        var eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        var sampled = new HashSet<Vec3d>();
+        for (int sample = 0; sample < 3; sample++) {
+            Vec3d point = AgentReturnableMine.capAim(cap, EAST, sample);
+            assertNotNull(point);
+            assertTrue(sampled.add(point));
+            assertEquals(cap, BlockPos.ofFloored(point));
+            assertFalse(AgentReturnableMine.witnessedCap(cap, EAST, terrain.ray(eye, point)));
+        }
+        assertNull(AgentReturnableMine.capAim(cap, EAST, 3), "do not swing back to a spent sample");
     }
 
     @Test

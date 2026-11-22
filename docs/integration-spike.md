@@ -78,6 +78,9 @@ exit, it can cut a short passage sideways from stable ground. It checks
 the newly exposed floor and headroom before stepping into the opening.
 If a stair is already dark, the player can turn a stick and coal into
 four torches and light its footing before opening the next cave lip.
+If the opening fills with visible water, or no reachable face can be
+found after checking it from the tread, the player tries another
+direction instead of sweeping the pick back and forth over the hole.
 
 Incoming damage interrupts work even when knockback puts the player
 in water. The player can look toward a sound or seek a visible dry

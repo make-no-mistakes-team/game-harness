@@ -2,6 +2,7 @@ package io.gameharness.survival;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.item.Items;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
@@ -215,6 +216,62 @@ final class AgentStallGuardTest {
 
         assertFalse(grade.lookOnly());
         assertNull(exits.riseTread(grade, 60));
+    }
+
+    @Test
+    void onlyADebitedBlockUnderTheExactRaisedFootCanEarnAnotherStep() {
+        var shaft = new AgentStallGuard.ShaftClimb();
+        var base = new BlockPos(0, 55, 0);
+        var raised = base.up();
+        var dirt = Blocks.DIRT.getDefaultState();
+        assertTrue(shaft.begin(base, null, false));
+
+        assertFalse(shaft.landed(raised, base, Blocks.DIRT, dirt, 8, 8), "an inventory no-op is not a receipt");
+        assertFalse(shaft.landed(raised, base.east(), Blocks.DIRT, dirt, 8, 7), "a neighboring top is not contact");
+        assertFalse(shaft.landed(raised, base, Blocks.ANDESITE, dirt, 8, 7), "the placed material must match");
+        assertFalse(shaft.landed(base, base, Blocks.DIRT, dirt, 8, 7), "a bob did not gain ground");
+        assertFalse(shaft.ordinaryFailed(raised, dirt));
+        assertFalse(shaft.begin(raised, dirt, false), "a new incident on the same column is not a fresh first step");
+
+        assertTrue(shaft.landed(raised, base, Blocks.DIRT, dirt, 8, 7));
+        assertFalse(shaft.begin(raised, dirt, true), "ordinary escape must get a turn first");
+        assertFalse(shaft.ordinaryFailed(raised.east(), dirt));
+        assertFalse(shaft.ordinaryFailed(raised, Blocks.STONE.getDefaultState()));
+        assertTrue(shaft.ordinaryFailed(raised, dirt));
+        assertTrue(shaft.begin(raised, dirt, true));
+        assertFalse(shaft.ordinaryFailed(raised.up(), dirt), "starting another jump invalidates the previous receipt");
+    }
+
+    @Test
+    void aShaftRunSpendsAtMostThreeBlocksAndBreakingItsTopCannotResetIt() {
+        var shaft = new AgentStallGuard.ShaftClimb();
+        var base = new BlockPos(0, 55, 0);
+        var andesite = Blocks.ANDESITE.getDefaultState();
+        var foot = base;
+        for (int i = 0; i < 3; i++) {
+            assertTrue(shaft.begin(foot, andesite, i != 0));
+            var above = foot.up();
+            assertTrue(shaft.landed(above, foot, Blocks.ANDESITE, andesite, 48 - i, 47 - i));
+            foot = above;
+            assertTrue(shaft.ordinaryFailed(foot, andesite));
+        }
+        assertFalse(shaft.begin(foot, andesite, true));
+        assertFalse(shaft.begin(foot, andesite, false));
+        shaft.broken(foot.down());
+        assertFalse(shaft.ordinaryFailed(foot, andesite), "replacing the broken support does not restore the receipt");
+        assertFalse(shaft.begin(foot, andesite, false));
+    }
+
+    @Test
+    void temporaryStepsPreferDisposableFullBlocksOverPickOrFurnaceMaterial() {
+        int reusable = AgentStallGuard.stepMaterialPriority(Items.COBBLESTONE);
+        assertTrue(reusable > 0);
+        assertEquals(reusable, AgentStallGuard.stepMaterialPriority(Items.COBBLED_DEEPSLATE));
+        for (var fill : new net.minecraft.item.Item[]{Items.ANDESITE, Items.DIORITE, Items.GRANITE, Items.TUFF, Items.DIRT})
+            assertTrue(AgentStallGuard.stepMaterialPriority(fill) > reusable);
+        for (var unsafe : new net.minecraft.item.Item[]{Items.GRAVEL, Items.SAND, Items.TUFF_SLAB, Items.TORCH,
+                Items.FURNACE, Items.WATER_BUCKET})
+            assertEquals(0, AgentStallGuard.stepMaterialPriority(unsafe));
     }
 
     private static AgentBody.OrdinaryGrade riseFromTop(BlockPos from, Direction direction, BlockState surface,

@@ -3157,6 +3157,15 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return hazards.lavaNear(client.player.getBoundingBox(), 0.65, tick);
     }
 
+    boolean temporaryStepFluidNear(Box sweep) {
+        return lavaEmergency || hazards.fluidNear(sweep.expand(0, 0.35, 0), 0.36, tick);
+    }
+
+    /** Veto only the physical volume of an already rendered temporary jump, never discover a target. */
+    boolean temporaryStepSweepClear(Box sweep) {
+        return !temporaryStepFluidNear(sweep) && dryGradeVolume(sweep) && client.world.isSpaceEmpty(client.player, sweep);
+    }
+
     boolean keysNeutral() {
         var keys = client.options;
         return !keys.forwardKey.isPressed() && !keys.backKey.isPressed() && !keys.leftKey.isPressed()

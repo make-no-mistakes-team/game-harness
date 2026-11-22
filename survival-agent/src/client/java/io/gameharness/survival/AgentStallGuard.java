@@ -18,6 +18,7 @@ import net.minecraft.client.gui.screen.ingame.FurnaceScreen;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.FallingBlockEntity;
+import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
@@ -57,6 +58,7 @@ final class AgentStallGuard {
     private static final int MAX_CUTS = 2;
     private static final int STEP_TICKS = 85;
     private static final int STEP_SETTLE_TICKS = 40;
+    private static final int SHAFT_MAX_RISE = 3, SHAFT_MAX_ATTEMPTS = 3;
     private static final int EDGE_STANCE_TICKS = 52;
     private static final int BLOCKED_RECHECK_TICKS = 43; // Stagger the rendered sampler's four interleaved phases.
     private static final int CHANGED_SUPPORT_TICKS = 3;
@@ -76,8 +78,9 @@ final class AgentStallGuard {
     private static final double STEP_CENTER = 0.14;
     private static final double STEP_CLEARANCE = 3.08; // 1.25-block jump plus 1.8-block standing height and margin.
     private static final Predicate<ItemStack> TORCH = s -> s.isOf(Items.TORCH);
-    private static final Predicate<ItemStack> STEP = s -> s.isOf(Items.COBBLESTONE) || s.isOf(Items.COBBLED_DEEPSLATE)
-        || s.isOf(Items.DIRT);
+    private static final Predicate<ItemStack> STEP_FILL = s -> stepMaterialPriority(s.getItem()) == 3;
+    private static final Predicate<ItemStack> STEP_DIRT = s -> stepMaterialPriority(s.getItem()) == 2;
+    private static final Predicate<ItemStack> STEP_REUSABLE = s -> stepMaterialPriority(s.getItem()) == 1;
 
     private enum Phase { WATCH, PENDING, WATER, SCOUT, BACKTRACK, WALK, LIGHT, CUT, STEP, SETTLE, RETRY,
                          ASSESS, DEPART, PASSAGE, ALTERNATIVE, BLOCKED }
@@ -90,6 +93,73 @@ final class AgentStallGuard {
 
     // A vanilla-foot-contact receipt on the exact level segment, not a terrain lookup at a remembered coordinate.
     private record FlatCrossing(BlockPos previous, BlockPos next, Vec3d previousFoot, Vec3d crossing, int tick) {}
+
+    /** A run attaches to physical footing, not an incident number or a jump intention. */
+    static final class ShaftClimb {
+        private BlockPos origin, takeoff;
+        private BlockState placedTop;
+        private int attempts;
+        private boolean ordinaryFailed;
+
+        boolean canStart(BlockPos foot) {
+            return origin == null || origin.getX() != foot.getX() || origin.getZ() != foot.getZ();
+        }
+
+        boolean readyOn(BlockPos foot) {
+            return ordinaryFailed && onRaisedFoot(foot);
+        }
+
+        boolean canContinue(BlockPos foot, BlockState support) {
+            return readyOn(foot) && placedTop == support && attempts < SHAFT_MAX_ATTEMPTS
+                && foot.getY() - origin.getY() < SHAFT_MAX_RISE;
+        }
+
+        boolean begin(BlockPos foot, BlockState support, boolean continuation) {
+            if (continuation ? !canContinue(foot, support) : !canStart(foot)) return false;
+            if (!continuation) {
+                origin = foot.toImmutable();
+                attempts = 0;
+            }
+            takeoff = foot.toImmutable();
+            attempts++;
+            ordinaryAdvanced();
+            placedTop = null;
+            return true;
+        }
+
+        boolean landed(BlockPos foot, BlockPos contact, Block material, BlockState top, int before, int after) {
+            if (takeoff == null || placedTop != null || !takeoff.equals(contact) || !foot.down().equals(takeoff)
+                    || !top.isOf(material) || before <= 0 || after != before - 1) return false;
+            placedTop = top;
+            return true;
+        }
+
+        boolean ordinaryFailed(BlockPos foot, BlockState support) {
+            if (!onRaisedFoot(foot) || placedTop != support) return false;
+            ordinaryFailed = true;
+            return true;
+        }
+
+        boolean onRaisedFoot(BlockPos foot) {
+            return placedTop != null && foot.getX() == takeoff.getX() && foot.getZ() == takeoff.getZ()
+                && foot.getY() == takeoff.getY() + 1;
+        }
+
+        void broken(BlockPos cell) {
+            if (cell.equals(takeoff)) {
+                placedTop = null;
+                ordinaryAdvanced();
+            }
+        }
+
+        void ordinaryAdvanced() { ordinaryFailed = false; }
+
+        void clear() {
+            origin = takeoff = null;
+            placedTop = null;
+            ordinaryAdvanced();
+        }
+    }
 
     /** Keep recently spent exits across handbacks; a changed camera angle is not a changed lane. */
     static final class Departures {
@@ -181,6 +251,7 @@ final class AgentStallGuard {
     private final BlockPos[] stairLights = new BlockPos[16];
     private final BlockPos[] route = new BlockPos[4];
     private final Departures departures = new Departures();
+    private final ShaftClimb shaftClimb = new ShaftClimb();
     private final BlockPos[] departurePath = new BlockPos[DEPARTURE_LENGTH];
     private final BlockState[] departureSupports = new BlockState[DEPARTURE_LENGTH];
     private final Vec3d[] travelCredits = new Vec3d[16];
@@ -241,6 +312,10 @@ final class AgentStallGuard {
     private Block stepBlock;
     private BlockState stepBase;
     private Vec3d stepAim;
+    private Box stepSweep;
+    private boolean shaftContinuation;
+    private final Predicate<ItemStack> placedStepItem =
+        s -> s.getItem() instanceof BlockItem item && item.getBlock() == stepBlock;
     private BlockPos settlingSupport;
     private int settlingAge;
     private boolean settledSupport;
@@ -336,7 +411,7 @@ final class AgentStallGuard {
 
     void mineDepartureRefused(String reason) {
         if (phase == Phase.WATCH) skillBlocked(reason);
-        else {
+        else if (phase != Phase.RETRY || !assessShaftRetry(reason)) {
             blockedReason = reason;
             assessAgain(reason);
         }
@@ -400,6 +475,7 @@ final class AgentStallGuard {
     void broken(BlockPos position, BlockState state) {
         water.broken(position, state);
         departures.changed(position);
+        shaftClimb.broken(position);
         if (lowCeilingFoot != null && (position.equals(lowCeilingFoot.up(2)) || position.equals(lowCeilingFoot.up(3))))
             lowCeilingFoot = null;
         if ((phase == Phase.ASSESS || phase == Phase.BLOCKED) && surveyFoot != null
@@ -722,7 +798,7 @@ final class AgentStallGuard {
     void priorityAim() {
         priorityAim = true;
         clearAngles();
-        if (phase == Phase.STEP && (stepStage == StepStage.JUMP || stepStage == StepStage.LAND))
+        if (phase == Phase.STEP && (shaftContinuation || stepStage == StepStage.JUMP || stepStage == StepStage.LAND))
             interruptStep("safety behavior interrupted the temporary jump or placement");
         else if (phase == Phase.DEPART && departureRise != null)
             transition(Phase.ASSESS, "safety behavior interrupted the witnessed rise; waiting for dry contact");
@@ -780,6 +856,7 @@ final class AgentStallGuard {
         } else if (phase == Phase.PENDING) {
             explicitRefusal = true;
         } else if (phase == Phase.RETRY) {
+            if (assessShaftRetry("ordinary play refused on the raised footing: " + reason)) return;
             if (blockedReason != null) {
                 replanOnAssessment = true;
                 assessAgain("ordinary replan refused: " + reason);
@@ -923,7 +1000,7 @@ final class AgentStallGuard {
             if (tick - leg.tick() > SITUATION_RETURN_AGE) break;
             if (!leg.next().equals(foot) || !departures.canCross(foot, leg.previous())
                     || target != null && !target.equals(leg.previous())
-                    || failedRecoveryFooting.contains(leg.previous())
+                    || failedRecoveryFooting != null && failedRecoveryFooting.contains(leg.previous())
                     || !foot.equals(adviceFoot) && leg.previous().equals(adviceFoot)) continue;
             return AgentDryLanding.bearing(foot, leg.previous());
         }
@@ -1077,22 +1154,26 @@ final class AgentStallGuard {
                 replan.run();
             }
             if ((phase == Phase.ASSESS || phase == Phase.BLOCKED) && settleEdgeStance(replan)) return true;
-            return assessAlternative(chooseAlternative, workAlternative, releaseAlternative);
+            return assessAlternative(chooseAlternative, workAlternative, releaseAlternative, mineRetryLease);
         }
         if (phase == Phase.RETRY && blockedReason != null) {
             if (retryWindowOpen(tick - entered, true, mineRetryLease)
                     || verifiedMining(entered) || verifiedFurnace()) return false;
+            if (assessShaftRetry("ordinary replan made no settled progress from the raised footing")) return true;
             replan.run();
             assessAgain("ordinary replan did not produce settled progress");
             return true;
         }
-        if (tick - incidentTick >= INCIDENT_TICKS) {
+        boolean raisedHandback = phase == Phase.RETRY && shaftClimb.onRaisedFoot(client.player.getBlockPos());
+        if (tick - incidentTick >= INCIDENT_TICKS && !raisedHandback
+                && !((phase == Phase.STEP || phase == Phase.SETTLE) && shaftContinuation)) {
             fail("incident deadline reached in " + report.phase() + " (" + report.detail() + ")");
             return true;
         }
         if (phase == Phase.RETRY) {
             if (retryWindowOpen(tick - entered, false, mineRetryLease)
                     || verifiedMining(entered) || verifiedFurnace()) return false;
+            if (assessShaftRetry("ordinary play made no settled progress from the raised footing")) return true;
             if (mineHandedBack) {
                 fail("ordinary miner handback made no settled progress (" + report.detail() + ")");
                 return true;
@@ -1113,8 +1194,7 @@ final class AgentStallGuard {
         if (recoveryYaw >= RECOVERY_TURN_LIMIT
                 && (phase == Phase.SCOUT || phase == Phase.BACKTRACK || phase == Phase.CUT)) {
             String reason = "bounded recovery turn budget exhausted (" + Math.round(recoveryYaw) + "deg)";
-            if (stepTried || !dryGround() || hands.count(STEP) == 0) fail(reason + "; no safe step available");
-            else startStep(reason + "; checking a temporary step without another sweep");
+            startStep(reason + "; checking a temporary step without another sweep");
             return true;
         }
         switch (phase) {
@@ -1157,7 +1237,8 @@ final class AgentStallGuard {
         return true;
     }
 
-    private boolean assessAlternative(Supplier<String> choose, Supplier<Alternative> work, Runnable release) {
+    private boolean assessAlternative(Supplier<String> choose, Supplier<Alternative> work, Runnable release,
+                                      boolean mineRetryLease) {
         if (phase == Phase.DEPART) {
             depart();
             return true;
@@ -1206,7 +1287,8 @@ final class AgentStallGuard {
         if (surveySector >= 4) {
             Direction facing = client.player.getHorizontalFacing();
             rememberPassage(facing);
-            if (offerAlternative(choose) || offerDeparture(facing) || offerRiseDeparture() || offerPassage()) return true;
+            if (offerAlternative(choose) || offerDeparture(facing) || offerShaftReturn(facing)
+                    || offerRiseDeparture() || offerPassage() || !mineRetryLease && offerShaftStep(foot)) return true;
             idleAtAssessment(true, "no distinct witnessed work or safe departure");
             return true;
         }
@@ -1255,6 +1337,7 @@ final class AgentStallGuard {
                 beginDeparture(surveyBearing, length);
                 return;
             }
+            if (offerShaftReturn(surveyBearing)) return;
         }
         if (surveyViews >= DEPARTURE_VIEWS || tick - surveySince >= DEPARTURE_LOOK_TICKS) {
             surveySector++;
@@ -1264,6 +1347,14 @@ final class AgentStallGuard {
 
     private boolean offerDeparture(Direction direction) {
         int length = visibleDeparture(direction);
+        if (length == 0) return false;
+        beginDeparture(direction, length);
+        return true;
+    }
+
+    private boolean offerShaftReturn(Direction direction) {
+        if (!shaftClimb.readyOn(surveyFoot) || recentReturn(surveyFoot) != direction) return false;
+        int length = visibleDeparture(direction, true);
         if (length == 0) return false;
         beginDeparture(direction, length);
         return true;
@@ -1598,6 +1689,7 @@ final class AgentStallGuard {
         water.clearEpisode();
         supplyFloodRetreat = null;
         departures.clear();
+        shaftClimb.clear();
         triedEdgeSupports.clear();
         edgeStance = null;
         surveyFoot = null;
@@ -1688,8 +1780,7 @@ final class AgentStallGuard {
     }
 
     private static boolean taskItem(Item item) {
-        return item != Items.DIRT && item != Items.COBBLESTONE && item != Items.COBBLED_DEEPSLATE
-            && item != Items.TUFF && item != Items.STONE && item != Items.GRASS_BLOCK && item != Items.ROOTED_DIRT
+        return stepMaterialPriority(item) == 0 && item != Items.STONE && item != Items.GRASS_BLOCK && item != Items.ROOTED_DIRT
             && item != Items.STICK && !item.getRegistryEntry().isIn(ItemTags.LEAVES);
     }
 
@@ -2212,6 +2303,43 @@ final class AgentStallGuard {
             || state.isOf(Blocks.STONE) || state.isOf(Blocks.DEEPSLATE) || state.isOf(Blocks.TUFF);
     }
 
+    static int stepMaterialPriority(Item item) {
+        if (item == Items.ANDESITE || item == Items.DIORITE || item == Items.GRANITE || item == Items.TUFF) return 3;
+        if (item == Items.DIRT) return 2;
+        return item == Items.COBBLESTONE || item == Items.COBBLED_DEEPSLATE ? 1 : 0;
+    }
+
+    private Predicate<ItemStack> stepMaterial() {
+        if (hands.count(STEP_FILL) > 0) return STEP_FILL;
+        if (hands.count(STEP_DIRT) > 0) return STEP_DIRT;
+        return hands.count(STEP_REUSABLE) > 0 ? STEP_REUSABLE : null;
+    }
+
+    private boolean assessShaftRetry(String reason) {
+        BlockPos foot = client.player.getBlockPos();
+        if (!shaftClimb.onRaisedFoot(foot) || !safeDryContact()
+                || !shaftClimb.ordinaryFailed(foot, body.dryCaveContact(foot))) return false;
+        // Proofs from the lower takeoff (or from before the ordinary retry) cannot license this step.
+        departures.revisit(foot);
+        surveyFoot = null;
+        blockedReason = reason;
+        replanOnAssessment = true;
+        recordRecoveryFailure(reason);
+        assessAgain(reason);
+        return true;
+    }
+
+    private boolean offerShaftStep(BlockPos foot) {
+        if (!shaftClimb.readyOn(foot) || foot.equals(navigationLowCeiling) || !stepPoseAllowed()
+                || !departures.canCross(foot, foot.up())) return false;
+        BlockState support = body.dryCaveContact(foot);
+        if (!shaftClimb.canContinue(foot, support) || stepMaterial() == null) return false;
+        Box sweep = stepSweep(foot);
+        if (body.temporaryStepFluidNear(sweep) || !shaftClimb.begin(foot, support, true)) return false;
+        beginStep(foot, sweep, true, "checking for a useful next rise from confirmed temporary footing");
+        return true;
+    }
+
     private void startStep(String description) {
         BlockPos footing = client.player.getBlockPos();
         if (footing.equals(navigationLowCeiling)) {
@@ -2224,19 +2352,47 @@ final class AgentStallGuard {
             fail("the temporary step on this footing was already refused");
             return;
         }
-        if (stepTried || !dryGround() || hands.count(STEP) == 0) {
-            fail("no verified alternate stance, safe obstruction or usable step material at " + from.toShortString());
+        if (stepTried || !shaftClimb.canStart(footing)) {
+            fail("temporary step already spent on this recovery or column at " + footing.toShortString());
             return;
         }
+        Box sweep = stepSweep(footing);
+        if (!safeDryContact() || !stepPoseAllowed() || body.temporaryStepFluidNear(sweep)) {
+            fail("no safe dry posture for a temporary step at " + footing.toShortString());
+            return;
+        }
+        if (stepMaterial() == null) {
+            fail("no verified alternate stance, safe obstruction or usable step material at " + footing.toShortString());
+            return;
+        }
+        if (shaftClimb.begin(footing, null, false)) beginStep(footing, sweep, false, description);
+    }
+
+    private void beginStep(BlockPos footing, Box sweep, boolean continuation, String description) {
         stepTried = true;
         stepLeafHeight = 0;
-        from = client.player.getBlockPos().toImmutable();
+        from = footing.toImmutable();
+        shaftContinuation = continuation;
+        stepSweep = sweep;
         stepStage = StepStage.CENTER;
         stepAim = null;
         stepSince = tick;
         stepHealth = client.player.getHealth();
         attempts++;
         transition(Phase.STEP, description);
+    }
+
+    private Box stepSweep(BlockPos foot) {
+        double edge = client.player.getWidth() * 0.5 + STEP_CENTER + 0.01;
+        Vec3d center = Vec3d.ofBottomCenter(foot);
+        return new Box(center.x - edge, center.y + 1e-5, center.z - edge,
+            center.x + edge, center.y + STEP_CLEARANCE, center.z + edge);
+    }
+
+    private boolean stepPoseAllowed() {
+        var player = client.player;
+        return !player.isClimbing() && !player.isUsingItem() && !player.getAbilities().flying
+            && !player.hasStatusEffect(StatusEffects.JUMP_BOOST) && !player.hasStatusEffect(StatusEffects.SLOW_FALLING);
     }
 
     private void step() {
@@ -2273,7 +2429,7 @@ final class AgentStallGuard {
             Vec3d overhead = Vec3d.ofBottomCenter(from).add(0, STEP_CLEARANCE, 0);
             double edge = player.getWidth() * 0.5 + STEP_CENTER + 0.01;
             body.turnFixed(player.getYaw(), -89);
-            if (player.getPitch() > -86) return;
+            if (player.getPitch() > -86 || !body.renderedDirection(player.getYaw(), -89, 4)) return;
             Vec3d eye = player.getEyePos();
             BlockHitResult lowCeiling = body.terrain(overhead, eye.distanceTo(overhead)).orElse(null);
             if (lowCeiling != null && lowCeiling.getSide() == Direction.DOWN
@@ -2281,7 +2437,7 @@ final class AgentStallGuard {
                     && lowCeiling.getPos().y < overhead.y - 0.05
                     && client.world.getBlockState(lowCeiling.getBlockPos()).getFluidState().isEmpty()) {
                 int height = lowCeiling.getBlockPos().getY() - from.getY();
-                if (height > stepLeafHeight && !contains(footprints, lowCeiling.getBlockPos().up())
+                if (!shaftContinuation && height > stepLeafHeight && !contains(footprints, lowCeiling.getBlockPos().up())
                         && body.beginStepLeaf(lowCeiling, protectedBlock)) {
                     stepLeafHeight = height;
                     stepStage = StepStage.CLEAR_LEAF;
@@ -2289,7 +2445,7 @@ final class AgentStallGuard {
                     return;
                 }
                 lowCeilingFoot = from;
-                String handback = mineHandback.apply(from);
+                String handback = shaftContinuation ? null : mineHandback.apply(from);
                 if (handback == null) failStep("visible ceiling blocks the temporary step");
                 else {
                     departures.reject(from, from.up());
@@ -2299,11 +2455,13 @@ final class AgentStallGuard {
                 }
                 return;
             }
-            if (!body.clearTerrain(overhead) || !body.clearTerrain(overhead.add(-edge, 0, -edge))
-                    || !body.clearTerrain(overhead.add(-edge, 0, edge))
-                    || !body.clearTerrain(overhead.add(edge, 0, -edge))
-                    || !body.clearTerrain(overhead.add(edge, 0, edge)))
+            if (!clearStepCrossSection(overhead, edge)) return;
+            if (shaftContinuation && !clearStepCrossSection(overhead.add(0, 1, 0), edge) && !higherShaftOpening())
+                return; // A jump-size hole alone is not evidence that the next rise gets anywhere.
+            if (!body.temporaryStepSweepClear(stepSweep)) {
+                failStep("the rendered jump does not have a dry physical sweep");
                 return;
+            }
             stepStage = StepStage.SUPPORT;
             transition(Phase.STEP, "jump clearance verified; lining up the current support");
         }
@@ -2320,7 +2478,9 @@ final class AgentStallGuard {
                 startTorchBypass();
                 return;
             }
-            if (!hands.equipForUse(STEP) || !(player.getMainHandStack().getItem() instanceof BlockItem item)) return;
+            Predicate<ItemStack> material = stepMaterial();
+            if (material == null || !hands.equipForUse(material)
+                    || !(player.getMainHandStack().getItem() instanceof BlockItem item)) return;
             BlockHitResult seen = stepTop(support, selected);
             if (seen == null) return;
             BlockState state = client.world.getBlockState(seen.getBlockPos());
@@ -2329,10 +2489,17 @@ final class AgentStallGuard {
                 return;
             }
             if (player.isSneaking() || player.getVelocity().horizontalLengthSquared() > 0.000144) return;
+            BlockState fill = item.getBlock().getDefaultState();
+            if (DRY_DANGER.test(fill) || !Block.isShapeFullCube(fill.getCollisionShape(client.world, from))
+                    || !standingOn(from) || !client.world.getBlockState(from).isReplaceable()
+                    || !body.temporaryStepSweepClear(stepSweep)) {
+                failStep("the block or its placement column no longer fits the verified jump");
+                return;
+            }
             stepBase = state;
             stepBlock = item.getBlock();
             stepAim = seen.getPos();
-            itemBefore = hands.count(STEP);
+            itemBefore = hands.count(placedStepItem);
             stepStage = StepStage.JUMP;
             transition(Phase.STEP, "jumping once above the verified support");
             body.jump();
@@ -2341,8 +2508,8 @@ final class AgentStallGuard {
         if (stepStage == StepStage.LAND && dryGround()
                 && from.up().equals(feetCell) && Math.abs(feet.y - from.getY() - 1) < 0.01) {
             BlockHitResult seen = stepTop(from, body.selectedFace());
-            if (seen != null && client.world.getBlockState(seen.getBlockPos()).isOf(stepBlock)
-                    && hands.count(STEP) < itemBefore) {
+            if (seen != null && shaftClimb.landed(feetCell, quietSupport(), stepBlock,
+                    client.world.getBlockState(seen.getBlockPos()), itemBefore, hands.count(placedStepItem))) {
                 reached.accept(feetCell);
                 retry("stood on confirmed temporary step; requiring ordinary-play progress");
             }
@@ -2355,11 +2522,33 @@ final class AgentStallGuard {
                 && player.getMainHandStack().getItem() instanceof BlockItem item && item.getBlock() == stepBlock) {
             BlockHitResult seen = stepTop(support, body.selectedFace());
             if (stepStage == StepStage.JUMP && seen != null && client.world.getBlockState(support) == stepBase
+                    && client.world.getBlockState(from).isReplaceable() && body.temporaryStepSweepClear(stepSweep)
                     && body.useContact(seen, AgentBody.Contact.LEAP_PLACE)) {
                 stepStage = StepStage.LAND;
                 transition(Phase.STEP, "placing one block beneath the airborne feet");
             }
         }
+    }
+
+    private boolean clearStepCrossSection(Vec3d center, double edge) {
+        return clearStepPoint(center) && clearStepPoint(center.add(-edge, 0, -edge))
+            && clearStepPoint(center.add(-edge, 0, edge)) && clearStepPoint(center.add(edge, 0, -edge))
+            && clearStepPoint(center.add(edge, 0, edge));
+    }
+
+    private boolean clearStepPoint(Vec3d point) {
+        return body.dryCaveSpace(point) == AgentBody.DryRouteSample.CLEAR;
+    }
+
+    private boolean higherShaftOpening() {
+        // This is a cue for the vertical gain, not permission to walk onto an unseen floor.
+        for (Direction direction : Direction.Type.HORIZONTAL) {
+            double x = direction.getOffsetX(), z = direction.getOffsetZ();
+            Vec3d opening = Vec3d.ofBottomCenter(from).add(x * 0.78, 3.45, z * 0.78);
+            if (clearStepPoint(opening.add(-z * 0.23, 0, x * 0.23))
+                    && clearStepPoint(opening.add(z * 0.23, -0.72, -x * 0.23))) return true;
+        }
+        return false;
     }
 
     private boolean floorTorch(BlockHitResult selected) {
@@ -2413,6 +2602,7 @@ final class AgentStallGuard {
         var player = client.player;
         boolean launched = stepStage == StepStage.JUMP || stepStage == StepStage.LAND;
         if (player.isTouchingWater() || player.isInLava() || player.hasVehicle() || feet.y < from.getY() - 0.04
+                || !stepPoseAllowed() || body.temporaryStepFluidNear(stepSweep)
                 || !from.equals(cell) && !(launched && from.up().equals(cell))
                 || !launched && !dryGround()
                 || stepStage != StepStage.CENTER && (!stepCentered(feet)
@@ -2428,6 +2618,7 @@ final class AgentStallGuard {
 
     private void interruptStep(String reason) {
         // Body.begin releases old jump/use intentions each tick; never issue another one for this column.
+        departures.reject(from, from.up());
         stepStage = null;
         stepBlock = null;
         stepBase = null;
@@ -2543,6 +2734,7 @@ final class AgentStallGuard {
         phase = next;
         if (next == Phase.WATCH) {
             blockedReason = null;
+            shaftClimb.ordinaryAdvanced();
             if (situation != null) situation.withdraw();
         }
         entered = tick;

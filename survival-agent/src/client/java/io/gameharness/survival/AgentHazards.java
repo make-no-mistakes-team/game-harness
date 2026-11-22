@@ -104,8 +104,16 @@ final class AgentHazards {
     }
 
     boolean lavaNear(Box body, double margin, int tick) {
+        return fluidNear(body, margin, tick, LAVA);
+    }
+
+    boolean fluidNear(Box body, double margin, int tick) {
+        return fluidNear(body, margin, tick, LAVA | WATER);
+    }
+
+    private boolean fluidNear(Box body, double margin, int tick, int kindsMask) {
         for (int i = 0; i < size; i++) {
-            if ((kinds[i] & LAVA) == 0 || tick - seen[i] > AGE) continue;
+            if ((kinds[i] & kindsMask) == 0 || tick - seen[i] > AGE) continue;
             BlockPos pos = hits[i].getBlockPos();
             if (pos.getY() + 1 > body.minY && pos.getY() < body.maxY
                     && pos.getX() + 1 + margin > body.minX && pos.getX() - margin < body.maxX

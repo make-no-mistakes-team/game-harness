@@ -358,6 +358,7 @@ final class AgentProgress {
     private boolean timberReady;
     private boolean departureKit;
     private boolean ordinarySurfaceWork;
+    private boolean ordinaryCaveDrops;
     private BlockHitResult timberWitness;
     private final Predicate<BlockHitResult> reachableTrunk = hit -> timberCandidate(hit) && timberInReach(hit);
     private BlockPos timberLastCut;
@@ -529,7 +530,9 @@ final class AgentProgress {
         stallGuard = new AgentStallGuard(c, body, hands, tools, this::protectRecoveryBlock, this::safeSupport,
             this::recordStallFooting, this::tryStallMineHandback);
         overland = new AgentOverlandSearch(c, body, AgentProgress::dangerous);
-        caves = new AgentCaves(c, body, hands, tools, this::recordCaveFooting, this::recordDryCaveFooting);
+        caves = new AgentCaves(c, body, hands, tools, this::recordCaveFooting, this::recordDryCaveFooting,
+            this::detachMine, this::recordOneWayCaveLanding, this::knownCaveReturn,
+            this::permitsOneWayCaveDrop, this::returnableFootholdProtected);
         returnableMine = new AgentReturnableMine(c, body);
         fall = new AgentFall(c, body, hands);
         defense = new AgentDefense(c, body, hands);
@@ -566,6 +569,7 @@ final class AgentProgress {
 
     void observeMemoryFooting(long observedTick) {
         caves.observeDryContact(observedTick);
+        if (caves.unverifiedDropInFlight()) return;
         boolean grounded = c.player.isOnGround() && !c.player.isTouchingWater();
         BlockPos standing = c.player.getBlockPos();
         boolean centered = Math.abs(c.player.getX() - standing.getX() - 0.5) <= 0.3
@@ -746,6 +750,43 @@ final class AgentProgress {
         appendGrounded(reached, false);
     }
 
+    private void recordOneWayCaveLanding(AgentDryLanding landing) {
+        // The old trail was detached at takeoff. The receipt is a new grounded
+        // starting point only, not a returnable stair, route edge, or recovery lease.
+        recordCaveFooting(landing.to());
+        digDirection = landing.bearing();
+        branchTurns = failedDirections = legLength = stairLength = deadEnds = litIndex = 0;
+        nextFoot = cavePeek = null;
+        closedDig.clear();
+    }
+
+    private boolean permitsOneWayCaveDrop(int height) {
+        if (!ordinaryCaveDrops || returnIndex >= 0 || resumeIndex >= 0 || exitStart != null || oreProbeReturning
+                || supplyEgress.active() || firing != Firing.NONE || pendingFurnaceMemory.current() != null)
+            return false;
+        if (!c.options.attackKey.isUnbound()
+                && AgentDryLanding.escapeKit(height, pickUses(stack -> stack.isIn(ItemTags.PICKAXES)), 0)) return true;
+        return !c.options.useKey.isUnbound() && !c.options.jumpKey.isUnbound()
+            && AgentDryLanding.escapeKit(height, 0, hands.count(BUILDING));
+    }
+
+    private boolean knownCaveReturn(BlockPos from, BlockPos lower) {
+        int end = activeTrail() - 1;
+        if (end < 2 || !from.equals(trail.get(end)) || returnIndex >= 0) return false;
+        // Require a local chain of independently walked treads, not an inverse
+        // inferred from this drop, a route through water, or a nearby position.
+        BlockPos upper = from;
+        for (int i = end - 1; i >= Math.max(0, end - 8); --i) {
+            BlockPos prior = trail.get(i);
+            Direction back = AgentDryLanding.bearing(upper, prior);
+            if (back == null || !body.walkedLaneDry(upper, prior, back)
+                    || !AgentSurfaceTread.retainedLaneClear(c, upper, prior, back)) return false;
+            if (prior.equals(lower)) return true;
+            upper = prior;
+        }
+        return false;
+    }
+
     private void selectCaveGoal() {
         caveLava = lavaProspecting;
         caveGoal = sought == Resource.DIAMOND || sought == Resource.IRON || sought == Resource.COAL ? sought
@@ -848,6 +889,7 @@ final class AgentProgress {
         if (win || c.player == null || c.world == null) return;
         tick++;
         ordinarySurfaceWork = macro == null || !macro.engaged();
+        ordinaryCaveDrops = macro == null;
         observeStairLight();
         if (ordinarySurfaceWork) {
             restoreLocalFurnace();
@@ -914,7 +956,7 @@ final class AgentProgress {
             interruptHands();
         }
         int priorLandings = fall.waterSuccesses() + fall.boatSuccesses();
-        if (fall.step(safetySpend)) {
+        if (!caves.controlsShortFall(tick) && fall.step(safetySpend)) {
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.SOURCE_UNGROUNDED);
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
@@ -1029,6 +1071,11 @@ final class AgentProgress {
             status = stallGuard.status();
             return;
         }
+        if (caves.drivingShallowDrop()) {
+            if (returnableMine.surveyingCave()) workReturnableMine(c.player.getBlockPos(), returnableMine.depth());
+            else surveyCave(null);
+            return;
+        }
         if (stepLocalFurnaceWatch()) return;
         // Keep a declared ordinary leg through vanilla momentum. The inventory/craft stage
         // itself correctly refuses moving footing; it cannot own the continuation here.
@@ -1037,7 +1084,7 @@ final class AgentProgress {
             return;
         }
         if (supplyEgress.step()) return;
-        if (workshopReturn == null && !returnableMine.settling() && !stallGuard.ownsRecovery()
+        if (workshopReturn == null && !returnableMine.settling() && !caves.shallowEntry() && !stallGuard.ownsRecovery()
                 && body.repairHeadroom(tools, protectedHeadroom)) {
             status = body.headroomReport().reason();
             return;
@@ -7073,11 +7120,16 @@ final class AgentProgress {
                 blockedTunnel();
                 return;
             }
+            if (ordinaryCaveDrops && nextFoot.getY() < current.getY()
+                    && !AgentSurfaceTread.retainedLaneClear(c, current, nextFoot, digDirection)) {
+                if (!startMineCaveShelf(current, digDirection, current.getY() - nextFoot.getY())) blockedTunnel();
+                return;
+            }
             nextStepProved = true;
             if (body.beginObservedStep(hit, floor)) rememberMotion();
             else walkDown(false);
         } else if (followObservedShelf(current, direction)) {
-            status = "following a witnessed shelf in the mine";
+            if (!caves.shallowEntry()) status = "following a witnessed shelf in the mine";
         } else if (hit != null && hit.getBlockPos().equals(current.down()) && hit.getSide() == Direction.UP) {
             // Crouch toward the lip on the proven current support to reveal the next one.
             creepToLip();
@@ -7122,6 +7174,15 @@ final class AgentProgress {
 
     boolean startMineCaveSurvey(BlockPos current, Direction bearing) {
         return considerMineCave(current, current.offset(bearing), bearing);
+    }
+
+    boolean startMineCaveShelf(BlockPos source, Direction bearing, int height) {
+        if (!ordinaryCaveDrops || height == 1 && !permitsOneWayCaveDrop(height)) return false;
+        if (!caves.beginShallowEntry(source, bearing, height, tick)) return false;
+        selectCaveGoal();
+        nextFoot = cavePeek = null;
+        status = caves.status();
+        return true;
     }
 
     boolean continueMineCaveSurvey(Direction bearing) {
@@ -7251,6 +7312,7 @@ final class AgentProgress {
             if (!body.clearTerrain(shin.add(0.22 * direction.z, 0, -0.22 * direction.x))
                     || !body.clearTerrain(shin.add(-0.22 * direction.z, 0, 0.22 * direction.x))
                     || body.hazardAhead(yaw(direction), 1.65)) continue;
+            if (drop != 0 && ordinaryCaveDrops) return startMineCaveShelf(current, digDirection, drop);
             nextFoot = foot;
             nextStepProved = true;
             return true;

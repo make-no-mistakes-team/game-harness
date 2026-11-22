@@ -2610,6 +2610,65 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         macroFlatWalk(vantage.goal(), yaw, player.getPitch());
     }
 
+    /** Retain actual stable vanilla contact throughout a short cave look, even while crouching. */
+    BlockState caveLipFooting(BlockPos source) {
+        var player = client.player;
+        if (lavaEmergency || player == null || !source.down().equals(player.supportingBlockPos.orElse(null))
+                || player.isTouchingWater() || player.isInLava() || player.isOnFire() || player.hurtTime != 0
+                || player.hasVehicle() || player.isSprinting() || player.isUsingItem() || player.isClimbing()
+                || player.getAbilities().flying || player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED) > 0.101
+                || client.options.forwardKey.isUnbound() || client.options.sneakKey.isUnbound()
+                || client.options.getAutoJump().getValue()) return null;
+        BlockState contact = dryCaveContact(source);
+        return contact != null && normalDryTraction(contact) ? contact : null;
+    }
+
+    /** Vanilla sneak toward the front of this exact support, never onto a new support. */
+    void driveCaveLip(BlockPos source, Direction bearing) {
+        var player = client.player;
+        double dx = bearing.getOffsetX(), dz = bearing.getOffsetZ();
+        Vec3d feet = player.getPos(), velocity = player.getVelocity();
+        double x = feet.x - source.getX() - 0.5, z = feet.z - source.getZ() - 0.5;
+        double along = x * dx + z * dz, across = x * dz - z * dx;
+        float yaw = heading(dx, dz);
+        sneak();
+        if (!hasView() || !player.isSneaking() || Math.abs(MathHelper.wrapDegrees(player.getYaw() - yaw)) > 2
+                || Math.abs(across) > 0.14 || along >= 0.29
+                || hazardAhead(yaw, 1.65)) return;
+        // Bound the next slow input plus neutral ground coast before the center
+        // could leave the already confirmed support, even with extra sneak speed.
+        double speed = 0.102 * player.getAttributeValue(EntityAttributes.SNEAKING_SPEED);
+        double coast = (Math.max(0, velocity.x * dx + velocity.z * dz) + speed) / (1 - 0.55);
+        if (along + coast > 0.45 || Math.abs(across + (velocity.x * dz - velocity.z * dx) / (1 - 0.55)) > 0.15)
+            return;
+        Box sweep = player.getBoundingBox().offset(0, 0.005, 0).stretch(coast * dx, 0, coast * dz);
+        if (dryGradeVolume(sweep) && client.world.isSpaceEmpty(player, sweep)) walk(false);
+    }
+
+    boolean centerOnCaveLip(BlockPos source, BlockState support) {
+        var player = client.player;
+        BlockPos floor = source.down();
+        if (!hasView() || lavaEmergency || !player.isOnGround() || player.isTouchingWater()
+                || player.isInLava() || player.isOnFire() || player.hurtTime != 0
+                || !floor.equals(player.supportingBlockPos.orElse(null)) || client.world.getBlockState(floor) != support)
+            return false;
+        Vec3d center = Vec3d.ofBottomCenter(source);
+        double dx = center.x - player.getX(), dz = center.z - player.getZ();
+        double distance = Math.hypot(dx, dz);
+        Box sweep = player.getBoundingBox().offset(0, 0.005, 0).stretch(dx, 0, dz);
+        if (distance >= 0.82 || hazardAhead(heading(dx, dz), distance + 0.12)
+                || !dryGradeVolume(sweep) || !client.world.isSpaceEmpty(player, sweep)) return false;
+        centerLanding = center;
+        return true;
+    }
+
+    AgentDryLanding caveDryLanding(BlockPos source, Direction bearing, int drop, BlockState upper, BlockHitResult top) {
+        if (upper == null || !dryLandingControls() || caveLipFooting(source) != upper || top == null
+                || !AgentDryLanding.caveTop(source, bearing, drop, top, client.world.getBlockState(top.getBlockPos())))
+            return null;
+        return dryLandingGeometry(source, upper, client.player.getPos(), top, bearing, false);
+    }
+
     private AgentDryLanding dryLandingFromTop(BlockPos source, BlockState upper, Vec3d from, BlockHitResult top,
                                               Predicate<BlockPos> untried) {
         if (top == null || top.isInsideBlock()) return null;
@@ -2620,17 +2679,24 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             if (source.getY() > to.getY()) dryLandingEvidence = DryLandingEvidence.FALL_BOUND;
             return null;
         }
+        AgentDryLanding landing = dryLandingGeometry(source, upper, from, top, travel, true);
+        if (landing == null) return null;
+        dryLandingEvidence = DryLandingEvidence.PICKUP;
+        if (!macroNoVisiblePickup(landing.center(), to.getY(), source.getY())) return null;
+        dryLandingEvidence = DryLandingEvidence.OFFERED;
+        return landing;
+    }
+
+    private AgentDryLanding dryLandingGeometry(BlockPos source, BlockState upper, Vec3d from, BlockHitResult top,
+                                               Direction travel, boolean reportSweep) {
+        BlockPos floor = top.getBlockPos(), to = floor.up();
         BlockState lower = client.world.getBlockState(floor);
         if (!normalDryTraction(lower) || !stableDryRouteTop(floor, lower) || dryCaveDanger(lower)) return null;
         Vec3d center = Vec3d.ofBottomCenter(to);
         var landing = new AgentDryLanding(source, upper, top, to, lower, travel, from, center,
             heading(center.x - from.x, center.z - from.z));
-        dryLandingEvidence = DryLandingEvidence.SWEEP;
-        if (!dryLandingClear(landing)) return null;
-        dryLandingEvidence = DryLandingEvidence.PICKUP;
-        if (!macroNoVisiblePickup(center, to.getY(), source.getY())) return null;
-        dryLandingEvidence = DryLandingEvidence.OFFERED;
-        return landing;
+        if (reportSweep) dryLandingEvidence = DryLandingEvidence.SWEEP;
+        return dryLandingClear(landing) ? landing : null;
     }
 
     private boolean dryLandingControls() {
@@ -2662,11 +2728,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         // The upper part uses the actual offset source, not a fictitious centered stance.
         // The lower volume is entirely in the receiving column. Whether it is clear
         // can only veto the already-ray-witnessed full landing top.
-        Box lower = new Box(to.getX() + 0.001, to.getY() + 0.001, to.getZ() + 0.001,
-            to.getX() + 0.999, y + player.getHeight() + 0.025, to.getZ() + 0.999);
-        double forwardOverhang = Math.max(0, player.getWidth() * 0.5 - 0.10);
-        lower = lower.stretch(landing.bearing().getOffsetX() * forwardOverhang, 0,
-            landing.bearing().getOffsetZ() * forwardOverhang);
+        Box lower = AgentDryLanding.receivingSweep(to, y, landing.bearing(), player.getWidth(), player.getHeight());
         if (!dryGradeVolume(lower) || !client.world.isSpaceEmpty(player, lower)) return false;
         if (!player.isOnGround() || feet.y < y - 0.055) return true;
         Box upper = player.getBoundingBox().offset(0, 0.005, 0).stretch(x - feet.x, 0, z - feet.z)

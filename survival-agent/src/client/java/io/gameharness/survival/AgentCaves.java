@@ -4,7 +4,9 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.function.BiConsumer;
+import java.util.function.BiPredicate;
 import java.util.function.Consumer;
+import java.util.function.IntPredicate;
 import java.util.function.Predicate;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
@@ -18,6 +20,7 @@ import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -32,6 +35,7 @@ final class AgentCaves {
     private static final Predicate<ItemStack> WATER = stack -> stack.isOf(Items.WATER_BUCKET);
     private static final Predicate<ItemStack> BUCKET = stack -> stack.isOf(Items.BUCKET);
     private static final Predicate<ItemStack> BOAT = stack -> stack.isIn(ItemTags.BOATS);
+    private static final Predicate<ItemStack> COBBLE = stack -> stack.isOf(Items.COBBLESTONE);
     private static final Predicate<ItemStack> BLOCK = stack -> stack.isOf(Items.COBBLESTONE)
         || stack.isOf(Items.COBBLED_DEEPSLATE) || stack.isOf(Items.DIRT) || stack.isIn(ItemTags.PLANKS);
     private static final int FLOOR = 1, SHIN = 2, HEAD = 4, LEFT = 8, RIGHT = 16, RETURN = 32;
@@ -46,15 +50,39 @@ final class AgentCaves {
         BlockPos mouth() { return origin.offset(bearing); }
     }
 
+    private static final class ShallowEntry {
+        final BlockState support;
+        final int height;
+        long peekFrame = -1, placementFrame;
+        BlockHitResult top;
+        AgentDryLanding drop;
+        boolean oneWay, separated;
+        String refusal;
+
+        ShallowEntry(BlockState support, int height) {
+            this.support = support;
+            this.height = height;
+        }
+    }
+
     private final MinecraftClient client;
     private final AgentBody body;
     private final AgentHands hands;
     private final AgentTools tools;
     private final Consumer<BlockPos> traveled;
     private final BiConsumer<BlockPos, BlockPos> traveledDry;
+    private final Consumer<BlockPos> departedOneWay;
+    private final Consumer<AgentDryLanding> landedOneWay;
+    private final BiPredicate<BlockPos, BlockPos> knownDryReturn;
+    private final IntPredicate permitsOneWay;
+    private final Predicate<BlockPos> protectedFoothold;
     private final AgentDryCaveRoute dryRoute;
     private final BlockPos[] quietLips = new BlockPos[8];
     private final int[] quietUntil = new int[quietLips.length];
+    private final Opening[] triedShallowLips = new Opening[8];
+    private final int[] triedShallowHeights = new int[triedShallowLips.length];
+    private int shallowCursor;
+    private ShallowEntry shallow;
     private final BlockPos[] visited = new BlockPos[9];
     private final int[] proof = new int[3];
     private final Set<BlockPos> lightStances = new HashSet<>();
@@ -83,13 +111,21 @@ final class AgentCaves {
     private boolean replayWater;
 
     AgentCaves(MinecraftClient client, AgentBody body, AgentHands hands, AgentTools tools,
-               Consumer<BlockPos> traveled, BiConsumer<BlockPos, BlockPos> traveledDry) {
+               Consumer<BlockPos> traveled, BiConsumer<BlockPos, BlockPos> traveledDry,
+               Consumer<BlockPos> departedOneWay, Consumer<AgentDryLanding> landedOneWay,
+               BiPredicate<BlockPos, BlockPos> knownDryReturn,
+               IntPredicate permitsOneWay, Predicate<BlockPos> protectedFoothold) {
         this.client = client;
         this.body = body;
         this.hands = hands;
         this.tools = tools;
         this.traveled = traveled;
         this.traveledDry = traveledDry;
+        this.departedOneWay = departedOneWay;
+        this.landedOneWay = landedOneWay;
+        this.knownDryReturn = knownDryReturn;
+        this.permitsOneWay = permitsOneWay;
+        this.protectedFoothold = protectedFoothold;
         dryRoute = new AgentDryCaveRoute(client, body, this::reachedDry);
     }
 
@@ -113,8 +149,50 @@ final class AgentCaves {
         lightReceipt = null;
         return confirmed;
     }
-    void observeDryContact(long tick) { dryRoute.contact(tick); }
-    void changedDry(BlockPos changed) { dryRoute.changed(changed); }
+    void observeDryContact(long tick) {
+        if (unverifiedDropInFlight()) observeOneWayDeparture();
+        else dryRoute.contact(tick);
+    }
+
+    private void observeOneWayDeparture() {
+        if (!shallow.oneWay || shallow.separated || (player.isOnGround() && player.getY() >= stance.getY() - 0.055))
+            return;
+        shallow.separated = true;
+        // Fence dormant-route rejoining at the intended landing. Takeoff still
+        // records no new footing; only the later settled contact can do that.
+        departedOneWay.accept(shallow.drop.to());
+    }
+
+    boolean unverifiedDropInFlight() {
+        return drivingShallowDrop() && shallow.oneWay;
+    }
+
+    boolean drivingShallowDrop() {
+        return world == client.world && player == client.player && phase == Phase.DRIVE
+            && shallow != null && shallow.drop != null;
+    }
+
+    /** A generic falling-distance forecast must not interrupt the already checked short coast. */
+    boolean controlsShortFall(int tick) {
+        if (!drivingShallowDrop() || shelfMotorTick + 1 != body.actionTick()
+                || tick - phaseSince >= 30 || player.isOnGround()) return false;
+        var landing = shallow.drop;
+        return body.dryLandingClear(landing)
+            && landing.neutralCoastFits(player.getPos(), player.getVelocity(), player.getWidth() * 0.5);
+    }
+
+    boolean shallowEntry() { return active() && shallow != null; }
+    void changedDry(BlockPos changed) {
+        dryRoute.changed(changed);
+        for (int i = 0; i < triedShallowLips.length; i++) {
+            Opening tried = triedShallowLips[i];
+            if (tried == null) continue;
+            BlockPos mouth = tried.mouth();
+            if (mouth.getX() == changed.getX() && mouth.getZ() == changed.getZ()
+                    && changed.getY() >= mouth.getY() - 3 && changed.getY() <= mouth.getY() + 2)
+                triedShallowLips[i] = null;
+        }
+    }
     void walkedDry(BlockPos from, BlockPos to) { dryRoute.walked(from, to); }
     void witnessedDry(BlockPos from, BlockPos to) { dryRoute.witnessed(from, to); }
     AgentDryCaveRoute.Offer dryRouteOffer() { return dryRoute.offer(); }
@@ -134,8 +212,8 @@ final class AgentCaves {
     boolean dryRouteInFlight(AgentDryCaveRoute.Offer offer) { return dryRoute.inFlight(offer); }
 
     boolean witnessedMineOpening(BlockPos current, Direction bearing) {
-        return aperture(current, current.offset(bearing), bearing)
-            || body.clearTerrain(Vec3d.ofCenter(current.offset(bearing, 2).up()));
+        return !triedShallow(current, bearing) && (aperture(current, current.offset(bearing), bearing)
+            || body.clearTerrain(Vec3d.ofCenter(current.offset(bearing, 2).up())));
     }
 
     boolean stepDryMine(int tick, BlockPos current, Direction direction, Predicate<BlockState> preferredOre) {
@@ -147,7 +225,8 @@ final class AgentCaves {
         if (sectorLight != null) return sectorLight.step(tick);
         if (dryRoute.routing()) {
             Direction shown = dryRoute.takeApertureView(current);
-            boolean chamber = shown != null && !quiet(current, tick) && aperture(current, current.offset(shown), shown);
+            boolean chamber = shown != null && !quiet(current, tick) && !triedShallow(current, shown)
+                && aperture(current, current.offset(shown), shown);
             boolean owned = stepDry(tick, current, direction, preferredOre);
             // The look already belonged to this route. Record the same actual cave
             // proof used at excavation's normal aperture, without retargeting the motor.
@@ -162,7 +241,7 @@ final class AgentCaves {
     }
 
     Opening drySurveyOpening() {
-        return active() && (phase == Phase.SURVEY || phase == Phase.LOOK_DOWN || phase == Phase.CENTER)
+        return active() && shallow == null && (phase == Phase.SURVEY || phase == Phase.LOOK_DOWN || phase == Phase.CENTER)
             && player.isOnGround() && !player.isTouchingWater() && player.getBlockPos().equals(stance)
             ? new Opening(origin, opening) : null;
     }
@@ -188,6 +267,34 @@ final class AgentCaves {
 
     void interruptLight() { sectorLight = null; }
 
+    /** A missed one-down foothold is a local visual question, not a new dry-route or retreat request. */
+    boolean beginShallowEntry(BlockPos source, Direction direction, int height, int tick) {
+        resetOnWorldChange();
+        if (active() || sectorLight != null || dryRoute.routing() || player == null || world == null) return false;
+        BlockState support = body.caveLipFooting(source);
+        if (!eligiblePeek(source, direction, height, support))
+            return false;
+        beginOpening(source, direction, tick);
+        startShallowPeek(direction, height, tick, support);
+        return true;
+    }
+
+    private boolean eligiblePeek(BlockPos source, Direction direction, int height, BlockState support) {
+        return support != null && (height == 1 || height == AgentDryLanding.MAX_DROP)
+            && AgentBody.drySurveyLaneCentered(source, player.getX(), player.getZ(), direction)
+            && !triedShallow(source, direction, height);
+    }
+
+    private void startShallowPeek(Direction direction, int height, int tick, BlockState support) {
+        int slot = shallowCursor++ % triedShallowLips.length;
+        triedShallowLips[slot] = new Opening(stance, direction);
+        triedShallowHeights[slot] = height;
+        opening = direction;
+        shallow = new ShallowEntry(support, height);
+        start(Phase.LOOK_DOWN, tick);
+        status = "taking one supported look at a possible " + height + "-block cave descent";
+    }
+
     /** A null ore predicate prospects for exposed lava; a null planned foot can only continue an excursion. */
     boolean step(int tick, BlockPos planned, Direction direction, Predicate<BlockState> preferredOre) {
         resetOnWorldChange();
@@ -200,7 +307,7 @@ final class AgentCaves {
             if (planned == null || direction == null || tick < cooldown || !player.isOnGround()
                 || player.isTouchingWater() || quiet(player.getBlockPos(), tick)) return false;
             BlockPos source = player.getBlockPos();
-            if (!aperture(source, planned, direction)) return false;
+            if (triedShallow(source, direction) || !aperture(source, planned, direction)) return false;
             beginOpening(source, direction, tick);
             return true;
         }
@@ -270,6 +377,7 @@ final class AgentCaves {
         world = client.world;
         player = client.player;
         origin = replayTo = null;
+        shallow = null;
         sectorLight = null;
         lightReceipt = null;
         lightStances.clear();
@@ -278,6 +386,8 @@ final class AgentCaves {
         entered = false;
         cooldown = 0;
         Arrays.fill(quietLips, null);
+        Arrays.fill(triedShallowLips, null);
+        shallowCursor = 0;
     }
 
     private boolean aperture(BlockPos from, BlockPos planned, Direction direction) {
@@ -339,6 +449,7 @@ final class AgentCaves {
     }
 
     private void resetLocalSurvey() {
+        shallow = null;
         bearing = opening;
         option = 0;
         needSurvey = true;
@@ -402,6 +513,14 @@ final class AgentCaves {
             BlockPos foot = ahead.up(i - 1);
             if (seen(foot)) continue;
             proof[i] = checkStep(foot, travel, proof[i]);
+            if (i == 0 && option == 0 && travel == opening && (proof[i] & FLOOR) != 0 && permitsOneWay.test(1)
+                    && !AgentSurfaceTread.reverseClear(client, stance, foot, travel)) {
+                BlockState support = body.caveLipFooting(stance);
+                if (eligiblePeek(stance, travel, 1, support)) {
+                    startShallowPeek(travel, 1, tick, support);
+                    return true;
+                }
+            }
             if (proof[i] == WALKABLE && beginShelf(foot, tick)) return true;
         }
         if (age >= 28 && option == 0 && (proof[0] & FLOOR) == 0) creep(ahead);
@@ -477,33 +596,44 @@ final class AgentCaves {
             if (dryRoute.levelPassage(stance, foot) != AgentDryCaveRoute.LevelPassage.WITNESSED
                     || !body.walkedLaneDry(stance, foot, travel)) return false;
         } else if (body.dryRouteFloor(floorAim(foot, travel), foot.down()) == null) return false;
+        if (stance.getY() > foot.getY() && (!body.walkedLaneDry(stance, foot, travel)
+                || !AgentSurfaceTread.retainedLaneClear(client, stance, foot, travel))) return false;
+        if (shallow != null && !shallowGradeClear()) return false;
         if (!body.dryRouteSweep(stance, foot)) return false;
         destination = foot;
+        startShelfDrive(tick);
+        return true;
+    }
+
+    private void startShelfDrive(int tick) {
         shelfLast = player.getPos();
         shelfMoves = 0;
         shelfMotorTick = body.actionTick();
         start(Phase.DRIVE, tick);
-        return true;
     }
 
     private boolean driveShelf(int tick) {
         if (shelfMotorTick + 1 != body.actionTick())
             return finish(tick, "local cave shelf interrupted; reobserve before moving");
         shelfMotorTick = body.actionTick();
-        if (stance.getY() == destination.getY() && !body.walkedLaneDry(stance, destination, travel))
-            return finish(tick, "local cave shelf refused: the exact level lane is no longer dry");
         Vec3d feet = player.getPos();
         if (feet.squaredDistanceTo(shelfLast) > 0.31)
             return finish(tick, "local cave shelf refused: actual body path was not contiguous");
         double dx = feet.x - shelfLast.x, dz = feet.z - shelfLast.z;
         if (dx * dx + dz * dz > 0.0004) shelfMoves++;
         shelfLast = feet;
+        if (shallow != null && shallow.drop != null) return driveShallowDrop(tick);
+        if (stance.getY() == destination.getY() && !body.walkedLaneDry(stance, destination, travel))
+            return finish(tick, "local cave shelf refused: the exact level lane is no longer dry");
         Vec3d target = Vec3d.ofBottomCenter(destination);
         if (shelfMoves >= 3 && player.isOnGround() && player.getBlockPos().equals(destination)
                 && Math.abs(feet.y - destination.getY()) <= 0.055 && horizontalSquared(target) <= 0.22 * 0.22
                 && player.getVelocity().horizontalLengthSquared() <= 0.016) {
+            if (shallow != null && !shallowGradeClear())
+                return finish(tick, "the installed step's return grade changed before arrival");
             BlockPos from = stance, to = destination;
             dryRoute.walked(from, to); // No inverse inferred from the arrival.
+            if (shallow != null) dryRoute.witnessed(to, from); // The built step's reverse grade was checked.
             traveledDry.accept(from, to);
             stance = to;
             visited[++steps] = to;
@@ -514,6 +644,8 @@ final class AgentCaves {
             return true;
         }
         AgentBody.DryRouteVeto veto = body.dryRouteVeto(stance, destination);
+        if (shallow != null && (veto != AgentBody.DryRouteVeto.CLEAR || !shallowGradeClear()
+                || tick - phaseSince > 26)) return refuseShallow(tick, "the installed step lost its safe return grade");
         if (tick - phaseSince > 26 || veto != AgentBody.DryRouteVeto.CLEAR) {
             status = "local cave shelf refused: " + (veto == AgentBody.DryRouteVeto.CLEAR ? "did not settle" : veto);
             if (!player.isOnGround() || !player.getBlockPos().equals(stance)) return finish(tick, status);
@@ -549,6 +681,7 @@ final class AgentCaves {
     }
 
     private boolean lookDown(int tick) {
+        if (shallow != null) return lookShallow(tick);
         BlockPos shaft = stance.offset(opening);
         look(Vec3d.ofBottomCenter(shaft), 69);
         status = "crouching at the cave lip to check for a lit floor below";
@@ -559,6 +692,92 @@ final class AgentCaves {
             BlockPos foot = shaft.down(drop);
             if (floor(foot, opening)) highBottom = foot;
         }
+        if (highBottom != null && highBottom.getY() == stance.getY() - AgentDryLanding.MAX_DROP
+                && permitsOneWay.test(AgentDryLanding.MAX_DROP)) {
+            BlockState support = body.caveLipFooting(stance);
+            if (eligiblePeek(stance, opening, AgentDryLanding.MAX_DROP, support)) {
+                startShallowPeek(opening, AgentDryLanding.MAX_DROP, tick, support);
+                return true;
+            }
+        }
+        if (startWater(shaft, tick)) return true;
+        return tick - phaseSince < 40 || alternatives(tick);
+    }
+
+    private boolean lookShallow(int tick) {
+        if (body.caveLipFooting(stance) != shallow.support
+                || body.hazardAhead(opening.getPositiveHorizontalDegrees(), 1.65))
+            return refuseShallow(tick, "the takeoff no longer has safe dry contact");
+        int age = tick - phaseSince;
+        int drop = shallow.height;
+        Vec3d aim = AgentDryLanding.caveTopAim(stance, opening, drop);
+        if (shallow.peekFrame < 0) {
+            look(Vec3d.ofBottomCenter(stance.offset(opening)), 75);
+            if (age < 18 && along(player.getPos().subtract(Vec3d.ofBottomCenter(stance)), opening) < 0.26) {
+                body.driveCaveLip(stance, opening);
+                return true;
+            }
+            shallow.peekFrame = body.renderedFrame();
+        }
+        body.aim(aim);
+        if (player.isSneaking() || player.getVelocity().horizontalLengthSquared() > 0.0025
+                || body.renderedFrame() <= shallow.peekFrame || !body.renderedAim(aim, 8)
+                || !body.dryRoutePointInView(aim) || body.dryRouteRaysSpent())
+            return age < 32 || refuseShallow(tick, "the supported downward look did not settle");
+
+        BlockPos bottom = stance.offset(opening).down(drop);
+        var top = body.dryRouteFloor(aim, bottom.down());
+        var landing = body.caveDryLanding(stance, opening, drop, shallow.support, top);
+        if (landing == null)
+            return refuseShallow(tick, "no visible stable dry " + drop + "-block landing with a clear body sweep");
+        boolean known = knownDryReturn.test(stance, bottom);
+        if (known || permitsOneWay.test(drop)) {
+            shallow.drop = landing;
+            shallow.oneWay = !known;
+            startShelfDrive(tick);
+            return true;
+        }
+        if (drop == 1) return refuseShallow(tick, "no verified return or usable escape supplies");
+        shallow.top = top;
+        highBottom = bottom;
+        return startWater(stance.offset(opening), tick) || alternatives(tick);
+    }
+
+    private boolean driveShallowDrop(int tick) {
+        AgentDryLanding landing = shallow.drop;
+        Vec3d feet = player.getPos();
+        observeOneWayDeparture();
+        BlockPos support = player.supportingBlockPos.orElse(null);
+        boolean safeGround = player.isOnGround() && !player.isTouchingWater() && !player.isInLava()
+            && !player.isOnFire() && player.hurtTime == 0;
+        if (shelfMoves >= 3 && landing.settled(feet, support,
+                    safeGround && support != null ? world.getBlockState(support) : null,
+                    player.getVelocity().horizontalLengthSquared(), safeGround)) {
+            entered = true;
+            if (shallow.oneWay) {
+                landedOneWay.accept(landing);
+                finish(tick, "landed a one-way " + landing.height() + "-block cave drop from "
+                    + landing.source().toShortString() + " to " + landing.to().toShortString() + "; no verified return");
+                return true;
+            }
+            // The earlier trail already connects these levels. Do not create a reversible fall edge.
+            traveled.accept(landing.to());
+            finish(tick, "rejoined the walked mine trail on its witnessed lower shelf");
+            return true;
+        }
+        status = shallow.oneWay ? "taking a witnessed " + landing.height() + "-block dry drop; no verified return"
+            : "walking off the witnessed lip and coasting onto the return-connected dry shelf";
+        if (tick - phaseSince >= 30 || feet.y < landing.to().getY() - 0.055)
+            return refuseShallow(tick, "the dry shelf did not settle as expected");
+        if (!player.isOnGround() || feet.y < stance.getY() - 0.055) return true; // Neutral air and landing.
+        if ((shallow.oneWay ? !permitsOneWay.test(landing.height()) : !knownDryReturn.test(stance, landing.to()))
+                || !body.dryLandingClear(landing))
+            return refuseShallow(tick, "the lower shelf or the descent prerequisites changed before takeoff");
+        body.driveDryLanding(landing);
+        return true;
+    }
+
+    private boolean startWater(BlockPos shaft, int tick) {
         if (highBottom != null && waterLink == null && !triedWater && !world.getDimension().ultrawarm()) {
             BlockPos shore = highBottom.offset(opening).up();
             BlockPos source = shaft.down();
@@ -591,10 +810,15 @@ final class AgentCaves {
                 }
             }
         }
-        return tick - phaseSince < 40 || alternatives(tick);
+        return false;
     }
 
     private boolean alternatives(int tick) {
+        if (shallow != null) {
+            if (highBottom != null && !triedPlace && beginShallowStep(tick)) return true;
+            return refuseShallow(tick, highBottom == null ? "no lit two-down full top was seen"
+                : "the lower shelf had no verified dry return, usable water route, or attached step");
+        }
         if (!player.getBlockPos().equals(stance) && atLip(stance)) {
             start(Phase.CENTER, tick);
             return true;
@@ -656,6 +880,15 @@ final class AgentCaves {
     }
 
     private boolean center(int tick) {
+        if (shallow != null) {
+            String reason = shallow.refusal;
+            if (body.caveLipFooting(stance) == shallow.support
+                    && horizontalSquared(Vec3d.ofBottomCenter(stance)) <= 0.14 * 0.14
+                    && player.getVelocity().horizontalLengthSquared() <= 0.0025) return finish(tick, reason);
+            if (tick - phaseSince > 26 || !body.centerOnCaveLip(stance, shallow.support))
+                return finish(tick, reason + "; released stable support positioning");
+            return true;
+        }
         status = "returning to the dry center of the cave lip";
         if (arrived(stance)) {
             if (!centerForBearing) return alternatives(tick);
@@ -820,6 +1053,7 @@ final class AgentCaves {
     }
 
     private boolean place(int tick) {
+        if (shallow != null) return placeShallowStep(tick);
         status = "building a lower step against a visible cave wall";
         if (tick - phaseSince >= 54) return alternatives(tick);
         if (lastAction != 0) {
@@ -848,6 +1082,62 @@ final class AgentCaves {
             lastAction = tick;
         }
         return true;
+    }
+
+    private boolean beginShallowStep(int tick) {
+        BlockPos cell = highBottom;
+        if (hands.count(COBBLE) <= AgentReturnableMine.WORKSHOP_RESERVE || protectedFoothold.test(cell)
+                || AgentReturnableMine.protectedCutAttachment(world, cell)) return false;
+        triedPlace = true;
+        travel = opening;
+        destination = cell.up();
+        start(Phase.PLACE, tick);
+        face = shallow.top;
+        return true;
+    }
+
+    private boolean placeShallowStep(int tick) {
+        status = "checking an attached cobblestone step above the witnessed shelf";
+        if (tick - phaseSince >= 36 || body.caveLipFooting(stance) != shallow.support
+                || body.hazardAhead(travel.getPositiveHorizontalDegrees(), 1.65))
+            return refuseShallow(tick, "no confirmed cobblestone step with a stable dry reverse grade");
+        BlockPos cell = destination.down();
+        if (lastAction != 0) {
+            body.aim(floorAim(destination, travel));
+            if (body.renderedFrame() > shallow.placementFrame && hands.count(COBBLE) == before - 1
+                    && world.getBlockState(cell).isOf(Blocks.COBBLESTONE) && beginShelf(destination, tick)) {
+                dryRoute.changed(cell);
+                return true;
+            }
+            return true;
+        }
+        int stock = hands.count(COBBLE);
+        if (stock <= AgentReturnableMine.WORKSHOP_RESERVE || protectedFoothold.test(cell)
+                || client.options.useKey.isUnbound() || client.options.jumpKey.isUnbound()
+                || !player.getOffHandStack().isEmpty() || !world.getOtherEntities(player, new Box(cell)).isEmpty()
+                || !AgentSurfaceTread.reverseClear(client, stance, destination, travel))
+            return refuseShallow(tick, "the exact shelf attachment or return jump cannot be used safely");
+        Vec3d aim = face.getPos();
+        body.aimFine(aim);
+        body.sneak();
+        if (!player.isSneaking() || !body.dryRouteBuildClear(stance, destination)
+                || !AgentReturnableMine.Foothold.empty(
+                    body.footholdSpace(AgentBody.footholdInterior(cell, travel, false)),
+                    body.footholdSpace(AgentBody.footholdInterior(cell, travel, true)))) return true;
+        AgentBody.Preparation preparation = AgentBody.Preparation.equipment(hands.equipForUse(COBBLE));
+        if (body.placeFoothold(face, cell, preparation)) {
+            before = stock;
+            shallow.placementFrame = body.renderedFrame();
+            lastAction = tick;
+        }
+        return true;
+    }
+
+    private boolean shallowGradeClear() {
+        return world.getBlockState(stance.down()) == shallow.support
+            && world.getBlockState(destination.down()).isOf(Blocks.COBBLESTONE)
+            && body.walkedLaneDry(stance, destination, travel)
+            && AgentSurfaceTread.retainedLaneClear(client, stance, destination, travel);
     }
 
     private boolean cut(int tick) {
@@ -1115,12 +1405,26 @@ final class AgentCaves {
     private boolean finish(int tick, String reason) {
         sectorLight = null;
         status = reason;
-        quietLips[quietCursor] = origin;
-        quietUntil[quietCursor] = tick + 420;
-        quietCursor = (quietCursor + 1) % quietLips.length;
+        if (shallow == null || entered) {
+            quietLips[quietCursor] = origin;
+            quietUntil[quietCursor] = tick + 420;
+            quietCursor = (quietCursor + 1) % quietLips.length;
+        }
+        shallow = null;
         origin = null;
         cooldown = tick + (entered ? 18 : 45);
         return false;
+    }
+
+    private boolean refuseShallow(int tick, String reason) {
+        String refusal = "cave lip skipped: " + reason;
+        if (body.centerOnCaveLip(stance, shallow.support)) {
+            shallow.refusal = refusal;
+            start(Phase.CENTER, tick);
+            status = refusal + "; returning to the supported mine stance";
+            return true;
+        }
+        return finish(tick, refusal);
     }
 
     private boolean defer(int tick, String reason) {
@@ -1131,6 +1435,20 @@ final class AgentCaves {
     private boolean quiet(BlockPos foot, int tick) {
         for (int i = 0; i < quietLips.length; i++) {
             if (tick < quietUntil[i] && foot.equals(quietLips[i])) return true;
+        }
+        return false;
+    }
+
+    private boolean triedShallow(BlockPos foot, Direction direction) {
+        return triedShallow(foot, direction, 0);
+    }
+
+    private boolean triedShallow(BlockPos foot, Direction direction, int height) {
+        if (world != client.world || player != client.player) return false;
+        for (int i = 0; i < triedShallowLips.length; i++) {
+            Opening tried = triedShallowLips[i];
+            if (tried != null && tried.bearing == direction && tried.origin.equals(foot)
+                    && (height == 0 || triedShallowHeights[i] == height)) return true;
         }
         return false;
     }

@@ -7,6 +7,7 @@ import net.minecraft.block.FallingBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
@@ -30,7 +31,8 @@ final class AgentReturnableMine {
     private static final int RELOCATION_HOPS = 10;
     private static final int DEPARTURE_VIEW_TICKS = 38;
     private static final int DRIFT_LIMIT = 2;
-    private static final int FOOTHOLD_LIMIT = 2, WORKSHOP_RESERVE = 8;
+    private static final int FOOTHOLD_LIMIT = 2;
+    static final int WORKSHOP_RESERVE = 8;
     private static final int FOOTHOLD_CONTACT_TICKS = 34, FOOTHOLD_RECEIPT_TICKS = 26;
     private static final Direction[] CARDINALS = {Direction.NORTH, Direction.EAST, Direction.SOUTH, Direction.WEST};
     private static final Direction[] ADJACENT = Direction.values();
@@ -376,7 +378,7 @@ final class AgentReturnableMine {
                 boolean continuing = host.continueMineCaveSurvey(caveBearing);
                 if (host.mineCaveHandedOff()) return finish(Outcome.DIVERTED, host.status());
                 if (host.caveFootsteps() != caveContacts)
-                    return finish(Outcome.DIVERTED, "cave travel reached a new footing");
+                    return finish(Outcome.DIVERTED, host.status());
                 if (continuing) return outcome;
             }
             cavePending = false;
@@ -405,7 +407,7 @@ final class AgentReturnableMine {
         switch (phase) {
             case ANCHOR -> anchor(now);
             case CHOOSE -> choose(host, now);
-            case OPEN -> open(now);
+            case OPEN -> open(host, now);
             case CUT -> cut(host, now);
             case LIGHT -> light(host, now);
             case FORWARD -> prove(host, now, false);
@@ -478,7 +480,11 @@ final class AgentReturnableMine {
                             && host.handoffReturnableResource(contact)) {
                         finish(Outcome.DIVERTED, "taking exposed ore before cutting a mine leg");
                     } else if (fact != Face.MINEABLE) {
-                        rejectChoice(candidate, now, fact);
+                        String detail = fact == Face.MATERIAL || fact == Face.TOOL
+                            ? "mine descent " + candidate + " refused " + Registries.BLOCK.getId(world.getBlockState(workCell).getBlock())
+                                + " at " + workCell.toShortString() + ": " + fact
+                            : null;
+                        rejectChoice(candidate, now, fact, detail);
                     } else if (contact != null && workCell.equals(contact.getBlockPos())) {
                         bearing = candidate;
                         to = nextTread(candidate);
@@ -537,7 +543,7 @@ final class AgentReturnableMine {
         begin(Phase.OPEN, now);
     }
 
-    private void open(int now) {
+    private void open(AgentProgress host, int now) {
         // No obstructing block is a result about excavation, not a witness of flooring.
         if (aim == null) aim = proofFloorAim(to, bearing, floorSample);
         body.aim(aim);
@@ -547,13 +553,18 @@ final class AgentReturnableMine {
             return;
         }
         if (top == AgentBody.DryRouteTop.WITNESSED) {
-            if (!body.walkedLaneDry(from, to, bearing)
-                    || !AgentSurfaceTread.retainedLaneClear(client, from, to, bearing)) {
+            if (!body.walkedLaneDry(from, to, bearing)) {
                 rejectChoice(bearing, now, Face.NO_EXIT);
                 return;
             }
             if (!body.dryRouteSweep(from, to)) {
                 if (now - phaseSince >= 28) rejectChoice(bearing, now, Face.NO_EXIT);
+                return;
+            }
+            if (!AgentSurfaceTread.retainedLaneClear(client, from, to, bearing)) {
+                if (!AgentSurfaceTread.reverseClear(client, from, to, bearing) && offerOneWayTread(host, now))
+                    return;
+                rejectChoice(bearing, now, Face.NO_EXIT);
                 return;
             }
         } else if (floorSample == 0 || top != AgentBody.DryRouteTop.NO_FULL_TOP || !body.renderedAim(aim, 8)) {
@@ -596,10 +607,6 @@ final class AgentReturnableMine {
         if (!footholdStance(build)) return;
         int stock = host.returnableFootholdStock();
         var options = client.options;
-        if (stock <= WORKSHOP_RESERVE) {
-            refuseFoothold(now, build.cell, "keeping eight cobblestone for the workshop");
-            return;
-        }
         if (options.useKey.isUnbound() || options.sneakKey.isUnbound() || options.forwardKey.isUnbound()
                 || options.jumpKey.isUnbound() || !player.getOffHandStack().isEmpty() || player.isUsingItem()) {
             refuseFoothold(now, build.cell, "use or return controls unavailable, off hand occupied, or another item in use");
@@ -632,8 +639,18 @@ final class AgentReturnableMine {
             build.anchor = body.visibleFootholdAttachment(build.cell, bearing, build.low, build.high,
                 player.getBlockInteractionRange());
             if (build.anchor == null) {
-                if (expired || body.renderedAim(view, 8))
+                if (expired || body.renderedAim(view, 8)) {
+                    Direction aperture = bearing;
                     refuseFoothold(now, build.cell, "no visible reachable stable top or side can attach to it");
+                    // This exact tread was visibly empty. Before changing bearing,
+                    // give the supported lip one chance to reveal a different route.
+                    if (host.startMineCaveShelf(build.from, aperture, AgentDryLanding.MAX_DROP))
+                        holdCave(host, aperture, now);
+                }
+                return;
+            }
+            if (stock <= WORKSHOP_RESERVE) {
+                refuseFoothold(now, build.cell, "keeping eight cobblestone for the workshop");
                 return;
             }
             build.anchorState = world.getBlockState(build.anchor.getBlockPos());
@@ -752,6 +769,14 @@ final class AgentReturnableMine {
         caveBearing = direction;
         caveSince = now;
         caveContacts = host.caveFootsteps();
+    }
+
+    private boolean offerOneWayTread(AgentProgress host, int now) {
+        Direction aperture = bearing;
+        if (!host.startMineCaveShelf(from, aperture, 1)) return false;
+        rejectChoice(aperture, now, Face.NO_EXIT, routeFailure("return headroom", to, "no verified reverse grade"));
+        holdCave(host, aperture, now);
+        return true;
     }
 
     private void prepareCut(int now) {
@@ -889,6 +914,10 @@ final class AgentReturnableMine {
             var sample = drift ? body.dryCaveSpace(aim) : body.dryRouteClear(aim);
             boolean cannotLight = sample == AgentBody.DryRouteSample.DARK
                 && (litHere || host.returnableTorches() <= TORCH_RESERVE) && body.renderedAim(aim, 14);
+            if (!reverse && !drift && foothold == null && proof >= (CLEARANCE_HEIGHTS.length - 1) * 2
+                    && (sample == AgentBody.DryRouteSample.OBSTRUCTION && body.renderedAim(aim, 10)
+                        || expired && sample == AgentBody.DryRouteSample.UNKNOWN)
+                    && offerOneWayTread(host, now)) return;
             if (sample != AgentBody.DryRouteSample.CLEAR && (expired || sample == AgentBody.DryRouteSample.FLUID
                     || cannotLight)) {
                 String side = (proof & 1) == 0 ? "right" : "left";
@@ -959,9 +988,14 @@ final class AgentReturnableMine {
             }
             return;
         }
-        if (!body.walkedLaneDry(source, target, direction)
-                || !reverse && openTread && !AgentSurfaceTread.retainedLaneClear(client, source, target, direction)) {
+        if (!body.walkedLaneDry(source, target, direction)) {
             refuseTread(now, reverse, routeFailure("dry columns", target, "unsafe block or changed return lane", reverse));
+            return;
+        }
+        if (!reverse && !drift && !AgentSurfaceTread.reverseClear(client, source, target, direction)
+                && foothold == null && offerOneWayTread(host, now)) return;
+        if (!reverse && openTread && !AgentSurfaceTread.retainedLaneClear(client, source, target, direction)) {
+            refuseTread(now, false, routeFailure("dry columns", target, "unsafe block or changed return lane"));
             return;
         }
         if (drift) {

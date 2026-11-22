@@ -108,6 +108,99 @@ final class FootholdGeometryTest {
     }
 
     @Test
+    void aSupportedPeekRevealsTheNaturalTopBelowTheMissingTread() {
+        var from = new BlockPos(0, 30, 0);
+        var bearing = Direction.EAST;
+        var floor = from.east().down(3);
+        var lip = new Box(from.down());
+        var eye = Vec3d.ofBottomCenter(from).add(0, 1.27, 0);
+        var target = AgentDryLanding.caveTopAim(from, bearing, 2);
+        assertTrue(lip.raycast(eye, target).isPresent(), "the retained lip can hide the lower floor");
+
+        var peek = eye.add(0.30, 0, 0);
+        assertTrue(lip.raycast(peek, target).isEmpty());
+        var point = new Box(floor).raycast(peek, target).orElseThrow();
+        var hit = new BlockHitResult(point, Direction.UP, floor, false);
+        assertTrue(AgentDryLanding.caveTop(from, bearing, 2, hit, Blocks.STONE.getDefaultState()));
+        var sweep = AgentDryLanding.receivingSweep(floor.up(), from.getY(), bearing, 0.60, 1.80);
+        assertFalse(sweep.intersects(new Box(floor)), "the support is below the fall volume");
+        assertFalse(sweep.intersects(lip), "the lower sweep must not sweep back through the old lip");
+        assertTrue(AgentBody.footholdFaceInEnvelope(hit, floor.up(), bearing),
+            "the revealed lower top can attach a real one-down step");
+    }
+
+    @Test
+    void aClippedWallFluidTopOrUnreachableShelfDoesNotBecomeADrop() {
+        var from = new BlockPos(0, 30, 0);
+        var bearing = Direction.EAST;
+        var floor = from.east().down(3);
+        var eye = Vec3d.ofBottomCenter(from).add(0.30, 1.27, 0);
+        var target = AgentDryLanding.caveTopAim(from, bearing, 2);
+        var point = new Box(floor).raycast(eye, target).orElseThrow();
+        var hit = new BlockHitResult(point, Direction.UP, floor, false);
+        var wall = floor.up(2);
+        var obstruction = new Box(wall).raycast(eye, target).orElseThrow();
+        assertFalse(AgentDryLanding.caveTop(from, bearing, 2,
+            new BlockHitResult(obstruction, Direction.UP, wall, false), Blocks.STONE.getDefaultState()));
+        assertFalse(AgentDryLanding.caveTop(from, bearing, 2, null, Blocks.STONE.getDefaultState()));
+        assertFalse(AgentDryLanding.caveTop(from, bearing, 2, hit, Blocks.LAVA.getDefaultState()));
+        assertFalse(AgentDryLanding.caveTop(from, bearing, 2, hit, Blocks.WATER.getDefaultState()));
+        assertFalse(AgentDryLanding.caveTop(from, bearing, 2, hit, Blocks.GRAVEL.getDefaultState()));
+        var sweep = AgentDryLanding.receivingSweep(floor.up(), from.getY(), bearing, 0.60, 1.80);
+        assertTrue(sweep.intersects(new Box(floor.up().east())),
+            "a lava or obstruction cell beyond the shelf lip still vetoes the overhanging body");
+        var farther = floor.east();
+        assertFalse(AgentDryLanding.caveTop(from, bearing, 2,
+            new BlockHitResult(Vec3d.ofBottomCenter(farther.up()), Direction.UP, farther, false),
+            Blocks.STONE.getDefaultState()));
+        assertFalse(AgentDryLanding.stoppingFits(from, bearing, Vec3d.ofBottomCenter(from).add(0.78, 0, 0),
+            new Vec3d(0.16, 0, 0), 0.102, 0, 0.30), "vanilla coast would overshoot the receiving shelf");
+    }
+
+    @Test
+    void oneDownWalkFitsUnderACeilingThatBlocksTheReturnJump() {
+        var from = new BlockPos(0, 30, 0);
+        var bearing = Direction.EAST;
+        var to = from.east().down();
+        var stone = Blocks.STONE.getDefaultState();
+        var feet = Vec3d.ofBottomCenter(from).add(0.30, 0, 0);
+        var eye = feet.add(0, 1.62, 0);
+        var ceiling = new Box(from.up(2));
+        var target = AgentDryLanding.caveTopAim(from, bearing, 1);
+        var hit = new BlockHitResult(new Box(to.down()).raycast(eye, target).orElseThrow(),
+            Direction.UP, to.down(), false);
+        assertTrue(AgentDryLanding.caveTop(from, bearing, 1, hit, stone));
+        assertFalse(AgentDryLanding.receivingSweep(to, from.getY(), bearing, 0.60, 1.80).intersects(ceiling));
+        assertTrue(AgentSurfaceTread.reverseJumpSweep(from, to, bearing, 0.60).intersects(ceiling));
+        assertTrue(AgentDryLanding.stoppingFits(from, bearing, feet, Vec3d.ZERO, 0.102, 0, 0.30));
+        assertTrue(AgentDryLanding.escapeKit(1, 1, 0), "a usable pick is sufficient, not proof of a return");
+        assertTrue(AgentDryLanding.escapeKit(2, 0, 2));
+        assertFalse(AgentDryLanding.escapeKit(2, 0, 1));
+        assertFalse(AgentDryLanding.escapeKit(1, 0, 0));
+        assertFalse(AgentDryLanding.escapeKit(3, 32, 64), "supplies never scale the permitted fall");
+    }
+
+    @Test
+    void oneWayDropReceiptNeedsSettledContactWithTheExactWitnessedTop() {
+        var from = new BlockPos(0, 30, 0);
+        var to = from.east().down(2);
+        var center = Vec3d.ofBottomCenter(to);
+        var stone = Blocks.STONE.getDefaultState();
+        var top = new BlockHitResult(center, Direction.UP, to.down(), false);
+        var landing = new AgentDryLanding(from, stone, top, to, stone, Direction.EAST,
+            Vec3d.ofBottomCenter(from), center, -90);
+        var airborne = Vec3d.ofBottomCenter(from).add(0.91, -0.7, 0);
+        assertTrue(landing.neutralCoastFits(airborne, new Vec3d(0.06, -0.34, 0), 0.30));
+        assertFalse(landing.neutralCoastFits(airborne, new Vec3d(0.11, -0.34, 0), 0.30));
+        assertTrue(landing.settled(center, to.down(), stone, 0.001, true));
+        assertFalse(landing.settled(center, to.down(), stone, 0.003, true), "still sliding");
+        assertFalse(landing.settled(center, to.down(), stone, 0, false), "airborne or no longer safely dry");
+        assertFalse(landing.settled(center, from.down(), stone, 0, true), "still on the starting support");
+        assertFalse(landing.settled(center.add(0, 0.25, 0), to.down(), stone, 0, true), "above the shelf");
+        assertFalse(landing.settled(center, to.down(), Blocks.DIRT.getDefaultState(), 0, true), "support changed");
+    }
+
+    @Test
     void oneWitnessedAttachmentCanPayForExactlyOneNewLitTop() {
         var from = new BlockPos(0, 30, 0);
         var build = new AgentMacroControl.ProspectSupport(from, from.east().down(), Direction.EAST);

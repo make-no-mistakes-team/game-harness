@@ -10303,10 +10303,16 @@ final class AgentProgress {
         // generic damage turn/backtrack when a ranged shot is the corroborating cue.
         boolean ranged = !creeper && (ordinary ? defense.observeOrdinaryRanged(ears, threat, hurt, tick)
             : defense.observeRanged(ears, threat, hurt, tick));
-        boolean melee = defense.observeMelee(ears, creeper ? null : threat,
+        boolean shoreSeparated = defense.separatedShoreSwimmer(threat, tick);
+        boolean melee = defense.observeMelee(ears, creeper ? null : threat, shoreSeparated,
             hurt && !creeper && (!ranged || c.player.isTouchingWater()),
             c.player.getHealth() <= 10 && wantsHealingMeal(), tick, safetySpend);
         if (!creeper && (ranged || melee)) return false;
+        if (shoreSeparated) {
+            // The same observation must not fall through into pursuit or a stale combat aim.
+            defense.forgetContact();
+            threat = null;
+        }
         if (hurt && c.currentScreen instanceof HandledScreen<?>) {
             defense.forgetContact();
             interruptHands();

@@ -84,6 +84,8 @@ in water. The player can look toward a sound or seek a visible dry
 bank. A sound is not permission to swing at an unseen mob.
 If a retreat is blocked, the player can strike a hostile mob it can
 see and reach, including while being knocked back.
+It need not abandon work on a dry bank to chase an unarmed drowned
+swimming below it. A visible trident or an actual hit changes that decision.
 Without a shield, the player can keep moving along a checked retreat
 or take visible solid cover between shots. A single dodge does not
 make it safe to resume mining. During calm inventory work

@@ -36,6 +36,47 @@ final class MeleeRecoveryTest {
     }
 
     @Test
+    void aSwimmerBelowDryFootingDoesNotKeepAContactOnlyRetreatAlive() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        assertTrue(recovery.observe(4184, CONTACT, false, false, DRY));
+        // As in the shoreline recording, the player can aim down at the drowned,
+        // but the drowned's head is still below the player's dry footing.
+        boolean separated = AgentDefense.MeleeRecovery.separatedShoreSwimmer(true, true, false, false, 0.9);
+        assertTrue(separated);
+        assertFalse(recovery.observe(4185, NONE, false, separated, DRY));
+        assertFalse(recovery.observe(4186, AMBIENT, false, separated, DRY));
+    }
+
+    @Test
+    void aSwimmerThatClosesTheGapIsNotExcludedFromImmediateDefense() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        assertTrue(AgentDefense.MeleeRecovery.separatedShoreSwimmer(true, true, false, false, 0.9));
+        boolean separated = AgentDefense.MeleeRecovery.separatedShoreSwimmer(true, true, false, false, 0.25);
+        assertFalse(separated);
+        assertTrue(recovery.observe(4270, CONTACT, false, separated, DRY));
+    }
+
+    @Test
+    void dryContactWetFootingAndHeldTridentsAreNotSeparatedShoreSightings() {
+        assertFalse(AgentDefense.MeleeRecovery.separatedShoreSwimmer(true, false, false, false, 0.9),
+            "a drowned already on land is not a swimmer");
+        assertFalse(AgentDefense.MeleeRecovery.separatedShoreSwimmer(false, true, false, false, 0.9),
+            "no exception during wading or a fall");
+        assertFalse(AgentDefense.MeleeRecovery.separatedShoreSwimmer(true, true, true, false, 0.9),
+            "the height gap does not prevent a trident throw");
+    }
+
+    @Test
+    void aNewImpactIsNotDismissedByAnUnrelatedSwimmerBelowTheBank() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        boolean separated = AgentDefense.MeleeRecovery.separatedShoreSwimmer(true, true, false, false, 0.9);
+        assertTrue(recovery.observe(2968, IMPACT, false, separated, DRY));
+        assertTrue(recovery.observe(2969, NONE, false, separated, DRY));
+        assertFalse(AgentDefense.MeleeRecovery.separatedShoreSwimmer(true, true, false, true, 0.9),
+            "a recent visually corroborated attacker is not treated as an unrelated sighting");
+    }
+
+    @Test
     void repeatedCriticalImpactsKeepOwnershipWithoutInventingSeparation() {
         // Ordinary campaign: 7.708 -> 5.708 HP, then 3.708 -> 1.708.
         var recovery = new AgentDefense.MeleeRecovery();

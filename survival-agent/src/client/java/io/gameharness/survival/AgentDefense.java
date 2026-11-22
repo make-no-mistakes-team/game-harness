@@ -11,6 +11,7 @@ import net.minecraft.entity.EquipmentSlot;
 import net.minecraft.entity.LivingEntity;
 import net.minecraft.entity.ai.RangedAttackMob;
 import net.minecraft.entity.attribute.EntityAttributes;
+import net.minecraft.entity.mob.DrownedEntity;
 import net.minecraft.entity.mob.EndermanEntity;
 import net.minecraft.entity.mob.ZombieEntity;
 import net.minecraft.entity.player.PlayerInventory;
@@ -34,6 +35,7 @@ final class AgentDefense {
     private static final float ZOMBIE_LOOK_PITCH = 10;
     private static final int MELEE_REORIENT_TICKS = 22;
     private static final long RANGED_ALERT_NANOS = 2_400_000_000L;
+    private static final double SHORE_MELEE_CLEARANCE = 0.5;
     private static final float[] MELEE_ESCAPE_TURNS = {0, -42, 42, -80, 80};
     private static final double[] MELEE_FLOOR_ROWS = {0.42, 0.78, 1.25, 1.9, 2.55, 3.04};
     private static final Predicate<ItemStack> SHIELD = stack -> stack.isOf(Items.SHIELD);
@@ -164,6 +166,14 @@ final class AgentDefense {
             return canMove ? DryAction.SURVEY : DryAction.WAIT;
         }
 
+        static boolean separatedShoreSwimmer(boolean dryGrounded, boolean inWater, boolean holdingTrident,
+                                             boolean recentAttacker, double gapBelowFeet) {
+            // Player attack reach is not reciprocal. Require a clear vertical gap below
+            // the player's feet, with room for a small rise before melee boxes can overlap.
+            return dryGrounded && inWater && !holdingTrident && !recentAttacker
+                && gapBelowFeet >= SHORE_MELEE_CLEARANCE;
+        }
+
         boolean observe(int tick, Evidence evidence, boolean critical, boolean separated, Footing footing) {
             if (footing == Footing.VEHICLE) {
                 active = pinned = shoreNeeded = settledBank = false;
@@ -236,8 +246,22 @@ final class AgentDefense {
 
     void stopZombieLook() { zombieLook = null; }
 
-    boolean observeMelee(AgentEars ears, LivingEntity visible, boolean hurt, boolean healingMeal, int tick,
-                        Predicate<ItemStack> spend) {
+    /** Takes only the current, sight-checked target from AgentBody. Never infer a route through terrain. */
+    boolean separatedShoreSwimmer(LivingEntity visible, int tick) {
+        if (!(visible instanceof DrownedEntity drowned)) return false;
+        var player = client.player;
+        boolean dryGrounded = player.isOnGround() && !player.isTouchingWater() && !player.hasVehicle()
+            && !player.isInLava();
+        return MeleeRecovery.separatedShoreSwimmer(dryGrounded, drowned.isSwimming() || drowned.isTouchingWater(),
+            holdsTrident(drowned), meleeAttacker(tick) == drowned, player.getY() - drowned.getBoundingBox().maxY);
+    }
+
+    private static boolean holdsTrident(LivingEntity visible) {
+        return visible instanceof DrownedEntity && visible.isHolding(Items.TRIDENT);
+    }
+
+    boolean observeMelee(AgentEars ears, LivingEntity visible, boolean shoreSeparated, boolean hurt,
+                         boolean healingMeal, int tick, Predicate<ItemStack> spend) {
         var player = client.player;
         var footing = player.hasVehicle() ? MeleeRecovery.Footing.VEHICLE
             : player.isTouchingWater() ? MeleeRecovery.Footing.WET
@@ -245,9 +269,10 @@ final class AgentDefense {
             : MeleeRecovery.Footing.UNSETTLED;
         Vec3d feet = player.getPos();
         double distance = visible == null ? Double.POSITIVE_INFINITY : player.squaredDistanceTo(visible);
-        boolean closeMelee = distance <= 5.0 * 5.0
+        boolean closeMelee = !shoreSeparated && distance <= 5.0 * 5.0
             && (visible instanceof ZombieEntity || !(visible instanceof RangedAttackMob) && distance <= 3.4 * 3.4);
         boolean wounded = criticallyHurt(player) || healingMeal;
+        boolean swimmerReceded = shoreSeparated && visible == meleeVisible;
         meleeVisible = closeMelee ? visible : null;
         var cue = ears.recentMeleeCue();
         meleeSound = cue;
@@ -260,7 +285,8 @@ final class AgentDefense {
         boolean close = closeMelee && (wounded || meleeOutmatched(spend));
         double movedX = meleeStart == null ? 0 : feet.x - meleeStart.x;
         double movedZ = meleeStart == null ? 0 : feet.z - meleeStart.z;
-        boolean separated = meleeDrove && movedX * movedX + movedZ * movedZ >= 5 * 5
+        boolean separated = swimmerReceded && !hit && !melee.pinned
+            || meleeDrove && movedX * movedX + movedZ * movedZ >= 5 * 5
             && distance >= 6 * 6 && body.hasRecentView() && footing == MeleeRecovery.Footing.DRY;
         boolean started = !melee.active;
         var evidence = hit ? MeleeRecovery.Evidence.IMPACT : close ? MeleeRecovery.Evidence.CONTACT
@@ -737,6 +763,7 @@ final class AgentDefense {
             lastShotPitch = cue.pitch();
         }
         Vec3d seen = body.rangedThreatPoint();
+        if (seen == null && holdsTrident(nearest)) seen = body.threatPoint();
         boolean wasActive = rangedEpisode.active;
         boolean meleeHit = nearest != null && !(nearest instanceof RangedAttackMob)
             && body.visiblyCorroboratesMeleeImpact(nearest);
@@ -829,7 +856,7 @@ final class AgentDefense {
         rangedHitNow = hurt && !client.player.isOnFire();
         var cue = ears.takeFreshRangedCue();
         boolean active = rangedActive();
-        Vec3d seen = hurt && visible instanceof RangedAttackMob
+        Vec3d seen = holdsTrident(visible) || hurt && visible instanceof RangedAttackMob
                 && (visible.isHolding(Items.BOW) || visible.isHolding(Items.CROSSBOW)) ? body.threatPoint() : null;
         if (cue == null && seen == null) {
             if (active && hurt) {

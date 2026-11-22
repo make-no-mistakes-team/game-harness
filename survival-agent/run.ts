@@ -1159,6 +1159,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       const parentDeath = source?.parentDeath;
       const launched = await launcher.launchAgent({
         runtimeCache: RUNTIME, port, goal, evidenceDir: dir, ...display,
+        onSetup: (phase) => { stage = phase; },
         beforeConnect: provisioned ? async (profileName) => {
           stage = "diagnostic_provisioning";
           if (macroTrial) await provisionMacroTrialWorld(runningServer.child, worldDir, profileName, startup);
@@ -1336,7 +1337,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         const auth = nativeLaunchFailure(error);
         const setupFailure = (fixture || macroTrial || urgentProbe) && stage === "diagnostic_provisioning" && error instanceof Error
           ? error.message : undefined;
-        result = new Stop("failed", auth?.error ?? setupFailure ?? `Run failed during ${stage}.`);
+        const clientTimeout = error instanceof Error && error.name === "TimeoutError"
+          ? stage === "client_session_check" ? "Official Minecraft profile verification timed out before client launch."
+          : stage === "client_dependencies" ? "Minecraft client dependency setup timed out before launch." : undefined
+          : undefined;
+        result = new Stop("failed", auth?.error ?? setupFailure ?? clientTimeout ?? `Run failed during ${stage}.`);
         if (!auth && error instanceof Error)
           await record("failure", { stage, category: error.name }).catch(() => {});
       }

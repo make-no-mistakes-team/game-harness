@@ -27,6 +27,11 @@ goal** starts the setup for another fresh world. The desktop will not take
 over an ordinary agent run already active in a terminal. **Deterministic
 (no model)** is the default and does not require a model login.
 
+Both modes verify the official Minecraft session before starting the
+client. A timeout at this step is not a failed gameplay attempt or
+proof that the account is signed out. A warm Fabric library cache
+does not need a network lookup for the loader profile.
+
 To use a strategy advisor, choose **Terra (gpt-6.1-terra)** under
 **Agent strategy**. The same local player controls movement, tools, inventory,
 mining, and threat response from the start. It keeps pursuing the goal while

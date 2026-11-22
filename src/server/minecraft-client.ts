@@ -37,11 +37,17 @@ import {
   stageFabricServerArtifact,
   type FabricServerArtifactSource,
 } from "./minecraft-server-artifact.ts";
+import {
+  FABRIC_CLIENT_LIBRARIES,
+  FABRIC_CLIENT_LOADER,
+  FABRIC_CLIENT_MAVEN,
+  FABRIC_CLIENT_MINECRAFT,
+} from "./fabric-client-profile.ts";
 
 export const JAVA = process.env.JAVA_HOME
   ? path.resolve(process.env.JAVA_HOME, "bin", "java")
   : (Bun.which("java") ?? "java");
-export const LOADER = "0.16.10";
+export const LOADER = FABRIC_CLIENT_LOADER;
 export const FABRIC_API = "0.119.4+1.21.4";
 const CLIENT_OPTIONS =
   "version:4189\npauseOnLostFocus:false\nmaxFps:60\nenableVsync:false\nfullscreen:false\nrenderDistance:6\nsimulationDistance:6\nautoJump:false\nshowSubtitles:true\nchatVisibility:2\nonboardAccessibility:false\nskipMultiplayerWarning:true\ntutorialStep:none\n";
@@ -234,6 +240,70 @@ export async function prepareFabricServer(
   return launcher;
 }
 
+export async function prepareFabricClientClasspath(
+  source: string,
+  dataDir: string,
+  signal: AbortSignal,
+  cachedLibraries?: string,
+) {
+  const vanilla = path.join(source, "versions", FABRIC_CLIENT_MINECRAFT, FABRIC_CLIENT_MINECRAFT);
+  const version = JSON.parse(await readFile(`${vanilla}.json`, "utf8"));
+  signal.throwIfAborted();
+  if (version.id !== FABRIC_CLIENT_MINECRAFT)
+    throw new Error("Expected the official Minecraft 1.21.4 client profile.");
+  const librariesByName = new Map<string, string>();
+  for (const lib of version.libraries) {
+    if (
+      lib.rules &&
+      !lib.rules.some(
+        (r: { action: string; os?: { name?: string } }) =>
+          r.action === "allow" && (!r.os || r.os.name === "linux"),
+      )
+    )
+      continue;
+    if (
+      lib.rules?.some(
+        (r: { action: string; os?: { name?: string } }) =>
+          r.action === "disallow" && (!r.os || r.os.name === "linux"),
+      )
+    )
+      continue;
+    const artifact = lib.downloads?.artifact;
+    if (!artifact) continue;
+    const file = path.join(source, "libraries", artifact.path);
+    if (!(await exists(file)))
+      throw new Error(
+        "The official installed Minecraft libraries are incomplete. Install Minecraft 1.21.4 using the official Launcher.",
+      );
+    const coordinate = String(lib.name).split(":");
+    librariesByName.set(
+      `${coordinate[0]}:${coordinate[1]}:${coordinate[3] ?? ""}`,
+      file,
+    );
+  }
+  for (const [group, name, revision, sha256] of FABRIC_CLIENT_LIBRARIES) {
+    signal.throwIfAborted();
+    const relative = `${group.replaceAll(".", "/")}/${name}/${revision}/${name}-${revision}.jar`;
+    const installed = path.join(dataDir, "native-libraries", relative);
+    let cached = cachedLibraries && path.join(cachedLibraries, relative);
+    if (!cached || !(await exists(cached)))
+      cached = (await exists(installed)) ? installed : undefined;
+    if (cached) {
+      const hash = createHash("sha256");
+      for await (const bytes of createReadStream(cached, { signal })) hash.update(bytes);
+      if (hash.digest("hex") !== sha256)
+        throw new Error(`Cached Fabric library checksum mismatch (${group}:${name}:${revision}).`);
+    } else {
+      await download(`${FABRIC_CLIENT_MAVEN}${relative}`, installed, sha256, "sha256", signal);
+    }
+    librariesByName.set(`${group}:${name}:`, cached ?? installed);
+  }
+  return {
+    libraries: [...librariesByName.values(), `${vanilla}.jar`],
+    assetIndex: String(version.assetIndex.id),
+  };
+}
+
 /** Trusted local launcher. Credentials exist only in memory and a private child stdin pipe. */
 export class MinecraftClient {
   readonly dataDir: string;
@@ -336,79 +406,6 @@ export class MinecraftClient {
     }
   }
 
-  private async fabricClasspath(signal: AbortSignal, cachedLibraries?: string) {
-    const version = JSON.parse(
-      await readFile(
-        path.join(this.source, "versions/1.21.4/1.21.4.json"),
-        "utf8",
-      ),
-    );
-    signal.throwIfAborted();
-    const profileUrl = `https://meta.fabricmc.net/v2/versions/loader/1.21.4/${LOADER}/profile/json`;
-    const loader = (await (
-      await fetch(profileUrl, {
-        signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
-      })
-    ).json()) as { libraries: Array<{ name: string; url: string }> };
-    const librariesByName = new Map<string, string>();
-    for (const lib of version.libraries) {
-      if (
-        lib.rules &&
-        !lib.rules.some(
-          (r: { action: string; os?: { name?: string } }) =>
-            r.action === "allow" && (!r.os || r.os.name === "linux"),
-        )
-      )
-        continue;
-      if (
-        lib.rules?.some(
-          (r: { action: string; os?: { name?: string } }) =>
-            r.action === "disallow" && (!r.os || r.os.name === "linux"),
-        )
-      )
-        continue;
-      const artifact = lib.downloads?.artifact;
-      if (!artifact) continue;
-      const file = path.join(this.source, "libraries", artifact.path);
-      if (!(await exists(file)))
-        throw new Error(
-          "The official installed Minecraft libraries are incomplete. Install Minecraft 1.21.4 using the official Launcher.",
-        );
-      const coordinate = String(lib.name).split(":");
-      librariesByName.set(
-        `${coordinate[0]}:${coordinate[1]}:${coordinate[3] ?? ""}`,
-        file,
-      );
-    }
-    for (const lib of loader.libraries) {
-      const [group, name, version] = lib.name.split(":");
-      const relative = `${group!.replaceAll(".", "/")}/${name}/${version}/${name}-${version}.jar`;
-      const cached = cachedLibraries && path.join(cachedLibraries, relative);
-      if (cached && await exists(cached)) {
-        librariesByName.set(`${group}:${name}:`, cached);
-        continue;
-      }
-      const file = path.join(this.dataDir, "native-libraries", relative);
-      if (!(await exists(file))) {
-        const url = `${lib.url}${relative}`;
-        const sum = await (
-          await fetch(`${url}.sha1`, {
-            signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
-          })
-        ).text();
-        await download(url, file, sum, "sha1", signal);
-      }
-      librariesByName.set(`${group}:${name}:`, file);
-    }
-    return {
-      libraries: [
-        ...librariesByName.values(),
-        path.join(this.source, "versions/1.21.4/1.21.4.jar"),
-      ],
-      assetIndex: String(version.assetIndex.id),
-    };
-  }
-
   private gameArguments(
     profile: { name: string; id: string },
     accessToken: string,
@@ -460,23 +457,27 @@ export class MinecraftClient {
       evidenceDir: string;
       display: string;
       authority: string;
+      onSetup?: (phase: "client_session_check" | "client_dependencies" | "client_startup") => void;
       beforeConnect?: (profileName: string) => Promise<void>;
     },
     signal: AbortSignal,
   ) {
+    config.onSetup?.("client_session_check");
     const { accessToken, profile } = await this.verifyOfficialSession(signal);
+    config.onSetup?.("client_dependencies");
     const tmp = path.join(this.directory, "tmp");
     await mkdir(tmp, { mode: 0o700 });
     await prepareFabricApi(this.directory, signal,
       path.join(config.runtimeCache, "native-client/mods/fabric-api.jar"));
-    const { libraries, assetIndex } = await this.fabricClasspath(
-      signal, path.join(config.runtimeCache, "native-libraries"),
+    const { libraries, assetIndex } = await prepareFabricClientClasspath(
+      this.source, this.dataDir, signal, path.join(config.runtimeCache, "native-libraries"),
     );
     await writeFile(
       path.join(this.directory, "options.txt"),
       CLIENT_OPTIONS,
       { mode: 0o600 },
     );
+    config.onSetup?.("client_startup");
     if (config.beforeConnect) {
       signal.throwIfAborted();
       await config.beforeConnect(profile.name);
@@ -557,7 +558,9 @@ export class MinecraftClient {
       evaluation: this.evaluation,
     };
     await privateJson(this.sessionFile, session);
-    const { libraries, assetIndex } = await this.fabricClasspath(signal);
+    const { libraries, assetIndex } = await prepareFabricClientClasspath(
+      this.source, this.dataDir, signal,
+    );
     libraries.push(mod);
     await writeFile(path.join(this.directory, "options.txt"), CLIENT_OPTIONS, { mode: 0o600 });
     const args = this.gameArguments(profile, accessToken, assetIndex, `${config.host}:${config.port}`);

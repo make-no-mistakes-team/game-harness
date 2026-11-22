@@ -146,6 +146,10 @@ function outcomeStatus(outcome: Record<string, unknown>) {
       if (outcome.reason === TERRA_ACTOR_REBUILD) return TERRA_ACTOR_REBUILD;
       if (outcome.reason === "The official Launcher Minecraft session is unavailable. Sign in and launch Minecraft 1.21.4 with the official Launcher.")
         return LAUNCHER_REQUIRED;
+      if (outcome.finalStage === "client_session_check")
+        return "Minecraft could not verify the official Launcher session. Check the connection to Minecraft services.";
+      if (outcome.finalStage === "client_dependencies")
+        return "Minecraft client dependencies could not be prepared. Check the installation and Fabric download access.";
       return outcome.finalStage === "client_startup" ?
         "Minecraft could not launch. Check the official Launcher installation and Fabric download access." :
         "Minecraft Survival Agent could not finish the run.";

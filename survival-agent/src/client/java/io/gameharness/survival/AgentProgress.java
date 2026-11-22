@@ -766,9 +766,10 @@ final class AgentProgress {
     }
 
     private void recordOneWayCaveLanding(AgentDryLanding landing) {
-        // The old trail was detached at takeoff. The receipt is a new grounded
-        // starting point only, not a returnable stair, route edge, or recovery lease.
+        // The old trail was detached at takeoff. The new dry footing is real
+        // navigation progress, not a returnable stair or an ore receipt.
         recordCaveFooting(landing.to());
+        stallGuard.navigationArrival(landing.source(), landing.to());
         mineResite.depth(landing.to());
         digDirection = landing.bearing();
         branchTurns = failedDirections = legLength = stairLength = deadEnds = litIndex = 0;
@@ -7913,11 +7914,12 @@ final class AgentProgress {
     static final class MineSetback {
         private final BlockPos[] retired = new BlockPos[8];
         private BlockPos site;
-        private int nextRetired, refusals, depth, material;
+        private int nextRetired, refusals, depth, material, lastExhaustedIncident;
 
         void begin(int y, int stock) {
             Arrays.fill(retired, null);
             nextRetired = 0;
+            lastExhaustedIncident = -1;
             depth = y;
             material = stock;
             progressing();
@@ -7952,6 +7954,14 @@ final class AgentProgress {
 
         boolean ready(boolean recoveryExhausted) {
             return refusals >= 2 || refusals > 0 && recoveryExhausted;
+        }
+
+        void recoveryEnded(BlockPos foot, int incidentTick) {
+            // Recovery may have interrupted the miner before its own EXHAUSTED result.
+            // A single terminal incident is evidence once, not a new reason on every idle tick.
+            if (incidentTick == lastExhaustedIncident) return;
+            lastExhaustedIncident = incidentTick;
+            if (site == null && !retired(foot)) exhausted(foot);
         }
 
         boolean retired(BlockPos foot) {
@@ -8078,18 +8088,22 @@ final class AgentProgress {
 
         boolean step() {
             BlockPos standing = c.player.getBlockPos();
+            var rememberedBatch = pendingFurnaceMemory.current();
             if (ore == null || sought != ore || firing != Firing.NONE || furnaceLoaded || localFurnace != null
-                    || pendingFurnaceMemory.current() != null || portal != null && portal.castEligible()) {
+                    || rememberedBatch != null && rememberedBatch.mayInvestigateCollection() || portal != null && portal.castEligible()) {
                 if (active()) release();
                 return false;
             }
             if (!active()) {
-                if (!setback.ready(stallGuard.exhaustedDryRecovery()) || returnIndex >= 0 || exitStart != null
+                boolean stalled = stallGuard.exhaustedDryRecovery();
+                if (!stalled && !setback.ready(false) || returnIndex >= 0 || exitStart != null
                         || supplyEgress.active() || returnableMine.active() || nextFoot != null || caveRetreat.shaft != null
                         || caves.active() || caves.routingDry() || stallWork != null || !safe()
                         || !exactContact(standing) || !body.hasRecentView()
                         || c.player.getVelocity().horizontalLengthSquared() > 0.0025
                         || attemptedAt != null && !MineSetback.different(attemptedAt, standing)) return false;
+                if (stalled) setback.recoveryEnded(standing, stallGuard.report().incidentTick());
+                if (!setback.ready(stalled)) return false;
                 int waypoint = mineRetreatTarget(trail, activeTrail() - 1, standing, eligibleReturn);
                 setback.retire();
                 // Invalidate advice for the failed opportunity. Its dedup bit stays spent.

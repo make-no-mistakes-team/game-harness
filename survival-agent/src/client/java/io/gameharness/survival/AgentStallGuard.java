@@ -324,7 +324,7 @@ final class AgentStallGuard {
         if (phase == Phase.RETRY) navigationRetry = true;
     }
 
-    /** The declared navigation job proved a return connection and actually reached this footing. */
+    /** A physically reached new dry footing ends a stall; it records neither a return edge nor ore. */
     void navigationArrival(BlockPos from, BlockPos foot) {
         if (!dryGround() || !foot.equals(client.player.getBlockPos()) || contains(navigationFootings, foot)) return;
         if (!contains(navigationFootings, from))

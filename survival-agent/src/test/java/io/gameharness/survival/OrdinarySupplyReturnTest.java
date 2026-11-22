@@ -71,6 +71,21 @@ final class OrdinarySupplyReturnTest {
     }
 
     @Test
+    void aTerminatedRecoveryCanReleaseAnInterruptedMineOnlyOnce() {
+        var foot = MINE.withY(50);
+        var mine = new AgentProgress.MineSetback();
+        mine.begin(50, 0);
+        assertFalse(mine.ready(false));
+        mine.recoveryEnded(foot, 271);
+        assertTrue(mine.ready(true), "do not require a second terminal receipt from the interrupted miner");
+        mine.material(1);
+        mine.recoveryEnded(foot, 271);
+        assertFalse(mine.ready(true), "the same idle incident cannot undo the actual ore pickup");
+        mine.recoveryEnded(foot.east(), 685);
+        assertTrue(mine.ready(true), "a genuinely later exhausted incident may trigger a new choice");
+    }
+
+    @Test
     void mineResiteRetreatNeedsAnExactContactAndContinuousDryGrades() {
         var foot = new BlockPos(-20, 50, 33);
         var trail = List.of(foot.west().up(3).south(3), foot.up(2).south(3),

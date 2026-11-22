@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { mkdir, open, rename, unlink, writeFile, type FileHandle } from "node:fs/promises";
 import { basename, join } from "node:path";
@@ -6,7 +6,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { ProviderPendingSpan } from "../../../survival-agent/pause-evidence.ts";
 import { SURVIVAL_AGENT_GOALS, TERRA_MODEL_ID } from "../../shared/survival-agent-ui.ts";
 import { validateMacroId, type MacroInference } from "./protocol.ts";
-import { openTerraExpeditionAdvisor, TerraOwnerDrainError, type TerraExpeditionDecision } from "./terra.ts";
+import {
+  EXPEDITION_RECOVERY_NEED, frameDimensions, isExpeditionRecoveryText, openTerraExpeditionAdvisor,
+  TerraOwnerDrainError, type ExpeditionRecovery, type TerraExpeditionDecision,
+} from "./terra.ts";
+import {
+  archiveExpeditionRecoveryFrame, EXPEDITION_RECOVERY_FRAME_DIRECTORY, FRAME_BYTES, FRAME_TIMEOUT_MS,
+} from "./visual-capture.ts";
 
 const REQUEST_TIMEOUT_MS = 35_000;
 const MAX_STATE_AGE_MS = 5_000;
@@ -14,9 +20,14 @@ const POLL_MS = 250;
 const COOLDOWN_MS = 8_000;
 const ADVICE_TICKS = 900;
 const MAX_STATE_BYTES = 16 * 1024;
+const RECOVERY_WIDTH = 1280;
+const RECOVERY_HEIGHT = 720;
 const ID = /^[a-z][a-z0-9_-]{0,63}$/;
 const ITEM = /^minecraft:[a-z0-9_]{1,96}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const RECOVERY_CONFIRMED = /^Situational recovery confirmed ([a-z][a-z0-9_-]{0,63}) \(([1-3])\/([1-3])\): /;
+const RECOVERY_STOPPED = /^Situational recovery stopped during ([a-z][a-z0-9_-]{0,63}) after confirming ([0-2])\/([1-3]) methods: /;
+const UTF8 = new TextDecoder("utf-8", { fatal: true });
 
 interface ExpeditionOptions {
   readonly dir: string;
@@ -27,6 +38,7 @@ interface ExpeditionOptions {
   readonly maxRequests: number;
   readonly maxRuntimeMs: number;
   readonly assertDisplay: () => void;
+  readonly captureRecoveryFrame?: (signal: AbortSignal) => Promise<Buffer>;
 }
 
 type VisibleState = Omit<TerraExpeditionDecision["view"], "objective">;
@@ -37,6 +49,7 @@ interface Basis {
   readonly goal: string;
   readonly tick: number;
   readonly need: string;
+  readonly incident?: number;
 }
 interface Receipt {
   readonly id: string;
@@ -63,10 +76,14 @@ interface Advice {
   readonly expiresTick: number;
   readonly need: string;
   readonly option: string;
+  readonly subgoal?: string;
+  readonly steps?: readonly string[];
 }
+type RecoveryContext = Pick<VisibleState, "recovery" | "options">;
 interface SentAdvice {
   readonly wire: Advice;
   readonly expiresAt: number;
+  readonly recovery?: RecoveryContext;
   applied: boolean;
 }
 
@@ -83,6 +100,14 @@ function text(value: unknown, maxBytes: number): value is string {
   return typeof value === "string" && Buffer.byteLength(value) <= maxBytes && !/[\x00-\x1f\x7f]/.test(value);
 }
 
+function parseRecovery(value: unknown): ExpeditionRecovery | undefined {
+  const recovery = object(value);
+  if (!recovery || Object.keys(recovery).length !== 2 || !count(recovery.incident) || recovery.incident === 0 ||
+      !Array.isArray(recovery.history) || recovery.history.length < 1 || recovery.history.length > 5 ||
+      !recovery.history.every(isExpeditionRecoveryText)) return;
+  return { incident: recovery.incident, history: recovery.history };
+}
+
 function parseState(value: unknown, run: string, goal: string): ExpeditionState | undefined {
   const state = object(value);
   if (!state || state.v !== 1 || state.run !== run || state.goal !== goal || !count(state.life) ||
@@ -90,6 +115,11 @@ function parseState(value: unknown, run: string, goal: string): ExpeditionState 
       typeof state.health !== "number" || !Number.isFinite(state.health) || state.health < 0 || state.health > 2048 ||
       !count(state.food, 20) || !text(state.activity, 512) ||
       !Array.isArray(state.options) || state.options.length > 8) return;
+  let recovery: ExpeditionRecovery | undefined;
+  if (state.need === EXPEDITION_RECOVERY_NEED) {
+    recovery = parseRecovery(state.recovery);
+    if (!recovery || state.options.length === 0) return;
+  } else if ("recovery" in state) return;
   const items = object(state.inventory);
   if (!items || Object.keys(items).length > 128) return;
   const inventory: Record<string, number> = Object.create(null);
@@ -100,7 +130,8 @@ function parseState(value: unknown, run: string, goal: string): ExpeditionState 
   for (const value of state.options) {
     const offer = object(value);
     if (!offer || typeof offer.id !== "string" || !ID.test(offer.id) || offer.id === "abstain" ||
-        !text(offer.summary, 512) || !offer.summary.trim() || options.some(({ id }) => id === offer.id)) return;
+        !text(offer.summary, 512) || !offer.summary.trim() || options.some(({ id }) => id === offer.id) ||
+        (recovery && Object.keys(offer).length !== 2)) return;
     options.push({ id: offer.id, summary: offer.summary });
   }
   const receipt = object(state.applied);
@@ -108,7 +139,7 @@ function parseState(value: unknown, run: string, goal: string): ExpeditionState 
     typeof receipt.option === "string" && ID.test(receipt.option) && count(receipt.tick, state.tick)
     ? { id: receipt.id, option: receipt.option, tick: receipt.tick } : undefined;
   return { run, goal, life: state.life, tick: state.tick, need: state.need,
-    inventory, options, health: state.health, food: state.food, activity: state.activity, applied };
+    inventory, options, health: state.health, food: state.food, activity: state.activity, applied, recovery };
 }
 
 async function readState(file: string, run: string, goal: string): Promise<Publication | undefined> {
@@ -128,8 +159,13 @@ async function readState(file: string, run: string, goal: string): Promise<Publi
     const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
     if (bytesRead !== info.size) return;
     let value;
-    try { value = JSON.parse(bytes.toString("utf8", 0, bytesRead)); } catch { return; }
+    try { value = JSON.parse(UTF8.decode(bytes.subarray(0, bytesRead))); } catch { return; }
     const state = parseState(value, run, goal);
+    if (state?.recovery) {
+      const after = await handle.stat();
+      if (after.nlink !== 1 || after.mode !== info.mode || after.size !== info.size ||
+          after.mtimeMs !== info.mtimeMs || after.ctimeMs !== info.ctimeMs) return;
+    }
     return state ? { state, mtimeMs: info.mtimeMs } : undefined;
   } finally {
     await handle.close();
@@ -140,10 +176,12 @@ function actionable(publication: Publication | undefined): publication is Public
   if (!publication) return false;
   const { state, mtimeMs } = publication;
   const age = Date.now() - mtimeMs;
-  return age >= -1_000 && age <= MAX_STATE_AGE_MS && state.health > 0 && state.need !== "none" && state.options.length >= 2;
+  return age >= -1_000 && age <= MAX_STATE_AGE_MS && state.health > 0 && state.need !== "none" &&
+    state.options.length >= (state.recovery ? 1 : 2);
 }
 
 function decisionKey(state: ExpeditionState) {
+  if (state.recovery) return `recovery:${state.life}:${state.recovery.incident}`;
   const offers = state.options.slice().sort((a, b) => a.id < b.id ? -1 : a.id === b.id ? 0 : 1);
   // Inventory informs the decision. Mining spoil, using a torch, or moving a stack
   // through the GUI does not reopen the same strategic choice.
@@ -152,15 +190,24 @@ function decisionKey(state: ExpeditionState) {
 
 function sameNeed(state: ExpeditionState, basis: Basis) {
   return state.run === basis.run && state.life === basis.life && state.goal === basis.goal && state.need === basis.need &&
-    state.tick >= basis.tick && state.tick <= basis.tick + ADVICE_TICKS;
+    state.recovery?.incident === basis.incident && state.tick >= basis.tick && state.tick <= basis.tick + ADVICE_TICKS;
 }
 
-async function publishAdvice(directory: string, advice: Advice, signal: AbortSignal) {
+function sameRecovery(current: ExpeditionState, context: RecoveryContext) {
+  const before = context.recovery;
+  const now = current.recovery;
+  return !!before && !!now && before.incident === now.incident && before.history.length === now.history.length &&
+    before.history.every((entry, index) => entry === now.history[index]) && current.options.length === context.options.length &&
+    context.options.every(offer => current.options.some(({ id, summary }) => id === offer.id && summary === offer.summary));
+}
+
+async function publishAdvice(directory: string, advice: Advice, signal: AbortSignal, current?: () => Promise<boolean>) {
   const temporary = join(directory, `.advice-${advice.id}`);
   const writer = await open(temporary, "wx", 0o600);
   try {
     try { await writer.writeFile(JSON.stringify(advice)); }
     finally { await writer.close(); }
+    if (current && !await current()) return false;
     if (signal.aborted) return false;
     await rename(temporary, join(directory, "advice.json"));
     return true;
@@ -175,7 +222,7 @@ function timing(moment: ProviderMoment) {
 
 /** Ordinary native play never waits for this optional, one-request-at-a-time advisor. */
 export function composeExpeditionAdvisor(options: ExpeditionOptions) {
-  const { dir, goal, authDirectory, maxRequests, maxRuntimeMs, assertDisplay } = options;
+  const { dir, goal, authDirectory, maxRequests, maxRuntimeMs, assertDisplay, captureRecoveryFrame } = options;
   const run = validateMacroId(basename(dir), "Expedition run");
   const objective = options.objective.trim();
   if (!(SURVIVAL_AGENT_GOALS as readonly string[]).includes(goal) || !count(maxRequests) ||
@@ -184,8 +231,9 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
     throw new Error("Invalid expedition goal, objective, or advisory limits.");
   const declaration = {
     strategy: "terra", model: TERRA_MODEL_ID, control: "local", mode: "expedition_advisory", authoring: null,
-    task: objective || null, input: "visible_state_text",
-    limits: { maxRequests, maxRuntimeMs, requestTimeoutMs: REQUEST_TIMEOUT_MS, cooldownMs: COOLDOWN_MS },
+    task: objective || null, input: captureRecoveryFrame ? "visible_state_text_or_recovery_jpeg" : "visible_state_text",
+    limits: { maxRequests, maxRuntimeMs, requestTimeoutMs: REQUEST_TIMEOUT_MS, cooldownMs: COOLDOWN_MS,
+      ...(captureRecoveryFrame ? { recoveryCaptureTimeoutMs: FRAME_TIMEOUT_MS } : {}) },
   } as const;
   const directory = join(dir, "expedition");
   const stateFile = join(directory, "state.json");
@@ -195,8 +243,10 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
   const authority = AbortSignal.any([signal, runtime.signal]);
   const spans: ProviderPendingSpan[] = [];
   const attemptedKeys = new Set<string>();
+  const dispatchedRecoveryFrames = new Set<string>();
   const published = new Map<string, SentAdvice>();
   let pending: SentAdvice | undefined;
+  let observedRecovery: { readonly sent: SentAdvice; readonly logged: Set<string> } | undefined;
   let journal: FileHandle | undefined;
   let journalTail = Promise.resolve(true);
   let startup: Promise<void> | undefined;
@@ -247,7 +297,35 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
     if (!await log("applied", { advice: wire, receipt, observedTick: state.tick })) return;
     sent.applied = true;
     applied++;
+    if (wire.steps) observedRecovery = { sent, logged: new Set() };
     if (pending === sent) pending = undefined;
+  }
+
+  async function observeRecovery(state: ExpeditionState | undefined) {
+    const observing = observedRecovery;
+    if (!observing) return;
+    const { wire, expiresAt } = observing.sent;
+    const receipt = state?.applied;
+    if (performance.now() > expiresAt ||
+        (state && (state.life !== wire.life || state.tick > wire.expiresTick || (receipt && receipt.id !== wire.id)))) {
+      observedRecovery = undefined;
+      return;
+    }
+    if (!receipt || !state || state.run !== wire.run || state.goal !== wire.goal || receipt.option !== wire.option ||
+        receipt.tick < wire.basisTick || !wire.steps) return;
+    const confirmed = RECOVERY_CONFIRMED.exec(state.activity);
+    const match = confirmed ?? RECOVERY_STOPPED.exec(state.activity);
+    if (!match) return;
+    const [, method, done, limit] = match;
+    const completed = Number(done);
+    const total = Number(limit);
+    const status = confirmed ? "confirmed" : "stopped";
+    const key = `${status}:${method}`;
+    if (wire.steps.length !== total || wire.steps[completed - (confirmed ? 1 : 0)] !== method || observing.logged.has(key)) return;
+    if (!await log("recovery_activity", { adviceId: wire.id, observedTick: state.tick, status, method, completed, total,
+      activity: state.activity })) return;
+    observing.logged.add(key);
+    if (!confirmed || completed === total) observedRecovery = undefined;
   }
 
   function checkDisplay() {
@@ -262,30 +340,71 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
 
   type Provider = Awaited<ReturnType<typeof openTerraExpeditionAdvisor>>;
   async function ask(provider: Provider, state: ExpeditionState, key: string) {
-    const { life, tick, need, inventory, options, health, food, activity } = state;
-    const basis: Basis = { run, goal, life, tick, need };
+    const { life, tick, need, inventory, options, health, food, activity, recovery } = state;
+    const basis: Basis = { run, goal, life, tick, need, ...(recovery ? { incident: recovery.incident } : {}) };
     const expiresAt = performance.now() + ADVICE_TICKS * 50;
     const attempt = ++attempts;
     lastAttemptAt = performance.now();
     attemptedKeys.add(key);
-    const view = { goal, ...(objective ? { objective } : {}), need, options, inventory, health, food, activity };
+    const view = { goal, ...(objective ? { objective } : {}), need, options, inventory, health, food, activity,
+      ...(recovery ? { recovery } : {}) };
     if (!await log("decision", { attempt, basis, view })) return;
+    async function stillCurrent() {
+      if (authority.aborted || provider.authoritySignal.aborted) return false;
+      const current = await readState(stateFile, run, goal).catch(() => {
+        protocolFault = true;
+        return undefined;
+      });
+      return !authority.aborted && !provider.authoritySignal.aborted && actionable(current) &&
+        performance.now() <= expiresAt && sameNeed(current.state, basis) &&
+        (recovery ? sameRecovery(current.state, state) : decisionKey(current.state) === key) && checkDisplay();
+    }
+
+    let frame: {
+      readonly archive: Awaited<ReturnType<typeof archiveExpeditionRecoveryFrame>>;
+      readonly hashKey: string;
+      readonly image: NonNullable<TerraExpeditionDecision["image"]>;
+      readonly receipt: { readonly relativePath: string; readonly sha256: string; readonly width: number; readonly height: number };
+    } | undefined;
+    if (recovery && captureRecoveryFrame) {
+      const omitted = (disposition: string) => log("disposition", { attempt, basis, dispatched: false, disposition });
+      if (!await stillCurrent()) return void await omitted(authority.aborted ? "cancelled" : "stale");
+      const deadline = AbortSignal.timeout(FRAME_TIMEOUT_MS);
+      const captureSignal = AbortSignal.any([authority, provider.authoritySignal, deadline]);
+      let jpeg: Buffer;
+      try { jpeg = await captureRecoveryFrame(captureSignal); }
+      catch {
+        if (!authority.aborted) checkDisplay();
+        return void await omitted(authority.aborted ? "cancelled" : deadline.aborted ? "capture_timeout" : "capture_unavailable");
+      }
+      if (captureSignal.aborted) return void await omitted(deadline.aborted ? "capture_timeout" : "cancelled");
+      if (!await stillCurrent()) return void await omitted(authority.aborted ? "cancelled" : "stale");
+      if (!Buffer.isBuffer(jpeg) || jpeg.length > FRAME_BYTES) return void await omitted("invalid_frame");
+      // The producer can retain its buffer. Bind a single owned snapshot to the file, hash and request.
+      const bytes = Buffer.from(jpeg);
+      const size = frameDimensions(bytes, "image/jpeg");
+      if (!size || size[0] !== RECOVERY_WIDTH || size[1] !== RECOVERY_HEIGHT) return void await omitted("invalid_frame");
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      const hashKey = `${life}:${sha256}`;
+      if (dispatchedRecoveryFrames.has(hashKey)) return void await omitted("duplicate_frame");
+      const archive = await archiveExpeditionRecoveryFrame(dir, bytes, authority).catch(() => undefined);
+      if (!archive) return void await omitted(authority.aborted ? "cancelled" : "archive_unavailable");
+      frame = { archive, hashKey, image: { type: "image", mimeType: "image/jpeg", data: bytes.toString("base64") },
+        receipt: { relativePath: archive.relativePath, sha256, width: size[0], height: size[1] } };
+    }
     let span: number | undefined;
+    let dispatchedFrame = false;
     const result = await provider.choose({
-      view,
+      view, image: frame?.image,
       async assertDispatch() {
-        const current = await readState(stateFile, run, goal).catch(() => {
-          protocolFault = true;
-          return undefined;
-        });
-        return !authority.aborted && actionable(current) && performance.now() <= expiresAt &&
-          sameNeed(current.state, basis) && decisionKey(current.state) === key && checkDisplay();
+        return (!frame || await frame.archive.verify().catch(() => false)) && await stillCurrent();
       },
       onProviderDispatch(moment) {
         providerDispatches++;
+        dispatchedFrame = !!frame;
         span = spans.length;
         spans.push({ startNs: moment.osNs, endNs: null, terminalObserved: false, stage: "live_observation" });
-        void log("dispatch", { attempt, basis, timing: timing(moment) });
+        void log("dispatch", { attempt, basis, timing: timing(moment), frame: frame?.receipt });
       },
       onProviderSettled(moment) {
         const start = span === undefined ? undefined : spans[span];
@@ -298,12 +417,22 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
         void log("settlement", { attempt, timing: timing(moment), terminalOsNs: terminal?.toString(),
           providerTerminalWallMs: moment.providerTerminalWallMs, providerTerminalMonotonicMs: moment.providerTerminalMonotonicMs });
       },
-    });
+    }).then(result => {
+      if (result.dispatched && frame) {
+        dispatchedFrame = true;
+        dispatchedRecoveryFrames.add(frame.hashKey);
+      }
+      return result;
+    }).finally(() => frame?.archive.finish(dispatchedFrame).catch(() => {
+      protocolFault = true;
+      end.abort();
+    }));
     if (result.dispatched) {
       providerSettlements++;
       if (span === undefined) {
         providerDispatches++;
         timingIncomplete = true;
+        if (frame) await log("dispatch", { attempt, basis, frame: frame.receipt });
       }
     }
     lastProviderOutcome = result.outcome;
@@ -315,12 +444,13 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
       const current = authority.aborted ? undefined : await readState(stateFile, run, goal);
       const option = options.find(({ id }) => id === proposal.option);
       if (option && actionable(current) && performance.now() <= expiresAt && sameNeed(current.state, basis) &&
-          current.state.options.some(({ id, summary }) => id === option.id && summary === option.summary) && checkDisplay()) {
+          (recovery ? sameRecovery(current.state, state) :
+            current.state.options.some(({ id, summary }) => id === option.id && summary === option.summary)) && checkDisplay()) {
         const wire = { v: 1, run, goal, life, id: randomUUID(), basisTick: tick, expiresTick: tick + ADVICE_TICKS,
-          need, option: option.id } as const;
-        if (await publishAdvice(directory, wire, authority)) {
+          need, option: option.id, ...("steps" in proposal ? { subgoal: proposal.subgoal, steps: proposal.steps } : {}) } as const;
+        if (await publishAdvice(directory, wire, authority, recovery ? stillCurrent : undefined)) {
           advice = wire;
-          pending = { wire, expiresAt, applied: false };
+          pending = { wire, expiresAt, recovery: recovery ? { recovery, options } : undefined, applied: false };
           published.set(wire.id, pending);
         }
       }
@@ -364,15 +494,18 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
         const current = await readState(stateFile, run, goal);
         const state = current?.state;
         await acknowledge(state);
+        await observeRecovery(state);
         const waiting = pending;
         if (waiting && (performance.now() > waiting.expiresAt || (state && (state.life !== waiting.wire.life ||
             state.tick > waiting.wire.expiresTick || state.need !== waiting.wire.need ||
+            (waiting.recovery && !sameRecovery(state, waiting.recovery)) ||
             !state.options.some(({ id }) => id === waiting.wire.option))))) {
           pending = undefined;
           await log("advice_no_longer_current", { advice: waiting.wire });
         }
-        if (!provider && !pending) break;
-        if (provider && !pending && !authority.aborted && actionable(current) && performance.now() - lastAttemptAt >= COOLDOWN_MS) {
+        if (!provider && !pending && !observedRecovery) break;
+        if (provider && !pending && !authority.aborted && actionable(current) && (!current.state.recovery || captureRecoveryFrame) &&
+            performance.now() - lastAttemptAt >= COOLDOWN_MS) {
           const key = decisionKey(current.state);
           if (!attemptedKeys.has(key)) await ask(provider, current.state, key);
         }
@@ -392,6 +525,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
   async function initialize() {
     signal.throwIfAborted();
     await mkdir(directory, { mode: 0o700 });
+    if (captureRecoveryFrame) await mkdir(join(directory, EXPEDITION_RECOVERY_FRAME_DIRECTORY), { mode: 0o700 });
     journal = await open(join(directory, "decisions.jsonl"), "wx", 0o600);
     await writeFile(join(directory, "active.json"), JSON.stringify({ v: 1, run }), { flag: "wx", mode: 0o600 });
     if (!signal.aborted) worker = background().catch(() => { cleanupFailed = true; });
@@ -401,8 +535,12 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
     await startup?.catch(() => {});
     await worker;
     if (journal) {
-      if (published.size > applied) {
-        try { await acknowledge((await readState(stateFile, run, goal))?.state); }
+      if (published.size > applied || observedRecovery) {
+        try {
+          const state = (await readState(stateFile, run, goal))?.state;
+          await acknowledge(state);
+          await observeRecovery(state);
+        }
         catch { protocolFault = true; }
       }
       await log(cleanupFailed ? "drain_failed" : "closed",

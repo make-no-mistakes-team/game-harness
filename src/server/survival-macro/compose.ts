@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, stat, unlink } from "node:fs/promises";
 import path from "node:path";
@@ -182,19 +183,34 @@ async function oneJpeg(
   }
 }
 
+function displayJpegReader(options: CaptureOptions) {
+  let command: CaptureCommand | undefined;
+  return async (signal: AbortSignal, temporary: string) => {
+    const selected = command ??= await jpegCommand({ ...options, signal });
+    signal.throwIfAborted();
+    return oneJpeg(options, selected, signal, temporary);
+  };
+}
+
+/** An ordinary recovery frame informs strategy only; it cannot authorize a screen-space action. */
+export function createRecoveryFrameCapture(options: CaptureOptions) {
+  const readJpeg = displayJpegReader(options);
+  return async (request: AbortSignal): Promise<Buffer> => {
+    const signal = AbortSignal.any([options.signal, request, AbortSignal.timeout(FRAME_TIMEOUT_MS)]);
+    signal.throwIfAborted();
+    if (!options.display.stillOwned()) throw new Error("The game display is no longer owned.");
+    const frame = await readJpeg(signal, path.join(options.dir, `.recovery-frame-${randomUUID()}`));
+    signal.throwIfAborted();
+    if (!options.display.stillOwned()) throw new Error("The game display changed during capture.");
+    if (!("bytes" in frame)) throw new Error(`Could not capture the game view: ${frame.failure}.`);
+    return frame.bytes;
+  };
+}
+
 export async function openTrustedFrameCapture(options: CaptureOptions & { assertDisplay: () => void; native?: boolean }) {
   await initializeFrameArchive(options.dir);
   options.assertDisplay();
-  let command: CaptureCommand | undefined;
-  return createTrustedFrameCapture({
-    ...options,
-    // Startup goal-only inference and successful native capture never initialize X11 capture.
-    readJpeg: async (signal, temporary) => {
-      const selected = command ??= await jpegCommand({ ...options, signal });
-      signal.throwIfAborted();
-      return oneJpeg(options, selected, signal, temporary);
-    },
-  });
+  return createTrustedFrameCapture({ ...options, readJpeg: displayJpegReader(options) });
 }
 
 /** Owns one admitted Terra lane. The deterministic runner never calls this module. */

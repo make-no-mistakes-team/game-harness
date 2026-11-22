@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { openTrustedFrameCapture } from "../../src/server/survival-macro/compose.ts";
+import { createRecoveryFrameCapture, openTrustedFrameCapture } from "../../src/server/survival-macro/compose.ts";
 import type { MacroObservation } from "../../src/server/survival-macro/protocol.ts";
 
 const dir = process.cwd();
@@ -57,6 +57,14 @@ assert.equal(decoded.stdout.length, 3);
 for (const [index, expected] of [0x35, 0xa9, 0x6e].entries()) {
   assert(Math.abs(decoded.stdout[index]! - expected) <= 5, `Unexpected captured pixel: ${[...decoded.stdout]}`);
 }
+// The advisory image uses the same private display; a lost lease during
+// acquisition must not release even an otherwise valid image to its caller.
+let owned = true;
+const recovery = createRecoveryFrameCapture({
+  ...settings,
+  display: { ...settings.display, stillOwned: () => { const previous = owned; owned = false; return previous; } },
+});
+await assert.rejects(recovery(signal), /display changed during capture/);
 const wrongDir = path.join(dir, "wrong-size");
 const wrongView = { ...observation, run: path.basename(wrongDir) };
 await mkdir(path.join(wrongDir, "macro"), { recursive: true, mode: 0o700 });

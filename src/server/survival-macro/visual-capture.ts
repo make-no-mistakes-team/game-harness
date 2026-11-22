@@ -9,6 +9,7 @@ import { frameDimensions } from "./terra.ts";
 
 export const FRAME_BYTES = 2 * 1024 * 1024;
 export const FRAME_TIMEOUT_MS = 1_000;
+export const EXPEDITION_RECOVERY_FRAME_DIRECTORY = "recovery-frames";
 const FRAME_DIRECTORY = "macro-frames";
 const NATIVE_TIMEOUT_MS = 500;
 const MAX_BASIS_TICKS = 40;
@@ -143,6 +144,36 @@ async function publish(directory: Directory, name: string, bytes: string | Buffe
     } finally {
       await handle.close();
     }
+  }
+}
+
+/** Holds the exact private archive entry until the expedition owner knows whether it was sent. */
+export async function archiveExpeditionRecoveryFrame(runPath: string, bytes: Buffer, signal: AbortSignal) {
+  const run = await openDirectory(runPath);
+  let lane: Directory | undefined;
+  let archive: Directory | undefined;
+  let stamp: BigIntStats | undefined;
+  const filename = `${randomUUID()}.jpg`;
+  async function finish(dispatched: boolean) {
+    try {
+      if (!dispatched && archive && stamp) await removeOwned(entry(archive, filename), stamp);
+    } finally {
+      await Promise.all([archive?.handle.close(), lane?.handle.close(), run.handle.close()]);
+    }
+  }
+  let owned = false;
+  try {
+    const parent = lane = await openDirectory(entry(run, "expedition"));
+    const frames = archive = await openDirectory(entry(parent, EXPEDITION_RECOVERY_FRAME_DIRECTORY));
+    const file = entry(frames, filename);
+    const written = stamp = await publish(frames, filename, bytes, signal);
+    const verify = async () => !signal.aborted && await directoryCurrent(run) && await directoryCurrent(parent) &&
+      await directoryCurrent(frames) && await fileCurrent(file, written);
+    if (!await verify()) throw new Error("Recovery archive changed before use.");
+    owned = true;
+    return { relativePath: `expedition/${EXPEDITION_RECOVERY_FRAME_DIRECTORY}/${filename}`, verify, finish };
+  } finally {
+    if (!owned) await finish(false);
   }
 }
 

@@ -10,7 +10,7 @@ import { JAVA, MinecraftClient, privateJson } from "../src/server/minecraft-clie
 import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
 import { osMonotonicNs } from "../src/server/os-monotonic.ts";
 import { TerraActorCompatibilityError } from "../src/server/survival-agent-artifact.ts";
-import { composeTerraSurvival, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
+import { composeTerraSurvival, createRecoveryFrameCapture, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
 import type { MacroStatus } from "../src/server/survival-macro/controller.ts";
 import { composeExpeditionAdvisor } from "../src/server/survival-macro/expedition.ts";
 import { descentFixtures, descentVariants, fixtureWorld, macroTrialWorld, provisionFixture, provisionMacroTrialWorld, terrainFixtures,
@@ -893,6 +893,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     const expeditionAdvisor = localOptions && composeExpeditionAdvisor({
       dir, goal, objective: localOptions.task ?? "", authDirectory: process.env.GAMEHARNESS_DATA_DIR ?? RUNTIME,
       signal, maxRequests: localOptions.maxRequests, maxRuntimeMs: wallMs,
+      captureRecoveryFrame: createRecoveryFrameCapture({ dir, display, ...SCREEN, ffmpeg, signal }),
       assertDisplay: () => {
         if (!display.stillOwned()) throw new Error("The run no longer owns its private Minecraft display.");
       },

@@ -12,7 +12,7 @@ import net.minecraft.util.math.Vec3d;
 /** Ordinary supply prospecting. A horizon is a preference, never a route or permission to move. */
 final class AgentOverlandSearch {
     private static final int MAX_LEG = 4, LOOK_TICKS = 38, DRIVE_TICKS = 65, RETRACE_LIMIT = 8;
-    private static final int VIEW_INTERVAL = 12;
+    private static final int VIEW_INTERVAL = 12, TIMBER_REFUSALS = 24;
     private static final float FLOOR_PITCH = 33, HORIZON_PITCH = 5;
 
     private enum Phase { CENTER, HORIZON, FLOOR, CLEARANCE, DRIVE, STOPPED }
@@ -53,6 +53,7 @@ final class AgentOverlandSearch {
     static final class Course {
         private final LongOpenHashSet walked = new LongOpenHashSet();
         private final ArrayList<BlockPos> crumbs = new ArrayList<>(RETRACE_LIMIT + 1);
+        private final ArrayList<BlockPos> timberRefusals = new ArrayList<>();
         private Direction horizon, side;
         private int newFootings;
 
@@ -62,10 +63,7 @@ final class AgentOverlandSearch {
                 side = bearing.rotateYClockwise();
             }
             walked.add(foot.asLong());
-            if (crumbs.isEmpty() || !foot.equals(crumbs.getLast())) {
-                crumbs.clear(); // An interruption need not have followed our checked route.
-                crumbs.add(foot);
-            }
+            settle(foot, false);
         }
 
         void restart(Direction bearing) {
@@ -90,12 +88,15 @@ final class AgentOverlandSearch {
         }
 
         boolean canExtend(BlockPos from, BlockPos to, Direction lane, int alreadyProved) {
+            return connected(from, to, lane, alreadyProved) && !walked.contains(to.asLong());
+        }
+
+        private static boolean connected(BlockPos from, BlockPos to, Direction lane, int alreadyProved) {
             int rise = to.getY() - from.getY();
             return lane.getAxis().isHorizontal()
                 && to.getX() - from.getX() == lane.getOffsetX()
                 && to.getZ() - from.getZ() == lane.getOffsetZ()
-                && (rise == 0 || alreadyProved == 0 && Math.abs(rise) == 1)
-                && !walked.contains(to.asLong());
+                && (rise == 0 || alreadyProved == 0 && Math.abs(rise) == 1);
         }
 
         boolean walkedSupport(BlockPos support) {
@@ -104,15 +105,62 @@ final class AgentOverlandSearch {
 
         boolean offerResource(BlockPos from, BlockPos to, Direction lane, int alreadyProved,
                               ResourceGoal goal, Predicate<BlockPos> witnessed) {
-            return canExtend(from, to, lane, alreadyProved) && !goal.reached(from)
-                && (goal.reached(to) || goal.remaining(to) + 0.09 < goal.remaining(from))
-                && witnessed.test(to);
+            return canExtend(from, to, lane, alreadyProved) && goalward(from, to, goal) && witnessed.test(to);
+        }
+
+        boolean offerTimberResource(BlockPos from, BlockPos to, Direction lane, int alreadyProved,
+                                    ResourceGoal goal, Predicate<BlockPos> witnessed) {
+            // A new collection may need to cross familiar ground. Goalward steps forbid loops.
+            return connected(from, to, lane, alreadyProved) && timberFooting(to)
+                && goalward(from, to, goal) && witnessed.test(to);
+        }
+
+        private static boolean goalward(BlockPos from, BlockPos to, ResourceGoal goal) {
+            return !goal.reached(from)
+                && (goal.reached(to) || goal.remaining(to) + 0.09 < goal.remaining(from));
+        }
+
+        boolean timberFooting(BlockPos foot) { return !timberRefusals.contains(foot); }
+
+        boolean timberRefusalNear(BlockPos foot) {
+            for (int i = 0; i < timberRefusals.size(); i++) {
+                if (foot.getSquaredDistance(timberRefusals.get(i)) <= 9) return true;
+            }
+            return false;
+        }
+
+        void rememberTimberRefusal(BlockPos foot, Direction bearing) {
+            start(foot, bearing);
+            if (!timberRefusals.remove(foot) && timberRefusals.size() == TIMBER_REFUSALS) timberRefusals.removeFirst();
+            timberRefusals.add(foot.toImmutable());
+        }
+
+        void changedTimberFooting(BlockPos block) {
+            for (int i = timberRefusals.size() - 1; i >= 0; i--) {
+                var foot = timberRefusals.get(i);
+                if (Math.abs(foot.getX() - block.getX()) + Math.abs(foot.getZ() - block.getZ()) <= 1
+                        && Math.abs(foot.getY() - block.getY()) <= 2) timberRefusals.remove(i);
+            }
+        }
+
+        void clearTimberRefusals() { timberRefusals.clear(); }
+
+        private void settle(BlockPos foot, boolean checkedTread) {
+            if (!crumbs.isEmpty() && foot.equals(crumbs.getLast())) return;
+            int known = crumbs.lastIndexOf(foot);
+            if (known >= 0) {
+                while (crumbs.size() > known + 1) crumbs.removeLast();
+                return;
+            }
+            // Recovery can return to a verified tread. An unknown footing cannot join that route.
+            if (!checkedTread) crumbs.clear();
+            else if (crumbs.size() == RETRACE_LIMIT + 1) crumbs.removeFirst();
+            crumbs.add(foot.toImmutable());
         }
 
         boolean arrived(BlockPos foot) {
+            settle(foot, true);
             if (!walked.add(foot.asLong())) return false;
-            if (crumbs.size() == RETRACE_LIMIT + 1) crumbs.removeFirst();
-            crumbs.add(foot);
             ++newFootings;
             return true;
         }
@@ -153,7 +201,7 @@ final class AgentOverlandSearch {
     private int option, length, since, skylineViews, lastSkyline, legs, landmarkUntil;
     private long skylineFrame;
     private double farthest;
-    private boolean risingView, refused, triedLower, canopyLeg;
+    private boolean risingView, refused, triedLower, canopyLeg, timberResource;
     private ResourceGoal resource;
     private String status = "overland search: preparing to look for supplies";
 
@@ -172,7 +220,7 @@ final class AgentOverlandSearch {
     String status() { return status; }
     boolean walkedSupport(BlockPos block) { return course.walkedSupport(block); }
     boolean untriedCanopyTread(BlockPos foot, BlockPos to, Direction bearing) {
-        return course.canExtend(foot, to, bearing, 0);
+        return course.timberFooting(to) && course.canExtend(foot, to, bearing, 0);
     }
 
     CanopyLaneRefusal takeCanopyLaneRefusal() {
@@ -222,6 +270,7 @@ final class AgentOverlandSearch {
         landmark = null;
         returnFoot = null;
         resource = null;
+        timberResource = false;
         canopyBranchFoot = null;
         canopyBranch = null;
         canopyRefusal = null;
@@ -240,6 +289,7 @@ final class AgentOverlandSearch {
 
     void guide(BlockPos witness, int tick) {
         resource = null;
+        timberResource = false;
         landmark = witness;
         landmarkUntil = tick + 150;
         phase = Phase.CENTER;
@@ -253,7 +303,24 @@ final class AgentOverlandSearch {
         resource = goal;
     }
 
+    void guideTimberCollection(ResourceGoal goal) {
+        // A new trunk changes the preferred bearing, not where we have already looked for footing.
+        interrupt();
+        if (client.player.getBlockPos().equals(blockedStance)) blockedStance = null;
+        resource = goal;
+        timberResource = true;
+    }
+
+    void rememberTimberRefusal(BlockPos foot) {
+        course.rememberTimberRefusal(foot, client.player.getHorizontalFacing());
+    }
+
+    boolean timberRefusalNear(BlockPos foot) { return course.timberRefusalNear(foot); }
+    void changedTimberFooting(BlockPos block) { course.changedTimberFooting(block); }
+    void clearTimberRefusals() { course.clearTimberRefusals(); }
+
     void changed(BlockPos position) {
+        changedTimberFooting(position);
         if (blockedStance != null && position.getSquaredDistance(blockedStance) <= 9) {
             blockedStance = null;
             if (phase == Phase.STOPPED) interrupt();
@@ -261,10 +328,10 @@ final class AgentOverlandSearch {
     }
 
     void step(int tick) {
-        step(tick, false);
+        step(tick, false, false);
     }
 
-    void step(int tick, boolean canopy) {
+    void step(int tick, boolean canopy, boolean scoutTimber) {
         var player = client.player;
         BlockPos foot = player.getBlockPos();
         if (driving()) {
@@ -314,7 +381,7 @@ final class AgentOverlandSearch {
                 }
             }
             case HORIZON -> horizon(tick);
-            case FLOOR -> floors(tick, canopy);
+            case FLOOR -> floors(tick, canopy, scoutTimber);
             case CLEARANCE -> clearance(tick, canopy);
             default -> throw new IllegalStateException("Unexpected surface-search phase " + phase);
         }
@@ -391,7 +458,7 @@ final class AgentOverlandSearch {
         }
     }
 
-    private void floors(int tick, boolean canopy) {
+    private void floors(int tick, boolean canopy, boolean scoutTimber) {
         float yaw = lane.getPositiveHorizontalDegrees();
         float pitch = resource != null && stance.getY() > resource.maxFootY ? 45 : FLOOR_PITCH;
         body.turn(yaw, pitch);
@@ -402,17 +469,17 @@ final class AgentOverlandSearch {
                 nextBearing(tick);
                 return;
             }
-        } else if (canopy && !triedLower && !client.options.jumpKey.isUnbound() && offer(stance, next.down())) {
+        } else if (canopy && !triedLower && !client.options.jumpKey.isUnbound() && offer(stance, next.down(), scoutTimber)) {
             triedLower = true;
-        } else if (offer(stance, next)) {
+        } else if (offer(stance, next, scoutTimber)) {
             for (int i = 1; i < MAX_LEG; i++) {
                 BlockPos farther = next.offset(lane);
-                if (!offer(next, farther)) break;
+                if (!offer(next, farther, scoutTimber)) break;
                 next = farther;
             }
-        } else if (offer(stance, next.up())) {
+        } else if (offer(stance, next.up(), scoutTimber)) {
             shownRiser = next;
-        } else if (triedLower || !offer(stance, next.down())) {
+        } else if (triedLower || !offer(stance, next.down(), scoutTimber)) {
             refuseBearing(tick, canopy);
             return;
         }
@@ -420,8 +487,10 @@ final class AgentOverlandSearch {
         since = tick;
     }
 
-    private boolean offer(BlockPos from, BlockPos next) {
-        return resource == null ? course.canExtend(from, next, lane, length) && witness(next)
+    private boolean offer(BlockPos from, BlockPos next, boolean scoutTimber) {
+        if (resource == null)
+            return (!scoutTimber || course.timberFooting(next)) && course.canExtend(from, next, lane, length) && witness(next);
+        return timberResource ? course.offerTimberResource(from, next, lane, length, resource, witnessFloor)
             : course.offerResource(from, next, lane, length, resource, witnessFloor);
     }
 

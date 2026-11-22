@@ -146,6 +146,62 @@ final class OverlandCourseTest {
     }
 
     @Test
+    void afterBackingUpFromAFailedTimberApproachTheCourseLooksForADifferentBranch() {
+        var course = new AgentOverlandSearch.Course();
+        var upper = new BlockPos(0, 68, 0);
+        var fork = upper.south().down();
+        var barren = fork.south().down();
+        course.start(upper, Direction.SOUTH);
+        assertTrue(course.arrived(fork));
+        assertTrue(course.arrived(barren));
+        course.rememberTimberRefusal(barren, Direction.SOUTH);
+
+        // Ordinary timber search resumes where stall recovery actually stood, one step up.
+        course.start(fork, Direction.SOUTH);
+        assertEquals(upper, course.previous(fork), "the checked way back to another fork is still available");
+        assertFalse(course.canExtend(fork, barren, Direction.SOUTH, 0), "do not go back to the failed landing");
+
+        var nextTrunk = barren.south();
+        var face = Vec3d.ofCenter(nextTrunk).add(0, 0, -0.5);
+        var goal = AgentProgress.timberCollectionGoal(Vec3d.ofBottomCenter(fork), nextTrunk, face, 0.6);
+        assertFalse(course.offerTimberResource(fork, barren, Direction.SOUTH, 0, goal, foot -> true),
+            "another downhill trunk does not make the old landing new");
+        assertTrue(course.canExtend(fork, fork.east(), Direction.EAST, 0),
+            "a different visible branch remains eligible for a footing check");
+
+        course.start(fork.west(), Direction.WEST);
+        assertNull(course.previous(fork.west()), "unrecorded recovery movement does not create a checked edge");
+    }
+
+    @Test
+    void aNewCollectionCanReuseCheckedGroundExceptForUnchangedFailedFooting() {
+        var course = new AgentOverlandSearch.Course();
+        var fork = new BlockPos(0, 67, 0);
+        var good = fork.east();
+        var barren = fork.south().down();
+        var target = new AgentOverlandSearch.ResourceGoal(new Vec3d(1.5, 66.5, 1.5), 0.55, 66, 67);
+        course.start(good, Direction.EAST);
+        course.start(fork, Direction.SOUTH);
+        course.rememberTimberRefusal(barren, Direction.SOUTH);
+        course.start(fork, Direction.SOUTH);
+
+        assertTrue(course.offerTimberResource(fork, good, Direction.EAST, 0, target, good::equals),
+            "a new trunk can use checked ground that did not fail");
+        course.restart(Direction.SOUTH);
+        course.start(fork, Direction.SOUTH);
+        assertTrue(course.offerResource(fork, barren, Direction.SOUTH, 0, target, barren::equals),
+            "a verified dropped item can still be picked up from a failed tree stance");
+        assertFalse(course.offerTimberResource(fork, barren, Direction.SOUTH, 0, target, foot -> true));
+        course.changedTimberFooting(barren.east(2));
+        assertFalse(course.offerTimberResource(fork, barren, Direction.SOUTH, 0, target, foot -> true),
+            "a remote change does not make the attempted landing useful");
+        course.changedTimberFooting(barren.up());
+        assertFalse(course.offerTimberResource(fork, barren, Direction.SOUTH, 0, target, foot -> false),
+            "a nearby break only permits a fresh check");
+        assertTrue(course.offerTimberResource(fork, barren, Direction.SOUTH, 0, target, barren::equals));
+    }
+
+    @Test
     void onlyAnActualReverseLegChangesTheHorizon() {
         var course = new AgentOverlandSearch.Course();
         var start = BlockPos.ORIGIN;

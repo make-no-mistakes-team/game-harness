@@ -372,9 +372,11 @@ final class AgentProgress {
     private final NightWorksite nightSite = new NightWorksite();
     private BlockHitResult timberWitness;
     private final Predicate<BlockHitResult> reachableTrunk = hit -> timberCandidate(hit) && timberInReach(hit);
+    private final Predicate<BlockHitResult> settledTrunk = hit -> reachableTrunk.test(hit) && closeTimberStance(hit);
     private BlockHitResult timberCollectionFace;
     private AgentOverlandSearch.ResourceGoal timberCollectionGoal;
     private int timberResourceTick;
+    private boolean timberScouting;
     private BlockPos timberLastCut;
     private final List<BlockPos> exhaustedStems = new ArrayList<>();
     private final List<BlockPos> unreachableTimber = new ArrayList<>();
@@ -695,7 +697,8 @@ final class AgentProgress {
         }
         returnableMine.observeBreak(position, state);
         supplyEgress.observeBreak(position, state);
-        if (!aperture) overland.changed(position);
+        if (aperture) overland.changedTimberFooting(position);
+        else overland.changed(position);
         mineResite.changed(position);
         memory.forgetOwnedWorkbench(c.world, position);
         if (c.world == oreWorld) forgetOre(position);
@@ -933,6 +936,8 @@ final class AgentProgress {
         surfaceApproach.abandonBootstrapPassage();
         surfaceApproach.canopy.reset();
         surfaceApproach.canopyGroundChecks.clear();
+        overland.clearTimberRefusals();
+        timberScouting = false;
         rangedOwnsLocalWork = false;
         dropReclaim = new DropReclaim();
         status = "looking for nearby drops after respawn";
@@ -1535,7 +1540,7 @@ final class AgentProgress {
         if (pickup != null) return pickup;
         BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), c.player.getBlockInteractionRange(), seen -> {
             BlockPos block = seen.getBlockPos();
-            return reachableTrunk.test(seen) && closeTimberStance(seen)
+            return settledTrunk.test(seen)
                 && !stallOreTried.contains(block) && !supportsTrail(block)
                 && !body.hazardAhead(yaw(seen.getPos().subtract(c.player.getPos())), 1.5);
         }).orElse(null);
@@ -5265,6 +5270,11 @@ final class AgentProgress {
         if (timberWitness != null && tendTimber()) return;
         if (startReachableTimber(true)) return;
         if (localOnly) return;
+        if (timberScouting && ordinarySurfaceWork) {
+            // Seeing another distant trunk is not a new route out of the same failed stance.
+            stepOverland();
+            return;
+        }
         BlockPos foot = player.getBlockPos();
         boolean canopy = bootstrapCanopy(foot);
         if (!canopy && !overland.owns(foot) && supplyEgress.seek(supplies)) return;
@@ -5407,7 +5417,7 @@ final class AgentProgress {
         boolean resource = overland.guidingResource(timberCollectionGoal) || overland.guidingResource(pickupLogGoal);
         BlockPos foot = c.player.getBlockPos();
         boolean canopy = pickupLogGoal == null && bootstrapCanopy(foot);
-        overland.step(tick, canopy);
+        overland.step(tick, canopy, !resource && timberScouting);
         var blockedLane = overland.takeCanopyLaneRefusal();
         if (canopy && blockedLane != null
                 && surfaceApproach.noteBootstrapLane(blockedLane.foot(), blockedLane.bearing(),
@@ -5419,6 +5429,7 @@ final class AgentProgress {
         if (overland.leased(tick)) stallGuard.navigationWork();
         var arrival = overland.takeArrival();
         if (arrival != null) {
+            if (!resource) timberScouting = false;
             surfaceApproach.bootstrapLanded(arrival.from(), arrival.foot());
             stallGuard.navigationArrival(arrival.from(), arrival.foot());
         }
@@ -5431,6 +5442,7 @@ final class AgentProgress {
         clearCollectionStance();
         overland.interrupt();
         timberWitness = log;
+        timberScouting = false;
         timberCanopy = null;
         timberLastCut = null;
         timberShelfCheckedFrom = null;
@@ -5444,13 +5456,16 @@ final class AgentProgress {
 
     private boolean startReachableTimber(boolean searchView) {
         if (!dryFieldFooting() || !safePickupStance()) return false;
+        boolean scouting = timberScouting && ordinarySurfaceWork;
+        if (scouting && !hands.stableCraftFooting()) return false;
         double reach = c.player.getBlockInteractionRange();
+        Predicate<BlockHitResult> candidate = scouting ? settledTrunk : reachableTrunk;
         BlockHitResult wood = null;
         if (c.crosshairTarget instanceof BlockHitResult pointed && pointed.getType() == HitResult.Type.BLOCK
-                && state(pointed).isIn(BlockTags.LOGS) && reachableTrunk.test(pointed))
+                && state(pointed).isIn(BlockTags.LOGS) && candidate.test(pointed))
             wood = body.macroMineWitness(pointed, reach);
         if (wood == null && searchView)
-            wood = body.find(state -> state.isIn(BlockTags.LOGS), reach, reachableTrunk).orElse(null);
+            wood = body.find(state -> state.isIn(BlockTags.LOGS), reach, candidate).orElse(null);
         if (wood == null) return false;
         witnessTimber(wood);
         chopFromTimberStance(wood);
@@ -5500,9 +5515,11 @@ final class AgentProgress {
         var goal = timberCollectionGoal;
         var player = c.player;
         boolean driving = overland.guidingResource(goal) && overland.driving();
-        if (!timberResourceAllowed(driving) || tick >= timberWorkUntil) {
+        if (!timberResourceAllowed(driving) || tick >= timberWorkUntil && !ordinarySurfaceWork) {
             return finishTimber("timber approach interrupted before safe footing");
         }
+        if (tick >= timberWorkUntil)
+            return refuseTimberCollection("timber approach expired before reaching a collection stance");
         timberResourceTick = tick;
         Vec3d feet = player.getPos();
         if (!driving && goal.reached(feet) && hands.stableCraftFooting()) {
@@ -5519,25 +5536,44 @@ final class AgentProgress {
                 return true;
             }
             if (!body.aligned(point)) return true;
+            if (ordinarySurfaceWork)
+                return refuseTimberCollection("the settled collection stance did not reveal the witnessed log face");
             clearCollectionStance();
             return false;
         }
         if (!overland.guidingResource(goal)) {
             // Use the same rolling, dry forestry approach as constrained work on level ground.
-            // A grade or a clipped optical window falls back to the checked overland treads.
-            if (goal.atHeight(feet.y) && body.hasRecentView()
+            // Near a failed stance, use checked treads that can exclude that specific landing.
+            boolean checkTreads = ordinarySurfaceWork && overland.timberRefusalNear(player.getBlockPos());
+            if (!checkTreads && goal.atHeight(feet.y) && body.hasRecentView()
                     && approachOrdinary(timberCollectionFace, goal.point(), goal.arrival(), false) != Walk.BLOCKED) {
                 status = "approaching a collection stance for the witnessed trunk";
                 return true;
             }
             if (!body.hasRecentView()) return true;
-            overland.guideResource(goal);
+            if (ordinaryApproach != null) {
+                body.stopHorizonTravel(ordinaryApproach);
+                ordinaryApproach = null;
+            }
+            if (ordinarySurfaceWork) overland.guideTimberCollection(goal);
+            else overland.guideResource(goal);
         }
         stepOverland();
         if (surfaceApproach.canopy.active() != null) return true;
-        if (overland.stopped() || !overland.guidingResource(goal))
-            return finishTimber("no witnessed dry collection stance for this trunk");
+        if (overland.stopped())
+            return refuseTimberCollection("no witnessed dry collection stance for this trunk");
+        if (!overland.guidingResource(goal))
+            return finishTimber("timber approach interrupted before safe footing");
         return true;
+    }
+
+    private boolean refuseTimberCollection(String reason) {
+        if (ordinarySurfaceWork) {
+            timberScouting = true;
+            // Keep actual footing even if rolling travel reached it without an overland leg.
+            if (hands.stableCraftFooting()) overland.rememberTimberRefusal(c.player.getBlockPos());
+        }
+        return finishTimber(reason);
     }
 
     private boolean timberResourceAllowed(boolean driving) {
@@ -7717,6 +7753,7 @@ final class AgentProgress {
                     body.recordWalkedLeg(tread.from, tread.to);
                     overland.landedCanopyTread(tread.from, tread.to, tread.edge.down());
                     stallGuard.navigationArrival(tread.from, tread.to);
+                    timberScouting = false;
                     timberNear = false;
                     timberScan = 0;
                     timberWorkUntil = tick + TIMBER_WORK_TICKS;

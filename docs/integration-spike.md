@@ -68,7 +68,10 @@ When gathering timber on uneven ground,
 it approaches a stance where it can collect the log, not just reach
 the trunk with a swing. It makes the first pick as soon as it can pay
 for the pick and a bench; a shovel or axe joins the batch only when
-the remaining materials cover it. If leaves hide the route, the player
+the remaining materials cover it. Before leaving for stone, the player
+can take nearby low logs for handles and light, even without an axe.
+It does not need to go looking for another tree to take this opportunity.
+If leaves hide the route, the player
 can cut a neighboring leaf while keeping its own support. It checks
 the exposed footing before stepping down. Choosing another trunk does
 not send it back onto the same failed collection spot.
@@ -97,7 +100,9 @@ in water. The player can look toward a sound or seek a visible dry
 bank. A sound is not permission to swing at an unseen mob.
 If water reaches a staircase on the way out of a mine, the player
 checks the downhill passage it just walked instead of swimming straight
-up under a roof. It does not assume the old tread is still clear or dry.
+up under a roof. A single dry step next to the breach is not a new
+worksite. The player keeps checking older connected stairs on its way
+out; it does not assume a previously walked tread is still clear or dry.
 If a retreat is blocked, the player can strike a hostile mob it can
 see and reach, including while being knocked back.
 It need not abandon work on a dry bank to chase an unarmed drowned

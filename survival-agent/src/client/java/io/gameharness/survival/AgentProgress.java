@@ -84,6 +84,9 @@ final class AgentProgress {
     private static final Predicate<ItemStack> BURNABLE_LOG = stack -> stack.isIn(ItemTags.LOGS_THAT_BURN);
     private static final Predicate<ItemStack> PLANK = stack -> stack.isIn(ItemTags.PLANKS);
     private static final Predicate<ItemStack> STONE = stack -> stack.isIn(ItemTags.STONE_TOOL_MATERIALS);
+    private static final Predicate<ItemStack> DECORATIVE_ROCK = stack -> stack.isOf(Items.ANDESITE)
+        || stack.isOf(Items.DIORITE) || stack.isOf(Items.GRANITE) || stack.isOf(Items.TUFF)
+        || stack.isOf(Items.CALCITE) || stack.isOf(Items.DRIPSTONE_BLOCK);
     private static final Predicate<ItemStack> FUEL = stack -> stack.isIn(ItemTags.COALS);
     private static final Predicate<ItemStack> STICK = item(Items.STICK);
     private static final Predicate<ItemStack> WOOD_PICK = item(Items.WOODEN_PICKAXE);
@@ -224,6 +227,7 @@ final class AgentProgress {
     private final AgentTools tools;
     private final AgentStallGuard stallGuard;
     private final AgentOverlandSearch overland;
+    private final FirstStone firstStone;
     private final Runnable stallReplan = this::replanStalledLocalWork;
     private final Supplier<String> stallChoose = this::chooseStallAlternative;
     private final Supplier<AgentStallGuard.Alternative> stallStep = this::workStallAlternative;
@@ -559,6 +563,7 @@ final class AgentProgress {
         stallGuard = new AgentStallGuard(c, body, hands, tools, this::protectRecoveryBlock, this::safeSupport,
             this::recordStallFooting, this::tryStallMineHandback, expedition);
         overland = new AgentOverlandSearch(c, body, AgentProgress::dangerous);
+        firstStone = new FirstStone();
         caves = new AgentCaves(c, body, hands, tools, this::recordCaveFooting, this::recordDryCaveFooting,
             this::detachMine, this::recordOneWayCaveLanding, this::knownCaveReturn,
             this::permitsOneWayCaveDrop, this::returnableFootholdProtected);
@@ -698,6 +703,7 @@ final class AgentProgress {
             quarryingStoneStock = false;
             target = null;
         }
+        firstStone.broken(position, state);
         body.observeHeadroomBreak(position);
         caves.changedDry(position);
         stallGuard.broken(position, state);
@@ -949,6 +955,7 @@ final class AgentProgress {
 
     void afterRespawn() {
         mineResite.reset();
+        firstStone.interrupt();
         defense.resetOrdinaryRanged();
         nightSite.reset();
         surfaceApproach.abandonBootstrapPassage();
@@ -991,6 +998,7 @@ final class AgentProgress {
         stallGuard.navigationSurveyReceipt(caves.drySurveyEvidence());
         stallGuard.observe(tick, confirmedFrameBlocks(), mealsEaten, status,
             returnableMine.hasProgressLease() || supplyEgress.active() || overland.leased(tick) || mineResite.leased()
+                || firstStone.traveling()
                 || surfaceApproach.canopy.active() != null
                 || defense.ordinaryRangedActive()
                 || ordinarySurfaceWork && localFurnace != null && !localFurnace.lost
@@ -1284,6 +1292,7 @@ final class AgentProgress {
             workReturnableMine(c.player.getBlockPos(), returnableMine.depth());
             return;
         }
+        if (ordinarySurfaceWork && firstStone.continueTravel()) return;
         if (continuingTimberTread()) {
             if (timberShelfTread != null) stepTimberShelf();
             else if (pickupTread != null) advancePickupTread();
@@ -1366,6 +1375,9 @@ final class AgentProgress {
         }
         if (!stonePick && !ironPick) {
             if (has(STONE, 3)) makePick("stone_pickaxe", STONE, 3);
+            else if (nextFoot == null && !firstStone.working() && ordinarySurfaceWork && needsTimberKit()
+                    && fieldWood.step(LOCAL_LIGHT, false)) return;
+            else if (ordinarySurfaceWork) firstStone.step();
             else if (!nightSite.guarding() && !has(SHOVEL, 1)
                     && affordsWood(table.position != null || has(table.item, 1) ? 1 : 5, 2)) {
                 requestTable("wooden_shovel", null, 1, 2);
@@ -1402,6 +1414,7 @@ final class AgentProgress {
 
     private void replanStalledLocalWork() {
         rememberStallWork();
+        firstStone.interrupt();
         surfaceApproach.abandon();
         if (refitPickCount >= 0) {
             refitPickCount = -1;
@@ -1621,6 +1634,7 @@ final class AgentProgress {
         BlockHitResult hit = body.find(resource.block, REACH - 0.4, seen -> {
             BlockPos block = seen.getBlockPos();
             return !stallOreTried.contains(block) && reachableResourceFace(block) && !supportsTrail(block)
+                && (resource != Resource.STONE || stoneStockFace(block))
                 && !body.hazardAhead(yaw(seen.getPos().subtract(c.player.getPos())), 1.5)
                 && tools.canHarvest(state(seen));
         }).orElse(null);
@@ -1628,6 +1642,7 @@ final class AgentProgress {
         stallOreTried.add(hit.getBlockPos());
         int before = hands.count(resource.drop);
         setTarget(hit, resource);
+        quarryingStoneStock = resource == Resource.STONE;
         stallWork = () -> {
             if (has(resource.drop, before + 1)) return stallAcquired();
             if (target != null) {
@@ -4700,7 +4715,8 @@ final class AgentProgress {
             if (anchor != null) return finishCut();
             if (attemptCount == attempts.length || tick < checkAfter || !timberReady || !dryFieldFooting()
                 || (!secondDeparture && resumeIndex >= 0)
-                || target != null || pickupItem != null || timberChop != null || !has(AXE, 1)) return false;
+                || target != null || pickupItem != null || timberChop != null
+                || !has(AXE, 1) && !(ordinarySurfaceWork && needsTimberKit() && hands.stableCraftFooting())) return false;
             checkAfter = tick + 12;
             int recipes = torchBatches(light, hands.count(TORCH));
             int logs = Math.max(0, recipes - hands.count(FUEL));
@@ -7257,6 +7273,422 @@ final class AgentProgress {
         gather(Resource.STONE, 0, Math.min(42, c.player.getBlockY() - 1));
     }
 
+    /** Spend wood-pick durability on a short search, not on an unproductive rock seam. */
+    static final class StoneProbeBudget {
+        private static final int DECORATIVE_LIMIT = 6;
+        private int stock, decorative;
+        private boolean wornQuarry;
+
+        void begin(int stock, int carriedVariants, int uses) {
+            this.stock = stock;
+            decorative = 0;
+            // On reload there may be no sequence of break receipts. A large haul AND
+            // a worn pick are evidence to change approach, not evidence of hidden stone.
+            wornQuarry = carriedVariants >= DECORATIVE_LIMIT && uses <= 12 + (3 - stock);
+        }
+
+        void observeStock(int stock) {
+            if (stock > this.stock) decorative = 0;
+            this.stock = stock;
+        }
+
+        void decorativeCut() { decorative++; }
+
+        boolean canSpendOnCover(int uses) { return uses > 3 - stock; }
+
+        boolean canDeepen(int uses, boolean retired) {
+            return !retired && !wornQuarry && decorative < DECORATIVE_LIMIT && canSpendOnCover(uses);
+        }
+    }
+
+    /** Bootstrap needs stone items, not depth. All new routes are lit, dry and at most one block of grade per tread. */
+    private final class FirstStone {
+        private static final int VIEW_TICKS = 22, PROBE_TICKS = 190, WALK_TICKS = 180;
+        private static final int STARTER_STEPS = 5, SIDE_PROBES = 3, REMEMBERED_WORK = 20;
+        private static final double STONE_VIEW = 8;
+        private final StoneProbeBudget budget = new StoneProbeBudget();
+        private final AgentOverlandSearch route = new AgentOverlandSearch(c, body, AgentBody::dryCaveDanger);
+        private final ArrayList<BlockPos> retired = new ArrayList<>(REMEMBERED_WORK);
+        private final ArrayList<BlockPos> triedProbes = new ArrayList<>(REMEMBERED_WORK);
+        private final ArrayList<BlockPos> refusedFaces = new ArrayList<>(6), refusedReturns = new ArrayList<>(4);
+        private final Predicate<BlockHitResult> distantFace = this::canApproach;
+        private ClientWorld world;
+        private BlockPos patch, exhaustedAt, viewFoot, probeFrom, probeTo, departure, refusedDeparture, stoppedAt, sightBlock;
+        private Direction forward, bearing;
+        private Vec3d sightPoint;
+        private AgentOverlandSearch.ResourceGoal goal;
+        private AgentSurfaceTread tread;
+        private int view, viewUntil, probeUntil, probeCheckAt, probeHeight, starterSteps, sideProbes, travelTick, walkUntil;
+        private BlockPos cutting;
+        private boolean backtracking;
+
+        boolean working() {
+            return probeTo != null || tread != null || walkUntil != 0 || target != null && quarryingStoneStock;
+        }
+
+        boolean traveling() {
+            return travelTick == tick - 1 && (tread != null || walkUntil != 0 && route.leased(tick));
+        }
+
+        void interrupt() {
+            probeFrom = probeTo = cutting = null;
+            tread = null;
+            backtracking = false;
+            stopWalk();
+            viewFoot = null;
+        }
+
+        void broken(BlockPos block, BlockState state) {
+            if (!block.equals(cutting)) return;
+            cutting = null;
+            if (decorative(state)) budget.decorativeCut();
+        }
+
+        private boolean decorative(BlockState state) {
+            return state.isOf(Blocks.ANDESITE) || state.isOf(Blocks.DIORITE) || state.isOf(Blocks.GRANITE)
+                || state.isOf(Blocks.TUFF) || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.DRIPSTONE_BLOCK);
+        }
+
+        private void beginPatch(BlockPos standing, Direction direction, int stock, int uses, boolean continuingInventory) {
+            patch = standing;
+            forward = direction;
+            budget.begin(stock, continuingInventory ? hands.count(DECORATIVE_ROCK) : 0, uses);
+            starterSteps = sideProbes = 0;
+            exhaustedAt = refusedDeparture = stoppedAt = viewFoot = null;
+        }
+
+        void step() {
+            if (world != c.world) {
+                interrupt();
+                world = c.world;
+                retired.clear();
+                triedProbes.clear();
+                refusedReturns.clear();
+                patch = null;
+            }
+            if (continueTravel()) return;
+            if (sought != Resource.STONE) {
+                sought = Resource.STONE;
+                soughtSince = tick;
+            }
+            status = "seeking collectible stone for the first stone pickaxe";
+            if (!safePickupStance() || !dryFieldFooting() || !body.hasRecentView()) return;
+            BlockPos standing = c.player.getBlockPos();
+            if (nextFoot != null) {
+                closeDig(nextFoot);
+                nextFoot = cavePeek = null;
+            }
+            int stock = hands.count(STONE);
+            budget.observeStock(stock);
+            // An actual new contact or a real pickup always beats a route, wear estimate or failed patch.
+            if (workOre(Resource.STONE, REACH - 0.35, false)) {
+                if (sightBlock != null) stopWalk();
+                return;
+            }
+            if (body.dryCaveContact(standing) == null) {
+                surfaceApproach.step(standing);
+                return;
+            }
+            if (c.player.getVelocity().horizontalLengthSquared() > 0.0025) return;
+            int uses = pickUses(WOOD_PICK);
+            Direction guarded = nightSite.mineBearing(standing);
+            if (patch == null) beginPatch(standing, guarded == null ? c.player.getHorizontalFacing() : guarded, stock, uses, true);
+            if (walkUntil != 0) {
+                walk(standing);
+                return;
+            }
+            if (!standing.equals(viewFoot)) {
+                viewFoot = standing;
+                view = 0;
+                viewUntil = tick + VIEW_TICKS;
+                refusedFaces.clear();
+            }
+            if (tick >= seekAfter && refusedFaces.size() < 6) {
+                var shown = body.find(Resource.STONE.block, STONE_VIEW, distantFace).orElse(null);
+                if (shown != null) {
+                    sightBlock = shown.getBlockPos();
+                    sightPoint = orePoint(shown);
+                    goal = new AgentOverlandSearch.ResourceGoal(Vec3d.ofCenter(sightBlock), 1.02,
+                        sightBlock.getY() - 2, sightBlock.getY());
+                    route.guideResource(goal);
+                    walkUntil = tick + WALK_TICKS;
+                    walk(standing);
+                    return;
+                }
+            }
+            boolean fresh = exhaustedAt == null && budget.canDeepen(uses, retiredAt(standing)) && starterSteps < STARTER_STEPS;
+            if (probeTo != null) {
+                if (probeTo.getY() == standing.getY() || fresh) {
+                    workProbe(standing, uses);
+                    return;
+                }
+                forgetProbe();
+            }
+            if (view < 4 && !standing.equals(stoppedAt)) {
+                Direction direction = directionAt(view);
+                body.turn(direction.getPositiveHorizontalDegrees(), 20);
+                if (tick >= viewUntil || body.renderedDirection(direction.getPositiveHorizontalDegrees(), 20, 8)) {
+                    view++;
+                    viewUntil = tick + VIEW_TICKS;
+                }
+                status = "checking visible rock faces before opening a stone probe";
+                return;
+            }
+            if (fresh && beginProbe(standing, true)) return;
+            if (exhaustedAt == null) {
+                exhaustedAt = standing;
+                remember(retired, standing);
+            }
+            if (beginBacktrack(standing)) return;
+            if (!standing.equals(refusedDeparture)) {
+                departure = standing;
+                route.restart(forward.rotateYClockwise());
+                walkUntil = tick + WALK_TICKS;
+                walk(standing);
+                return;
+            }
+            if (sideProbes < SIDE_PROBES && beginProbe(standing, false)) return;
+            if (uses < 3 - stock) {
+                makePick("wooden_pickaxe", PLANK, 3);
+                return;
+            }
+            if (lightDarkStair(standing)) return;
+            if (!standing.equals(stoppedAt)) {
+                stoppedAt = standing;
+                localBlock = "no witnessed stone face or distinct dry route from the exhausted first-pick quarry";
+            }
+        }
+
+        private boolean canApproach(BlockHitResult face) {
+            BlockPos block = face.getBlockPos();
+            return !refusedFaces.contains(block) && reachableResourceFace(block) && !protectRecoveryBlock(block)
+                && !underMineFootprint(block) && !stoneStockFace(block)
+                && c.player.getBlockY() - block.getY() <= 2 && block.getY() - c.player.getBlockY() <= 4
+                && tools.canHarvest(state(face));
+        }
+
+        boolean continueTravel() {
+            if (tread == null && !route.driving()) return false;
+            if (travelTick != tick - 1 || world != c.world || !safePickupStance()) {
+                interrupt();
+                return false;
+            }
+            if (tread != null) stepTread();
+            else walk(c.player.getBlockPos());
+            return true;
+        }
+
+        private void walk(BlockPos standing) {
+            if (sightBlock != null && goal.reached(c.player.getPos()) && dryFieldFooting()
+                    && !route.driving() && tick < walkUntil) {
+                body.aim(sightPoint);
+                if (!stoneStockFace(sightBlock) && goal.reached(standing)) {
+                    body.centerOnGroundedSupport(standing, body.dryCaveContact(standing));
+                } else {
+                    var hit = perceive(sightPoint, REACH - 0.35);
+                    if (hit != null && sightBlock.equals(hit.getBlockPos()) && stoneStockFace(sightBlock)
+                            && Resource.STONE.block.test(state(hit)) && tools.canHarvest(state(hit))) {
+                        stopWalk();
+                        setTarget(hit, Resource.STONE);
+                        quarryingStoneStock = true;
+                        mineTarget(Resource.STONE);
+                        return;
+                    }
+                }
+                status = "rechecking the exposed stone from its pickup stance";
+                return;
+            }
+            if (tick >= walkUntil && !route.driving()) {
+                refuseWalk(standing);
+                return;
+            }
+            travelTick = tick;
+            route.step(tick, true, false); // Even a lit change of height needs the reverse sweep.
+            status = (sightBlock == null ? "leaving a depleted stone prospect; " : "approaching exposed stone; ") + route.status();
+            var arrival = route.takeArrival();
+            if (arrival != null) {
+                if (adjacent(arrival.from(), arrival.foot())) recordDryCaveFooting(arrival.from(), arrival.foot());
+                else stallGuard.navigationArrival(arrival.from(), arrival.foot());
+                if (departure != null && !retiredAt(arrival.foot())) {
+                    Direction outward = directional(Vec3d.ofBottomCenter(arrival.foot()).subtract(Vec3d.ofBottomCenter(departure)));
+                    stopWalk();
+                    beginPatch(arrival.foot(), outward, hands.count(STONE), pickUses(WOOD_PICK), false);
+                    status = "reached different witnessed ground to prospect for stone";
+                }
+            }
+            if (route.takeRefusal()) refuseWalk(standing);
+        }
+
+        private void refuseWalk(BlockPos standing) {
+            if (sightBlock != null) refusedFaces.add(sightBlock);
+            else refusedDeparture = standing;
+            stopWalk();
+        }
+
+        private void stopWalk() {
+            walkUntil = 0;
+            departure = sightBlock = null;
+            sightPoint = null;
+            goal = null;
+            route.interrupt();
+        }
+
+        private Direction directionAt(int step) {
+            return switch (step) {
+                case 0 -> forward;
+                case 1 -> forward.rotateYClockwise();
+                case 2 -> forward.rotateYCounterclockwise();
+                default -> forward.getOpposite();
+            };
+        }
+
+        private boolean beginBacktrack(BlockPos from) {
+            int at = trail.lastIndexOf(from);
+            if (at <= 0) return false;
+            var to = trail.get(at - 1);
+            if (to.getY() < from.getY() || !adjacent(from, to) || sameStem(from, to)
+                    || refusedReturns.contains(to) || stallGuard.refusedCrossing(from, to)) return false;
+            tread = AgentSurfaceTread.ordinaryRecall(c, from, to, tick);
+            if (tread == null) return false;
+            backtracking = true;
+            stepTread();
+            return true;
+        }
+
+        private boolean beginProbe(BlockPos from, boolean down) {
+            for (int index = down ? 0 : 1; index < 4; index++) {
+                Direction direction = directionAt(index);
+                BlockPos to = from.offset(direction).down(down ? 1 : 0);
+                if (triedProbes.contains(to) || trail.contains(to) || stallGuard.refusedCrossing(from, to)) continue;
+                bearing = direction;
+                probeFrom = from;
+                probeTo = to;
+                probeUntil = tick + PROBE_TICKS;
+                probeCheckAt = tick + VIEW_TICKS;
+                probeHeight = down ? 2 : 1;
+                remember(triedProbes, to);
+                if (!down) sideProbes++;
+                status = down ? "checking a one-step stone exposure" : "checking a different level stone probe";
+                return true;
+            }
+            return false;
+        }
+
+        private void workProbe(BlockPos standing, int uses) {
+            boolean down = probeTo.getY() < probeFrom.getY();
+            status = down ? "opening one shallow stone prospect step" : "opening a bounded level stone prospect";
+            if (tick >= probeUntil || !probeFrom.equals(standing) || body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65)) {
+                forgetProbe();
+                return;
+            }
+            if (Math.abs(c.player.getX() - standing.getX() - 0.5) > 0.17
+                    || Math.abs(c.player.getZ() - standing.getZ() - 0.5) > 0.17) {
+                body.centerOnGroundedSupport(standing, body.dryCaveContact(standing));
+                if (tick >= probeCheckAt) forgetProbe();
+                return;
+            }
+            if (probeHeight < 0) {
+                body.turn(bearing.getPositiveHorizontalDegrees(), down ? 55 : 30);
+                var edge = body.witnessedOrdinaryTread(probeFrom, probeTo, bearing);
+                if (edge == null) {
+                    if (tick >= probeCheckAt) forgetProbe();
+                    return; // No fresh full top, no motion and no deeper probe into this opening.
+                }
+                tread = AgentSurfaceTread.ordinaryStock(edge, probeFrom, tick);
+                stepTread();
+                return;
+            }
+            BlockPos cell = probeTo.up(probeHeight);
+            Vec3d point = Vec3d.ofCenter(cell, down && probeHeight == 0 ? 0.91 : 0.55);
+            body.aim(point);
+            var hit = perceive(point, REACH - 0.35);
+            if (hit == null || !cell.equals(hit.getBlockPos())) {
+                var space = body.dryCaveSpace(point);
+                if (space == AgentBody.DryRouteSample.CLEAR) nextProbeCell();
+                else if (space == AgentBody.DryRouteSample.FLUID || tick >= probeCheckAt) forgetProbe();
+                return;
+            }
+            BlockState material = state(hit);
+            if (material.getCollisionShape(c.world, cell).isEmpty() && !AgentBody.dryCaveDanger(material)) {
+                nextProbeCell();
+                return;
+            }
+            if (!returnableCutAllowed(hit) || supportsTrail(cell) || body.lavaBreachesDig(cell)
+                    || c.world.getBlockState(cell.up()).getBlock() instanceof net.minecraft.block.FallingBlock
+                    || material.isIn(BlockTags.PICKAXE_MINEABLE) && !budget.canSpendOnCover(uses)) {
+                forgetProbe();
+                return;
+            }
+            body.aimContact(hit, AgentBody.Contact.MINE);
+            if (readyForMine(material)) {
+                if (body.mine(hit)) cutting = cell;
+                else if (body.miningFootingRefused(cell)) forgetProbe();
+            }
+        }
+
+        private void nextProbeCell() {
+            probeHeight--;
+            probeCheckAt = tick + VIEW_TICKS;
+        }
+
+        private void stepTread() {
+            travelTick = tick;
+            var current = tread;
+            status = backtracking ? "rechecking a walked return out of the depleted stone prospect"
+                : "testing the freshly witnessed footing of the stone prospect";
+            switch (current.step(c, body, tick)) {
+                case CHECKING -> { }
+                case MOVING -> rememberMotion();
+                case LANDED -> {
+                    recordDryCaveFooting(current.from, current.to);
+                    if (backtracking) {
+                        if (!retiredAt(current.to)) {
+                            beginPatch(current.to, forward.rotateYClockwise(), hands.count(STONE), pickUses(WOOD_PICK), false);
+                        } else refusedDeparture = current.to;
+                    } else if (current.to.getY() < current.from.getY()) {
+                        starterSteps++;
+                        // Keep checking for real stone from every new tread, without resurveying the whole compass.
+                        viewFoot = current.to;
+                        view = 4;
+                        refusedFaces.clear();
+                    } else if (!retiredAt(current.to)) {
+                        beginPatch(current.to, bearing, hands.count(STONE), pickUses(WOOD_PICK), false);
+                    }
+                    finishTread();
+                }
+                case REFUSED -> {
+                    if (backtracking) remember(refusedReturns, current.to);
+                    finishTread();
+                }
+            }
+        }
+
+        private void finishTread() {
+            tread = null;
+            backtracking = false;
+            forgetProbe();
+        }
+
+        private void forgetProbe() {
+            probeFrom = probeTo = cutting = null;
+        }
+
+        private boolean retiredAt(BlockPos foot) {
+            for (BlockPos site : retired) if (!differentStoneGround(site, foot)) return true;
+            return false;
+        }
+
+        private void remember(ArrayList<BlockPos> sites, BlockPos foot) {
+            if (sites.contains(foot)) return;
+            if (sites.size() == REMEMBERED_WORK) sites.removeFirst();
+            sites.add(foot);
+        }
+    }
+
+    private static boolean differentStoneGround(BlockPos first, BlockPos second) {
+        return Math.abs(first.getX() - second.getX()) + Math.abs(first.getZ() - second.getZ()) >= 3;
+    }
+
     private void setTarget(BlockHitResult hit, Resource resource) {
         target = hit.getBlockPos();
         miningResource = resource;
@@ -7300,6 +7732,10 @@ final class AgentProgress {
             return;
         }
         double distance = c.player.getEyePos().distanceTo(targetPoint);
+        if (quarryingStoneStock && (!stoneStockFace(target) || distance > REACH - 0.35)) {
+            abandonTarget();
+            return;
+        }
         if (distance < targetNearest - 0.55) {
             targetNearest = distance;
             targetDeadline = tick + 200;
@@ -7334,7 +7770,7 @@ final class AgentProgress {
                 body.pauseWork();
                 forgetOreTarget();
                 target = null;
-            } else if (horizontalDistance(c.player.getPos(), targetPoint) > 0.72) {
+            } else if (!quarryingStoneStock && horizontalDistance(c.player.getPos(), targetPoint) > 0.72) {
                 // A ramp changes the viewing angle; walk around the masking near face before giving up.
                 if (approachOrdinary(perceive(targetPoint, SEARCH), targetPoint, 0.62, true) == Walk.BLOCKED) abandonTarget();
             } else {

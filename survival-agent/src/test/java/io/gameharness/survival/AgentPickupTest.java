@@ -76,6 +76,32 @@ final class AgentPickupTest {
     }
 
     @Test
+    void firstPickStopsDeepeningAfterSixDecorativeCutsWithoutAStoneReceipt() {
+        var work = new AgentProgress.StoneProbeBudget();
+        work.begin(0, 0, 59);
+        assertTrue(work.canDeepen(59, false));
+        for (int i = 0; i < 5; i++) work.decorativeCut();
+        assertTrue(work.canDeepen(54, false));
+        work.decorativeCut();
+        assertFalse(work.canDeepen(53, false));
+        work.observeStock(1);
+        assertTrue(work.canDeepen(52, false), "actual usable stock is progress, unlike loose variants");
+        assertFalse(work.canDeepen(52, true), "a receipt does not erase a retired worksite");
+    }
+
+    @Test
+    void resumingTheWornQuarryConservesEnoughUsesForActualStone() {
+        var work = new AgentProgress.StoneProbeBudget();
+        work.begin(0, 48, 8);
+        assertFalse(work.canDeepen(8, false));
+        assertTrue(work.canSpendOnCover(8), "a short distinct lateral probe is still payable");
+        assertFalse(work.canSpendOnCover(3), "reserve one wooden-pick use per missing stone");
+        work.begin(2, 48, 59);
+        assertTrue(work.canDeepen(59, false), "decorative inventory alone proves neither failure nor hidden stone");
+        assertTrue(work.canSpendOnCover(2), "two cobblestone already collected reduce the reserve to one use");
+    }
+
+    @Test
     void lowerQuarryDropThatFailsFlatInputCanBeCollectedFromAWitnessedTread() {
         var rim = new BlockPos(0, 61, 0);
         var lower = rim.north().down();

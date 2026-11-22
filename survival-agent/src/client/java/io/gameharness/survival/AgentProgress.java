@@ -378,6 +378,7 @@ final class AgentProgress {
     private BlockHitResult timberWitness;
     private final Predicate<BlockHitResult> reachableTrunk = hit -> timberCandidate(hit) && timberInReach(hit);
     private final Predicate<BlockHitResult> settledTrunk = hit -> reachableTrunk.test(hit) && closeTimberStance(hit);
+    private final Predicate<BlockHitResult> treadTrunk = this::timberFromTread;
     private BlockHitResult timberCollectionFace;
     private AgentOverlandSearch.ResourceGoal timberCollectionGoal;
     private int timberResourceTick;
@@ -5546,21 +5547,38 @@ final class AgentProgress {
     }
 
     private boolean startReachableTimber(boolean searchView) {
-        if (!dryFieldFooting() || !safePickupStance()) return false;
         boolean scouting = timberScouting && ordinarySurfaceWork;
         if (scouting && !hands.stableCraftFooting()) return false;
+        var wood = findTimber(searchView, scouting ? settledTrunk : reachableTrunk);
+        if (wood == null) return false;
+        witnessTimber(wood);
+        chopFromTimberStance(wood);
+        return true;
+    }
+
+    private boolean cutTimberFromTread(boolean searchView) {
+        if (!hands.stableCraftFooting()) return false;
+        var wood = findTimber(searchView, treadTrunk);
+        if (wood == null) return false;
+        witnessTimber(wood);
+        beginTimberChop(wood, false);
+        return true;
+    }
+
+    private boolean timberFromTread(BlockHitResult hit) {
+        return settledTrunk.test(hit) && AgentSupplyEgress.timberAtTread(c.player.getBlockY(), hit.getBlockPos().getY());
+    }
+
+    private BlockHitResult findTimber(boolean searchView, Predicate<BlockHitResult> candidate) {
+        if (!dryFieldFooting() || !safePickupStance()) return null;
         double reach = c.player.getBlockInteractionRange();
-        Predicate<BlockHitResult> candidate = scouting ? settledTrunk : reachableTrunk;
         BlockHitResult wood = null;
         if (c.crosshairTarget instanceof BlockHitResult pointed && pointed.getType() == HitResult.Type.BLOCK
                 && state(pointed).isIn(BlockTags.LOGS) && candidate.test(pointed))
             wood = body.macroMineWitness(pointed, reach);
         if (wood == null && searchView)
             wood = body.find(state -> state.isIn(BlockTags.LOGS), reach, candidate).orElse(null);
-        if (wood == null) return false;
-        witnessTimber(wood);
-        chopFromTimberStance(wood);
-        return true;
+        return wood;
     }
 
     private void chopFromTimberStance(BlockHitResult wood) {
@@ -5708,7 +5726,7 @@ final class AgentProgress {
         private int benchBefore, benchCollectUntil, connectors, builds, buildBefore, anchorChoice;
         private long revealedFrame;
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
-        private boolean triedLower, built, mineDeparture, floodWarning;
+        private boolean triedLower, built, mineDeparture, floodWarning, checkingExit;
 
         boolean active() { return world == c.world && order.active(); }
 
@@ -5928,7 +5946,7 @@ final class AgentProgress {
         }
 
         private boolean handoffTimber(boolean searchView) {
-            if (!startReachableTimber(searchView)) return false;
+            if (!cutTimberFromTread(searchView)) return false;
             body.pauseWork();
             return ready("reachable timber from connected footing");
         }
@@ -5978,6 +5996,7 @@ final class AgentProgress {
 
         private void survey(int count) {
             surveying = true;
+            checkingExit = false;
             views = count;
             view = openViews = roofViews = wallViews = 0;
             since = tick;
@@ -5987,6 +6006,21 @@ final class AgentProgress {
         private boolean look() {
             if (outdoors()) return ready("confirmed open ground");
             BlockPos from = order.foot();
+            if (checkingExit) {
+                float outward = bearing.getPositiveHorizontalDegrees();
+                body.turn(outward, 47);
+                status = "supply egress: checking for walkable ground beyond the opening";
+                if (!body.renderedDirection(outward, 47, 9) && tick - since < LOOK_TICKS) return true;
+                if (order.handoffSurface(body.dryCaveProbeView(), bearing, woodlandLane))
+                    return surfaceReady(from, outward, "confirmed open ground with a connected lane");
+                // Seeing daylight through a hole doesn't put the player's feet on its rim.
+                // Keep ownership for the ordinary checked rise in that direction.
+                checkingExit = surveying = false;
+                enclosed = true;
+                choice = flatBearings = 0;
+                since = tick;
+                return true;
+            }
             Direction direction = option(view);
             float yaw = direction.getPositiveHorizontalDegrees();
             int age = tick - since;
@@ -6000,7 +6034,12 @@ final class AgentProgress {
             if ((scene & AgentBody.SUPPLY_OPEN) != 0) openViews |= bit;
             if ((scene & AgentBody.SUPPLY_ROOF) != 0) roofViews |= bit;
             if ((scene & AgentBody.SUPPLY_WALL) != 0) wallViews |= bit;
-            if (Integer.bitCount(openViews) >= 2) return surfaceReady(from, yaw, "confirmed open ground");
+            if (Integer.bitCount(openViews) >= 2) {
+                bearing = option(Integer.numberOfTrailingZeros(openViews));
+                checkingExit = true;
+                since = tick;
+                return true;
+            }
             // A single open sector may be the mouth of a shaft. Corroborate it across bearings.
             if (views == 1 && openViews != 0) views = 4;
             if ((openViews & bit) == 0 && age < 3 * LOOK_TICKS
@@ -7786,7 +7825,7 @@ final class AgentProgress {
                 long frame = body.renderedFrame();
                 if (!hands.stableCraftFooting() || !body.hasRecentView() || !canopy.freshOpening(frame)) return true;
                 if (plan.top()) {
-                    if (!canopyRecovery && startReachableTimber(false)) {
+                    if (!canopyRecovery && cutTimberFromTread(false)) {
                         abandonBootstrapPassage();
                         return true;
                     }

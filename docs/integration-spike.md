@@ -69,6 +69,9 @@ the remaining materials cover it. If leaves hide the route, the player
 can cut a neighboring leaf while keeping its own support. It checks
 the exposed footing before stepping down. Choosing another trunk does
 not send it back onto the same failed collection spot.
+Seeing sky or a log through the mouth of a shaft is not enough to
+finish an ascent. The player looks for ground it can walk onto, or
+timber it can cut and collect from its current tread.
 When gathering cobblestone, the player chooses a face close enough to
 collect the drop. If it breaks stone but cannot pick up the drop, it
 must change footing before quarrying another face. It can clear

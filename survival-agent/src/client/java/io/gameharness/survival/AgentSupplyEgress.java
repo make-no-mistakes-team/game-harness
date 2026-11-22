@@ -28,6 +28,11 @@ final class AgentSupplyEgress {
     BlockPos foot() { return foot; }
     boolean active() { return foot != null; }
 
+    /** A trunk above the mouth of a shaft is a landmark, not collected supplies. */
+    static boolean timberAtTread(int feetY, int logY) {
+        return logY >= feetY && logY <= feetY + 1;
+    }
+
     boolean holdOrdinary(boolean airborne) {
         if (!airborne) airborneHold = false;
         return airborneHold;
@@ -218,6 +223,16 @@ final class AgentSupplyEgress {
     /** A lit adjacent soil tread and clear passage suffice; a leaf ceiling does not make it a cave. */
     boolean handoffWoodland(AgentDryCaveRoute.ProbeView view, Direction bearing,
                            BiPredicate<BlockPos, Direction> sweepClear) {
+        return handoffLane(view, bearing, sweepClear, true);
+    }
+
+    boolean handoffSurface(AgentDryCaveRoute.ProbeView view, Direction bearing,
+                           BiPredicate<BlockPos, Direction> sweepClear) {
+        return handoffLane(view, bearing, sweepClear, false);
+    }
+
+    private boolean handoffLane(AgentDryCaveRoute.ProbeView view, Direction bearing,
+                                BiPredicate<BlockPos, Direction> sweepClear, boolean woodland) {
         if (!active()) return false;
         for (int i = 0; i < 3; i++) {
             Direction lane = i == 0 ? bearing : i == 1 ? bearing.rotateYClockwise() : bearing.rotateYCounterclockwise();
@@ -227,9 +242,11 @@ final class AgentSupplyEgress {
             // to witness and authorize all of its own inputs independently.
             Vec3d farTop = center.add(0.38 * lane.getOffsetX(), -0.03, 0.38 * lane.getOffsetZ());
             if (view.top(farTop, support) != AgentBody.DryRouteTop.WITNESSED) continue;
-            var shown = view.state(support);
-            if (!(shown.isOf(Blocks.GRASS_BLOCK) || shown.isOf(Blocks.PODZOL) || shown.isOf(Blocks.MYCELIUM))
-                    || view.space(center.add(0, 0.82, 0)) != AgentBody.DryRouteSample.CLEAR
+            if (woodland) {
+                var shown = view.state(support);
+                if (!(shown.isOf(Blocks.GRASS_BLOCK) || shown.isOf(Blocks.PODZOL) || shown.isOf(Blocks.MYCELIUM))) continue;
+            }
+            if (view.space(center.add(0, 0.82, 0)) != AgentBody.DryRouteSample.CLEAR
                     || !sweepClear.test(to, lane)) continue;
             finish();
             return true;

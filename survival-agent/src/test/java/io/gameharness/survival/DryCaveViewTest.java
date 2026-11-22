@@ -34,6 +34,23 @@ final class DryCaveViewTest {
     }
 
     @Test
+    void aLogAndDaylightAboveAShaftDoNotFinishTheAscent() {
+        var view = new ForwardView(40);
+        var egress = new AgentSupplyEgress();
+        assertTrue(egress.begin(SOURCE, true));
+        view.blocks.remove(SOURCE.east().down());
+        view.blocks.put(SOURCE.down(), Blocks.DIRT.getDefaultState());
+        view.blocks.put(SOURCE.east().up(3), Blocks.OAK_LOG.getDefaultState());
+        assertFalse(AgentSupplyEgress.timberAtTread(SOURCE.getY(), SOURCE.getY() + 3));
+        assertFalse(egress.handoffSurface(view, Direction.EAST, (foot, bearing) -> true));
+        assertTrue(egress.active());
+        view.blocks.put(SOURCE.east().down(), Blocks.STONE.getDefaultState());
+        assertTrue(egress.handoffSurface(view, Direction.EAST, (foot, bearing) ->
+            view.sweepClear(AgentSurfaceTread.retainedTreadSweep(SOURCE, foot, 0.6))));
+        assertFalse(egress.active());
+    }
+
+    @Test
     void aConnectedGrassTreadUnderCanopyHandsOffSupplyEgressWithoutOpenSky() {
         var view = new ForwardView(40);
         var landing = SOURCE.east();

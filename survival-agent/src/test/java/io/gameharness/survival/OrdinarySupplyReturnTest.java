@@ -2,10 +2,17 @@ package io.gameharness.survival;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import net.minecraft.block.Blocks;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 final class OrdinarySupplyReturnTest {
@@ -13,6 +20,9 @@ final class OrdinarySupplyReturnTest {
     private static final BlockPos STAIR = ENTRANCE.east().down();
     private static final BlockPos MINE = STAIR.east().down();
     private static final List<BlockPos> TRAIL = List.of(ENTRANCE, STAIR, MINE);
+
+    @BeforeAll
+    static void initializeVanilla() { VanillaTestResources.initialize(); }
 
     @Test
     void returnStartsAtTheActorNotTheOldTipAndRequiresAConnectedPrefix() {
@@ -76,6 +86,57 @@ final class OrdinarySupplyReturnTest {
     }
 
     @Test
+    void ordinaryRecallDoesNotRequireAPickupFreeLaneButIsolatedRecallStillDoes() {
+        var stone = Blocks.STONE.getDefaultState();
+        var edge = new AgentSurfaceTread.Edge(MINE, stone, MINE.north(), stone, Direction.NORTH);
+        var ordinary = AgentSurfaceTread.recall(edge, false, 12, AgentSurfaceTread.RecallPolicy.ORDINARY);
+        var isolated = AgentSurfaceTread.recall(edge, false, 12, AgentSurfaceTread.RecallPolicy.ISOLATED);
+        assertFalse(ordinary.requiresPickupFreeSweep());
+        assertTrue(isolated.requiresPickupFreeSweep());
+    }
+
+    @Test
+    void ordinaryRecallAllowsOnlyBoundedDirectedDropsAndStillRequiresSettledPhysicalContact() {
+        var stone = Blocks.STONE.getDefaultState();
+        var lower = MINE.north().down(2);
+        var edge = new AgentSurfaceTread.Edge(MINE, stone, lower, stone, Direction.NORTH);
+        var ordinary = AgentSurfaceTread.recall(edge, false, 12, AgentSurfaceTread.RecallPolicy.ORDINARY);
+        assertNotNull(ordinary);
+        assertTrue(ordinary.ordinaryDescent(), "this downward proof carries no authority for the inverse grade");
+        assertNull(AgentSurfaceTread.recall(edge, true, 12, AgentSurfaceTread.RecallPolicy.ORDINARY));
+        assertNull(AgentSurfaceTread.recall(edge, false, 12, AgentSurfaceTread.RecallPolicy.ISOLATED));
+        var tooLow = new AgentSurfaceTread.Edge(MINE, stone, lower.down(), stone, Direction.NORTH);
+        assertNull(AgentSurfaceTread.recall(tooLow, false, 12, AgentSurfaceTread.RecallPolicy.ORDINARY));
+
+        var feet = Vec3d.ofBottomCenter(lower);
+        var top = new BlockHitResult(feet, Direction.UP, lower.down(), false);
+        assertTrue(AgentDryLanding.caveTop(MINE, Direction.NORTH, 2, top, stone));
+        assertFalse(AgentDryLanding.caveTop(MINE, Direction.NORTH, 2, top, Blocks.WATER.getDefaultState()));
+        var landing = new AgentDryLanding(MINE, stone, top, lower, stone, Direction.NORTH,
+            Vec3d.ofBottomCenter(MINE), feet, 180, true);
+        assertFalse(landing.settled(feet, lower.down(), stone, 0, false), "coordinates alone are not an arrival");
+        assertFalse(landing.settled(feet, lower.down(), Blocks.DIRT.getDefaultState(), 0, true), "changed support");
+        assertFalse(landing.settled(feet, lower.down(), stone, 0.01, true), "unsettled momentum");
+        assertTrue(landing.settled(feet, lower.down(), stone, 0, true));
+    }
+
+    @Test
+    void refusedReturnCanOnlyUseAnotherExactJoinBehindTheFailedEdge() {
+        var foot = MINE;
+        var wrong = foot.east();
+        var next = foot.north();
+        var trail = List.of(next.north(), next, foot, foot.south(), wrong, foot, foot.west());
+        assertEquals(2, AgentProgress.mineRetreatRejoin(trail, 0, 5, foot,
+            (from, to) -> !to.equals(wrong)));
+        assertEquals(-1, AgentProgress.mineRetreatRejoin(trail, 0, 2, foot, (from, to) -> true),
+            "a failed rejoin cannot restart or count the same tread");
+        assertEquals(-1, AgentProgress.mineRetreatRejoin(trail, 0, 5, foot.up(), (from, to) -> true),
+            "a nearby location is not a physical join");
+        assertEquals(-1, AgentProgress.mineRetreatRejoin(trail, 0, 5, foot,
+            (from, to) -> !to.equals(wrong) && !to.equals(next)), "do not retry a refused directed lane");
+    }
+
+    @Test
     void nativeResiteNeedsPhysicalDistanceAndDoesNotCreditDepthOrOre() {
         var foot = MINE.withY(50);
         var newSite = foot.north(6).down(6);
@@ -88,6 +149,7 @@ final class OrdinarySupplyReturnTest {
         assertFalse(mine.resited(foot.north(2)));
         assertTrue(mine.ready(false), "a neighboring landing is not a different mine start");
         assertTrue(mine.resited(newSite));
+        assertFalse(mine.resited(newSite), "the same settled relocation cannot be credited twice");
         assertTrue(mine.retired(foot));
         assertFalse(mine.ready(false));
         mine.exhausted(newSite);

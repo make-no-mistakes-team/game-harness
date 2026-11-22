@@ -63,10 +63,11 @@ unknown floor, lava, or a greater drop still requires another approach.
 The player can attach a cobblestone step to a visible face or place a
 level connector to a shelf it can already see. A confirmed placement
 is not a crossing. If neither route is usable, it can try a short
-level passage instead. After repeated failures at the same site, the
-local player can retrace checked steps and try a different area. It
-does not need a model reply to leave a spent mine, and does not count
-that trip as ore.
+level passage instead. After repeated failures at one site, the local
+player can retrace checked steps or cut a checked ascent to try a
+different area. A loose item in the path is not a reason to abandon
+an ordinary return. Changing sites needs no model reply and earns no
+ore credit.
 
 A useful pause is still play. For example, the player can watch the
 furnace finish one raw iron. Count the original load, not the input

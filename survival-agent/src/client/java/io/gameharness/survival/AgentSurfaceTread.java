@@ -3,6 +3,7 @@ package io.gameharness.survival;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.entity.EntityPose;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
@@ -14,12 +15,15 @@ import net.minecraft.util.math.Vec3d;
 final class AgentSurfaceTread {
     private static final int PROOF_TICKS = 65;
     private static final int DRIVE_TICKS = 54;
+    private static final int DROP_PEEK_TICKS = 18;
+    private static final int DROP_DRIVE_TICKS = 30;
     static final int ORDINARY_GRADE_TICKS = DRIVE_TICKS + 2;
     // Includes the successful boundary ticks and a fresh post-landing frame.
     static final int ACTION_TICKS = PROOF_TICKS + DRIVE_TICKS + 4;
     record Edge(BlockPos upper, BlockState upperSupport, BlockPos lower, BlockState lowerSupport, Direction down) {}
     enum Result { CHECKING, MOVING, LANDED, REFUSED }
     enum ReturnClearance { CLEAR, DAMP, OVERHEAD, OBSTRUCTION }
+    enum RecallPolicy { ISOLATED, ORDINARY }
 
     final Edge edge;
     final boolean returning;
@@ -27,7 +31,8 @@ final class AgentSurfaceTread {
     private final Direction travel;
     private final Vec3d center, floorAim, nearFloorAim, chestAim, headAim;
     private final BlockPos sourceSupport, landingSupport;
-    private final boolean isolated, witnessedOutbound, ordinaryGrade, stockAccess;
+    private final RecallPolicy recallPolicy;
+    private final boolean witnessedOutbound, ordinaryGrade, stockAccess;
     private final AgentDryCaveRoute.Probe levelProbe;
     private final AgentWalkedRoute.Motion motion = new AgentWalkedRoute.Motion();
     private final long started;
@@ -36,14 +41,17 @@ final class AgentSurfaceTread {
     private String refusal;
     private ReturnClearance returnRefusal = ReturnClearance.CLEAR;
     private AgentSurfaceTread ahead;
+    private AgentDryLanding drop;
+    private int dropMotorTick;
+    private String dropProof;
 
     AgentSurfaceTread(Edge edge, boolean returning, long started) {
-        this(edge, returning, started, false, false, false, false);
+        this(edge, returning, started, null, false, false, false);
     }
 
     /** The ordinary prospect just re-witnessed this landing and both passage samples. */
     static AgentSurfaceTread witnessedOutbound(Edge edge, long tick) {
-        return new AgentSurfaceTread(edge, false, tick, false, true, false, false);
+        return new AgentSurfaceTread(edge, false, tick, null, true, false, false);
     }
 
     static boolean ordinaryRiseSide(BlockPos from, Direction travel, BlockHitResult hit) {
@@ -66,21 +74,21 @@ final class AgentSurfaceTread {
     }
 
     static AgentSurfaceTread ordinaryGrade(Edge edge, BlockPos from, long tick) {
-        return new AgentSurfaceTread(edge, edge.lower.equals(from), tick, false, true, true, false);
+        return new AgentSurfaceTread(edge, edge.lower.equals(from), tick, null, true, true, false);
     }
 
     /** Ordinary stock/supply work may collect; it still uses the same checked level/grade motor. */
     static AgentSurfaceTread ordinaryStock(Edge edge, BlockPos from, long tick) {
-        return new AgentSurfaceTread(edge, !edge.upper.equals(from), tick, false, true,
+        return new AgentSurfaceTread(edge, !edge.upper.equals(from), tick, null, true,
             edge.upper.getY() != edge.lower.getY(), true);
     }
 
-    private AgentSurfaceTread(Edge edge, boolean returning, long started, boolean isolated,
+    private AgentSurfaceTread(Edge edge, boolean returning, long started, RecallPolicy recallPolicy,
                               boolean witnessedOutbound, boolean ordinaryGrade, boolean stockAccess) {
         this.edge = edge;
         this.returning = returning;
         this.started = started;
-        this.isolated = isolated;
+        this.recallPolicy = recallPolicy;
         this.witnessedOutbound = witnessedOutbound;
         this.ordinaryGrade = ordinaryGrade;
         this.stockAccess = stockAccess;
@@ -90,28 +98,73 @@ final class AgentSurfaceTread {
         sourceSupport = from.down();
         landingSupport = to.down();
         center = Vec3d.ofBottomCenter(to);
-        floorAim = center.add(0.28 * travel.getOffsetX(), -0.032, 0.28 * travel.getOffsetZ());
-        nearFloorAim = center.add(-0.22 * travel.getOffsetX(), -0.032, -0.22 * travel.getOffsetZ());
+        floorAim = ordinaryDescent() ? AgentDryLanding.caveTopAim(from, travel, from.getY() - to.getY())
+            : center.add(0.28 * travel.getOffsetX(), -0.032, 0.28 * travel.getOffsetZ());
+        nearFloorAim = ordinaryDescent() ? AgentDryLanding.caveTopAim(from, travel, from.getY() - to.getY(), true)
+            : center.add(-0.22 * travel.getOffsetX(), -0.032, -0.22 * travel.getOffsetZ());
         chestAim = center.add(0.07 * travel.getOffsetX(), 1.32, 0.07 * travel.getOffsetZ());
-        headAim = isolated ? center.add(0.12 * travel.getOffsetX(), 1.76, 0.12 * travel.getOffsetZ()) : chestAim;
+        headAim = isolated() ? center.add(0.12 * travel.getOffsetX(), 1.76, 0.12 * travel.getOffsetZ()) : chestAim;
         levelProbe = from.getY() == to.getY() && !witnessedOutbound
             ? new AgentDryCaveRoute.Probe(from, to, travel) : null;
     }
 
-    /** Build only from the next already walked edge; ordinary tread proof still precedes any input. */
+    /** The constrained recall remains pickup-free and reverse-proved. */
     static AgentSurfaceTread recall(MinecraftClient client, BlockPos from, BlockPos to, long tick) {
+        return recall(client, from, to, tick, RecallPolicy.ISOLATED);
+    }
+
+    static AgentSurfaceTread ordinaryRecall(MinecraftClient client, BlockPos from, BlockPos to, long tick) {
+        return recall(client, from, to, tick, RecallPolicy.ORDINARY);
+    }
+
+    private static Direction recallBearing(BlockPos from, BlockPos to) {
         int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ();
-        Direction travel = dx == 0 ? dz > 0 ? Direction.SOUTH : Direction.NORTH : dx > 0 ? Direction.EAST : Direction.WEST;
-        if (client.options.forwardKey.isUnbound() || to.getY() > from.getY() && client.options.jumpKey.isUnbound()
-                || !cardinalTread(from, to, travel)) return null;
+        return dx == 0 ? dz > 0 ? Direction.SOUTH : Direction.NORTH : dx > 0 ? Direction.EAST : Direction.WEST;
+    }
+
+    private static boolean recallGeometry(BlockPos from, BlockPos to, Direction travel, RecallPolicy policy) {
+        return cardinalTread(from, to, travel)
+            || policy == RecallPolicy.ORDINARY && AgentDryLanding.shape(from, to, travel);
+    }
+
+    static boolean ordinaryRecallGeometry(BlockPos from, BlockPos to) {
+        return recallGeometry(from, to, recallBearing(from, to), RecallPolicy.ORDINARY);
+    }
+
+    private static AgentSurfaceTread recall(MinecraftClient client, BlockPos from, BlockPos to, long tick,
+                                            RecallPolicy policy) {
+        Direction travel = recallBearing(from, to);
         boolean up = to.getY() > from.getY();
+        if (!recallGeometry(from, to, travel, policy) || client.options.forwardKey.isUnbound()
+                || up && client.options.jumpKey.isUnbound()) return null;
         BlockPos upper = up ? to : from, lower = up ? from : to;
         var edge = new Edge(upper, client.world.getBlockState(upper.down()),
             lower, client.world.getBlockState(lower.down()), up ? travel.getOpposite() : travel);
-        return new AgentSurfaceTread(edge, up, tick, true, false, false, false);
+        return recall(edge, up, tick, policy);
     }
 
+    static AgentSurfaceTread recall(Edge edge, boolean up, long tick, RecallPolicy policy) {
+        if (!(up ? cardinalTread(edge.upper, edge.lower, edge.down)
+                : recallGeometry(edge.upper, edge.lower, edge.down, policy))) return null;
+        return new AgentSurfaceTread(edge, up, tick, policy, false, false, false);
+    }
+
+    private boolean isolated() { return recallPolicy == RecallPolicy.ISOLATED; }
+    boolean requiresPickupFreeSweep() { return isolated() || ordinaryGrade && !stockAccess; }
+    boolean ordinaryDescent() { return recallPolicy == RecallPolicy.ORDINARY && to.getY() < from.getY(); }
     boolean inFlight() { return drivingSince >= 0; }
+
+    boolean leftTakeoff(MinecraftClient client) {
+        var player = client.player;
+        return drop != null && inFlight() && (!player.isOnGround() || player.getY() < from.getY() - 0.055
+            || !drop.overlapsLip(player.getPos(), player.getWidth() * 0.5));
+    }
+
+    boolean controlsShortFall(MinecraftClient client, AgentBody body, long tick) {
+        var player = client.player;
+        return drop != null && inFlight() && !player.isOnGround() && dropMotorTick + 1 == body.actionTick()
+            && tick - drivingSince < DROP_DRIVE_TICKS && body.caveDryLandingRefusal(drop) == null;
+    }
 
     boolean refusedOnTakeoff(BlockPos foot, boolean grounded) {
         return !returning && grounded && from.equals(foot);
@@ -119,7 +172,7 @@ final class AgentSurfaceTread {
 
     /** Look ahead only along the next exact walked level edge, never around a corner or over a riser. */
     AgentSurfaceTread recallSuccessor(MinecraftClient client, BlockPos next, long tick) {
-        if (!isolated || !straightLevelContinuation(from, to, next, travel)) return null;
+        if (!isolated() || !straightLevelContinuation(from, to, next, travel)) return null;
         if (ahead == null || !ahead.to.equals(next)) ahead = recall(client, to, next, tick);
         return ahead;
     }
@@ -240,18 +293,27 @@ final class AgentSurfaceTread {
         var player = client.player;
         String support = supportRefusal(client, body);
         if (support != null) return refuse(support);
+        if (ordinaryDescent()) return stepOrdinaryDescent(client, body, tick);
         if (drivingSince >= 0 && !motion.observe(player.getX(), player.getY(), player.getZ()))
             return refuse("The body drifted off the exact dry tread.");
-        if (drivingSince < 0 && tick - started > PROOF_TICKS)
+        if (drivingSince < 0 && tick - started > PROOF_TICKS) {
+            if (recallPolicy == RecallPolicy.ORDINARY)
+                return refuse(levelProbe != null ? "Level tread proof expired: " + levelProbe.evidence()
+                    : !floorSeen ? "The rising tread's exact floor was not witnessed."
+                    : "The rising tread's chest clearance was not witnessed.");
             return refuse("The dry landing or passage could not be witnessed within the tread's view window.");
+        }
         if (drivingSince >= 0 && tick - drivingSince > DRIVE_TICKS)
             return refuse("The body did not ground on the dry landing within the tread's movement window.");
         if (!body.hasRecentView()) return drivingSince < 0 ? Result.CHECKING : Result.MOVING;
-        if ((isolated || ordinaryGrade && !stockAccess) && !body.macroNoVisiblePickup(center, Math.min(from.getY(), to.getY()),
+        if (requiresPickupFreeSweep() && !body.macroNoVisiblePickup(center, Math.min(from.getY(), to.getY()),
                 Math.max(from.getY(), to.getY()) + 0.32)) return refuse("The dry tread no longer has a pickup-free sweep.");
         if (drivingSince < 0) {
             if (!player.isOnGround() || !player.getBlockPos().equals(from))
                 return refuse("The body is not grounded on the exact dry takeoff tread.");
+            if (recallPolicy == RecallPolicy.ORDINARY && (body.dryCaveContact(from) != sourceState()
+                    || !sourceSupport.equals(player.supportingBlockPos.orElse(null))))
+                return refuse("The player lacks stable vanilla contact on the exact takeoff support.");
             if (!witnessedOutbound && !centered(player.getPos(), from, 0.17)) {
                 body.centerOnSupport(sourceSupport);
                 return Result.CHECKING;
@@ -259,9 +321,11 @@ final class AgentSurfaceTread {
             if (player.getVelocity().horizontalLengthSquared() > 0.0025) return Result.CHECKING;
             if (!witnessedOutbound && !sampleProof(body, null, 0)) {
                 if (levelProbe != null && (levelProbe.visiblyRefused()
-                        || body.renderedDirection(travel.getPositiveHorizontalDegrees(), AgentBody.LEVEL_ROUTE_PITCH, 5)
+                        || recallPolicy != RecallPolicy.ORDINARY
+                            && body.renderedDirection(travel.getPositiveHorizontalDegrees(), AgentBody.LEVEL_ROUTE_PITCH, 5)
                             && !body.dryRouteRaysSpent()))
-                    return refuse("The current view does not verify the exact level tread's floor and passage.");
+                    return refuse(recallPolicy == RecallPolicy.ORDINARY ? "Level tread proof: " + levelProbe.evidence()
+                        : "The current view does not verify the exact level tread's floor and passage.");
                 lookThroughOpening(body, player.getEyePos(), tick);
                 return Result.CHECKING;
             }
@@ -270,9 +334,13 @@ final class AgentSurfaceTread {
         if (player.getY() < Math.min(from.getY(), to.getY()) - 0.055)
             return refuse("The body is below the lowest verified dry tread.");
         ReturnClearance reverse = level ? ReturnClearance.CLEAR : reverseClearance(client, edge.upper, edge.lower, edge.down);
+        var ordinaryVeto = recallPolicy == RecallPolicy.ORDINARY && reverse == ReturnClearance.CLEAR
+            ? body.dryRouteVeto(from, to) : null;
         if (reverse != ReturnClearance.CLEAR
-                || !(ordinaryGrade ? body.ordinaryGradeSweep(from, to) : body.dryRouteSweep(from, to))) {
+                || (ordinaryVeto != null ? ordinaryVeto != AgentBody.DryRouteVeto.CLEAR
+                    : !(ordinaryGrade ? body.ordinaryGradeSweep(from, to) : body.dryRouteSweep(from, to)))) {
             if (drivingSince >= 0 && tick - drivingSince < 5) return Result.CHECKING;
+            if (ordinaryVeto != null) return refuse("Live dry tread veto: " + ordinaryVeto);
             // A collision alone does not identify a block. If the ordinary body
             // lane is also unusable, don't treat this as an isolated overhead veto.
             returnRefusal = reverse == ReturnClearance.DAMP ? reverse
@@ -282,13 +350,17 @@ final class AgentSurfaceTread {
             return refuse(switch (returnRefusal) {
                 case DAMP -> "Fluid vetoes the retained reverse tread.";
                 case OVERHEAD -> "The retained reverse jump intersects an overhead obstruction above the clear walking lane.";
-                default -> "The live body sweep, reverse passage, or support is obstructed for the exact dry tread.";
+                default -> recallPolicy == RecallPolicy.ORDINARY && reverse != ReturnClearance.CLEAR
+                    ? "The rising tread's jump clearance is obstructed."
+                    : "The live body sweep, reverse passage, or support is obstructed for the exact dry tread.";
             });
         }
         if (drivingSince < 0) beginDrive(player.getPos(), tick);
         boolean carry = successor != null && canCarry(client, body, successor, tick);
         boolean landed = player.isOnGround() && player.getBlockPos().equals(to)
             && centered(player.getPos(), to, 0.23) && Math.abs(player.getY() - to.getY()) <= 0.055;
+        if (landed && recallPolicy == RecallPolicy.ORDINARY)
+            landed = landingSupport.equals(player.supportingBlockPos.orElse(null)) && body.dryCaveContact(to) == landingState();
         double remaining = (center.x - player.getX()) * travel.getOffsetX() + (center.z - player.getZ()) * travel.getOffsetZ();
         if (landed && (carry && AgentBody.dryStrideContact(remaining)
                 || player.getVelocity().horizontalLengthSquared() <= 0.0025)) {
@@ -300,6 +372,72 @@ final class AgentSurfaceTread {
             return Result.LANDED;
         }
         body.driveDryRoute(from, to, travel, carry);
+        return Result.MOVING;
+    }
+
+    private Result stepOrdinaryDescent(MinecraftClient client, AgentBody body, long tick) {
+        var player = client.player;
+        if (inFlight()) {
+            if (dropMotorTick + 1 != body.actionTick()
+                    || !motion.observe(player.getX(), player.getY(), player.getZ()))
+                return refuse("The one-way descent lost its contiguous body path.");
+            dropMotorTick = body.actionTick();
+            if (tick - drivingSince >= DROP_DRIVE_TICKS)
+                return refuse(dropProof != null ? dropProof : "The one-way descent did not settle on the witnessed support.");
+            if (leftTakeoff(client)) {
+                var veto = body.caveDryLandingRefusal(drop);
+                if (veto != null) return refuse(veto.detail());
+                if (drop.settled(player.getPos(), player.supportingBlockPos.orElse(null), landingState(),
+                        player.getVelocity().horizontalLengthSquared(), player.isOnGround())) {
+                    return motion.traversed() ? Result.LANDED : refuse("The body did not traverse the witnessed descent.");
+                }
+                return Result.MOVING; // Never steer in the air or jump back over the lip.
+            }
+            var veto = body.driveCaveDryLanding(drop);
+            if (veto != null && veto != AgentBody.CaveLandingRefusal.ALIGNMENT
+                    && veto != AgentBody.CaveLandingRefusal.FLOOR_RECHECK) return refuse(veto.detail());
+            dropProof = veto == null ? null : veto.detail();
+            return Result.MOVING;
+        }
+        if (tick - started > PROOF_TICKS)
+            return refuse(dropProof != null ? dropProof : "No settled view of the exact lower top before the look expired.");
+        if (!body.hasRecentView()) return Result.CHECKING;
+        if (body.caveLipFooting(from) != sourceState())
+            return refuse("The takeoff lacks stable dry contact or the controls for a bounded drop.");
+        if (body.hazardAhead(travel.getPositiveHorizontalDegrees(), 1.65))
+            return refuse("A visible hazard vetoes the directed descent.");
+        if (tick - started < DROP_PEEK_TICKS) {
+            double across = (player.getX() - from.getX() - 0.5) * travel.getOffsetZ()
+                - (player.getZ() - from.getZ() - 0.5) * travel.getOffsetX();
+            if (Math.abs(across) > 0.14) {
+                if (!body.centerOnCaveLip(from, sourceState()))
+                    return refuse("The player could not center safely on the witnessed lip.");
+                return Result.CHECKING;
+            }
+            body.turnFixed(travel.getPositiveHorizontalDegrees(), 75);
+            body.driveCaveLip(from, travel);
+            return Result.CHECKING;
+        }
+        Vec3d aim = tick - started < 38 ? floorAim : nearFloorAim;
+        body.aim(aim);
+        if (player.getPose() != EntityPose.STANDING || player.getVelocity().horizontalLengthSquared() > 0.0025
+                || !body.renderedAim(aim, 8) || body.dryRouteRaysSpent()) return Result.CHECKING;
+        int height = from.getY() - to.getY();
+        var check = body.caveDryLanding(from, travel, height, sourceState(), aim);
+        if (check.landing() == null) {
+            dropProof = check.refusal().detail();
+            return Result.CHECKING;
+        }
+        var landing = check.landing();
+        var veto = body.driveCaveDryLanding(landing);
+        if (veto != null) {
+            dropProof = veto.detail();
+            return Result.CHECKING;
+        }
+        dropProof = null;
+        drop = landing;
+        beginDrive(player.getPos(), tick);
+        dropMotorTick = body.actionTick();
         return Result.MOVING;
     }
 
@@ -322,10 +460,12 @@ final class AgentSurfaceTread {
         var world = client.world;
         if (player.isTouchingWater() || player.isInLava() || player.isOnFire() || player.hasVehicle() || player.hurtTime != 0)
             return "The player's current body state is unsafe for the dry tread.";
-        if (!cardinalTread(edge.upper, edge.lower, edge.down)) return "The retained tread no longer has cardinal geometry.";
+        if (!(ordinaryDescent() ? AgentDryLanding.shape(from, to, travel) : cardinalTread(edge.upper, edge.lower, edge.down)))
+            return "The retained tread no longer has cardinal geometry.";
         if (world.getBlockState(sourceSupport) != sourceState()) return "The exact takeoff support state changed.";
         if (world.getBlockState(landingSupport) != landingState()) return "The exact landing support state changed.";
-        return (from.getY() == to.getY() || isolated || witnessedOutbound) && !body.walkedLaneDry(from, to, travel)
+        return !ordinaryDescent() && (from.getY() == to.getY() || isolated() || witnessedOutbound
+                || recallPolicy == RecallPolicy.ORDINARY) && !body.walkedLaneDry(from, to, travel)
             ? "A retained dry tread column is no longer safe." : null;
     }
 
@@ -347,8 +487,8 @@ final class AgentSurfaceTread {
         if (!floorSeen) floorSeen = body.dryRouteFloor(floorAim, landingSupport) != null
             || body.dryRouteFloor(nearFloorAim, landingSupport) != null;
         if (!chestSeen) chestSeen = body.dryRouteClear(chestAim) == AgentBody.DryRouteSample.CLEAR;
-        if (isolated && !headSeen) headSeen = body.dryRouteClear(headAim) == AgentBody.DryRouteSample.CLEAR;
-        return floorSeen && chestSeen && (!isolated || headSeen);
+        if (isolated() && !headSeen) headSeen = body.dryRouteClear(headAim) == AgentBody.DryRouteSample.CLEAR;
+        return floorSeen && chestSeen && (!isolated() || headSeen);
     }
 
     private void lookThroughOpening(AgentBody body, Vec3d eye, long tick) {
@@ -359,7 +499,7 @@ final class AgentSurfaceTread {
         // Cover the landing and its opening in one rendered view. If a lip or
         // narrow FOV hides one end, favor that end once rather than aiming a checklist.
         double low = pitch(eye, floorAim);
-        double high = pitch(eye, isolated ? headAim : chestAim);
+        double high = pitch(eye, isolated() ? headAim : chestAim);
         double blend = tick - started < 18 ? 0.5 : !floorSeen ? 0.8 : 0.22;
         body.turnFixed(travel.getPositiveHorizontalDegrees(), (float) (low * blend + high * (1 - blend)));
     }
@@ -375,7 +515,7 @@ final class AgentSurfaceTread {
             && levelProbe != null && next.sampleProof(body, levelProbe.floorState(body.actionTick()), levelProbe.floorSeenAt())
             && body.dryRouteContinuationClear(next.from, next.to, travel,
                 next.sourceState(), next.landingState())
-            && (!next.isolated || body.macroNoVisiblePickup(next.center, next.from.getY(), next.to.getY() + 0.32));
+            && (!next.isolated() || body.macroNoVisiblePickup(next.center, next.from.getY(), next.to.getY() + 0.32));
     }
 
     /** Veto only on the two positively identified columns; never use collision to discover a tread. */

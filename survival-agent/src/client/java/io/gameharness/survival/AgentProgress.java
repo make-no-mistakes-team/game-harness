@@ -571,6 +571,10 @@ final class AgentProgress {
     }
 
     void observeMemoryFooting(long observedTick) {
+        if (mineResite.oneWayInFlight()) {
+            mineResite.discardCrossedDropSuffix();
+            return;
+        }
         caves.observeDryContact(observedTick);
         if (caves.unverifiedDropInFlight()) return;
         boolean grounded = c.player.isOnGround() && !c.player.isTouchingWater();
@@ -776,6 +780,10 @@ final class AgentProgress {
         if (!ordinaryCaveDrops || returnIndex >= 0 || resumeIndex >= 0 || exitStart != null || oreProbeReturning
                 || supplyEgress.active() || firing != Firing.NONE || pendingFurnaceMemory.current() != null)
             return false;
+        return hasCaveEscapeKit(height);
+    }
+
+    private boolean hasCaveEscapeKit(int height) {
         if (!c.options.attackKey.isUnbound()
                 && AgentDryLanding.escapeKit(height, pickUses(stack -> stack.isIn(ItemTags.PICKAXES)), 0)) return true;
         return !c.options.useKey.isUnbound() && !c.options.jumpKey.isUnbound()
@@ -971,7 +979,7 @@ final class AgentProgress {
             interruptHands();
         }
         int priorLandings = fall.waterSuccesses() + fall.boatSuccesses();
-        if (!caves.controlsShortFall(tick) && fall.step(safetySpend)) {
+        if (!caves.controlsShortFall(tick) && !mineResite.controlsShortFall() && fall.step(safetySpend)) {
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.SOURCE_UNGROUNDED);
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
@@ -1098,7 +1106,7 @@ final class AgentProgress {
             stepOverland();
             return;
         }
-        if (supplyEgress.step()) return;
+        if (!mineResite.ascending() && supplyEgress.step()) return;
         // A planned retreat owns its advancing waypoints, not the local stall
         // incident it is trying to leave. Danger, hands and paid work ran first.
         if (ordinaryCaveDrops && mineResite.step()) return;
@@ -1603,7 +1611,8 @@ final class AgentProgress {
 
     private void recordStallFooting(BlockPos reached) {
         // This callback identifies a landing, not the crossing that reached it.
-        if (returnIndex >= 0 && dryFieldFooting() && !rejoinReturn(reached)) abandonReturn(reached);
+        if (!mineResite.retreating() && returnIndex >= 0 && dryFieldFooting() && !rejoinReturn(reached))
+            abandonReturn(reached);
     }
 
     /** Only ordinary trail work may continue under a witnessed low ceiling; never widen the pillar. */
@@ -4899,7 +4908,7 @@ final class AgentProgress {
         private int benchBefore, benchCollectUntil, connectors, builds, buildBefore, anchorChoice;
         private long revealedFrame;
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
-        private boolean triedLower, built;
+        private boolean triedLower, built, mineDeparture;
 
         boolean active() { return world == c.world && order.active(); }
 
@@ -4952,11 +4961,37 @@ final class AgentProgress {
                         != (AgentBody.SUPPLY_ROOF | AgentBody.SUPPLY_WALL)) return false;
             }
             if (!order.begin(standing, grounded)) return false;
+            start(c.player.getHorizontalFacing(), tick + JOB_TICKS, false);
             surveyActivity = "supply egress: surveying the rendered roof and opening for " + need;
-            deadline = tick + JOB_TICKS;
-            bearing = c.player.getHorizontalFacing();
+            return step();
+        }
+
+        boolean beginMineDeparture(BlockPos standing, Direction direction, int end) {
+            if (world != c.world) {
+                world = c.world;
+                order.reset();
+                openFoot = unknownFoot = null;
+            }
+            if (!order.begin(standing, dryFieldFooting())) return false;
+            start(direction, end, true);
+            surveyActivity = "mine departure: checking for a supported ascent out of the enclosed area";
+            return true;
+        }
+
+        void cancelMineDeparture() {
+            if (!mineDeparture) return;
+            mineDeparture = false;
+            order.finish();
+            to = armedCut = null;
+            driving = 0;
+        }
+
+        private void start(Direction direction, int end, boolean resite) {
+            mineDeparture = resite;
+            deadline = end;
+            bearing = direction;
             walked.clear();
-            walked.add(standing);
+            walked.add(order.foot());
             firstRefusal = lastRefusal = null;
             to = armedCut = packedBench = null;
             driving = 0;
@@ -4964,10 +4999,9 @@ final class AgentProgress {
             revealedFrame = -1;
             rises = levels = cuts = connectors = builds = 0;
             sourceProved = walkedReturn = lighting = triedLight = triedCraftLight = false;
-            returning = findReturn();
-            enclosed = returning && trail.get(backEnd).getY() >= standing.getY() + 2;
+            returning = !mineDeparture && findReturn();
+            enclosed = returning && trail.get(backEnd).getY() >= order.foot().getY() + 2;
             survey(4);
-            return step();
         }
 
         boolean step() {
@@ -5016,7 +5050,7 @@ final class AgentProgress {
                 body.centerOnSupport(from.down());
                 return true;
             }
-            if (packedBench == null && ordinaryHandoff(from)) return true;
+            if (!mineDeparture && packedBench == null && ordinaryHandoff(from)) return true;
             if (surveying) return look();
             if (packedBench != null && tick < benchCollectUntil) {
                 body.aim(Vec3d.ofBottomCenter(packedBench));
@@ -5047,6 +5081,7 @@ final class AgentProgress {
             }
             if (to == null && !choose()) return true;
             status = crossingActivity;
+            if (mineDeparture && !mineResite.eligibleReturn(from, to)) return refuse("the directed tread was already refused");
             if (body.hazardAhead(lane.getPositiveHorizontalDegrees(), 1.5))
                 return refuse("visible lava near the selected crossing");
             if (revealedFrame == body.renderedFrame()) return true;
@@ -5168,6 +5203,7 @@ final class AgentProgress {
             }
             if (!enclosed && !returning && walked.size() == 1) {
                 // An inconclusive roofless view isn't a cave, including in treeless terrain.
+                if (mineDeparture) return ready("no enclosure witnessed for a supported ascent");
                 unknownFoot = from;
                 return ready("no enclosure observed; continuing ordinary timber traversal");
             }
@@ -5501,6 +5537,7 @@ final class AgentProgress {
         private boolean cutFace(BlockPos cell, BlockHitResult hit) {
             BlockState material = state(hit);
             boolean ownBench = material.isOf(table.block) && memory.ownsWorkbench(c.world, cell);
+            if (ownBench && mineDeparture) return refuse("the ascent would disturb the existing portable workshop");
             if (!material.isOf(table.block)) memory.forgetOwnedWorkbench(c.world, cell);
             var admission = returnableFace(cell, material);
             if (ownBench) {
@@ -5551,7 +5588,7 @@ final class AgentProgress {
             BlockPos from = order.foot();
             var veto = body.dryRouteVeto(from, to);
             if (veto != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(veto));
-            if (settled(to)) {
+            if (settled(to) && (!mineDeparture || mineResite.exactContact(to))) {
                 BlockPos old = from;
                 from = to;
                 order.landed(from);
@@ -5561,8 +5598,8 @@ final class AgentProgress {
                 body.recordWalkedLeg(old, from);
                 if (from.getY() > old.getY()) {
                     rises++;
-                    stallGuard.navigationArrival(old, from);
-                    status = "supply egress rise " + rises + ": " + old.toShortString()
+                    if (!mineDeparture) stallGuard.navigationArrival(old, from);
+                    status = (mineDeparture ? "mine departure rise " : "supply egress rise ") + rises + ": " + old.toShortString()
                         + " -> " + from.toShortString() + " (settled; return connected)";
                 } else {
                     if (!returning && from.getY() < old.getY()) connectors++;
@@ -5580,6 +5617,7 @@ final class AgentProgress {
                 bearing = lane;
                 handoffAfter = tick;
                 survey(reachedReturnEnd ? 4 : 1);
+                if (mineDeparture) mineResite.ascended(from, lane);
                 return true;
             }
             if (tick - driving >= 45) return refuse("ordinary jump or walk did not settle on the witnessed top");
@@ -5652,7 +5690,7 @@ final class AgentProgress {
                 resumeStep = -1;
                 supplyExcursion.reset();
             }
-            status = "supply egress: " + why + " at " + from.toShortString();
+            status = (mineDeparture ? "mine departure: " : "supply egress: ") + why + " at " + from.toShortString();
             if (order.active()) order.finish();
             to = armedCut = null;
             driving = 0;
@@ -5663,6 +5701,11 @@ final class AgentProgress {
             body.pauseWork();
             to = armedCut = null;
             driving = 0;
+            if (mineDeparture) {
+                status = "mine departure ascent blocked at " + order.foot().toShortString() + ": " + why;
+                order.finish(); // A strategic departure refusal is not a supply order refusal.
+                return true;
+            }
             status = order.refuse(why
                 + (packedBench == null ? "" : "; no safe pickup reached for the portable crafting table"), airborne());
             return true;
@@ -7942,15 +7985,26 @@ final class AgentProgress {
         int target = join;
         while (target > Math.max(0, join - 16)) {
             BlockPos from = trail.get(target), to = trail.get(target - 1);
-            if (!adjacent(from, to) || sameStem(from, to) || !eligible.test(from, to)) break;
+            if (!AgentSurfaceTread.ordinaryRecallGeometry(from, to) || !eligible.test(from, to)) break;
             target--;
         }
         // A single neighboring foothold is local recovery, not a retreat plan.
         return join - target >= 3 ? target : -1;
     }
 
+    static int mineRetreatRejoin(List<BlockPos> trail, int limit, int failedSource, BlockPos foot,
+                                BiPredicate<BlockPos, BlockPos> eligible) {
+        for (int join = failedSource - 1; join > limit; --join) {
+            if (!foot.equals(trail.get(join))) continue;
+            BlockPos next = trail.get(join - 1);
+            if (AgentSurfaceTread.ordinaryRecallGeometry(foot, next) && eligible.test(foot, next)) return join;
+        }
+        return -1;
+    }
+
     private final class MineResite {
-        private static final int RETURN_TICKS = 860, WALK_TICKS = 240;
+        private static final int RETURN_TICKS = 860, WALK_TICKS = 240, ASCENT_TICKS = 1200;
+        private record RefusedEdge(BlockPos from, BlockPos to) {}
         private final MineSetback setback = new MineSetback();
         private Resource ore;
         private ClientWorld world;
@@ -7958,12 +8012,17 @@ final class AgentProgress {
         private AgentSurfaceTread tread;
         private int until;
         private Direction outward;
+        private List<RefusedEdge> refusedEdges;
+        private String returnFailure, walkFailure, ascentStatus;
         private final BiPredicate<BlockPos, BlockPos> eligibleReturn = this::eligibleReturn;
-        private boolean returning;
+        private boolean returning, ascending;
 
         boolean active() { return until != 0; }
         boolean leased() { return active() && tick < until; }
         boolean retreating() { return active() && returning; }
+        boolean ascending() { return active() && ascending; }
+        boolean oneWayInFlight() { return retreating() && tread != null && tread.ordinaryDescent() && tread.inFlight(); }
+        boolean controlsShortFall() { return oneWayInFlight() && tread.controlsShortFall(c, body, tick); }
 
         void reset() {
             release();
@@ -7974,6 +8033,7 @@ final class AgentProgress {
 
         void observe() {
             if (world != c.world) reset();
+            if (!ordinaryCaveDrops && active()) release();
             if (ore != null && setback.site != null && setback.material(stock(ore))) attemptedAt = null;
         }
 
@@ -8025,9 +8085,9 @@ final class AgentProgress {
             }
             if (!active()) {
                 if (!setback.ready(stallGuard.exhaustedDryRecovery()) || returnIndex >= 0 || exitStart != null
-                        || returnableMine.active() || nextFoot != null || caveRetreat.shaft != null
+                        || supplyEgress.active() || returnableMine.active() || nextFoot != null || caveRetreat.shaft != null
                         || caves.active() || caves.routingDry() || stallWork != null || !safe()
-                        || !dryFieldFooting() || !body.hasRecentView() || Math.abs(c.player.getY() - standing.getY()) > 0.055
+                        || !exactContact(standing) || !body.hasRecentView()
                         || c.player.getVelocity().horizontalLengthSquared() > 0.0025
                         || attemptedAt != null && !MineSetback.different(attemptedAt, standing)) return false;
                 int waypoint = mineRetreatTarget(trail, activeTrail() - 1, standing, eligibleReturn);
@@ -8041,7 +8101,9 @@ final class AgentProgress {
                 outward = c.player.getHorizontalFacing();
                 if (setback.resited(standing)) return settled(standing);
                 attemptedAt = standing.toImmutable();
-                if (waypoint >= 0 && startReturn(waypoint, false)) {
+                returnFailure = walkFailure = null;
+                if (waypoint >= 0) {
+                    startReturnAt(groundedTrailIndex(), waypoint, false);
                     returning = true;
                     lastJoined = attemptedAt;
                     until = tick + RETURN_TICKS;
@@ -8053,29 +8115,80 @@ final class AgentProgress {
                 stopAt(standing); // An ore receipt superseded the relocation, not the other way round.
                 return false;
             }
-            if (!safe()) return refuse(standing, "unsafe conditions interrupted the mine departure");
+            if (!safe()) return refuse(standing, departureStatus("unsafe conditions interrupted the mine departure"));
+            if (ascending) {
+                status = ascentStatus;
+                if (supplyEgress.active()) supplyEgress.step();
+                if (ascending) {
+                    ascentStatus = status;
+                    status = departureStatus(ascentStatus);
+                    if (!supplyEgress.active()) return refuse(standing, status);
+                }
+                return true;
+            }
             if (returning && (tick >= until || returnIndex < 0)) {
-                returnRefused();
+                returnRefused(returnFrom, returnIndex < 0 ? null : trail.get(returnIndex),
+                    returnIndex < 0 ? "the exact trail join was lost" : "the bounded return window expired");
                 return true;
             }
             if (returning) {
                 retreatTunnel();
                 return true;
             }
-            if (tick >= until) return refuse(standing, "no different safe mine start was reached in the walking window");
+            if (tick >= until) return tryAscent(standing, "no different safe mine start in the surface walking window");
             overland.step(tick);
-            status = overland.status();
+            status = departureStatus(overland.status());
             var arrival = overland.takeArrival();
             if (arrival != null && setback.resited(arrival.foot())) {
                 outward = directional(Vec3d.ofBottomCenter(arrival.foot()).subtract(Vec3d.ofBottomCenter(arrival.from())));
                 return settled(arrival.foot());
             }
-            if (overland.takeRefusal()) return refuse(standing, status);
+            if (overland.takeRefusal()) return tryAscent(standing, overland.status());
             return true;
         }
 
+        private boolean exactContact(BlockPos standing) {
+            return dryFieldFooting() && body.dryCaveContact(standing) != null
+                && standing.down().equals(c.player.supportingBlockPos.orElse(null));
+        }
+
         private boolean eligibleReturn(BlockPos from, BlockPos to) {
-            return !stallGuard.refusedCrossing(from, to);
+            if (stallGuard.refusedCrossing(from, to)) return false;
+            if (refusedEdges != null) for (var edge : refusedEdges)
+                if (edge.from.equals(from) && edge.to.equals(to)) return false;
+            return true;
+        }
+
+        private String departureStatus(String detail) {
+            if (walkFailure != null) detail = walkFailure + "; " + detail;
+            return returnFailure == null ? detail : returnFailure + "; " + detail;
+        }
+
+        private boolean tryAscent(BlockPos standing, String reason) {
+            if (exactContact(standing) && body.hasRecentView() && !supplyEgress.outdoors() && has(TORCH, 2)
+                    && pickUses(RETURNABLE_PICKS) >= 6 && !c.options.forwardKey.isUnbound()
+                    && !c.options.jumpKey.isUnbound() && !c.options.attackKey.isUnbound()) {
+                overland.interrupt();
+                if (supplyEgress.beginMineDeparture(standing, outward, tick + ASCENT_TICKS)) {
+                    keepStandingPrefix(standing);
+                    ascending = true;
+                    until = tick + ASCENT_TICKS;
+                    walkFailure = reason;
+                    ascentStatus = "checking for a different mine start along a supported ascent";
+                    status = departureStatus(ascentStatus);
+                    return true;
+                }
+            }
+            return refuse(standing, departureStatus(reason));
+        }
+
+        void ascended(BlockPos to, Direction bearing) {
+            recordCaveFooting(to);
+            outward = bearing;
+            if (setback.resited(to)) {
+                settled(to);
+                status = departureStatus(status);
+            }
         }
 
         private void walkFrom(BlockPos standing) {
@@ -8092,43 +8205,94 @@ final class AgentProgress {
             overland.restart(outward);
         }
 
-        boolean arrivedAt(BlockPos foot) { return arrived(foot) && foot.equals(lastJoined); }
+        boolean arrivedAt(BlockPos foot) { return foot.equals(lastJoined) && exactContact(foot); }
 
         void follow(BlockPos from, BlockPos to) {
-            status = "rechecking the walked return toward " + to.toShortString() + " to leave the exhausted mine";
-            if (tread == null || !tread.to.equals(to)) {
-                if (!eligibleReturn(from, to)) {
-                    returnRefused();
-                    return;
-                }
-                tread = AgentSurfaceTread.recall(c, from, to, tick);
+            status = departureStatus("rechecking walked return " + from.toShortString() + " -> " + to.toShortString());
+            if (!eligibleReturn(from, to)) {
+                returnRefused(from, to, "the directed edge was already refused");
+                return;
             }
+            if (tread == null || !tread.from.equals(from) || !tread.to.equals(to))
+                tread = AgentSurfaceTread.ordinaryRecall(c, from, to, tick);
             if (tread == null) {
-                returnRefused();
+                returnRefused(from, to, "the grade or its movement controls are unavailable");
+                return;
+            }
+            if (tread.ordinaryDescent() && !tread.leftTakeoff(c) && !hasCaveEscapeKit(from.getY() - to.getY())) {
+                returnRefused(from, to, "no usable pick or enough solid blocks for the one-way landing");
                 return;
             }
             switch (tread.step(c, body, tick)) {
                 case CHECKING -> { }
                 case MOVING -> rememberMotion();
                 case LANDED -> {
+                    boolean oneWay = tread.ordinaryDescent();
+                    if (oneWay) {
+                        // Retain only the historical prefix underfoot. No breadcrumb crosses
+                        // this drop upward, and no navigation receipt implies a reverse jump.
+                        trimCaveTrail(returnIndex + 1);
+                    }
+                    tread = null;
                     lastJoined = to;
                     outward = AgentDryLanding.bearing(from, to);
+                    if (setback.resited(to)) settled(to);
+                    if (oneWay) status += "; landed one-way " + from.toShortString() + " -> " + to.toShortString()
+                        + " (no reverse tread proved)";
                 }
-                case REFUSED -> returnRefused();
+                case REFUSED -> returnRefused(from, to, tread.refusal());
             }
         }
 
-        void returnRefused() {
+        void returnRefused(BlockPos from, BlockPos to, String reason) {
             // Do not call abandonReturn: it would schedule a resume into the failed mine.
             BlockPos standing = c.player.getBlockPos();
-            if (dryFieldFooting() && standing.equals(lastJoined) && setback.resited(standing)) {
+            returnFailure = "walked return refused" + (from == null || to == null ? ""
+                : " " + from.toShortString() + " -> " + to.toShortString()) + ": " + reason;
+            if (from != null && to != null && eligibleReturn(from, to)) {
+                if (refusedEdges == null) refusedEdges = new ArrayList<>(4);
+                refusedEdges.add(new RefusedEdge(from, to));
+                stallGuard.refuseCrossing(from, to);
+            }
+            discardCrossedDropSuffix();
+            tread = null;
+            body.pauseWork();
+            boolean joined = standing.equals(lastJoined) && exactContact(standing);
+            if (joined && setback.resited(standing)) {
                 settled(standing);
+                status = departureStatus(status);
                 return;
             }
+            if (joined && from != null && returnIndex >= 0 && tick < until) {
+                int alternative = mineRetreatRejoin(trail, returnTo, returnIndex + 1, standing, eligibleReturn);
+                if (alternative >= 0) {
+                    returnIndex = alternative;
+                    returnFrom = null;
+                    status = departureStatus("checking the next physically joined waypoint");
+                    return;
+                }
+            }
             clearReturn();
+            if (!exactContact(standing)) {
+                refuse(standing, returnFailure);
+                return;
+            }
+            keepStandingPrefix(standing);
             walkFrom(standing);
-            body.pauseWork();
-            status = "walked return no longer reverified; checking different dry footing from here";
+            status = departureStatus("checking different dry footing from here");
+        }
+
+        void discardCrossedDropSuffix() {
+            if (oneWayInFlight() && returnIndex >= 0 && tread.leftTakeoff(c)) trimCaveTrail(returnIndex + 1);
+        }
+
+        private void keepStandingPrefix(BlockPos standing) {
+            int join = trail.lastIndexOf(standing);
+            if (join >= 0) trimCaveTrail(join + 1);
+            else {
+                detachMine(standing);
+                appendGrounded(standing, false);
+            }
         }
 
         void returned(int index) {
@@ -8156,7 +8320,7 @@ final class AgentProgress {
 
         private boolean refuse(BlockPos foot, String reason) {
             stopAt(foot);
-            if (dryFieldFooting()) attemptedAt = foot.toImmutable();
+            if (exactContact(foot)) attemptedAt = foot.toImmutable();
             stallGuard.mineDepartureRefused(reason);
             status = stallGuard.status();
             return true;
@@ -8164,7 +8328,7 @@ final class AgentProgress {
 
         private void stopAt(BlockPos foot) {
             release();
-            if (dryFieldFooting()) {
+            if (exactContact(foot)) {
                 stopFoot = foot.toImmutable();
                 int index = trail.lastIndexOf(foot);
                 trimCaveTrail(index + 1);
@@ -8175,12 +8339,16 @@ final class AgentProgress {
         }
 
         private void release() {
-            if (returning) clearReturn();
+            if (returning) {
+                discardCrossedDropSuffix();
+                clearReturn();
+            } else if (ascending) supplyEgress.cancelMineDeparture();
             else if (active()) overland.interrupt();
-            returning = false;
+            returning = ascending = false;
             until = 0;
             tread = null;
             lastJoined = null;
+            if (refusedEdges != null) refusedEdges.clear();
         }
     }
 
@@ -8213,6 +8381,11 @@ final class AgentProgress {
         if (!dryFieldFooting()) return false;
         int anchor = connectedReturnAnchor(trail, activeTrail() - 1, index, c.player.getBlockPos(), walkedWaterReturn);
         if (anchor < 0) return false;
+        startReturnAt(anchor, index, preserve);
+        return true;
+    }
+
+    private void startReturnAt(int anchor, int index, boolean preserve) {
         clearReturn();
         returnIndex = anchor;
         returnTo = index;
@@ -8227,7 +8400,6 @@ final class AgentProgress {
         forcedLight = false;
         target = null;
         clearPickup();
-        return true;
     }
 
     private boolean rejoinReturn(BlockPos standing) {
@@ -8257,7 +8429,8 @@ final class AgentProgress {
             }
             if (!standing.equals(next) && !standing.equals(returnFrom)) {
                 if (mineResite.retreating()) {
-                    mineResite.returnRefused();
+                    mineResite.returnRefused(returnFrom, next,
+                        "grounded outside the exact joining tread at " + standing.toShortString());
                     return;
                 }
                 if (!rejoinReturn(standing)) {

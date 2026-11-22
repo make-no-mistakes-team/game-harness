@@ -126,6 +126,8 @@ final class AgentHands {
 
     record OrdinaryIronPlan(String preparation, OrdinaryIronFuel first) {}
 
+    record FirstIronPlan(OrdinaryIronPlan heat, int benchPlanks, int handlePlanks, int sticks) {}
+
     private record Step(Mode mode, Slot slot, Item item, int count) {}
 
     private static final class Click {
@@ -692,6 +694,37 @@ final class AgentHands {
         var inventory = c.player.getInventory();
         return ordinaryIronPlan(inventory, wanted, planks, sticks, c.world.getFuelRegistry(),
             slot -> canEquipSlot(inventory, slot), installed, paid);
+    }
+
+    FirstIronPlan firstIronPlan(int wanted, int benchWood, boolean hasFurnace, boolean hasFurnaceStone) {
+        var inventory = c.player.getInventory();
+        return firstIronPlan(inventory, wanted, benchWood, hasFurnace, hasFurnaceStone, c.world.getFuelRegistry(),
+            slot -> canEquipSlot(inventory, slot));
+    }
+
+    static FirstIronPlan firstIronPlan(PlayerInventory inventory, int wanted, int benchWood, boolean hasFurnace,
+                                       boolean hasFurnaceStone, FuelRegistry fuels, IntPredicate usablePickSlot) {
+        var complete = ordinaryIronPlan(inventory, wanted, benchWood, 2, fuels, usablePickSlot, ItemStack.EMPTY, false);
+        if (complete != null) return new FirstIronPlan(complete, benchWood, 0, 2);
+        if (wanted <= 0 || !hasFurnace && !hasFurnaceStone) return null;
+
+        // Missing pick handles need not prevent a fully funded smelt. Convert wood only
+        // if the furnace itself requires a new bench, and reserve any partial pick stock.
+        var stock = new IronFuelStock(inventory, usablePickSlot);
+        int availablePlanks = stock.planks();
+        String preparation = null;
+        while (!hasFurnace && availablePlanks < benchWood) {
+            Item result = stock.convertLog(fuels, true);
+            if (result == null) return null;
+            if (preparation == null) preparation = Registries.ITEM.getId(result).getPath();
+            availablePlanks = stock.planks();
+        }
+        int bench = Math.min(benchWood, availablePlanks);
+        int sticks = Math.min(2, stock.sticks);
+        int handles = sticks < 2 ? Math.min(2, availablePlanks - bench) : 0;
+        var first = stock.fuel(Math.min(3, wanted), bench + handles, sticks, fuels, ItemStack.EMPTY, ItemStack::getMaxCount);
+        return first != null && stock.covers(first, wanted, bench + handles, sticks, fuels)
+            ? new FirstIronPlan(new OrdinaryIronPlan(preparation, first), bench, handles, sticks) : null;
     }
 
     /** Quote the same one-source loads the furnace UI will make, without crediting residual burn time. */

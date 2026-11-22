@@ -117,6 +117,54 @@ final class LocalSmeltTest {
             "necessary bench materials are unavailable as fuel");
     }
 
+    @Test
+    void coalAndACarriedBenchFundIronBeforeTheSecondHandleExists() {
+        var inventory = ironStock(new ItemStack(Items.RAW_IRON, 4), new ItemStack(Items.COAL, 10),
+            new ItemStack(Items.COBBLESTONE, 64), new ItemStack(Items.CRAFTING_TABLE),
+            new ItemStack(Items.STONE_PICKAXE), new ItemStack(Items.STONE_PICKAXE),
+            new ItemStack(Items.WOODEN_PICKAXE), new ItemStack(Items.STICK));
+
+        var plan = firstIronPlan(inventory, 0, false, true);
+        assertNull(plan.heat().preparation());
+        assertEquals(1, plan.sticks());
+        assertEquals(Items.COAL, plan.heat().first().item());
+        assertEquals(1, plan.heat().first().count());
+        assertEquals(3, plan.heat().first().units());
+
+        inventory.setStack(8, new ItemStack(Items.BIRCH_PLANKS, 2));
+        var completePick = firstIronPlan(inventory, 0, false, true);
+        assertEquals("stick", completePick.heat().preparation());
+        assertEquals(2, completePick.sticks());
+    }
+
+    @Test
+    void smeltOnlyProtectsPartialWoodAndRequiresABenchIfTheFurnaceMustBeCrafted() {
+        var inventory = ironStock(new ItemStack(Items.RAW_IRON, 3), new ItemStack(Items.COAL),
+            new ItemStack(Items.STICK), new ItemStack(Items.BIRCH_PLANKS, 3),
+            new ItemStack(Items.WOODEN_PICKAXE));
+        assertNull(firstIronPlan(inventory, 4, false, true), "three planks do not fund a required table");
+        assertNull(firstIronPlan(inventory, 4, false, false), "no available furnace or stone for a furnace");
+
+        var carriedFurnace = firstIronPlan(inventory, 4, true, false);
+        assertEquals(3, carriedFurnace.benchPlanks());
+        assertEquals(1, carriedFurnace.sticks());
+        assertEquals(Items.COAL, carriedFurnace.heat().first().item());
+
+        inventory.setStack(3, new ItemStack(Items.BIRCH_PLANKS, 5));
+        var craftFurnace = firstIronPlan(inventory, 4, false, true);
+        assertEquals(4, craftFurnace.benchPlanks());
+        assertEquals(1, craftFurnace.handlePlanks());
+        assertEquals(1, craftFurnace.sticks());
+
+        inventory.setStack(1, ItemStack.EMPTY);
+        assertNull(firstIronPlan(inventory, 4, false, true), "don't burn the bench, partial handles or last pick");
+    }
+
+    private static AgentHands.FirstIronPlan firstIronPlan(PlayerInventory inventory, int benchWood,
+                                                            boolean hasFurnace, boolean hasFurnaceStone) {
+        return AgentHands.firstIronPlan(inventory, 3, benchWood, hasFurnace, hasFurnaceStone, fuels, slot -> true);
+    }
+
     private static AgentHands.OrdinaryIronPlan ironPlan(PlayerInventory inventory, int wanted) {
         return AgentHands.ordinaryIronPlan(inventory, wanted, 0, 2, fuels, slot -> true, ItemStack.EMPTY, false);
     }

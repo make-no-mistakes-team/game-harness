@@ -70,7 +70,7 @@ final class AgentProgress {
     private static final int STAIR_LIGHT_RECEIPT_TICKS = 8;
     private static final int KIT_WOOD_PICK = 1, KIT_STONE_PICK = 1 << 1, KIT_DEEP_PICK = 1 << 2;
     private static final int KIT_LIGHT = 1 << 3, KIT_IRON = 1 << 4, KIT_STONE = 1 << 5, KIT_WOOD = 1 << 6;
-    private static final int KIT_WORKBENCH = 1 << 7, KIT_FURNACE = 1 << 8;
+    private static final int KIT_WORKBENCH = 1 << 7, KIT_FURNACE = 1 << 8, KIT_IRON_PICK_READY = 1 << 9;
     // Planning for ordinary burnable planks in Java 1.21.4; furnace loading checks the actual stack's fuel value.
     private static final int PLANK_BURN_TICKS = 300;
     private static final int ORE_MEMORY_LIMIT = 18;
@@ -232,7 +232,7 @@ final class AgentProgress {
     private final Set<BlockPos> stallRouteTried = new HashSet<>();
     private final Set<Integer> stallDropsTried = new HashSet<>();
     private Supplier<AgentStallGuard.Alternative> stallWork;
-    private int stallWorkIncident, stallKit;
+    private int stallWorkIncident, stallKit, stallIronTried;
     private boolean stallTorchTried;
     private final Predicate<BlockPos> protectedHeadroom = this::protectRecoveryBlock;
     private final Predicate<BlockHitResult> returnableOreFace = this::returnableOreReachable;
@@ -297,8 +297,9 @@ final class AgentProgress {
     private int furnaceDemand;
     private boolean furnaceLoaded;
     private boolean furnaceNeedsFuel;
+    private boolean furnaceForFirstPick;
     private ItemStack furnaceBlockedFuel = ItemStack.EMPTY;
-    private int furnaceIronPlanks, furnaceIronSticks;
+    private int furnaceIronPlanks, furnaceIronHandlePlanks, furnaceIronSticks;
     private Direction furnaceContactFacing;
     private BlockPos furnaceContactFooting;
     private final AgentPendingFurnaceMemory pendingFurnaceMemory;
@@ -1219,6 +1220,7 @@ final class AgentProgress {
             return;
         }
         if (stepLocalFurnaceWatch()) return;
+        if (stepFundedIronWorkshop()) return;
         if (!surfaceApproach.canopyRecovery && surfaceApproach.workBootstrapPassage()) return;
         // Keep a declared ordinary leg through vanilla momentum. The inventory/craft stage
         // itself correctly refuses moving footing; it cannot own the continuation here.
@@ -1440,6 +1442,7 @@ final class AgentProgress {
             stallRouteTried.clear();
             stallDropsTried.clear();
             stallTorchTried = false;
+            stallIronTried = 0;
             stallStation = null;
             stallStationPosition = null;
             stallKit = availableStallKit();
@@ -1461,24 +1464,21 @@ final class AgentProgress {
         if (stone) kit |= KIT_STONE_PICK;
         if (iron) kit |= KIT_DEEP_PICK;
         if (has(TORCH, 2)) kit |= KIT_LIGHT;
-        if (!iron && has(INGOT, 3)) kit |= KIT_IRON;
+        if (!iron && has(INGOT, 3)) {
+            kit |= KIT_IRON;
+            if (affordsWood(ironTableWood(), 2)) kit |= KIT_IRON_PICK_READY;
+        }
         if (!iron && !stone && has(STONE, 3)) kit |= KIT_STONE;
         if (!iron && !stone && !wooden && affordsWood(3, 2)) kit |= KIT_WOOD;
         // Count an actual owned station when it can advance this leg, separately from wood
         // that was already convertible in theory. Do not credit spare copies or slot changes.
         if (!iron && has(table.item, 1) && stallWorkbenchNeeded(kit)) kit |= KIT_WORKBENCH;
-        if (!iron && stone && has(furnace.item, 1) && stallFurnaceNeeded()) kit |= KIT_FURNACE;
+        if (!iron && stone && needsTimberKit() && fundedFirstIron(3 - hands.count(INGOT)) != null) kit |= KIT_FURNACE;
         return kit;
     }
 
     private boolean stallWorkbenchNeeded(int kit) {
         return (kit & KIT_WOOD) != 0 || (kit & (KIT_STONE | KIT_IRON)) != 0 && affordsWood(0, 2);
-    }
-
-    private boolean stallFurnaceNeeded() {
-        int missing = 3 - hands.count(INGOT);
-        return missing > 0 && has(RAW_IRON, missing)
-            && ownedIronPlan(missing, ironTableWood(), 2) != null;
     }
 
     /** Inspect only the existing camera, owned items and actually traveled routes; do not perform another sweep. */
@@ -1503,15 +1503,21 @@ final class AgentProgress {
         if (portal == null || !portal.locallyStopped()) {
             String station = stallStation == null ? null : stallVisibleStation(stallStation);
             if (station == null && stallStation != table && stallWorkbenchNeeded(kit)) station = stallVisibleStation(table);
-            if (station == null && stallStation != furnace && (kit & (KIT_STONE_PICK | KIT_DEEP_PICK)) == KIT_STONE_PICK
-                    && stallFurnaceNeeded()) station = stallVisibleStation(furnace);
+            if (station == null && stallStation != furnace && (kit & KIT_FURNACE) != 0)
+                station = stallVisibleStation(furnace);
             if (station != null) return station;
-            if (gained != 0) {
+            int workshop = kit & (KIT_FURNACE | KIT_IRON_PICK_READY);
+            int distinctWorkshop = stallStation == null ? workshop & ~stallIronTried : 0;
+            if ((gained | distinctWorkshop) != 0) {
                 stallKit |= kit;
+                stallIronTried |= workshop;
                 replanStalledLocalWork();
                 stallWork = () -> AgentStallGuard.Alternative.REPLAN;
                 if ((gained & KIT_WORKBENCH) != 0) return "replanning with an owned crafting table and pickaxe ingredients";
-                if ((gained & KIT_FURNACE) != 0) return "replanning with an owned furnace, raw iron and fuel";
+                if (((gained | distinctWorkshop) & KIT_IRON_PICK_READY) != 0)
+                    return "replanning with owned iron pick materials and a payable bench";
+                if (((gained | distinctWorkshop) & KIT_FURNACE) != 0)
+                    return "replanning with raw iron, fuel and a payable furnace";
                 return "replanning with newly available owned tools, light or materials";
             }
         }
@@ -1790,6 +1796,61 @@ final class AgentProgress {
         acquireIron(desired, 0);
     }
 
+    private boolean stepFundedIronWorkshop() {
+        if (!ordinaryCaveDrops || !needsTimberKit() || has(DEEP_PICK, 1)) return false;
+        boolean supplyReturn = returnIndex >= 0 && returnForSupplies;
+        boolean oldTravel = supplyEgress.active() || mineResite.active() || overland.driving() || supplyReturn;
+        if (portal != null && (portalStarted || portal.locallyStopped() || portal.castEligible()
+                || portalSupplies.stoneBank != null || !oldTravel && !furnaceForFirstPick)) return false;
+        if (!hands.stableCraftFooting() || !body.hasRecentView() || body.lavaEmergency()
+                || nextFoot != null || localFurnace != null || returnableMine.settling()
+                || returnIndex >= 0 && !supplyReturn && !mineResite.retreating()
+                || supplyEgress.active() && !supplyEgress.canYieldToWorkshop()
+                || mineResite.tread != null && mineResite.tread.inFlight()) return false;
+        if (stallGuard.ownsRecovery() && !oldTravel) return false;
+        if (firing != Firing.NONE) {
+            if (!furnaceForFirstPick || oldTravel || stallGuard.ownsRecovery()) return false;
+            fire(firing, furnaceDemand);
+            return true;
+        }
+
+        int missing = 3 - hands.count(INGOT);
+        var smelt = missing > 0 && has(STONE_PICK, 1) ? fundedFirstIron(missing) : null;
+        // With ingots in hand, seek handles only if needed. A genuine handle
+        // search keeps its travel turn until the missing wood is actually owned.
+        if (missing > 0 ? smelt == null : oldTravel && !affordsWood(ironTableWood(), 2)) return false;
+        if (oldTravel) {
+            // Release obsolete search at settled footing, not an in-flight crossing
+            // or the return to a real workshop. Keep the proven mine trail.
+            if (mineResite.active()) mineResite.release();
+            if (supplyEgress.active()) supplyEgress.yieldToWorkshop();
+            if (supplyReturn) {
+                int anchor = groundedTrailIndex();
+                clearReturn();
+                resumeAfterReturn(c.player.getBlockPos(), anchor);
+            }
+            overland.interrupt();
+            body.pauseWork();
+        }
+        if (stallGuard.ownsRecovery()) return false; // The distinct-work chooser can now see the workshop.
+        if (smelt != null) workFirstIron(3, smelt);
+        else makePick("iron_pickaxe", INGOT, 3);
+        return true;
+    }
+
+    private AgentHands.FirstIronPlan fundedFirstIron(int wanted) {
+        if (wanted <= 0 || !has(RAW_IRON, wanted)) return null;
+        boolean installed = ironFurnaceAvailable(), stone = has(STONE, 8);
+        return installed || stone ? hands.firstIronPlan(wanted, ironTableWood(), installed, stone) : null;
+    }
+
+    private boolean ironFurnaceAvailable() {
+        return furnace.placed != 0 || has(furnace.item, 1)
+            || localStation(furnace, furnaceWitness)
+                && !reservedFurnace(furnace.position != null ? furnace.position : furnaceWitness)
+            || visibleLocalFurnace() != null;
+    }
+
     private void acquireIron(int desired, int sticks) {
         if (firing != Firing.NONE) {
             fire(firing, furnaceDemand);
@@ -1806,8 +1867,21 @@ final class AgentProgress {
         int raw = hands.count(RAW_IRON);
         int batch = Math.min(3, desired - ingots);
         if (raw >= batch) {
-            int benchWood = sticks > 0 || !has(furnace.item, 1) && !localStation(furnace, furnaceWitness)
-                && visibleLocalFurnace() == null ? ironTableWood() : 0;
+            boolean hasFurnace = ironFurnaceAvailable();
+            int benchWood = sticks > 0 || !hasFurnace ? ironTableWood() : 0;
+            if (sticks > 0) {
+                var plan = hands.firstIronPlan(batch, benchWood, hasFurnace, has(STONE, 8));
+                if (plan != null) {
+                    workFirstIron(desired, plan);
+                    return;
+                }
+                if (!has(TORCH, 2) && craftTorches(LOCAL_LIGHT)) return;
+                if (!hasFurnace && !affordsWood(benchWood, 0)) seekExpeditionSupplies("furnace workbench wood");
+                else if (!hasFurnace && !has(STONE, 8)) gatherStone();
+                else if (!workOre(Resource.COAL, has(TORCH, 2) ? SEARCH : REACH - 0.35, true))
+                    seekExpeditionSupplies("furnace fuel");
+                return;
+            }
             var plan = ownedIronPlan(batch, benchWood, sticks);
             if (plan == null) {
                 if (!has(TORCH, 2) && craftTorches(LOCAL_LIGHT)) return;
@@ -1839,7 +1913,14 @@ final class AgentProgress {
     }
 
     private int ironBenchReserve() {
-        return furnaceIronPlanks == 0 ? 0 : localTableWood();
+        return furnaceIronHandlePlanks + (furnaceIronPlanks == 0 ? 0 : Math.min(furnaceIronPlanks, localTableWood()));
+    }
+
+    private void workFirstIron(int desired, AgentHands.FirstIronPlan plan) {
+        if (prepareIronStock(plan.heat())) return;
+        furnaceForFirstPick = true;
+        furnaceIronHandlePlanks = plan.handlePlanks();
+        startIron(desired, plan.benchPlanks(), plan.sticks());
     }
 
     private void startIron(int demand, int planks, int sticks) {
@@ -4011,8 +4092,11 @@ final class AgentProgress {
                 var plan = hands.ordinaryIronPlan(wanted, ironBenchReserve(), furnaceIronSticks,
                     furnaceBlockedFuel, furnaceLoaded);
                 if (plan == null) {
+                    boolean unpaidFirstPick = furnaceForFirstPick && !furnaceLoaded;
                     finishFire();
-                    if (portalSupplies == null || portalSupplies.stoneBank == null) seekExpeditionSupplies("furnace fuel");
+                    if (unpaidFirstPick) blockStation(furnace, "the furnace cannot take the quoted iron fuel");
+                    else if (portalSupplies == null || portalSupplies.stoneBank == null)
+                        seekExpeditionSupplies("furnace fuel");
                     return;
                 }
                 if (prepareIronStock(plan)) return;
@@ -4049,8 +4133,9 @@ final class AgentProgress {
         charcoalHandleReserve = PICK_HANDLES;
         furnaceLoaded = false;
         furnaceNeedsFuel = false;
+        furnaceForFirstPick = false;
         furnaceBlockedFuel = ItemStack.EMPTY;
-        furnaceIronPlanks = furnaceIronSticks = 0;
+        furnaceIronPlanks = furnaceIronHandlePlanks = furnaceIronSticks = 0;
     }
 
     private boolean declineOptionalCharcoal(String reason) {
@@ -5842,6 +5927,16 @@ final class AgentProgress {
             order.finish();
             to = armedCut = null;
             driving = 0;
+        }
+
+        boolean canYieldToWorkshop() {
+            return driving == 0 && proof != Proof.FOOTHOLD_RECEIPT
+                && (packedBench == null || has(table.item, benchBefore + 1) || tick >= benchCollectUntil);
+        }
+
+        void yieldToWorkshop() {
+            order.finish();
+            to = armedCut = packedBench = null;
         }
 
         private void start(Direction direction, int end, boolean resite) {
@@ -9413,7 +9508,11 @@ final class AgentProgress {
         boolean step() {
             BlockPos standing = c.player.getBlockPos();
             var rememberedBatch = pendingFurnaceMemory.current();
+            boolean firstPickIngots = ore == Resource.IRON && !has(DEEP_PICK, 1) && has(INGOT, 3)
+                && (!active() || hands.stableCraftFooting() && (tread == null || !tread.inFlight())
+                    && (!ascending || supplyEgress.canYieldToWorkshop()));
             if (ore == null || sought != ore || firing != Firing.NONE || furnaceLoaded || localFurnace != null
+                    || firstPickIngots
                     || rememberedBatch != null && rememberedBatch.mayInvestigateCollection() || portal != null && portal.castEligible()) {
                 if (active()) release();
                 return false;
@@ -9428,6 +9527,8 @@ final class AgentProgress {
                         || attemptedAt != null && !MineSetback.different(attemptedAt, standing)) return false;
                 if (stalled) setback.recoveryEnded(standing, stallGuard.report().incidentTick());
                 if (!setback.ready(stalled)) return false;
+                if (ore == Resource.IRON && !has(DEEP_PICK, 1) && fundedFirstIron(3 - hands.count(INGOT)) != null)
+                    return false;
                 int waypoint = mineRetreatTarget(trail, activeTrail() - 1, standing, eligibleReturn);
                 setback.retire();
                 // Invalidate advice for the failed opportunity. Its dedup bit stays spent.

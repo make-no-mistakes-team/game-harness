@@ -57,6 +57,7 @@ final class AgentStallGuard {
     private static final int MAX_CUTS = 2;
     private static final int STEP_TICKS = 85;
     private static final int STEP_SETTLE_TICKS = 40;
+    private static final int EDGE_STANCE_TICKS = 52;
     private static final int BLOCKED_RECHECK_TICKS = 43; // Stagger the rendered sampler's four interleaved phases.
     private static final int CHANGED_SUPPORT_TICKS = 3;
     private static final int ALTERNATIVE_TICKS = 210;
@@ -247,6 +248,9 @@ final class AgentStallGuard {
     private BlockPos observedQuietSupport;
     private int observedQuietAge, quietTicks;
     private Vec3d lastAssessedFeet;
+    private final Set<BlockPos> triedEdgeSupports = new HashSet<>();
+    private AgentBody.EdgeStance edgeStance;
+    private int edgeStanceSince, edgeStanceTurn;
     private BlockPos departureFrom, surveyFoot;
     private Direction departureBearing, surveyBearing;
     private AgentBody.OrdinaryGrade surveyRise, departureRise;
@@ -1051,6 +1055,7 @@ final class AgentStallGuard {
                 replanOnAssessment = false;
                 replan.run();
             }
+            if ((phase == Phase.ASSESS || phase == Phase.BLOCKED) && settleEdgeStance(replan)) return true;
             return assessAlternative(chooseAlternative, workAlternative, releaseAlternative);
         }
         if (phase == Phase.RETRY && blockedReason != null) {
@@ -1101,6 +1106,33 @@ final class AgentStallGuard {
             case SETTLE -> settleStep();
             default -> { }
         }
+        return true;
+    }
+
+    private boolean settleEdgeStance(Runnable replan) {
+        if (edgeStance != null && edgeStanceTurn != tick - 1) edgeStance = null;
+        if (edgeStance == null) {
+            if (tick < alternativeCheckAt) return false;
+            var stance = body.edgeStance();
+            if (stance == null || !triedEdgeSupports.add(stance.support())) return false;
+            edgeStance = stance;
+            edgeStanceSince = tick;
+            transition(Phase.ASSESS, "checking the full top already supporting the feet at this edge");
+        }
+        body.pauseWork();
+        if (tick - edgeStanceSince >= EDGE_STANCE_TICKS) {
+            edgeStance = null;
+            return false;
+        }
+        edgeStanceTurn = tick;
+        var result = body.settleEdgeStance(edgeStance);
+        if (result == AgentBody.EdgeStanceResult.WORKING) return true;
+        edgeStance = null;
+        if (result == AgentBody.EdgeStanceResult.REFUSED) return false;
+        body.pauseWork();
+        surveyFoot = null;
+        replan.run();
+        retry("settled inward on the witnessed support; returning to ordinary play");
         return true;
     }
 
@@ -1544,6 +1576,8 @@ final class AgentStallGuard {
         world = client.world;
         water.clearEpisode();
         departures.clear();
+        triedEdgeSupports.clear();
+        edgeStance = null;
         surveyFoot = null;
         lowCeilingFoot = null;
         triedPassages.clear();
@@ -1674,6 +1708,8 @@ final class AgentStallGuard {
         rejectedStances.clear();
         triedCuts.clear();
         triedPassages.clear();
+        triedEdgeSupports.clear();
+        edgeStance = null;
         lowCeilingFoot = null;
         drivenStances.clear();
         assessedSupports.clear();

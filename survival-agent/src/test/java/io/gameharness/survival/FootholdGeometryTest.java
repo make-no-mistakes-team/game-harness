@@ -12,11 +12,13 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.EmptyBlockView;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -70,6 +72,66 @@ final class FootholdGeometryTest {
                 "same-block positioning cannot follow the body onto the next tile");
         }
         assertFalse(AgentBody.sameSurveySupport(foot.down(), actual.add(0, -0.5, 0)));
+    }
+
+    @Test
+    void canFinishSettlingOnTheTreadAlreadySupportingTheBodyAcrossTheCellLine() {
+        var tread = new BlockPos(-15, 36, -22);
+        var edge = new Vec3d(-14.519715871668827, 37, -20.977740632182073);
+        assertEquals(tread.south(), BlockPos.ofFloored(edge).down());
+        assertFalse(AgentBody.sameSurveySupport(tread, edge), "ordinary same-cell centering is not a crossing");
+        var stance = AgentBody.EdgeStance.start(tread, edge, standingBox(edge));
+        assertNotNull(stance);
+
+        var justInside = edge.add(0, 0, -0.04);
+        assertTrue(AgentBody.sameSurveySupport(tread, justInside));
+        assertFalse(stance.settled(justInside), "crossing the grid line does not yet give full-width takeoff");
+        assertNotNull(stance.sweep(tread, justInside, standingBox(justInside), Vec3d.ZERO, 0, -0.04));
+        assertTrue(stance.settled(new Vec3d(-14.52, 37, -21.40)));
+    }
+
+    @Test
+    void anOverlappingCornerDoesNotPermitAnOutwardInputOrNewSupport() {
+        var tread = new BlockPos(-15, 36, -22);
+        var edge = new Vec3d(-15.02, 37, -20.98);
+        var body = standingBox(edge);
+        var stance = AgentBody.EdgeStance.start(tread, edge, body);
+        assertNotNull(stance, "both axes overlap the same actual tread");
+        var sweep = stance.sweep(tread, edge, body, Vec3d.ZERO, 0.022, -0.022);
+        assertNotNull(sweep);
+        assertTrue(sweep.intersects(new Box(tread.up(2))), "a head obstruction can veto the entire inward sweep");
+        assertNull(stance.sweep(tread, edge, body, Vec3d.ZERO, -0.022, -0.022));
+        assertNull(stance.sweep(tread.south(), edge, body, Vec3d.ZERO, 0.022, -0.022));
+        assertNull(AgentBody.EdgeStance.start(tread.north(), edge, body), "a remote tread is not current support");
+        assertNull(AgentBody.EdgeStance.start(tread.down(), edge, body), "an unseen lower floor is not current support");
+        assertNull(AgentBody.EdgeStance.start(tread, edge.add(-0.29, 0, 0), body.offset(-0.29, 0, 0)));
+        assertNull(AgentBody.EdgeStance.start(tread, edge.add(-0.17, 0, 0.17), body.offset(-0.17, 0, 0.17)),
+            "overlap alone does not permit a longer diagonal shift");
+    }
+
+    @Test
+    void onlyTheExactVisibleStableDryTopCanAuthorizeEdgeCentering() {
+        var tread = new BlockPos(-15, 36, -22);
+        var edge = new Vec3d(-14.52, 37, -20.98);
+        var stance = AgentBody.EdgeStance.start(tread, edge, standingBox(edge));
+        assertNotNull(stance);
+        var world = EmptyBlockView.INSTANCE;
+        var top = Vec3d.ofBottomCenter(tread.up());
+        var contact = new BlockHitResult(top, Direction.UP, tread, false);
+        var stone = Blocks.STONE.getDefaultState();
+        assertTrue(stance.dryTop(contact, stone, world));
+        assertFalse(stance.dryTop(null, stone, world), "contact alone cannot authorize movement without a rendered top");
+        assertFalse(stance.dryTop(new BlockHitResult(top, Direction.SOUTH, tread, false), stone, world));
+        assertFalse(stance.dryTop(new BlockHitResult(top.add(0, 0, 1), Direction.UP, tread.south(), false), stone, world));
+        for (var material : new net.minecraft.block.Block[] {
+                Blocks.WATER, Blocks.LAVA, Blocks.MAGMA_BLOCK, Blocks.FIRE, Blocks.GRAVEL, Blocks.STONE_SLAB, Blocks.ICE
+        }) {
+            assertFalse(stance.dryTop(contact, material.getDefaultState(), world), material.toString());
+        }
+    }
+
+    private static Box standingBox(Vec3d feet) {
+        return new Box(feet.x - 0.3, feet.y, feet.z - 0.3, feet.x + 0.3, feet.y + 1.8, feet.z + 0.3);
     }
 
     @Test

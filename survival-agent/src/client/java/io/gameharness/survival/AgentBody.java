@@ -4392,6 +4392,129 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return x >= 0 && x < 1 && z >= 0 && z < 1 && Math.abs(feet.y - support.getY() - 1) <= 0.055;
     }
 
+    enum EdgeStanceResult { WORKING, SETTLED, REFUSED }
+
+    /** Same physical contact, even when the player's center initially lies in another column. */
+    record EdgeStance(BlockPos support, Vec3d origin, Vec3d center) {
+        private static final double LIMIT = 0.80;
+        private static final double SETTLED = 0.125;
+        private static final double COAST = 1 / (1 - 0.55); // Normal full-block ground drag is 0.6 * 0.91.
+
+        static EdgeStance start(BlockPos support, Vec3d feet, Box body) {
+            if (support == null || sameSurveySupport(support, feet) || !overlaps(support, feet, body)) return null;
+            Vec3d center = Vec3d.ofBottomCenter(support.up());
+            return feet.squaredDistanceTo(center) <= LIMIT * LIMIT ? new EdgeStance(support.toImmutable(), feet, center) : null;
+        }
+
+        private static boolean overlaps(BlockPos support, Vec3d feet, Box body) {
+            return Math.abs(feet.y - support.getY() - 1) <= 0.035
+                && Math.min(body.maxX, support.getX() + 1) - Math.max(body.minX, support.getX()) >= 0.05
+                && Math.min(body.maxZ, support.getZ() + 1) - Math.max(body.minZ, support.getZ()) >= 0.05;
+        }
+
+        boolean holds(BlockPos contact, Vec3d feet, Box body) {
+            return support.equals(contact) && overlaps(support, feet, body)
+                && feet.squaredDistanceTo(origin) <= LIMIT * LIMIT && feet.squaredDistanceTo(center) <= LIMIT * LIMIT;
+        }
+
+        boolean settled(Vec3d feet) { return feet.squaredDistanceTo(center) <= SETTLED * SETTLED; }
+
+        boolean dryTop(BlockHitResult hit, BlockState state, BlockView world) {
+            return matchesDryRouteTop(hit, support) && !hit.isInsideBlock() && !dryCaveDanger(state)
+                && !(state.getBlock() instanceof FallingBlock) && normalDryTraction(state)
+                && Block.isShapeFullCube(state.getCollisionShape(world, support));
+        }
+
+        Box sweep(BlockPos contact, Vec3d feet, Box standing, Vec3d motion, double inputX, double inputZ) {
+            if (!holds(contact, feet, standing)) return null;
+            double dx = center.x - feet.x, dz = center.z - feet.z;
+            double coastX = COAST * motion.x, coastZ = COAST * motion.z;
+            double pressX = COAST * (motion.x + inputX), pressZ = COAST * (motion.z + inputZ);
+            if (!inwardAxis(origin.x, feet.x, center.x, coastX, pressX)
+                    || !inwardAxis(origin.z, feet.z, center.z, coastZ, pressZ)
+                    || origin.squaredDistanceTo(feet.x + coastX, feet.y, feet.z + coastZ) > LIMIT * LIMIT
+                    || origin.squaredDistanceTo(feet.x + pressX, feet.y, feet.z + pressZ) > LIMIT * LIMIT) return null;
+            return new Box(
+                standing.minX + Math.min(0, Math.min(dx, Math.min(coastX, pressX))), standing.minY + 0.005,
+                standing.minZ + Math.min(0, Math.min(dz, Math.min(coastZ, pressZ))),
+                standing.maxX + Math.max(0, Math.max(dx, Math.max(coastX, pressX))), standing.maxY,
+                standing.maxZ + Math.max(0, Math.max(dz, Math.max(coastZ, pressZ))));
+        }
+
+        private static boolean inwardAxis(double origin, double feet, double center, double coast, double press) {
+            // The body may approach the settled band from outside it, but never extend its overhang.
+            double low = Math.min(Math.max(origin, feet), center - SETTLED) - 0.006;
+            double high = Math.max(Math.min(origin, feet), center + SETTLED) + 0.006;
+            return feet + Math.min(0, Math.min(coast, press)) >= low
+                && feet + Math.max(0, Math.max(coast, press)) <= high;
+        }
+    }
+
+    EdgeStance edgeStance() {
+        if (!hasView() || !edgeStanceControls()) return null;
+        var player = client.player;
+        return EdgeStance.start(player.supportingBlockPos.orElse(null), player.getPos(), player.getBoundingBox());
+    }
+
+    EdgeStanceResult settleEdgeStance(EdgeStance stance) {
+        if (!hasView()) return EdgeStanceResult.WORKING; // No ray or movement during a render gap.
+        if (!edgeStanceControls()) return EdgeStanceResult.REFUSED;
+        var player = client.player;
+        Vec3d feet = player.getPos();
+        BlockPos contact = player.supportingBlockPos.orElse(null);
+        if (!stance.holds(contact, feet, player.getBoundingBox())) return EdgeStanceResult.REFUSED;
+        Vec3d center = stance.center();
+        Vec3d point = center.add(0, -0.025, 0);
+        aimFixed(point);
+        BlockHitResult hit = inView(point) ? visibleHit(point, Ray.TERRAIN) : null;
+        if (!matchesDryRouteTop(hit, contact)) return EdgeStanceResult.WORKING;
+        if (!stance.dryTop(hit, client.world.getBlockState(contact), client.world)) return EdgeStanceResult.REFUSED;
+
+        double dx = center.x - feet.x, dz = center.z - feet.z;
+        float yaw = heading(dx, dz);
+        Vec3d motion = player.getVelocity();
+        boolean centered = stance.settled(feet);
+        boolean drive = !centered && player.isSneaking()
+            && Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) <= 6;
+        double inputX = 0, inputZ = 0;
+        if (drive) {
+            double angle = Math.toRadians(player.getYaw());
+            double acceleration = 0.102 * player.getAttributeValue(EntityAttributes.SNEAKING_SPEED) + 0.008;
+            inputX = -acceleration * Math.sin(angle);
+            inputZ = acceleration * Math.cos(angle);
+        }
+        Box standing = player.getDimensions(EntityPose.STANDING).getBoxAt(feet);
+        Box sweep = stance.sweep(contact, feet, standing, motion, inputX, inputZ);
+        if (drive && sweep == null) {
+            drive = false;
+            sweep = stance.sweep(contact, feet, standing, motion, 0, 0);
+        }
+        // These are negative-only vetoes over the standing hull of the witnessed inward shift.
+        if (sweep == null || !caveLandingVolumeDry(sweep) || !client.world.isSpaceEmpty(player, sweep)
+                || hazardAhead(yaw, Math.hypot(dx, dz) + 0.12)) return EdgeStanceResult.REFUSED;
+        if (centered) return player.getPose() == EntityPose.STANDING && motion.horizontalLengthSquared() <= 0.000144
+            ? EdgeStanceResult.SETTLED : EdgeStanceResult.WORKING;
+        sneak();
+        if (drive) {
+            walkDownTo(center);
+            flatWalk = true;
+        }
+        return EdgeStanceResult.WORKING;
+    }
+
+    private boolean edgeStanceControls() {
+        if (lavaEmergency || !client.isWindowFocused() || client.getOverlay() != null
+                || client.options.getAutoJump().getValue() || client.options.forwardKey.isUnbound()
+                || client.options.sneakKey.isUnbound()) return false;
+        var player = client.player;
+        return player.isOnGround() && !player.isTouchingWater() && !player.isInLava() && !player.isOnFire()
+            && !player.isSprinting() && !player.isClimbing() && !player.isUsingItem() && !player.hasVehicle()
+            && !player.getAbilities().flying && !player.hasNoDrag() && player.hurtTime == 0
+            && player.getVelocity().horizontalLengthSquared() <= 0.0025
+            && player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED) <= 0.101
+            && player.getAttributeValue(EntityAttributes.SNEAKING_SPEED) <= 0.36;
+    }
+
     static boolean drySurveyLaneCentered(BlockPos foot, double x, double z, Direction facing) {
         x -= foot.getX() + 0.5;
         z -= foot.getZ() + 0.5;

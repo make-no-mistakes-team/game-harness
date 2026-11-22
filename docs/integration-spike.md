@@ -82,6 +82,9 @@ four torches and light its footing before opening the next cave lip.
 Incoming damage interrupts work even when knockback puts the player
 in water. The player can look toward a sound or seek a visible dry
 bank. A sound is not permission to swing at an unseen mob.
+If water reaches a staircase on the way out of a mine, the player
+checks the downhill passage it just walked instead of swimming straight
+up under a roof. It does not assume the old tread is still clear or dry.
 If a retreat is blocked, the player can strike a hostile mob it can
 see and reach, including while being knocked back.
 It need not abandon work on a dry bank to chase an unarmed drowned
@@ -115,6 +118,9 @@ ore credit.
 A useful pause is still play. For example, the player can watch the
 furnace finish one raw iron. Count the original load, not the input
 remaining: the last ore of a larger batch is still part of that batch.
+For an iron pick, the player keeps two sticks for the handle. It can
+smelt the ore in smaller loads using different fuels, including a plain
+wooden pick it no longer needs, rather than leave the mine for more coal.
 Once a larger batch is burning, the player can close the screen and
 pick up a useful drop or do nearby workshop work. If nothing is safe
 or useful, it can watch the surroundings until it is time to check the

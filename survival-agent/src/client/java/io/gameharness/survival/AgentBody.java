@@ -1474,6 +1474,9 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     boolean repairHeadroom(AgentTools tools, Predicate<BlockPos> protectedBlock) {
         return headroom.step(tick, tools, protectedBlock);
     }
+    boolean beginStepLeaf(BlockHitResult face, Predicate<BlockPos> protectedBlock) {
+        return headroom.beginStepLeaf(tick, face, protectedBlock);
+    }
     AgentHeadroom.Report headroomReport() { return headroom.report(); }
     void observeHeadroomBreak(BlockPos position) { headroom.broken(position); }
 

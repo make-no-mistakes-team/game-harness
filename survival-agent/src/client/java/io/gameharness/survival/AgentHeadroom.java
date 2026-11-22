@@ -34,7 +34,7 @@ final class AgentHeadroom {
     private int launchTick, lastShortTick, blockedTick, cutTick;
     private double peak, risingVelocity;
     private BlockPos cut;
-    private boolean surveying, checkingFirstClip, attacked, broken;
+    private boolean surveying, checkingFirstClip, attacked, broken, leafOnly;
     private Report report = new Report(0, 0, 0, "");
 
     AgentHeadroom(MinecraftClient client, AgentBody body) {
@@ -129,7 +129,25 @@ final class AgentHeadroom {
         blockedTick = now;
         surveying = true;
         checkingFirstClip = firstClip;
+        leafOnly = false;
         note(why);
+    }
+
+    boolean beginStepLeaf(int now, BlockHitResult face, Predicate<BlockPos> protectedBlock) {
+        var player = client.player;
+        BlockPos leaf = face.getBlockPos();
+        if (!dry(player) || !player.isOnGround() || !body.hasRecentView() || protectedBlock.test(leaf)
+                || !stepLeaf(player.getBlockPos(), face, client.world.getBlockState(leaf))) return false;
+        start(now, player.getPos(), player.getYaw(), false, "clearing the witnessed leaf over the step");
+        attacked = broken = false;
+        select(face, now);
+        leafOnly = true;
+        return true;
+    }
+
+    static boolean stepLeaf(BlockPos foot, BlockHitResult face, BlockState state) {
+        return face.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK && face.getSide() == Direction.DOWN
+            && face.getBlockPos().equals(foot.up(2)) && AgentSupplyEgress.naturalDryLeaf(state);
     }
 
     boolean step(int now, AgentTools tools, Predicate<BlockPos> protectedBlock) {
@@ -183,7 +201,8 @@ final class AgentHeadroom {
         BlockHitResult seen = body.perceive(cutAim, player.getEyePos().distanceTo(cutAim) + 0.09).orElse(null);
         if (seen == null || !seen.getBlockPos().equals(cut)) return true;
         BlockState state = client.world.getBlockState(seen.getBlockPos());
-        if (!natural(state) || protectedBlock.test(cut) || !state.getFluidState().isEmpty()
+        if ((leafOnly ? !AgentSupplyEgress.naturalDryLeaf(state) : !natural(state))
+                || protectedBlock.test(cut) || !state.getFluidState().isEmpty()
                 || state.getHardness(client.world, cut) < 0 || !tools.canHarvest(state))
             return bypass("visible obstruction is not safe to cut");
         if (unsafeVisibleCover(player, seen)) return bypass("visible falling material, fluid or attachment above the obstruction");

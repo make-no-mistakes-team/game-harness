@@ -23,6 +23,19 @@ final class CanopyPassageTest {
     static void initializeVanilla() { VanillaTestResources.initialize(); }
 
     @Test
+    void onlyTheNaturalLeafUndersideInTheJumpColumnCanOpenTheStep() {
+        var leaf = Blocks.OAK_LEAVES.getDefaultState();
+        BlockPos cap = FOOT.up(2);
+        var hit = new BlockHitResult(Vec3d.ofBottomCenter(cap), Direction.DOWN, cap, false);
+        assertTrue(AgentHeadroom.stepLeaf(FOOT, hit, leaf));
+        assertFalse(AgentHeadroom.stepLeaf(FOOT.east(), hit, leaf));
+        assertFalse(AgentHeadroom.stepLeaf(FOOT, top(cap), leaf));
+        assertFalse(AgentHeadroom.stepLeaf(FOOT, hit, leaf.with(Properties.WATERLOGGED, true)));
+        assertFalse(AgentHeadroom.stepLeaf(FOOT, hit, leaf.with(LeavesBlock.PERSISTENT, true)));
+        assertFalse(AgentHeadroom.stepLeaf(FOOT, hit, Blocks.STONE.getDefaultState()));
+    }
+
+    @Test
     void aWitnessedSideLeafNeedsNoLogButCannotBeAProtectedOrPersistentSupport() {
         var leaf = Blocks.OAK_LEAVES.getDefaultState();
         assertTrue(AgentSupplyEgress.canopyContact(leaf, true, false));

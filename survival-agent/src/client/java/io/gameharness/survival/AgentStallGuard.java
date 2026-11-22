@@ -80,7 +80,7 @@ final class AgentStallGuard {
 
     private enum Phase { WATCH, PENDING, WATER, SCOUT, BACKTRACK, WALK, LIGHT, CUT, STEP, SETTLE, RETRY,
                          ASSESS, DEPART, PASSAGE, ALTERNATIVE, BLOCKED }
-    private enum StepStage { CENTER, HEADROOM, SUPPORT, TORCH_BYPASS, JUMP, LAND }
+    private enum StepStage { CENTER, HEADROOM, CLEAR_LEAF, SUPPORT, TORCH_BYPASS, JUMP, LAND }
     private enum PassageStage { HEAD, LEGS, LANDING }
     enum Alternative { WORKING, ADVANCED, ADVANCED_BUT_HELD, REPLAN, REFUSED }
 
@@ -233,6 +233,7 @@ final class AgentStallGuard {
     private int proof, probeSince, driveSince, routeLength, routeIndex, cutCount, itemBefore;
     private boolean cutFinished;
     private StepStage stepStage;
+    private boolean stepLeafTried;
     private int stepSince;
     private float stepHealth;
     private Block stepBlock;
@@ -2170,6 +2171,7 @@ final class AgentStallGuard {
             return;
         }
         stepTried = true;
+        stepLeafTried = false;
         from = client.player.getBlockPos().toImmutable();
         stepStage = StepStage.CENTER;
         stepAim = null;
@@ -2187,6 +2189,7 @@ final class AgentStallGuard {
             failStep(switch (stepStage) {
                 case CENTER -> "could not center on the current support";
                 case HEADROOM -> "could not verify jump and standing clearance";
+                case CLEAR_LEAF -> "could not clear the witnessed overhead leaf";
                 case SUPPORT -> "could not verify the current top face or equip a step block";
                 case TORCH_BYPASS -> "the floor torch occupies the step cell and no adjacent footing was proved";
                 case JUMP -> "did not reach a valid placement window";
@@ -2203,6 +2206,10 @@ final class AgentStallGuard {
             }
             return;
         }
+        if (stepStage == StepStage.CLEAR_LEAF) {
+            if (body.repairHeadroom(tools, protectedBlock)) return;
+            stepStage = StepStage.HEADROOM;
+        }
         if (stepStage == StepStage.HEADROOM) {
             // At this pose the whole tested column, not just the crosshair, must be in view.
             Vec3d overhead = Vec3d.ofBottomCenter(from).add(0, STEP_CLEARANCE, 0);
@@ -2215,6 +2222,13 @@ final class AgentStallGuard {
                     && lowCeiling.getBlockPos().getX() == from.getX() && lowCeiling.getBlockPos().getZ() == from.getZ()
                     && lowCeiling.getPos().y < overhead.y - 0.05
                     && client.world.getBlockState(lowCeiling.getBlockPos()).getFluidState().isEmpty()) {
+                if (!stepLeafTried && !contains(footprints, lowCeiling.getBlockPos().up())
+                        && body.beginStepLeaf(lowCeiling, protectedBlock)) {
+                    stepLeafTried = true;
+                    stepStage = StepStage.CLEAR_LEAF;
+                    transition(Phase.STEP, "clearing one witnessed overhead leaf before rechecking the jump");
+                    return;
+                }
                 lowCeilingFoot = from;
                 String handback = mineHandback.apply(from);
                 if (handback == null) failStep("visible ceiling blocks the temporary step");

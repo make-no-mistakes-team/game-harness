@@ -72,6 +72,9 @@ not send it back onto the same failed collection spot.
 Seeing sky or a log through the mouth of a shaft is not enough to
 finish an ascent. The player looks for ground it can walk onto, or
 timber it can cut and collect from its current tread.
+If a natural leaf directly overhead blocks a jump, it can clear that
+leaf from settled footing and check the entire jump space again before
+placing a step. This does not authorize digging straight up through rock.
 When gathering cobblestone, the player chooses a face close enough to
 collect the drop. If it breaks stone but cannot pick up the drop, it
 must change footing before quarrying another face. It can clear

@@ -196,6 +196,14 @@ final class AgentOverlandSearch {
         refused = false;
     }
 
+    /** Adopt the separately proved and settled reversible step without losing its return breadcrumb. */
+    void landedCanopyTread(BlockPos from, BlockPos foot, Direction bearing) {
+        course.start(from, bearing);
+        course.arrived(foot);
+        if (from.equals(blockedStance)) blockedStance = null;
+        recheckCanopyBranch(foot, bearing);
+    }
+
     Arrival takeArrival() {
         Arrival result = arrival;
         arrival = null;

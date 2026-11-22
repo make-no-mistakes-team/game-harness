@@ -2,6 +2,7 @@ package io.gameharness.survival;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -38,6 +39,19 @@ final class CanopyPassageTest {
     }
 
     @Test
+    void anAdjacentCanopyTopOpensOnlyOutsideTheFootprintTrailAndAttachments() {
+        var leaves = Blocks.OAK_LEAVES.getDefaultState();
+        BlockPos crown = FOOT.east().down();
+        assertTrue(AgentSupplyEgress.canopyTopLeaf(FOOT, Direction.EAST, top(crown), leaves, false));
+        assertFalse(AgentSupplyEgress.canopyTopLeaf(FOOT, Direction.EAST, face(crown), leaves, false));
+        assertFalse(AgentSupplyEgress.canopyTopLeaf(FOOT, Direction.EAST, top(FOOT.down()), leaves, false));
+        assertFalse(AgentSupplyEgress.canopyTopLeaf(FOOT, Direction.EAST, top(crown.east()), leaves, false));
+        assertFalse(AgentSupplyEgress.canopyTopLeaf(FOOT, Direction.EAST, top(crown), leaves, true));
+        assertFalse(AgentSupplyEgress.canopyTopLeaf(FOOT, Direction.EAST, top(crown), leaves.with(LeavesBlock.PERSISTENT, true), false));
+        assertFalse(AgentSupplyEgress.canopyTopLeaf(FOOT, Direction.EAST, top(crown), leaves.with(Properties.WATERLOGGED, true), false));
+    }
+
+    @Test
     void aRealLowerTopWinsAndOnlyTheSelectedOwnBreakOpensItsBranch() {
         var passage = new AgentSupplyEgress.CanopyPassage();
         var east = face(FOOT.east().up());
@@ -46,10 +60,10 @@ final class CanopyPassageTest {
         passage.offer(FOOT, Direction.WEST, west, true);
         var selected = passage.begin(FOOT);
         assertEquals(west, selected.face());
-        assertFalse(passage.broken(east.getBlockPos()));
+        assertFalse(passage.broken(east.getBlockPos(), 12));
         assertEquals(0, passage.cuts());
-        assertTrue(passage.broken(west.getBlockPos()));
-        assertFalse(passage.broken(west.getBlockPos()));
+        assertTrue(passage.broken(west.getBlockPos(), 12));
+        assertFalse(passage.broken(west.getBlockPos(), 13));
         assertEquals(1, passage.cuts());
         passage.finish();
         assertEquals(east, passage.begin(FOOT).face());
@@ -72,14 +86,16 @@ final class CanopyPassageTest {
     }
 
     @Test
-    void realCutsAreLimitedAtOneFootingAndAcrossTheBootstrap() {
+    void realCutsRenewOnlyAtANewWalkedBranchWithAnObservedWorksite() {
         var passage = new AgentSupplyEgress.CanopyPassage();
+        BlockPos originalStem = FOOT.north(2);
+        passage.productive(FOOT, originalStem);
         for (int tree = 0; tree < 3; tree++) {
             BlockPos foot = FOOT.east(4 * tree);
             for (BlockPos leaf : new BlockPos[]{foot.east().up(), foot.east()}) {
                 passage.offer(foot, Direction.EAST, face(leaf), false);
                 assertEquals(leaf, passage.begin(foot).face().getBlockPos());
-                assertTrue(passage.broken(leaf));
+                assertTrue(passage.broken(leaf, 12));
                 passage.finish();
             }
             passage.offer(foot, Direction.WEST, face(foot.west()), true);
@@ -87,8 +103,19 @@ final class CanopyPassageTest {
         }
         assertEquals(6, passage.cuts());
         BlockPos other = FOOT.east(16);
+        passage.productive(other, originalStem.up(2));
         passage.offer(other, Direction.EAST, face(other.east()), true);
         assertNull(passage.begin(other));
+        passage.landed(other.west(), other);
+        passage.productive(other, originalStem.up(3));
+        passage.offer(other, Direction.EAST, face(other.east()), true);
+        assertNull(passage.begin(other), "a fresh angle on the same stem is not a new branch");
+        passage.productive(other, other.east(3));
+        passage.offer(other, Direction.EAST, face(other.east()), true);
+        assertEquals(other.east(), passage.begin(other).face().getBlockPos());
+        passage.finish();
+        assertEquals(0, passage.cuts());
+        assertFalse(passage.available(FOOT, FOOT.south()), "the old footing stays spent");
     }
 
     @Test
@@ -96,6 +123,7 @@ final class CanopyPassageTest {
         var passage = new AgentSupplyEgress.CanopyPassage();
         for (int i = 0; i < 12; i++) {
             BlockPos from = FOOT.east(4 * i);
+            passage.landed(from.west(), from);
             var leaf = face(from.east().up());
             passage.offer(from, Direction.EAST, leaf, false);
             assertEquals(leaf, passage.begin(from).face());
@@ -104,6 +132,19 @@ final class CanopyPassageTest {
         BlockPos other = FOOT.south(4);
         passage.offer(other, Direction.EAST, face(other.east().up()), false);
         assertNull(passage.begin(other));
+        assertEquals(0, passage.cuts());
+    }
+
+    @Test
+    void failedCutsCannotGrindThroughEveryLeafFromOneFooting() {
+        var passage = new AgentSupplyEgress.CanopyPassage();
+        for (Direction direction : new Direction[]{Direction.NORTH, Direction.SOUTH, Direction.WEST}) {
+            passage.offer(FOOT, direction, face(FOOT.offset(direction).up()), false);
+            assertNotNull(passage.begin(FOOT));
+            passage.finish();
+        }
+        passage.offer(FOOT, Direction.EAST, top(FOOT.east().down()), true);
+        assertNull(passage.begin(FOOT));
         assertEquals(0, passage.cuts());
     }
 
@@ -119,11 +160,16 @@ final class CanopyPassageTest {
         assertFalse(course.canExtend(FOOT, lower.down(), Direction.EAST, 0));
         assertTrue(course.arrived(lower));
         assertTrue(course.walkedSupport(lower.down()));
+        assertEquals(FOOT, course.previous(lower));
         assertFalse(course.canExtend(FOOT, lower, Direction.EAST, 0));
         assertTrue(course.canExtend(FOOT, FOOT.east(), Direction.EAST, 0));
     }
 
     private static BlockHitResult face(BlockPos leaf) {
         return new BlockHitResult(Vec3d.ofCenter(leaf), Direction.WEST, leaf, false);
+    }
+
+    private static BlockHitResult top(BlockPos block) {
+        return new BlockHitResult(Vec3d.ofBottomCenter(block.up()), Direction.UP, block, false);
     }
 }

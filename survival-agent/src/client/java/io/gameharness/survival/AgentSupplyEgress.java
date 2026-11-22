@@ -89,22 +89,58 @@ final class AgentSupplyEgress {
             && AgentSurfaceTread.prospectLevelCell(from, hit.getBlockPos(), lane) && naturalDryLeaf(state);
     }
 
+    static boolean canopyTopLeaf(BlockPos from, Direction lane, BlockHitResult hit, BlockState state, boolean protectedCell) {
+        return !protectedCell && lane.getAxis().isHorizontal()
+            && AgentBody.matchesDryRouteTop(hit, from.offset(lane).down()) && !hit.isInsideBlock()
+            && naturalDryLeaf(state);
+    }
+
     /** Keep finite, exact leaf premises separate from a successful cut or a traversed lane. */
     static final class CanopyPassage {
-        private static final int MAX_CUTS = 6, MAX_CUTS_FROM_FOOT = 2, MAX_ATTEMPTS = 12;
-        record Candidate(BlockPos foot, Direction bearing, BlockHitResult face, boolean lowerTop) {}
+        private static final int MAX_CUTS = 6, MAX_ATTEMPTS = 12, CUTS_AT_SITE = 2, ATTEMPTS_AT_SITE = 3;
+        record Candidate(BlockPos foot, Direction bearing, BlockHitResult face, boolean lowerTop) {
+            boolean top() { return face.getBlockPos().getY() < foot.getY(); }
+            int priority() {
+                if (lowerTop) return top() ? 2 : 3;
+                return top() ? 1 : 0;
+            }
+        }
+
+        private static final class Site {
+            int attempts, cuts;
+        }
 
         private final Candidate[] branches = new Candidate[Direction.values().length];
-        private final Set<BlockPos> attempts = new HashSet<>();
-        private final Map<BlockPos, Integer> cutsFromFoot = new HashMap<>();
-        private BlockPos footing;
+        private final Set<BlockPos> attemptedLeaves = new HashSet<>(), walked = new HashSet<>(), worksites = new HashSet<>();
+        private final Map<BlockPos, Site> sites = new HashMap<>();
+        private BlockPos footing, budgetOrigin, newArrival;
         private Candidate active;
-        private boolean opened;
-        private int cuts;
+        private long openedFrame = -1;
+        private int cuts, attempts;
 
         boolean available(BlockPos foot, BlockPos leaf) {
-            return cuts < MAX_CUTS && attempts.size() < MAX_ATTEMPTS && !attempts.contains(leaf)
-                && cutsFromFoot.getOrDefault(foot, 0) < MAX_CUTS_FROM_FOOT;
+            Site site = sites.get(foot);
+            return cuts < MAX_CUTS && attempts < MAX_ATTEMPTS && !attemptedLeaves.contains(leaf)
+                && (site == null || site.cuts < CUTS_AT_SITE && site.attempts < ATTEMPTS_AT_SITE);
+        }
+
+        boolean walkedSupport(BlockPos support) { return walked.contains(support.up()); }
+
+        void landed(BlockPos from, BlockPos to) {
+            walked.add(from.toImmutable());
+            newArrival = walked.add(to.toImmutable()) ? to.toImmutable() : null;
+        }
+
+        void productive(BlockPos foot, BlockPos worksite) {
+            // Height changes on one stem, camera rotation and returned footprints do not earn more cuts.
+            if (!worksites.add(worksite.withY(0)) || !foot.equals(newArrival) || budgetOrigin == null || active != null)
+                return;
+            long dx = (long) foot.getX() - budgetOrigin.getX(), dz = (long) foot.getZ() - budgetOrigin.getZ();
+            if (dx * dx + dz * dz < 9) return;
+            budgetOrigin = foot.toImmutable();
+            newArrival = null;
+            cuts = attempts = 0;
+            Arrays.fill(branches, null);
         }
 
         void offer(BlockPos foot, Direction lane, BlockHitResult face, boolean lowerTop) {
@@ -121,7 +157,7 @@ final class AgentSupplyEgress {
             Candidate best = null;
             for (Candidate branch : branches) {
                 if (branch == null || !available(foot, branch.face.getBlockPos())) continue;
-                if (best == null || branch.lowerTop && !best.lowerTop) best = branch;
+                if (best == null || branch.priority() > best.priority()) best = branch;
             }
             return take(best);
         }
@@ -132,35 +168,50 @@ final class AgentSupplyEgress {
 
         private Candidate take(Candidate candidate) {
             if (active != null || candidate == null || !available(candidate.foot, candidate.face.getBlockPos())) return null;
-            attempts.add(candidate.face.getBlockPos().toImmutable());
+            if (budgetOrigin == null) budgetOrigin = candidate.foot;
+            walked.add(candidate.foot);
+            attemptedLeaves.add(candidate.face.getBlockPos().toImmutable());
+            sites.computeIfAbsent(candidate.foot, ignored -> new Site()).attempts++;
+            attempts++;
             branches[candidate.bearing.ordinal()] = null;
             return active = candidate;
         }
 
         Candidate active() { return active; }
-        boolean opened() { return opened; }
+        boolean opened() { return openedFrame >= 0; }
+        boolean freshOpening(long frame) { return opened() && frame > openedFrame; }
         int cuts() { return cuts; }
 
-        boolean broken(BlockPos leaf) {
-            if (active == null || opened || !leaf.equals(active.face.getBlockPos())) return false;
-            opened = true;
+        boolean broken(BlockPos leaf, long frame) {
+            if (active == null || opened() || !leaf.equals(active.face.getBlockPos())) return false;
+            openedFrame = frame;
             cuts++;
-            cutsFromFoot.merge(active.foot, 1, Integer::sum);
+            sites.get(active.foot).cuts++;
             return true;
+        }
+
+        /** The native grade witness includes both the visible top and the reversible sweep. */
+        AgentSurfaceTread.Edge revealedDescent(long frame, AgentSurfaceTread.Edge edge) {
+            if (!freshOpening(frame) || active == null || !active.top() || edge == null
+                    || !active.foot.equals(edge.upper()) || !active.face.getBlockPos().equals(edge.lower())
+                    || active.bearing != edge.down()) return null;
+            return edge;
         }
 
         void finish() {
             active = null;
-            opened = false;
+            openedFrame = -1;
         }
 
         void reset() {
             finish();
-            footing = null;
+            footing = budgetOrigin = newArrival = null;
             Arrays.fill(branches, null);
-            attempts.clear();
-            cutsFromFoot.clear();
-            cuts = 0;
+            attemptedLeaves.clear();
+            walked.clear();
+            worksites.clear();
+            sites.clear();
+            cuts = attempts = 0;
         }
     }
 

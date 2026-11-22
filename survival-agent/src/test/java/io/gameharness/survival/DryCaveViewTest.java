@@ -289,6 +289,51 @@ final class DryCaveViewTest {
     }
 
     @Test
+    void openingACanopyTopRevealsABareHandedStepOnlyWithAFreshDryTopAndClearReturn() {
+        var leaves = Blocks.OAK_LEAVES.getDefaultState();
+        var grass = Blocks.GRASS_BLOCK.getDefaultState();
+        BlockPos landing = SOURCE.east().down(), floor = landing.down();
+        Vec3d lowerAim = Vec3d.ofBottomCenter(landing).add(0.42, -0.025, 0);
+        var view = new ForwardView(51);
+        view.blocks.put(SOURCE.down(), leaves);
+        view.blocks.put(landing, leaves);
+        view.blocks.put(floor, grass);
+        var mask = view.firstTerrainHit(lowerAim);
+        assertTrue(AgentSupplyEgress.canopyTopLeaf(SOURCE, Direction.EAST, mask, leaves, false));
+        assertEquals(AgentBody.DryRouteTop.OCCLUDED, view.top(lowerAim, floor));
+        var passage = new AgentSupplyEgress.CanopyPassage();
+        passage.offer(SOURCE, Direction.EAST, mask, false);
+        assertEquals(mask, passage.begin(SOURCE).face());
+        assertNull(passage.revealedDescent(38, null));
+        assertTrue(passage.broken(landing, 39));
+        view.blocks.remove(landing);
+
+        var crown = AgentSurfaceTread.reverseJumpSweep(SOURCE, landing, Direction.EAST, 0.6);
+        var top = view.firstTerrainHit(lowerAim);
+        assertTrue(AgentBody.matchesDryRouteTop(top, floor));
+        var edge = AgentSurfaceTread.witnessedGradeEdge(SOURCE, leaves, Direction.EAST, top, grass, view.sweepClear(crown));
+        assertNotNull(edge);
+        assertNull(passage.revealedDescent(39, edge), "the stale render cannot establish a revealed tread");
+        var crossing = passage.revealedDescent(40, edge);
+        assertNotNull(crossing);
+        assertEquals(landing, AgentSurfaceTread.ordinaryStock(crossing, SOURCE, 40).to);
+        assertFalse(AgentDryLanding.escapeKit(1, 0, 0), "the step does not require one-way escape supplies");
+
+        view.blocks.put(SOURCE.east().up(2), Blocks.STONE.getDefaultState());
+        assertTrue(AgentBody.matchesDryRouteTop(view.firstTerrainHit(lowerAim), floor));
+        assertNull(passage.revealedDescent(41, AgentSurfaceTread.witnessedGradeEdge(SOURCE, leaves, Direction.EAST,
+            view.firstTerrainHit(lowerAim), grass, view.sweepClear(crown))), "the visible floor is now one-way");
+        view.blocks.remove(floor);
+        assertNull(view.firstTerrainHit(lowerAim), "empty space is not a landing");
+        assertNull(passage.revealedDescent(42, null));
+        view.blocks.put(floor.down(), grass);
+        var deepTop = view.firstTerrainHit(lowerAim.add(0, -1, 0));
+        assertTrue(AgentBody.matchesDryRouteTop(deepTop, floor.down()));
+        assertNull(passage.revealedDescent(43, AgentSurfaceTread.witnessedGradeEdge(
+            SOURCE, leaves, Direction.EAST, deepTop, grass, true)), "a two-block drop is not a reversible tread");
+    }
+
+    @Test
     void offCenterProspectDepartureNeedsAFreshDryEdgeBeforeItCanBecomeAWalk() {
         var actual = Vec3d.ofBottomCenter(SOURCE).add(0, 0, -0.346);
         var centered = Vec3d.ofBottomCenter(SOURCE);

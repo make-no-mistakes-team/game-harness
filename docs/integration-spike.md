@@ -61,7 +61,10 @@ Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.
 
 The player gathers supplies for the next stretch of mine, keeping
-enough light for the return. When gathering timber on uneven ground,
+enough light for the return. If it lands partly on a stair edge, it can
+ease inward on the dry block supporting its feet before setting up a
+workshop. That small shift is not a new route or a resource gain.
+When gathering timber on uneven ground,
 it approaches a stance where it can collect the log, not just reach
 the trunk with a swing. It makes the first pick as soon as it can pay
 for the pick and a bench; a shovel or axe joins the batch only when
@@ -128,9 +131,14 @@ ore credit.
 A useful pause is still play. For example, the player can watch the
 furnace finish one raw iron. Count the original load, not the input
 remaining: the last ore of a larger batch is still part of that batch.
-For an iron pick, the player keeps two sticks for the handle. It can
+Before making a spare stone pick or a batch of torches, the player
+keeps two sticks for its first iron pick when it can. Replacing the
+last usable pick or lighting an unsafe passage takes precedence. It can
 smelt the ore in smaller loads using different fuels, including a plain
 wooden pick it no longer needs, rather than leave the mine for more coal.
+If it already has the ore, fuel and a place to smelt, a missing stick
+does not postpone the ingots. The stick is needed at the crafting
+table, not at the furnace.
 Once a larger batch is burning, the player can close the screen and
 pick up a useful drop or do nearby workshop work. If nothing is safe
 or useful, it can watch the surroundings until it is time to check the

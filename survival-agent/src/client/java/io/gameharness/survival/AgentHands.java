@@ -11,8 +11,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
+import java.util.function.IntPredicate;
 import java.util.function.Predicate;
 import java.util.function.ToIntFunction;
+import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.navigation.GuiNavigationType;
 import net.minecraft.client.gui.screen.Screen;
@@ -27,7 +29,9 @@ import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.util.Window;
+import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.player.PlayerInventory;
+import net.minecraft.item.FuelRegistry;
 import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
@@ -118,6 +122,10 @@ final class AgentHands {
 
     record IronBatch(int units, Item fuel, int fuelCount, int fuelTicks) {}
 
+    record OrdinaryIronFuel(int slot, Item item, int count, int units) {}
+
+    record OrdinaryIronPlan(String preparation, OrdinaryIronFuel first) {}
+
     private record Step(Mode mode, Slot slot, Item item, int count) {}
 
     private static final class Click {
@@ -182,6 +190,7 @@ final class AgentHands {
     private AgentWorkOrder.Budget smeltBudget;
     private AgentLocalSmelt.Load ordinaryLoad;
     private AgentLocalSmelt.Withdrawal ordinaryWithdrawal;
+    private int ordinaryIronSticks = -1, ordinaryIronPlanks;
     private boolean scopedSmelt;
     private int ironDeposited, fuelDeposited;
     private long workEvidence;
@@ -679,7 +688,186 @@ final class AgentHands {
         return true;
     }
 
-    boolean smelt(boolean charcoal, int batchLimit, AgentLocalSmelt.Load receipt, boolean refuel) {
+    OrdinaryIronPlan ordinaryIronPlan(int wanted, int planks, int sticks, ItemStack installed, boolean paid) {
+        var inventory = c.player.getInventory();
+        return ordinaryIronPlan(inventory, wanted, planks, sticks, c.world.getFuelRegistry(),
+            slot -> canEquipSlot(inventory, slot), installed, paid);
+    }
+
+    /** Quote the same one-source loads the furnace UI will make, without crediting residual burn time. */
+    static OrdinaryIronPlan ordinaryIronPlan(PlayerInventory inventory, int wanted, int planks, int sticks,
+                                             FuelRegistry fuels, IntPredicate usablePickSlot, ItemStack installed,
+                                             boolean paid) {
+        if (wanted <= 0 || !installed.isEmpty() && fuels.getFuelTicks(installed) == 0) return null;
+        var stock = new IronFuelStock(inventory, usablePickSlot);
+        if (!installed.isEmpty() && ordinaryIronFuelRank(installed, stock.betterPick) == Integer.MAX_VALUE) return null;
+        String preparation = null;
+        while (true) {
+            int availablePlanks = stock.planks();
+            if (!paid && stock.sticks < sticks && availablePlanks >= 2) {
+                if (!stock.makeSticks()) return null;
+                if (preparation == null) preparation = "stick";
+                availablePlanks -= 2;
+            }
+            if (paid || stock.sticks >= sticks && availablePlanks >= planks) {
+                var first = stock.fuel(Math.min(3, wanted), planks, sticks, fuels, installed,
+                    stack -> installed.isEmpty() || same(installed, stack) ? stack.getMaxCount() - installed.getCount() : 0);
+                if (first != null && (paid || stock.covers(first, wanted, planks, sticks, fuels)))
+                    return new OrdinaryIronPlan(preparation, first);
+            }
+            if (!installed.isEmpty()) return null;
+            Item result = stock.convertLog(fuels, !paid && (stock.sticks < sticks || availablePlanks < planks));
+            if (result == null) return null;
+            if (preparation == null) preparation = Registries.ITEM.getId(result).getPath();
+        }
+    }
+
+    private static final class IronFuelStock {
+        private final ItemStack[] stacks = new ItemStack[PlayerInventory.MAIN_SIZE];
+        private final int[] available = new int[PlayerInventory.MAIN_SIZE];
+        private final boolean betterPick;
+        private int sticks;
+
+        IronFuelStock(PlayerInventory inventory, IntPredicate usablePickSlot) {
+            for (int i = 0; i < stacks.length; ++i) {
+                var stack = stacks[i] = inventory.getStack(i);
+                available[i] = stack.getCount();
+                if (stack.isOf(Items.STICK)) sticks += available[i];
+            }
+            betterPick = hasBetterMiningPick(inventory, usablePickSlot);
+        }
+
+        int planks() {
+            int count = 0;
+            for (int i = 0; i < stacks.length; ++i)
+                if (available[i] > 0 && stacks[i].isIn(ItemTags.PLANKS)) count += available[i];
+            return count;
+        }
+
+        boolean makeSticks() {
+            int remaining = 2;
+            // The ordinary stick craft selects the first compatible plank for each cell.
+            for (int i = 0; remaining > 0 && i < stacks.length; ++i) {
+                if (!stacks[i].isIn(ItemTags.PLANKS)) continue;
+                int take = Math.min(available[i], remaining);
+                available[i] -= take;
+                remaining -= take;
+            }
+            if (!put(new ItemStack(Items.STICK, 4))) return false;
+            sticks += 4;
+            return true;
+        }
+
+        Item convertLog(FuelRegistry fuels, boolean needsWood) {
+            for (int i = 0; i < stacks.length; ++i) {
+                var log = stacks[i];
+                if (available[i] <= 0 || !ingredientMatches('l', log)) continue;
+                Item planks = planksFor(log);
+                if (planks == null) continue;
+                var result = new ItemStack(planks, planks == Items.BAMBOO_PLANKS ? 2 : 4);
+                if (!needsWood && fuels.getFuelTicks(result) <= 0) continue;
+                --available[i];
+                if (put(result)) return planks;
+                ++available[i];
+            }
+            return null;
+        }
+
+        private boolean put(ItemStack result) {
+            int empty = -1;
+            for (int i = 0; i < stacks.length; ++i) {
+                if (available[i] <= 0) {
+                    if (empty < 0) empty = i;
+                } else if (same(stacks[i], result) && result.getMaxCount() - available[i] >= result.getCount()) {
+                    available[i] += result.getCount();
+                    return true;
+                }
+            }
+            if (empty < 0) return false;
+            stacks[empty] = result;
+            available[empty] = result.getCount();
+            return true;
+        }
+
+        private void spend(OrdinaryIronFuel fuel, int count) {
+            if (fuel.slot < 0) return;
+            available[fuel.slot] -= count;
+            if (fuel.item == Items.STICK) sticks -= count;
+        }
+
+        boolean covers(OrdinaryIronFuel first, int wanted, int planks, int sticks, FuelRegistry fuels) {
+            int left = wanted - first.units;
+            if (left <= 0) return true;
+            spend(first, first.count);
+            var next = fuel(Math.min(3, left), planks, sticks, fuels, ItemStack.EMPTY, ItemStack::getMaxCount);
+            boolean covered = next != null && covers(next, left, planks, sticks, fuels);
+            spend(first, -first.count);
+            return covered;
+        }
+
+        OrdinaryIronFuel fuel(int wanted, int planks, int handles, FuelRegistry fuels, ItemStack installed,
+                              ToIntFunction<ItemStack> fuelRoom) {
+            int installedHeat = fuels.getFuelTicks(installed) * installed.getCount();
+            int bestUnits = Math.min(wanted, installedHeat / SMELT_TICKS);
+            if (bestUnits == wanted) return new OrdinaryIronFuel(-1, installed.getItem(), 0, bestUnits);
+            int source = -1, amount = 0, bestRank = Integer.MAX_VALUE;
+            int spareSticks = Math.max(0, sticks - handles);
+            for (int i = 0; i < stacks.length; ++i) {
+                int payable = available[i];
+                if (payable <= 0) continue;
+                var stack = stacks[i];
+                if (stack.isOf(Items.STICK)) payable = Math.min(payable, spareSticks);
+                else if (planks > 0 && stack.isIn(ItemTags.PLANKS)) {
+                    int reserved = Math.min(planks, payable);
+                    planks -= reserved;
+                    payable -= reserved;
+                }
+                if (payable <= 0) continue;
+                int rank = ordinaryIronFuelRank(stack, betterPick);
+                if (rank == Integer.MAX_VALUE) continue;
+                int ticks = fuels.getFuelTicks(stack);
+                if (ticks <= 0) continue;
+                int units = Math.min(wanted, (installedHeat + ticks * Math.min(payable, fuelRoom.applyAsInt(stack)))
+                    / SMELT_TICKS);
+                if (units <= installedHeat / SMELT_TICKS || units < bestUnits
+                        || units == bestUnits && rank >= bestRank) continue;
+                bestUnits = units;
+                bestRank = rank;
+                source = i;
+                amount = Math.ceilDiv(units * SMELT_TICKS - installedHeat, ticks);
+                if (rank == 0 && units == wanted) break;
+            }
+            return bestUnits == 0 ? null
+                : new OrdinaryIronFuel(source, source < 0 ? installed.getItem() : stacks[source].getItem(), amount, bestUnits);
+        }
+    }
+
+    private static boolean hasBetterMiningPick(PlayerInventory inventory, IntPredicate usableSlot) {
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; ++slot) {
+            ItemStack stack = inventory.getStack(slot);
+            if (!stack.isOf(Items.STONE_PICKAXE) && !stack.isOf(Items.IRON_PICKAXE)
+                    && !stack.isOf(Items.DIAMOND_PICKAXE) && !stack.isOf(Items.NETHERITE_PICKAXE)) continue;
+            var tool = stack.get(DataComponentTypes.TOOL);
+            if (tool != null && (!stack.isDamageable() || stack.getMaxDamage() - stack.getDamage() > tool.damagePerBlock())
+                    && stack.isSuitableFor(Blocks.IRON_ORE.getDefaultState())
+                    && stack.isSuitableFor(Blocks.STONE.getDefaultState())
+                    && stack.getMiningSpeedMultiplier(Blocks.STONE.getDefaultState()) > 2
+                    && usableSlot.test(slot)) return true;
+        }
+        return false;
+    }
+
+    private static int ordinaryIronFuelRank(ItemStack stack, boolean betterPick) {
+        var changes = stack.getComponentChanges();
+        if (stack.isOf(Items.WOODEN_PICKAXE))
+            return betterPick && !stack.hasEnchantments() && (changes.isEmpty()
+                || stack.getDamage() > 0 && changes.entrySet().size() == 1) ? 3 : Integer.MAX_VALUE;
+        if (!changes.isEmpty()) return Integer.MAX_VALUE;
+        return stack.isOf(Items.STICK) ? 4 : fuelRank(stack.getItem());
+    }
+
+    boolean smelt(boolean charcoal, int batchLimit, AgentLocalSmelt.Load receipt, boolean refuel,
+                  int ironPlanks, int ironSticks) {
         if (busy() || c.player == null || c.world == null) return false;
         if (!(c.currentScreen instanceof FurnaceScreen furnace)) return report("smelt", "furnace required");
         var handler = furnace.getScreenHandler();
@@ -710,6 +898,49 @@ final class AgentHands {
             if (!(charcoal ? existing.isIn(ItemTags.LOGS_THAT_BURN) : existing.isOf(Items.RAW_IRON)))
                 return report("smelt", "unrelated furnace input");
             if (handler.isBurning() || installedHeat > 0) return report("smelt", "cooking");
+        }
+
+        if (!charcoal) {
+            var inventory = c.player.getInventory();
+            var stock = new IronFuelStock(inventory, slot -> canEquipSlot(inventory, slot));
+            if (!fuelStack.isEmpty() && ordinaryIronFuelRank(fuelStack, stock.betterPick) == Integer.MAX_VALUE)
+                return report("smelt", "fuel slot occupied");
+            if (inputSource != null && (stock.sticks < ironSticks || stock.planks() < ironPlanks))
+                return report("smelt", "no fuel");
+            if (inputSource != null && inputCount < batchLimit) {
+                // Compatible raw iron may already be split across visible storage.
+                ItemStack raw = inputSource.getStack();
+                for (Slot slot : handler.slots) {
+                    if (slot == inputSource || !isStorage(slot) || !same(slot.getStack(), raw)) continue;
+                    inputCount = Math.min(batchLimit, inputCount + slot.getStack().getCount());
+                    if (inputCount == batchLimit) break;
+                }
+            }
+            var payment = stock.fuel(Math.min(batchLimit, inputCount), ironPlanks, ironSticks,
+                fuels, fuelStack, stack -> room(fuel, stack));
+            if (payment == null) return report("smelt", "no fuel");
+            if (inputSource != null && !stock.covers(payment, Math.min(batchLimit, inputCount), ironPlanks, ironSticks, fuels))
+                return report("smelt", "no fuel");
+            Slot source = payment.slot < 0 ? null : storageSlot(handler, payment.slot);
+            if (payment.slot >= 0 && source == null) return report("smelt", "fuel source not visible");
+            start(Job.SMELT, "smelt", furnace);
+            ordinaryLoad = inputSource == null ? null : receipt;
+            ordinaryIronPlanks = ironPlanks;
+            ordinaryIronSticks = ironSticks;
+            if (source != null) transfer(source, fuel, payment.count, true);
+            if (inputSource != null) {
+                ItemStack raw = inputSource.getStack();
+                int inputRemaining = payment.units;
+                for (Slot slot : handler.slots) {
+                    if (!isStorage(slot) || !same(slot.getStack(), raw)) continue;
+                    int amount = Math.min(inputRemaining, slot.getStack().getCount());
+                    transfer(slot, input, amount, true);
+                    inputRemaining -= amount;
+                    if (inputRemaining == 0) break;
+                }
+            }
+            planned = true;
+            return true;
         }
 
         Slot fuelSource = null;
@@ -1126,7 +1357,7 @@ final class AgentHands {
                 return false;
             }
             if (click.step.mode != Mode.CLEAR_BOOK && (!clickTargetReady(handler.getCursorStack())
-                    || !boundedFurnaceDeposit(handler.getCursorStack()))) {
+                    || !furnaceDepositAllowed(handler.getCursorStack()))) {
                 finish("slot changed before press");
                 return false;
             }
@@ -1177,7 +1408,7 @@ final class AgentHands {
 
         // Vanilla places a carried stack on release, and the furnace may have ticked since press.
         if (isFurnacePlacement() && (!clickTargetReady(handler.getCursorStack())
-                || !boundedFurnaceDeposit(handler.getCursorStack()))) {
+                || !furnaceDepositAllowed(handler.getCursorStack()))) {
             finish("furnace slot changed before release");
             return false;
         }
@@ -1455,6 +1686,20 @@ final class AgentHands {
     private boolean isFurnacePlacement() {
         Step step = click.step;
         return job == Job.SMELT && (step.mode == Mode.ONE || step.mode == Mode.PUT) && !isStorage(step.slot);
+    }
+
+    private boolean furnaceDepositAllowed(ItemStack cursor) {
+        if (!isFurnacePlacement()) return true;
+        if (ordinaryIronSticks < 0 || click.step.slot.id != 1) return boundedFurnaceDeposit(cursor);
+        int retained = click.step.mode == Mode.ONE ? cursor.getCount() - 1 : 0;
+        if (cursor.isOf(Items.STICK) && count(stack -> stack.isOf(Items.STICK)) + retained < ordinaryIronSticks
+                || cursor.isIn(ItemTags.PLANKS) && count(stack -> stack.isIn(ItemTags.PLANKS)) + retained < ordinaryIronPlanks)
+            return false;
+        var inventory = player.getInventory();
+        boolean better = cursor.isOf(Items.WOODEN_PICKAXE)
+            && hasBetterMiningPick(inventory, slot -> canEquipSlot(inventory, slot));
+        return ordinaryIronFuelRank(cursor, better) != Integer.MAX_VALUE
+            && c.world.getFuelRegistry().getFuelTicks(cursor) > 0;
     }
 
     private boolean boundedFurnaceDeposit(ItemStack cursor) {
@@ -1929,6 +2174,8 @@ final class AgentHands {
         smeltBudget = null;
         ordinaryLoad = null;
         ordinaryWithdrawal = null;
+        ordinaryIronSticks = -1;
+        ordinaryIronPlanks = 0;
         scopedSmelt = false;
         ironDeposited = fuelDeposited = 0;
         craftSettleDeadline = 0;

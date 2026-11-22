@@ -293,6 +293,8 @@ final class AgentProgress {
     private int furnaceDemand;
     private boolean furnaceLoaded;
     private boolean furnaceNeedsFuel;
+    private ItemStack furnaceBlockedFuel = ItemStack.EMPTY;
+    private int furnaceIronPlanks, furnaceIronSticks;
     private Direction furnaceContactFacing;
     private BlockPos furnaceContactFooting;
     private final AgentPendingFurnaceMemory pendingFurnaceMemory;
@@ -1367,7 +1369,7 @@ final class AgentProgress {
             return;
         }
         if (!ironPick) {
-            acquireIron(3);
+            acquireIron(3, 2);
             return;
         }
         if (portalSupplies != null && portalSupplies.step(false)) return;
@@ -1466,7 +1468,7 @@ final class AgentProgress {
     private boolean stallFurnaceNeeded() {
         int missing = 3 - hands.count(INGOT);
         return missing > 0 && has(RAW_IRON, missing)
-            && (has(FUEL, 1) || affordsWood(localTableWood() + furnacePlanks(missing), 2));
+            && ownedIronPlan(missing, ironTableWood(), 2) != null;
     }
 
     /** Inspect only the existing camera, owned items and actually traveled routes; do not perform another sweep. */
@@ -1775,6 +1777,10 @@ final class AgentProgress {
     }
 
     void acquireIron(int desired) {
+        acquireIron(desired, 0);
+    }
+
+    private void acquireIron(int desired, int sticks) {
         if (firing != Firing.NONE) {
             fire(firing, furnaceDemand);
             return;
@@ -1788,21 +1794,48 @@ final class AgentProgress {
         if (has(DEEP_PICK, 1) && !has(DIAMOND, portal == null ? 1 : 3)
             && workOre(Resource.DIAMOND, REACH - 0.35, false)) return;
         int raw = hands.count(RAW_IRON);
-        if (raw >= Math.min(3, desired - ingots)) {
-            if (!has(TORCH, 2) && craftTorches(LOCAL_LIGHT)) return;
-            if (!has(FUEL, 1)) {
-                int heatPlanks = furnacePlanks(Math.min(3, raw));
-                if (!affordsWood(localTableWood() + heatPlanks, 2)) {
-                    if (!workOre(Resource.COAL, has(TORCH, 2) ? SEARCH : REACH - 0.35, true))
-                        seekExpeditionSupplies("furnace fuel");
-                    return;
-                }
-                if (!supplyPlanks(heatPlanks)) return;
+        int batch = Math.min(3, desired - ingots);
+        if (raw >= batch) {
+            int benchWood = sticks > 0 || !has(furnace.item, 1) && !localStation(furnace, furnaceWitness)
+                && visibleLocalFurnace() == null ? ironTableWood() : 0;
+            var plan = ownedIronPlan(batch, benchWood, sticks);
+            if (plan == null) {
+                if (!has(TORCH, 2) && craftTorches(LOCAL_LIGHT)) return;
+                if (!affordsWood(benchWood, sticks)) seekExpeditionSupplies("workshop wood");
+                else if (!workOre(Resource.COAL, has(TORCH, 2) ? SEARCH : REACH - 0.35, true))
+                    seekExpeditionSupplies("furnace fuel");
+                return;
             }
-            fire(Firing.IRON, desired);
+            if (!prepareIronStock(plan)) startIron(desired, benchWood, sticks);
         } else {
             gather(Resource.IRON, surfaceDeparture() ? 115 : 0, 16);
         }
+    }
+
+    private AgentHands.OrdinaryIronPlan ownedIronPlan(int wanted, int planks, int sticks) {
+        return hands.ordinaryIronPlan(wanted, planks, sticks, ItemStack.EMPTY, false);
+    }
+
+    private boolean prepareIronStock(AgentHands.OrdinaryIronPlan plan) {
+        if (plan.preparation() == null) return false;
+        status = plan.preparation().equals("stick") ? "crafting the reserved iron pick handles"
+            : "turning owned wood into workshop planks";
+        hands.craft(plan.preparation());
+        return true;
+    }
+
+    private int ironTableWood() {
+        return localTableWood() == 0 || body.find(TABLE_BLOCK, REACH).isPresent() ? 0 : 4;
+    }
+
+    private int ironBenchReserve() {
+        return furnaceIronPlanks == 0 ? 0 : localTableWood();
+    }
+
+    private void startIron(int demand, int planks, int sticks) {
+        furnaceIronPlanks = planks;
+        furnaceIronSticks = sticks;
+        fire(Firing.IRON, demand);
     }
 
     boolean mineDiamonds(int count) {
@@ -2271,7 +2304,7 @@ final class AgentProgress {
                 return true;
             }
             if (has(RAW_IRON, 3) && (canSetLocalFurnace() || localStation(furnace, furnaceWitness))) {
-                acquireIron(3);
+                acquireIron(3, 2);
                 return true;
             }
             if (workOre(Resource.IRON, torches > 1 ? SEARCH : REACH - 0.35, true)) return true;
@@ -2488,15 +2521,17 @@ final class AgentProgress {
             }
             limit = payable;
         }
-        if (hands.smelt(firing == Firing.CHARCOAL, limit, loading, false)) {
+        if (hands.smelt(firing == Firing.CHARCOAL, limit, loading, false, ironBenchReserve(), furnaceIronSticks)) {
             if (loading != null)
                 localFurnace = new LocalFurnace(furnaceWitness, furnaceContactFooting, furnaceContactFacing,
                     c.world, handler.syncId, loading);
             furnaceNeedsFuel = false;
+            furnaceBlockedFuel = ItemStack.EMPTY;
             return;
         }
         String result = hands.status();
         furnaceNeedsFuel = result.equals("smelt: no fuel");
+        if (furnaceNeedsFuel && firing == Firing.IRON) furnaceBlockedFuel = fuel.copy();
         if (!furnaceNeedsFuel) {
             finishFire();
             if (!result.equals("smelt: no input")) blockStation(furnace, result);
@@ -2584,12 +2619,16 @@ final class AgentProgress {
         }
         if (tick < furnaceWarmUntil) return;
         // A paid batch can be refueled, never topped up with fresh input while outstanding.
-        if (hands.smelt(firing == Firing.CHARCOAL, input.getCount(), null, true)) {
+        int refuelLimit = firing == Firing.CHARCOAL ? input.getCount() : Math.min(3, input.getCount());
+        if (hands.smelt(firing == Firing.CHARCOAL, refuelLimit, null, true,
+                ironBenchReserve(), furnaceIronSticks)) {
             furnaceWarmUntil = tick + 40;
             furnaceNeedsFuel = false;
+            furnaceBlockedFuel = ItemStack.EMPTY;
             return;
         }
         furnaceNeedsFuel = hands.status().equals("smelt: no fuel");
+        if (furnaceNeedsFuel && firing == Firing.IRON) furnaceBlockedFuel = handler.getSlot(1).getStack().copy();
         screen.close();
         if (!furnaceNeedsFuel) retryLocalFurnace(job, hands.status());
     }
@@ -2631,6 +2670,10 @@ final class AgentProgress {
         }
         localFurnace = job;
         firing = job.batch.raw() == Items.RAW_IRON ? Firing.IRON : Firing.CHARCOAL;
+        if (firing == Firing.IRON && !has(DEEP_PICK, 1)) {
+            furnaceIronSticks = 2;
+            furnaceIronPlanks = ironTableWood();
+        }
         furnace.position = furnaceWitness = job.pos;
         furnaceLoaded = true;
         furnaceDemand = (firing == Firing.IRON ? hands.count(INGOT) : 0) + job.batch.units();
@@ -2716,7 +2759,7 @@ final class AgentProgress {
         if (untried(job, FurnaceSide.TORCHES) && torchCraftBatches(LOCAL_LIGHT) > 0) return FurnaceSide.TORCHES;
         if (untried(job, FurnaceSide.LIGHT) && trail.size() - litIndex >= 7 && has(TORCH, 3)
                 && c.world.getLightLevel(c.player.getBlockPos()) <= 8) return FurnaceSide.LIGHT;
-        if (untried(job, FurnaceSide.STICKS) && firing == Firing.IRON && !has(DEEP_PICK, 1)
+        if (untried(job, FurnaceSide.STICKS) && firing == Firing.IRON && furnaceIronSticks > 0
                 && !has(STICK, 2) && has(PLANK, 2)) return FurnaceSide.STICKS;
         if (untried(job, FurnaceSide.PICK) && firing == Firing.CHARCOAL && !has(DEEP_PICK, 1)
                 && localStation(table, null) && has(STONE, 3) && affordsWood(0, 2)) {
@@ -2941,9 +2984,19 @@ final class AgentProgress {
                 || job.routeTo == null && !dryFieldFooting()) return true;
         if (furnaceNeedsFuel) {
             status = "preparing fuel for the paid furnace";
-            if (hands.stableCraftFooting() && hands.prepareSmeltFuel(false)) furnaceNeedsFuel = false;
-            else retryLocalFurnace(job, "the paid furnace needs usable fuel");
-            return true;
+            if (firing == Firing.IRON) {
+                var plan = hands.ordinaryIronPlan(1, ironBenchReserve(), furnaceIronSticks, furnaceBlockedFuel, true);
+                if (plan == null) {
+                    retryLocalFurnace(job, "the paid furnace needs usable fuel");
+                    return true;
+                }
+                if (prepareIronStock(plan)) return true;
+                furnaceNeedsFuel = false;
+            } else {
+                if (hands.stableCraftFooting() && hands.prepareSmeltFuel(false)) furnaceNeedsFuel = false;
+                else retryLocalFurnace(job, "the paid furnace needs usable fuel");
+                return true;
+            }
         }
         furnace.position = furnaceWitness = job.pos;
         Vec3d center = Vec3d.ofCenter(job.pos);
@@ -3159,6 +3212,7 @@ final class AgentProgress {
             boolean makeBucket = bucketCost != 0 && ingots >= bucketCost;
             boolean smeltIron = ingots < reserve && raw > 0 && ingots + raw >= Math.max(1, bucketCost);
             if (makeBucket || smeltIron) {
+                int batch = Math.min(raw, reserve - ingots);
                 boolean carriedBench = has(table.item, 1);
                 boolean canMakeBench = affordsWood(4, 0);
                 boolean localBench = !carriedBench && visibleOrRemembered(table);
@@ -3169,14 +3223,14 @@ final class AgentProgress {
                     return true;
                 }
                 if (smeltIron && (!shoreOnly || bucketCost == 0 || benchReady)) {
-                    int batch = Math.min(raw, reserve - ingots);
                     boolean usableFurnace = has(furnace.item, 1) || visibleOrRemembered(furnace);
                     int benchWood = (bucketCost == 0 && usableFurnace) || carriedBench || localBench ? 0 : 4;
-                    if ((has(FUEL, 1) || affordsWood(furnacePlanks(batch) + benchWood, 0))
-                        && (usableFurnace || has(STONE, 8) && (carriedBench || canMakeBench || localBench))) {
+                    var plan = ownedIronPlan(batch, benchWood, 0);
+                    if (plan != null && (usableFurnace || has(STONE, 8) && benchReady)) {
                         returning = false;
+                        if (prepareIronStock(plan)) return true;
                         smelting = true;
-                        fire(Firing.IRON, ingots + batch);
+                        startIron(ingots + batch, benchWood, 0);
                         return true;
                     }
                 }
@@ -3186,7 +3240,8 @@ final class AgentProgress {
                     if (tick < resupplyUntil && fieldWood.step(0, true)) return true;
                     returning = false;
                 }
-                if (!tripUsed && returnForWorkshop(makeBucket, has(FUEL, 1))) return true;
+                if (!tripUsed && returnForWorkshop(makeBucket, smeltIron && ownedIronPlan(batch, 0, 0) != null))
+                    return true;
             }
             returning = false;
             if (ingots > bucketCost && reserve > bucketCost && has(FLINT, 1)) {
@@ -3583,15 +3638,6 @@ final class AgentProgress {
         table.openAttempts = 0;
     }
 
-    private boolean supplyPlanks(int quantity) {
-        if (has(PLANK, quantity)) return true;
-        if (ensureWood(quantity, 0)) {
-            status = "turning logs into planks";
-            hands.craftBatch(woodBatch(quantity, 0));
-        }
-        return false;
-    }
-
     private boolean ensureWood(int planks, int sticks) {
         if (affordsWood(planks, sticks)) return true;
         seekTimber();
@@ -3632,7 +3678,8 @@ final class AgentProgress {
         int held = hands.count(TORCH);
         int batches = Math.min(Math.min(3, hands.count(FUEL)), torchBatches(reserve, held));
         while (batches > 0 && !affordsWood(localTableWood(), batches + 2)) batches--;
-        if (batches == 0 && held < reserve && has(FUEL, 1) && canSpareEmergencyStick(held)) {
+        if (batches == 0 && held < reserve && has(FUEL, 1) && canSpareEmergencyStick(held)
+                && (firing != Firing.IRON || furnaceIronSticks == 0)) {
             // In a dark passage the two planks in hand buy four real sticks.
             // Make the affordable batch now instead of waiting for hypothetical bench timber.
             batches = Math.min(Math.min(3, hands.count(FUEL)), torchBatches(reserve, held));
@@ -3917,21 +3964,34 @@ final class AgentProgress {
         }
         if (needsFurnaceLight() && has(FUEL, 1) && craftTorches(LOCAL_LIGHT)) return;
         if (furnaceNeedsFuel) {
-            furnaceNeedsFuel = false;
-            if (firing == Firing.CHARCOAL && !furnaceLoaded) {
+            if (firing == Firing.IRON) {
+                int wanted = furnaceLoaded ? 1 : Math.min(3, furnaceDemand - hands.count(INGOT));
+                var plan = hands.ordinaryIronPlan(wanted, ironBenchReserve(), furnaceIronSticks,
+                    furnaceBlockedFuel, furnaceLoaded);
+                if (plan == null) {
+                    finishFire();
+                    if (portalSupplies == null || portalSupplies.stoneBank == null) seekExpeditionSupplies("furnace fuel");
+                    return;
+                }
+                if (prepareIronStock(plan)) return;
+                furnaceNeedsFuel = false;
+            } else if (!furnaceLoaded) {
+                furnaceNeedsFuel = false;
                 if (!declineOptionalCharcoal("the furnace can't take the quoted charcoal fuel")) {
                     finishFire();
                     releaseUnpaidFurnace(furnace.position);
                     seekExpeditionSupplies("furnace fuel");
                 }
                 return;
+            } else {
+                furnaceNeedsFuel = false;
+                status = "preparing usable furnace fuel";
+                if (!hands.prepareSmeltFuel(false)) {
+                    finishFire();
+                    if (portalSupplies == null || portalSupplies.stoneBank == null) seekExpeditionSupplies("furnace fuel");
+                }
+                return;
             }
-            status = "preparing usable furnace fuel";
-            if (!hands.prepareSmeltFuel(false)) {
-                finishFire();
-                if (portalSupplies == null || portalSupplies.stoneBank == null) seekExpeditionSupplies("furnace fuel");
-            }
-            return;
         }
         useStation(furnace, seen);
     }
@@ -3946,6 +4006,8 @@ final class AgentProgress {
         firing = Firing.NONE;
         furnaceLoaded = false;
         furnaceNeedsFuel = false;
+        furnaceBlockedFuel = ItemStack.EMPTY;
+        furnaceIronPlanks = furnaceIronSticks = 0;
     }
 
     private boolean declineOptionalCharcoal(String reason) {

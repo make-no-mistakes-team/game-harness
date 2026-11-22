@@ -50,7 +50,9 @@ saved campaign. Ordinary advisory play does not create skill-trial worlds.
 
 The player gathers supplies for the next stretch of mine, keeping
 enough light for the return. From solid footing it can cut a nearby
-block. A cut does not authorize a step into the opening.
+block. It can clear settled gravel from beside the column, not from
+underneath it, and waits for falling material to settle. A cut does
+not authorize a step into the opening.
 
 During ordinary exploration the player can descend one or two blocks onto
 a visible, stable, dry landing with clear body space and no immediate
@@ -58,9 +60,13 @@ threat. A usable pick or building blocks are enough to attempt this
 short descent; the player may have to make its way back later. It does
 not record the descent as proof that it can climb back. An unlit or
 unknown floor, lava, or a greater drop still requires another approach.
-The player can attach a cobblestone step to a visible face, verify it,
-or try a short level passage instead. Only inventory gains count as
-collected supplies.
+The player can attach a cobblestone step to a visible face or place a
+level connector to a shelf it can already see. A confirmed placement
+is not a crossing. If neither route is usable, it can try a short
+level passage instead. After repeated failures at the same site, the
+local player can retrace checked steps and try a different area. It
+does not need a model reply to leave a spent mine, and does not count
+that trip as ore.
 
 A useful pause is still play. For example, the player can watch the
 furnace finish one raw iron. Count the original load, not the input

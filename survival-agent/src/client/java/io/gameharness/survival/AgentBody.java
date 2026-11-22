@@ -2625,6 +2625,16 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     /** Vanilla sneak toward the front of this exact support, never onto a new support. */
     void driveCaveLip(BlockPos source, Direction bearing) {
+        driveCaveLip(source, bearing, 0.29, 0.45);
+    }
+
+    /** The placement peek keeps the whole stopping hull on the independently grounded top. */
+    void driveFootholdPeek(BlockPos source, Direction bearing) {
+        double margin = 0.5 - client.player.getWidth() * 0.5 - 0.015;
+        driveCaveLip(source, bearing, margin, margin);
+    }
+
+    private void driveCaveLip(BlockPos source, Direction bearing, double advance, double stop) {
         var player = client.player;
         double dx = bearing.getOffsetX(), dz = bearing.getOffsetZ();
         Vec3d feet = player.getPos(), velocity = player.getVelocity();
@@ -2633,13 +2643,13 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         float yaw = heading(dx, dz);
         sneak();
         if (!hasView() || !player.isSneaking() || Math.abs(MathHelper.wrapDegrees(player.getYaw() - yaw)) > 2
-                || Math.abs(across) > 0.14 || along >= 0.29
+                || Math.abs(across) > 0.14 || along >= advance
                 || hazardAhead(yaw, 1.65)) return;
         // Bound the next slow input plus neutral ground coast before the center
         // could leave the already confirmed support, even with extra sneak speed.
         double speed = 0.102 * player.getAttributeValue(EntityAttributes.SNEAKING_SPEED);
         double coast = (Math.max(0, velocity.x * dx + velocity.z * dz) + speed) / (1 - 0.55);
-        if (along + coast > 0.45 || Math.abs(across + (velocity.x * dz - velocity.z * dx) / (1 - 0.55)) > 0.15)
+        if (along + coast > stop || Math.abs(across + (velocity.x * dz - velocity.z * dx) / (1 - 0.55)) > Math.min(0.15, stop))
             return;
         Box sweep = player.getBoundingBox().offset(0, 0.005, 0).stretch(coast * dx, 0, coast * dz);
         if (dryGradeVolume(sweep) && client.world.isSpaceEmpty(player, sweep)) walk(false);

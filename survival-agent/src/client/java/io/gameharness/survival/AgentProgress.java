@@ -141,7 +141,7 @@ final class AgentProgress {
 
     private enum Walk { LOOKING, MOVING, BLOCKED }
     private enum Footing { LEVEL, DOWN, STEEP, JUMP, WATER, EDGE, UNKNOWN, BLOCKED }
-    enum Dig { LOOKING, CLEAR, BLOCKED, DARK, LIP, RESOURCE }
+    enum Dig { LOOKING, CLEAR, BLOCKED, DARK, LIP, RESOURCE, FALLING_COVER, GRAVEL_LIMIT }
     private enum Firing { NONE, IRON, CHARCOAL }
     enum FurnaceSite { PAID, LOCAL, RETURN, ESTABLISH }
     private enum FurnaceSide { TORCHES, LIGHT, STICKS, PICK }
@@ -519,6 +519,7 @@ final class AgentProgress {
     private int pendingStairLightSince, pendingStairTorchCount, observedStairLightUse;
     private BlockPos witnessedStairCut;
     private int witnessedStairCutTick;
+    private boolean witnessedGravelCut;
 
     AgentProgress(MinecraftClient c, AgentBody body, AgentHands hands, String goal, AgentMemory memory,
                   AgentExpedition expedition, AgentPendingFurnaceMemory pendingFurnaceMemory) {
@@ -664,7 +665,7 @@ final class AgentProgress {
         caves.changedDry(position);
         stallGuard.broken(position, state);
         surfaceApproach.broken(position, state);
-        returnableMine.observeBreak(position);
+        returnableMine.observeBreak(position, state);
         supplyEgress.observeBreak(position, state);
         overland.changed(position);
         mineResite.changed(position);
@@ -7303,6 +7304,43 @@ final class AgentProgress {
             ? AgentReturnableMine.Face.PROTECTED : face;
     }
 
+    /** Admission shared by ordinary stair selection and mining, not by the exact-effect lanes. */
+    AgentReturnableMine.Face returnableLaneFace(BlockPos foot, Direction bearing, BlockHitResult hit, boolean drift) {
+        BlockPos cell = hit.getBlockPos();
+        BlockState shown = state(hit);
+        if (!shown.isOf(Blocks.GRAVEL)) {
+            var fact = returnableFace(hit);
+            return drift && fact == AgentReturnableMine.Face.MINEABLE
+                    && !AgentReturnableMine.stationaryDriftCut(c.world, foot, cell, bearing, hit, c.player.getBoundingBox())
+                ? AgentReturnableMine.Face.MATERIAL : fact;
+        }
+        if (underMineFootprint(cell)) return AgentReturnableMine.Face.FOOTPRINT;
+        if (protectedGravelColumn(cell)) return AgentReturnableMine.Face.PROTECTED;
+        var player = c.player;
+        if (player.isTouchingWater() || player.isInLava()) return AgentReturnableMine.Face.FLUID;
+        if (body.lavaEmergency() || body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65)
+                || body.lavaBreachesDig(cell)) return AgentReturnableMine.Face.LAVA;
+        if (player.hurtTime != 0 || player.isOnFire() || player.hasVehicle() || player.getAbilities().flying
+                || player.getVelocity().horizontalLengthSquared() > 0.0025) return AgentReturnableMine.Face.FOOTPRINT;
+        var contact = AgentReturnableMine.lateralGravelFace(c.world, foot, bearing, hit, player.getBoundingBox(),
+            body.dryCaveContact(foot), player.getEyePos(), player.getBlockInteractionRange(), drift);
+        if (contact != AgentReturnableMine.Face.MINEABLE) return contact;
+        Vec3d above = Vec3d.ofCenter(cell.up(), 0.20);
+        var cover = AgentReturnableMine.gravelCover(c.world, cell,
+            perceive(above, player.getEyePos().distanceTo(above) + 0.04));
+        if (cover != null) return cover;
+        if (!returnableMine.gravelCutAvailable()) return AgentReturnableMine.Face.GRAVEL_LIMIT;
+        return tools.canHarvest(shown) ? AgentReturnableMine.Face.MINEABLE : AgentReturnableMine.Face.TOOL;
+    }
+
+    private boolean protectedGravelColumn(BlockPos cell) {
+        // Gravity must not have a path into a retained route, takeoff, or remembered workshop.
+        if (sameStem(cell, table.position) || sameStem(cell, furnace.position) || sameStem(cell, furnaceWitness)
+                || sameStem(cell, pendingStairLight) || sameStem(cell, nextFoot)) return true;
+        for (int i = trail.size() - 1; i >= 0; i--) if (sameStem(cell, trail.get(i))) return true;
+        return false;
+    }
+
     private AgentReturnableMine.Face returnableFace(BlockPos position, BlockState observed) {
         if (underMineFootprint(position)) return AgentReturnableMine.Face.FOOTPRINT;
         if (protectRecoveryBlock(position)) return AgentReturnableMine.Face.PROTECTED;
@@ -7512,31 +7550,28 @@ final class AgentProgress {
     }
 
     private Dig clear(BlockPos position, Vec3d point, BlockPos lip) {
-        return clear(position, point, lip, false, false, null);
+        return clear(position, point, lip, false, null, null, false);
     }
 
-    Dig clearReturnable(BlockPos position, Vec3d point) {
-        return clear(position, point, null, true, true, null);
+    Dig clearReturnableLane(BlockPos foot, BlockPos position, Direction bearing, Vec3d point, boolean drift) {
+        return clear(position, point, null, true, foot, bearing, drift);
     }
 
     Dig clearReturnableHeadroom(BlockPos position, Vec3d point) {
-        return clear(position, point, null, true, false, null);
+        return clear(position, point, null, true, null, null, false);
     }
 
-    Dig clearReturnableSide(BlockPos foot, BlockPos position, Direction bearing, Vec3d point) {
-        if (!foot.equals(c.player.getBlockPos())) return Dig.BLOCKED;
-        return clear(position, point, null, true, true, bearing);
-    }
-
-    private Dig clear(BlockPos position, Vec3d point, BlockPos lip, boolean returnable, boolean resourceHandoff,
-                      Direction sideBearing) {
+    private Dig clear(BlockPos position, Vec3d point, BlockPos lip, boolean returnable,
+                      BlockPos foot, Direction bearing, boolean drift) {
         if (returnable && underMineFootprint(position)) return Dig.BLOCKED;
+        if (foot != null && !foot.equals(c.player.getBlockPos())) return Dig.BLOCKED;
         body.aim(point);
         double length = c.player.getEyePos().distanceTo(point);
         BlockHitResult hit = perceive(point, length + 0.18);
         boolean stair = returnable || nextFoot != null;
         if (hit == null) {
-            if (stair && position.equals(witnessedStairCut) && tick - witnessedStairCutTick <= 3) {
+            if (stair && position.equals(witnessedStairCut) && tick - witnessedStairCutTick <= 3
+                    && (foot == null || !witnessedGravelCut)) {
                 // Missing one render does not make the same vanilla outlined crack go dark.
                 if (body.continueMine(position)) return Dig.LOOKING;
                 if (body.miningFootingRefused(position)) return Dig.BLOCKED;
@@ -7568,21 +7603,21 @@ final class AgentProgress {
         }
         BlockState state = state(hit);
         if (returnable) {
-            if (resourceHandoff && handoffReturnableResource(hit)) return Dig.RESOURCE;
+            if (foot != null && handoffReturnableResource(hit)) return Dig.RESOURCE;
             // An outline (grass, a torch) is not a wall and should not be dug.
             if (state.getFluidState().isEmpty() && !AgentBody.dryCaveDanger(state)
                     && state.getCollisionShape(c.world, position).isEmpty())
                 return returnableClearance(point);
-            if (sideBearing == null) {
-                if (!returnableCutAllowed(hit)) return Dig.BLOCKED;
-            } else if (!AgentReturnableMine.stationaryDriftCut(c.world, c.player.getBlockPos(), position, sideBearing,
-                    hit, c.player.getBoundingBox()) || returnableFace(position, state) != AgentReturnableMine.Face.MINEABLE) {
-                return Dig.BLOCKED;
+            var fact = foot == null ? returnableFace(hit) : returnableLaneFace(foot, bearing, hit, drift);
+            if (fact == AgentReturnableMine.Face.FALLING_COVER) return Dig.FALLING_COVER;
+            if (fact == AgentReturnableMine.Face.GRAVEL_LIMIT) return Dig.GRAVEL_LIMIT;
+            if (fact != AgentReturnableMine.Face.MINEABLE) return Dig.BLOCKED;
+            if (!state.isOf(Blocks.GRAVEL)) {
+                Vec3d above = Vec3d.ofCenter(position.up(), 0.20);
+                BlockHitResult cover = perceive(above, c.player.getEyePos().distanceTo(above) + 0.04);
+                if (cover != null && cover.getBlockPos().equals(position.up())
+                        && state(cover).getBlock() instanceof net.minecraft.block.FallingBlock) return Dig.BLOCKED;
             }
-            Vec3d above = Vec3d.ofCenter(position.up(), 0.20);
-            BlockHitResult cover = perceive(above, c.player.getEyePos().distanceTo(above) + 0.04);
-            if (cover != null && cover.getBlockPos().equals(position.up())
-                    && state(cover).getBlock() instanceof net.minecraft.block.FallingBlock) return Dig.BLOCKED;
         }
         if (state.isReplaceable() && state.getFluidState().isEmpty() && !state.isOf(Blocks.SNOW)) return Dig.CLEAR;
         if (dangerous(state) || !state.getFluidState().isEmpty()
@@ -7598,6 +7633,7 @@ final class AgentProgress {
         if (body.mine(hit) && stair) {
             witnessedStairCut = position;
             witnessedStairCutTick = tick;
+            witnessedGravelCut = state.isOf(Blocks.GRAVEL);
         } else if (body.miningFootingRefused(position)) return Dig.BLOCKED;
         return Dig.LOOKING;
     }

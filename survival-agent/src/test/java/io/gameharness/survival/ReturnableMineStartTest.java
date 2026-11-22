@@ -74,6 +74,102 @@ final class ReturnableMineStartTest {
     }
 
     @Test
+    void aRealAdjacentGravelFaceCanBeCutButDoesNotProveTheEastTread() {
+        var terrain = new Terrain(new HashMap<>());
+        var mineable = AgentReturnableMine.Face.MINEABLE;
+        var footprint = AgentReturnableMine.Face.FOOTPRINT;
+        BlockPos side = RIM.east();
+        BlockState stone = Blocks.STONE.getDefaultState();
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        terrain.blocks.put(RIM.down(), stone);
+        for (int height = -1; height <= 1; height++) {
+            BlockPos gravel = side.up(height);
+            terrain.blocks.put(gravel, Blocks.GRAVEL.getDefaultState());
+            Vec3d aim = height == -1 ? AgentReturnableMine.capAim(gravel, EAST, 0) : Vec3d.ofCenter(gravel);
+            BlockHitResult shown = terrain.ray(eye, aim);
+            assertEquals(mineable, AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, shown, hull, stone, eye, 4.5, false));
+            assertEquals(height >= 0 ? mineable : footprint,
+                AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, shown, hull, stone, eye, 4.5, true),
+                "a drift can clear foot and head but cannot remove its own intended tread");
+            assertEquals(AgentReturnableMine.Face.OCCLUDED,
+                AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, shown, hull, stone, eye, 0.25, false));
+            terrain.blocks.remove(gravel);
+        }
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, side.down(), EAST, null, stone, stone, true),
+            "opening the side does not establish a floor or a return");
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, side, EAST, top(side.down()), stone,
+            Blocks.GRAVEL.getDefaultState(), true), "newly settled gravel is not a mine tread");
+    }
+
+    @Test
+    void gravelDoesNotAuthorizeUndercuttingWorkingUnderTheColumnOrBreakingAnAttachment() {
+        var terrain = new Terrain(new HashMap<>());
+        var footprint = AgentReturnableMine.Face.FOOTPRINT;
+        BlockPos side = RIM.east();
+        BlockState stone = Blocks.STONE.getDefaultState(), gravel = Blocks.GRAVEL.getDefaultState();
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        terrain.blocks.put(RIM.down(), gravel);
+        terrain.blocks.put(side, gravel);
+        terrain.blocks.put(side.up(2), gravel);
+        var shown = terrain.ray(eye, Vec3d.ofCenter(side));
+        assertEquals(footprint, AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST,
+            top(RIM.down()), hull, stone, eye, 4.5, false));
+        assertEquals(footprint, AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST,
+            terrain.ray(eye, Vec3d.ofCenter(side.up(2))), hull, stone, eye, 4.5, false));
+        assertEquals(footprint, AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, shown, hull, null, eye, 4.5, false));
+        assertEquals(footprint, AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, shown, hull, gravel, eye, 4.5, false));
+        assertEquals(footprint, AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, shown,
+            hull.offset(0.25, 0, 0), stone, eye, 4.5, false));
+        terrain.blocks.put(side.up(), Blocks.TORCH.getDefaultState());
+        assertEquals(AgentReturnableMine.Face.PROTECTED,
+            AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, shown, hull, stone, eye, 4.5, false));
+        terrain.blocks.put(side.up(), Blocks.WATER.getDefaultState());
+        var cover = terrain.ray(eye, Vec3d.ofCenter(side.up(), 0.20));
+        assertEquals(AgentReturnableMine.Face.FLUID, AgentReturnableMine.gravelCover(terrain, side, cover));
+        terrain.blocks.put(side.up(), gravel);
+        cover = terrain.ray(eye, Vec3d.ofCenter(side.up(), 0.20));
+        assertEquals(AgentReturnableMine.Face.FALLING_COVER, AgentReturnableMine.gravelCover(terrain, side, cover));
+    }
+
+    @Test
+    void aGravelBreakAndAFallingEntityCannotStandInForFreshSettledClearance() {
+        var work = new AgentReturnableMine.GravelWork();
+        assertTrue(work.canCut());
+        assertEquals(AgentReturnableMine.Fall.WAITING, work.settle(1, true), "an active fall vetoes the first cut as well");
+        assertEquals(AgentReturnableMine.Fall.WAITING, work.settle(2, false));
+        assertEquals(AgentReturnableMine.Fall.SETTLED, work.settle(8, false));
+        work.broke(10);
+        assertEquals(AgentReturnableMine.Fall.WAITING, work.settle(11, false), "air before gravity runs is not clear");
+        assertEquals(AgentReturnableMine.Fall.WAITING, work.settle(14, true), "an active fall vetoes stepping");
+        assertEquals(AgentReturnableMine.Fall.WAITING, work.settle(18, false),
+            "disappearance could be a replacement block, not an open passage");
+        assertEquals(AgentReturnableMine.Fall.SETTLED, work.settle(24, false));
+        var terrain = new Terrain(new HashMap<>());
+        BlockPos side = RIM.east();
+        BlockState gravel = Blocks.GRAVEL.getDefaultState(), stone = Blocks.STONE.getDefaultState();
+        terrain.blocks.put(side, gravel);
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        Vec3d point = Vec3d.ofCenter(side);
+        assertEquals(AgentReturnableMine.Face.MINEABLE,
+            AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, terrain.ray(eye, point),
+                hull, stone, eye, 4.5, false), "the replacement needs a new witnessed cut");
+        work.broke(25);
+        assertEquals(AgentReturnableMine.Fall.WAITING, work.settle(26, false));
+        assertEquals(AgentReturnableMine.Fall.SETTLED, work.settle(32, false));
+        assertTrue(work.canCut());
+        work.broke(40);
+        assertFalse(work.canCut(), "same-cell replacement breaks count toward the finite budget");
+        assertEquals(AgentReturnableMine.Fall.UNSAFE, work.settle(64, true), "a sustained fall must be declined");
+        terrain.blocks.remove(side);
+        assertEquals(AgentReturnableMine.Face.OCCLUDED,
+            AgentReturnableMine.lateralGravelFace(terrain, RIM, EAST, terrain.ray(eye, point),
+                hull, stone, eye, 4.5, false), "a miss supplies no gravel face to work");
+    }
+
+    @Test
     void shortGrassDoesNotProtectAVisibleCapButAWorkbenchOrAttachedTorchDoes() {
         var terrain = new Terrain(new HashMap<>());
         BlockPos cap = RIM.east().down();
@@ -266,6 +362,76 @@ final class ReturnableMineStartTest {
         var occupied = terrain.footholdSpace(eye, build.high, cell);
         assertEquals(AgentBody.FootholdSpace.OCCUPIED, occupied);
         assertNotNull(build.placementRefusal(hull, 9, false, empty, occupied, face));
+    }
+
+    @Test
+    void aVisibleLevelShelfCanAttachTheConnectorWhenTheLowerCellCannot() {
+        var terrain = new Terrain(new HashMap<>());
+        BlockState stone = Blocks.STONE.getDefaultState(), cobble = Blocks.COBBLESTONE.getDefaultState();
+        BlockPos bridge = RIM.east(), shelf = bridge.east();
+        terrain.blocks.put(RIM.down(), stone);
+        terrain.blocks.put(shelf.down(), stone);
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        var lower = new AgentReturnableMine.Foothold(RIM, EAST, stone, 0);
+        var level = new AgentReturnableMine.Foothold(RIM, EAST, stone, 0, true);
+        assertEquals(bridge.down(), level.cell);
+        assertEquals(HitResult.Type.MISS,
+            terrain.ray(eye, AgentReturnableMine.proofFloorAim(lower.landing, EAST, 1)).getType());
+        var anchor = terrain.ray(eye, AgentBody.footholdAttachmentAim(shelf.down(), EAST, EAST));
+        assertEquals(Direction.WEST, anchor.getSide());
+        var emptyLow = terrain.footholdSpace(eye, level.low, level.cell);
+        var emptyHigh = terrain.footholdSpace(eye, level.high, level.cell);
+        assertNotNull(lower.placementRefusal(hull, 9, false, emptyLow, emptyHigh, anchor),
+            "this real attaching face is one block above the attempted stair support");
+        assertNotNull(level.placementRefusal(hull, 9, false, emptyLow, emptyHigh, anchor),
+            "an attachment alone is not a reason to build");
+
+        var shelfAim = AgentReturnableMine.proofFloorAim(shelf, EAST, 0);
+        var shelfTop = terrain.ray(eye, shelfAim);
+        Box onwardSweep = AgentSurfaceTread.retainedTreadSweep(bridge, shelf, 0.60);
+        level.outlet = AgentReturnableMine.witnessedLevelOutlet(RIM, bridge, shelfTop, stone, terrain.clear(onwardSweep));
+        assertNotNull(level.outlet);
+        assertNull(level.placementRefusal(hull, 9, false, emptyLow, emptyHigh, anchor));
+        var bridgeAim = AgentReturnableMine.proofFloorAim(bridge, EAST, 0);
+        level.issued(20, 9);
+        assertFalse(level.confirms(21, terrain.ray(eye, bridgeAim), cobble, 8),
+            "debit alone still does not witness the installed top");
+        terrain.blocks.put(level.cell, cobble);
+        var placedTop = terrain.ray(eye, bridgeAim);
+        assertFalse(level.confirms(20, placedTop, cobble, 8));
+        assertFalse(level.confirms(21, placedTop, cobble, 9));
+        assertTrue(level.confirms(21, placedTop, cobble, 8));
+        var outbound = AgentReturnableMine.witnessedTransit(RIM, bridge, EAST, placedTop, stone, cobble,
+            terrain.clear(AgentSurfaceTread.retainedTreadSweep(RIM, bridge, 0.60)));
+        assertNotNull(outbound);
+        assertEquals(outbound.upper().getY(), outbound.lower().getY());
+        assertNull(AgentReturnableMine.witnessedTransit(RIM, bridge, EAST, placedTop, null, cobble, true),
+            "a new top is no substitute for the retained source support");
+        var fromBridge = Vec3d.ofBottomCenter(bridge).add(0, 1.62, 0);
+        assertNotNull(AgentReturnableMine.witnessedTransit(bridge, RIM, Direction.WEST,
+            terrain.ray(fromBridge, AgentReturnableMine.proofFloorAim(RIM, Direction.WEST, 0)), cobble, stone,
+            terrain.clear(AgentSurfaceTread.retainedTreadSweep(bridge, RIM, 0.60))),
+            "the original support is still usable in reverse");
+    }
+
+    @Test
+    void aLevelConnectorWillNotLeadToMissingSupportOrThroughBlockedHeadroom() {
+        var terrain = new Terrain(new HashMap<>());
+        BlockState stone = Blocks.STONE.getDefaultState();
+        BlockPos bridge = RIM.east(), shelf = bridge.north();
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0);
+        Vec3d floor = AgentReturnableMine.proofFloorAim(shelf, Direction.NORTH, 0);
+        assertNull(AgentReturnableMine.witnessedLevelOutlet(RIM, bridge, terrain.ray(eye, floor), stone, true));
+        assertNull(AgentReturnableMine.witnessedLevelOutlet(RIM, bridge, top(RIM.down()), stone, true),
+            "the original support is a return, not worthwhile onward terrain");
+
+        terrain.blocks.put(shelf.down(), stone);
+        var shown = terrain.ray(eye, floor);
+        Box onwardSweep = AgentSurfaceTread.retainedTreadSweep(bridge, shelf, 0.60);
+        assertNotNull(AgentReturnableMine.witnessedLevelOutlet(RIM, bridge, shown, stone, terrain.clear(onwardSweep)));
+        terrain.blocks.put(shelf.up(), stone);
+        assertNull(AgentReturnableMine.witnessedLevelOutlet(RIM, bridge, shown, stone, terrain.clear(onwardSweep)));
     }
 
     @Test

@@ -8,7 +8,6 @@ import net.minecraft.block.LeavesBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.registry.tag.BlockTags;
-import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
@@ -187,7 +186,7 @@ final class AgentHeadroom {
         if (!natural(state) || protectedBlock.test(cut) || !state.getFluidState().isEmpty()
                 || state.getHardness(client.world, cut) < 0 || !tools.canHarvest(state))
             return bypass("visible obstruction is not safe to cut");
-        if (fallingOrLavaAbove(player, seen)) return bypass("visible falling hazard or lava above the obstruction");
+        if (unsafeVisibleCover(player, seen)) return bypass("visible falling material, fluid or attachment above the obstruction");
         body.aimContact(seen, AgentBody.Contact.MINE);
         if (tools.readyFor(state) && body.mine(seen)) {
             if (!attacked) note("clearing visible " + cut.toShortString() + " with the best available tool");
@@ -283,15 +282,22 @@ final class AgentHeadroom {
     private static double crownX(int i, double width) { return i == 0 ? 0 : i <= 2 ? -width : width; }
     private static double crownZ(int i, double width) { return i == 0 ? 0 : i % 2 == 0 ? -width : width; }
 
-    private boolean fallingOrLavaAbove(ClientPlayerEntity player, BlockHitResult face) {
+    private boolean unsafeVisibleCover(ClientPlayerEntity player, BlockHitResult face) {
         Direction side = face.getSide();
         Vec3d edge = face.getPos().add(side.getOffsetX() * 0.08, 0, side.getOffsetZ() * 0.08);
         Vec3d above = new Vec3d(edge.x, cut.getY() + 1.36, edge.z);
         BlockHitResult visible = body.perceive(above, player.getEyePos().distanceTo(above) + 0.06).orElse(null);
         if (visible == null || visible.getBlockPos().getY() <= cut.getY()) return false;
-        BlockState state = client.world.getBlockState(visible.getBlockPos());
-        return state.getBlock() instanceof FallingBlock || state.isOf(Blocks.POINTED_DRIPSTONE)
-            || state.getFluidState().isIn(FluidTags.LAVA);
+        return unsafeCutCover(client.world.getBlockState(visible.getBlockPos()));
+    }
+
+    /** Classify a visible cover face only; never use hidden neighbors to authorize a cut. */
+    static boolean unsafeCutCover(BlockState state) {
+        return state.getBlock() instanceof FallingBlock || AgentBody.dryCaveDanger(state)
+            || state.isOf(Blocks.POINTED_DRIPSTONE) || state.isOf(Blocks.TORCH)
+            || state.isOf(Blocks.SOUL_TORCH) || state.isOf(Blocks.REDSTONE_TORCH)
+            || state.isOf(Blocks.WALL_TORCH) || state.isOf(Blocks.SOUL_WALL_TORCH) || state.isOf(Blocks.REDSTONE_WALL_TORCH)
+            || state.isOf(Blocks.CRAFTING_TABLE) || state.hasBlockEntity();
     }
 
     private static boolean natural(BlockState state) {

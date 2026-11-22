@@ -49,6 +49,33 @@ final class AgentPickupTest {
     }
 
     @Test
+    void stockQuarryDistinguishesPickReachFromPickupRange() {
+        var foot = new BlockPos(0, 61, 0);
+        var stance = PLAYER.offset(0.5, 61, 0.5);
+        assertTrue(AgentProgress.stoneWithinPickupStance(stance, foot.west()));
+        assertTrue(AgentProgress.stoneWithinPickupStance(stance, foot.west().up()));
+        assertFalse(AgentProgress.stoneWithinPickupStance(stance, foot.west().down()),
+            "the near ledge block needs checked excavation, not a cut from the rim");
+        assertFalse(AgentProgress.stoneWithinPickupStance(stance, foot.west(2)),
+            "a level face across the opening is within pick reach but its cargo is not");
+        assertFalse(AgentProgress.stoneWithinPickupStance(stance, foot.west(2).down(2)));
+
+        var surveyedLowerFoot = foot.west().down();
+        var lowerStance = PLAYER.offset(-0.5, 60, 0.5);
+        assertTrue(AgentProgress.stoneWithinPickupStance(lowerStance, surveyedLowerFoot.west()),
+            "a checked move turns a previously remote lower wall into collectible work");
+    }
+
+    @Test
+    void stockQuarryUsesActualStanceRatherThanTheNominalTileCenter() {
+        var foot = new BlockPos(0, 61, 0);
+        var nearWestWall = PLAYER.offset(0.3, 61, 0.5);
+        assertTrue(AgentProgress.stoneWithinPickupStance(nearWestWall, foot.west()));
+        assertFalse(AgentProgress.stoneWithinPickupStance(nearWestWall, foot.east()),
+            "the opposite wall is too far to allow for the drop's spawn offset");
+    }
+
+    @Test
     void lowerQuarryDropThatFailsFlatInputCanBeCollectedFromAWitnessedTread() {
         var rim = new BlockPos(0, 61, 0);
         var lower = rim.north().down();

@@ -127,6 +127,38 @@ final class AgentStallGuardTest {
     }
 
     @Test
+    void aSidePassageCanOnlyClearItsExactHeadOrFootFaceFromTheTakeoff() {
+        var from = new BlockPos(0, 60, 0);
+        var foot = from.east();
+        var head = foot.up();
+
+        assertTrue(AgentStallGuard.passageFace(foot, Direction.EAST,
+            new BlockHitResult(Vec3d.ofCenter(head), Direction.WEST, head, false), true));
+        assertTrue(AgentStallGuard.passageFace(foot, Direction.EAST,
+            new BlockHitResult(Vec3d.ofCenter(foot), Direction.WEST, foot, false), false));
+        assertFalse(AgentStallGuard.passageFace(foot, Direction.EAST,
+            new BlockHitResult(Vec3d.ofCenter(foot.down()), Direction.WEST, foot.down(), false), false));
+        assertFalse(AgentStallGuard.passageFace(foot, Direction.EAST,
+            new BlockHitResult(Vec3d.ofCenter(from.up(2)), Direction.DOWN, from.up(2), false), true));
+        assertFalse(AgentStallGuard.passageFace(foot, Direction.EAST,
+            new BlockHitResult(Vec3d.ofCenter(head), Direction.NORTH, head, false), true));
+        assertFalse(AgentStallGuard.passageFace(foot, Direction.EAST,
+            new BlockHitResult(Vec3d.ofCenter(head), Direction.WEST, head, true), true));
+    }
+
+    @Test
+    void passageCoverCannotRestOnTheCutIfItFallsFlowsOrIsAttached() {
+        assertFalse(AgentHeadroom.unsafeCutCover(Blocks.DIRT.getDefaultState()));
+        assertFalse(AgentHeadroom.unsafeCutCover(Blocks.STONE.getDefaultState()));
+        assertTrue(AgentHeadroom.unsafeCutCover(Blocks.GRAVEL.getDefaultState()));
+        assertTrue(AgentHeadroom.unsafeCutCover(Blocks.SAND.getDefaultState()));
+        assertTrue(AgentHeadroom.unsafeCutCover(Blocks.WATER.getDefaultState()));
+        assertTrue(AgentHeadroom.unsafeCutCover(Blocks.LAVA.getDefaultState()));
+        assertTrue(AgentHeadroom.unsafeCutCover(Blocks.TORCH.getDefaultState()));
+        assertTrue(AgentHeadroom.unsafeCutCover(Blocks.POINTED_DRIPSTONE.getDefaultState()));
+    }
+
+    @Test
     void witnessedGrassLipStillAdmitsTheOrdinaryTreadAfterThePillarAndAnotherRiseFailed() {
         var exits = new AgentStallGuard.Departures();
         var hollow = new BlockPos(0, 64, 0);

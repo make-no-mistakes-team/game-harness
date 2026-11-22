@@ -61,10 +61,13 @@ for the pick and a bench; a shovel or axe joins the batch only when
 the remaining materials cover it. If natural foliage hides the route, the player
 can cut a neighboring leaf while keeping its own support. It must see
 and check the newly exposed footing before stepping down.
-From solid footing it can cut a nearby
-block. It can clear settled gravel from beside the column, not from
-underneath it, and waits for falling material to settle. A cut does
-not authorize a step into the opening.
+When gathering cobblestone, the player chooses a face close enough to
+collect the drop. If it breaks stone but cannot pick up the drop, it
+must change footing before quarrying another face. It can clear
+settled gravel from beside the column, not from underneath it, and
+waits for falling material to settle. Under a low ceiling with no open
+exit, it can cut a short passage sideways from stable ground. It checks
+the newly exposed floor and headroom before stepping into the opening.
 
 Incoming damage interrupts work even when knockback puts the player
 in water. The player can look toward a sound or seek a visible dry

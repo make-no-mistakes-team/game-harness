@@ -1,5 +1,6 @@
 package io.gameharness.survival;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
@@ -14,6 +15,8 @@ import net.minecraft.block.LeavesBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.ingame.FurnaceScreen;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.Entity;
+import net.minecraft.entity.FallingBlockEntity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.Item;
@@ -22,8 +25,11 @@ import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.util.TypeFilter;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -57,6 +63,11 @@ final class AgentStallGuard {
     private static final int DEPARTURE_DRIVE_TICKS = 62;
     private static final int DEPARTURE_VIEWS = 2;
     private static final float DEPARTURE_PITCH = 33;
+    private static final int PASSAGE_TICKS = 145;
+    private static final int PASSAGE_BREAK_SETTLE_TICKS = 8;
+    private static final int MAX_PASSAGES = 2;
+    private static final TypeFilter<Entity, FallingBlockEntity> FALLING_ENTITIES =
+        TypeFilter.instanceOf(FallingBlockEntity.class);
     private static final Predicate<BlockState> DRY_DANGER = AgentBody::dryCaveDanger;
     private static final double STEP_CENTER = 0.14;
     private static final double STEP_CLEARANCE = 3.08; // 1.25-block jump plus 1.8-block standing height and margin.
@@ -65,8 +76,9 @@ final class AgentStallGuard {
         || s.isOf(Items.DIRT);
 
     private enum Phase { WATCH, PENDING, WATER, SCOUT, BACKTRACK, WALK, LIGHT, CUT, STEP, SETTLE, RETRY,
-                         ASSESS, DEPART, ALTERNATIVE, BLOCKED }
+                         ASSESS, DEPART, PASSAGE, ALTERNATIVE, BLOCKED }
     private enum StepStage { CENTER, HEADROOM, SUPPORT, TORCH_BYPASS, JUMP, LAND }
+    private enum PassageStage { HEAD, LEGS, LANDING }
     enum Alternative { WORKING, ADVANCED, ADVANCED_BUT_HELD, REPLAN, REFUSED }
 
     record Report(int incidents, int attempts, int recoveries, int failures, String phase, String detail,
@@ -170,6 +182,8 @@ final class AgentStallGuard {
     private final Set<BlockPos> triedStances = new HashSet<>();
     private final Set<BlockPos> rejectedStances = new HashSet<>();
     private final Set<BlockPos> triedCuts = new HashSet<>();
+    private final Set<BlockPos> triedPassages = new HashSet<>();
+    private final ArrayList<FallingBlockEntity> passageFalling = new ArrayList<>(1);
     private final Set<BlockPos> drivenStances = new HashSet<>();
     private final Set<BlockPos> assessedSupports = new HashSet<>();
     private final int[] inventory = new int[Registries.ITEM.size()];
@@ -191,6 +205,7 @@ final class AgentStallGuard {
     private long navigationSurvey, settledNavigationSurvey;
     private BlockPos lastGround, mining, incidentFrom;
     private BlockPos navigationLowCeiling;
+    private BlockPos lowCeilingFoot;
     private FurnaceScreen cooking;
     private Vec3d anchor, confirmedFoot, priorGroundFeet;
     private int flatCrossingCount, priorGroundAge, confirmedFootAge;
@@ -229,7 +244,13 @@ final class AgentStallGuard {
     private AgentBody.OrdinaryGrade surveyRise, departureRise;
     private AgentSurfaceTread departureTread;
     private int departureLength, surveySector, surveySince, surveyViews, ordinarySetupUntil;
-    private long surveyFrame;
+    private int passageCues, passageSince, passageBreakAt;
+    private Direction passageBearing;
+    private BlockPos passageFrom, passageTo, passageCut;
+    private Box passageOpening;
+    private PassageStage passageStage;
+    private boolean passageBroke;
+    private long surveyFrame, passageBreakFrame;
     private boolean replanOnAssessment, safeIdle;
 
     AgentStallGuard(MinecraftClient client, AgentBody body, AgentHands hands, AgentTools tools,
@@ -356,6 +377,8 @@ final class AgentStallGuard {
     void broken(BlockPos position, BlockState state) {
         water.broken(position, state);
         departures.changed(position);
+        if (lowCeilingFoot != null && (position.equals(lowCeilingFoot.up(2)) || position.equals(lowCeilingFoot.up(3))))
+            lowCeilingFoot = null;
         if ((phase == Phase.ASSESS || phase == Phase.BLOCKED) && surveyFoot != null
                 && position.getSquaredDistance(surveyFoot) <= 16) {
             departures.revisit(surveyFoot);
@@ -372,6 +395,12 @@ final class AgentStallGuard {
         }
         if (phase == Phase.CUT && position.equals(cut)) {
             cutFinished = true;
+            return;
+        }
+        if (phase == Phase.PASSAGE && position.equals(passageCut)) {
+            passageBroke = true;
+            passageBreakAt = tick;
+            passageBreakFrame = body.renderedFrame();
             return;
         }
         if (phase != Phase.WATCH && phase != Phase.RETRY && (phase != Phase.PENDING || tookControl)
@@ -627,6 +656,8 @@ final class AgentStallGuard {
             interruptStep("safety behavior interrupted the temporary jump or placement");
         else if (phase == Phase.DEPART && departureRise != null)
             transition(Phase.ASSESS, "safety behavior interrupted the witnessed rise; waiting for dry contact");
+        else if (phase == Phase.PASSAGE)
+            assessAgain("safety behavior interrupted the witnessed side passage");
     }
 
     /** Time spent on emergency inputs is not failed ordinary work or a recovery receipt. */
@@ -695,9 +726,12 @@ final class AgentStallGuard {
         if (client.player.isTouchingWater() || client.player.hasVehicle()) {
             if (phase == Phase.DEPART && departureRise != null)
                 transition(Phase.ASSESS, "left dry contact during the witnessed rise");
+            else if (phase == Phase.PASSAGE)
+                assessAgain("left dry contact while checking the witnessed side passage");
             return false;
         }
-        if (phase == Phase.ASSESS || phase == Phase.DEPART || phase == Phase.ALTERNATIVE || phase == Phase.BLOCKED) {
+        if (phase == Phase.ASSESS || phase == Phase.DEPART || phase == Phase.PASSAGE
+                || phase == Phase.ALTERNATIVE || phase == Phase.BLOCKED) {
             if (replanOnAssessment) {
                 replanOnAssessment = false;
                 replan.run();
@@ -760,6 +794,10 @@ final class AgentStallGuard {
             depart();
             return true;
         }
+        if (phase == Phase.PASSAGE) {
+            clearPassage();
+            return true;
+        }
         if (phase == Phase.ALTERNATIVE) {
             Alternative result = !safeDryContact() || tick - entered >= ALTERNATIVE_TICKS
                 ? Alternative.REFUSED : work.get();
@@ -791,14 +829,16 @@ final class AgentStallGuard {
         if (!foot.equals(surveyFoot)) {
             surveyFoot = foot.toImmutable();
             surveyRise = null;
+            passageCues = 0;
             departures.stoodOn(foot);
             setSurveyBearing(client.player.getHorizontalFacing());
             surveySector = departures.beginSurvey(foot) ? 0 : 4;
             if (offerAlternative(choose)) return true;
         }
         if (surveySector >= 4) {
-            if (offerAlternative(choose) || offerDeparture(client.player.getHorizontalFacing())
-                    || offerRiseDeparture()) return true;
+            Direction facing = client.player.getHorizontalFacing();
+            rememberPassage(facing);
+            if (offerAlternative(choose) || offerDeparture(facing) || offerRiseDeparture() || offerPassage()) return true;
             idleAtAssessment(true, "no distinct witnessed work or safe departure");
             return true;
         }
@@ -838,12 +878,15 @@ final class AgentStallGuard {
             surveyViews++;
             // Inspect the short level route before the wider resource scans spend the frame's shared rays.
             int length = visibleDeparture(surveyBearing);
+            if (length == 0) {
+                rememberRise(surveyBearing);
+                rememberPassage(surveyBearing);
+            }
             if (offerAlternative(choose)) return;
             if (length != 0) {
                 beginDeparture(surveyBearing, length);
                 return;
             }
-            rememberRise(surveyBearing);
         }
         if (surveyViews >= DEPARTURE_VIEWS || tick - surveySince >= DEPARTURE_LOOK_TICKS) {
             surveySector++;
@@ -889,6 +932,159 @@ final class AgentStallGuard {
         var grade = body.ordinaryGrade(Vec3d.ofBottomCenter(floor));
         if (grade != null && grade.from().equals(surveyFoot) && grade.bearing() == direction && grade.floor().equals(floor)
                 && (surveyRise == null || !grade.lookOnly())) surveyRise = grade;
+    }
+
+    private boolean passageEligible(BlockPos foot, Direction direction) {
+        if (!foot.equals(lowCeilingFoot) || triedPassages.size() >= MAX_PASSAGES) return false;
+        BlockPos target = foot.offset(direction);
+        return departures.newLanding(target) && departures.canCross(foot, target) && !triedPassages.contains(target);
+    }
+
+    private void rememberPassage(Direction direction) {
+        int bit = 1 << direction.ordinal();
+        if ((passageCues & bit) != 0 || !passageEligible(surveyFoot, direction)) return;
+        BlockPos target = surveyFoot.offset(direction);
+        for (int height = 1; height >= 0; height--) {
+            BlockPos cell = height == 1 ? target.up() : target;
+            Vec3d point = passagePoint(cell, height == 1);
+            BlockHitResult hit = passageRay(point);
+            if (passageFace(target, direction, hit, height == 1) && canCut(hit)) {
+                passageCues |= bit;
+                return;
+            }
+            if (height == 1 && !body.overlandClear(point, DRY_DANGER)) return;
+        }
+    }
+
+    private boolean offerPassage() {
+        // The sweep saw a near face, not a route. Spend it once, after open routes and normal work.
+        for (Direction direction : Direction.Type.HORIZONTAL) {
+            int bit = 1 << direction.ordinal();
+            if ((passageCues & bit) == 0) continue;
+            passageCues &= ~bit;
+            if (!passageEligible(surveyFoot, direction)) continue;
+            passageFrom = surveyFoot;
+            passageTo = passageFrom.offset(direction);
+            triedPassages.add(passageTo);
+            passageBearing = direction;
+            passageSince = tick;
+            passageBreakAt = 0;
+            passageStage = PassageStage.HEAD;
+            passageOpening = new Box(passageTo).expand(0, 1.5, 0);
+            passageCut = null;
+            passageBroke = false;
+            attempts++;
+            transition(Phase.PASSAGE, "checking the witnessed side passage around the low ceiling toward "
+                + passageTo.toShortString());
+            return true;
+        }
+        return false;
+    }
+
+    private void clearPassage() {
+        var player = client.player;
+        if (tick - passageSince >= PASSAGE_TICKS || !passageFrom.equals(player.getBlockPos())
+                || quietSupport() == null || body.dryCaveContact(passageFrom) == null
+                || centerMargin(player.getPos(), passageFrom) < player.getWidth() * 0.5
+                || body.hazardAhead(passageBearing.getPositiveHorizontalDegrees(), 1.65)) {
+            assessAgain("side passage did not yield safe clearance and different footing within its bound");
+            return;
+        }
+        if (passageBreakAt != 0 && (tick - passageBreakAt < PASSAGE_BREAK_SETTLE_TICKS
+                || body.renderedFrame() <= passageBreakFrame)) return;
+        if (passageBreakAt != 0 && fallingInPassage()) {
+            assessAgain("falling material became visible after the side cut");
+            return;
+        }
+        if (passageStage == PassageStage.LANDING) {
+            body.turn(passageBearing.getPositiveHorizontalDegrees(), DEPARTURE_PITCH);
+            if (body.renderedDirection(passageBearing.getPositiveHorizontalDegrees(), DEPARTURE_PITCH, 6)) {
+                // A break does not prove a floor, a dry opening, or the width of a safe stopping lane.
+                int length = visibleDeparture(passageBearing);
+                if (length != 0) beginDeparture(passageBearing, length);
+            }
+            return;
+        }
+        boolean head = passageStage == PassageStage.HEAD;
+        BlockPos cell = head ? passageTo.up() : passageTo;
+        Vec3d point = passagePoint(cell, head);
+        Vec3d cover = passageCoverPoint(cell, passageBearing);
+        // Keep the face and the lower edge of its cover together in the real camera.
+        body.aim(point.lerp(cover, 0.34));
+        AgentBody.DryRouteSample sample = body.dryCaveSpace(point);
+        if (sample == AgentBody.DryRouteSample.FLUID) {
+            assessAgain("fluid became visible in the witnessed side passage");
+            return;
+        }
+        if (sample == AgentBody.DryRouteSample.CLEAR) {
+            if (passageCut != null && !passageBroke) {
+                assessAgain("side clearance changed without a confirmed cut");
+                return;
+            }
+            passageCut = null;
+            passageBroke = false;
+            passageStage = head ? PassageStage.LEGS : PassageStage.LANDING;
+            return;
+        }
+        if (passageBroke) {
+            if (sample == AgentBody.DryRouteSample.OBSTRUCTION)
+                assessAgain("the cleared side face was obstructed again");
+            return; // Wait for lit dry air through the edit; never attack a replacement.
+        }
+        BlockHitResult hit = passageRay(point);
+        if (hit == null) return;
+        if (!passageFace(passageTo, passageBearing, hit, head) || !canCut(hit)) {
+            assessAgain("side passage is blocked by an unverified or protected face");
+            return;
+        }
+        if (visibleCutCoverUnsafe(cell, cover)) {
+            assessAgain("side passage has fluid, falling, or supported material above the cut");
+            return;
+        }
+        BlockState state = client.world.getBlockState(hit.getBlockPos());
+        body.aimContact(hit, AgentBody.Contact.MINE);
+        if (tools.readyFor(state) && body.mine(hit)) {
+            if (passageCut == null) {
+                passageCut = cell;
+                transition(Phase.PASSAGE, "clearing the witnessed side face at " + cell.toShortString());
+            }
+        } else if (body.miningFootingRefused(cell)) {
+            assessAgain("vanilla mining contact would leave the safe takeoff");
+        }
+    }
+
+    private boolean fallingInPassage() {
+        // Only this exposed passage; a candidate must also be inside the rendered view and unoccluded.
+        client.world.collectEntitiesByType(FALLING_ENTITIES, passageOpening,
+            entity -> entity.isAlive() && body.clearTerrain(entity.getBoundingBox().getCenter()), passageFalling, 1);
+        if (passageFalling.isEmpty()) return false;
+        passageFalling.clear();
+        return true;
+    }
+
+    private boolean visibleCutCoverUnsafe(BlockPos cell, Vec3d cover) {
+        BlockHitResult above = passageRay(cover);
+        return above != null && above.getBlockPos().getY() > cell.getY()
+            && AgentHeadroom.unsafeCutCover(client.world.getBlockState(above.getBlockPos()));
+    }
+
+    private BlockHitResult passageRay(Vec3d point) {
+        return body.perceive(point, client.player.getEyePos().distanceTo(point) + 0.04).orElse(null);
+    }
+
+    private static Vec3d passagePoint(BlockPos cell, boolean head) {
+        return Vec3d.ofCenter(cell, head ? 0.53 : 0.83);
+    }
+
+    private static Vec3d passageCoverPoint(BlockPos cell, Direction direction) {
+        return Vec3d.ofCenter(cell.up(), 0.09).add(-0.36 * direction.getOffsetX(), 0,
+            -0.36 * direction.getOffsetZ());
+    }
+
+    static boolean passageFace(BlockPos landing, Direction direction, BlockHitResult hit, boolean head) {
+        return hit != null && hit.getType() == HitResult.Type.BLOCK && !hit.isInsideBlock()
+            && direction.getAxis().isHorizontal() && hit.getSide() == direction.getOpposite()
+            && hit.getBlockPos().equals(head ? landing.up() : landing);
     }
 
     private boolean offerRiseDeparture() {
@@ -1014,6 +1210,8 @@ final class AgentStallGuard {
         water.clearEpisode();
         departures.clear();
         surveyFoot = null;
+        lowCeilingFoot = null;
+        triedPassages.clear();
         surveyRise = departureRise = null;
         departureTread = null;
         replanOnAssessment = false;
@@ -1135,6 +1333,8 @@ final class AgentStallGuard {
         triedStances.clear();
         rejectedStances.clear();
         triedCuts.clear();
+        triedPassages.clear();
+        lowCeilingFoot = null;
         drivenStances.clear();
         assessedSupports.clear();
         departures.resetSurveys();
@@ -1573,11 +1773,12 @@ final class AgentStallGuard {
             if (body.aligned(cutAim)) cut = null;
             return;
         }
-        BlockState state = client.world.getBlockState(seen.getBlockPos());
-        if (!naturalObstruction(state) || !tools.canHarvest(state) || !state.getFluidState().isEmpty()) {
+        if (!canCut(seen) || seen.getSide().getAxis().isHorizontal()
+                && visibleCutCoverUnsafe(cut, passageCoverPoint(cut, seen.getSide().getOpposite()))) {
             cut = null;
             return;
         }
+        BlockState state = client.world.getBlockState(seen.getBlockPos());
         body.aimContact(seen, AgentBody.Contact.MINE);
         if (tools.readyFor(state)) body.mine(seen);
     }
@@ -1587,15 +1788,23 @@ final class AgentStallGuard {
         for (int i = 0; i < 8; ++i) {
             // Try head-level first. Only camera-admitted near faces can justify a cut.
             BlockPos cell = from.offset(direction(i & 3)).up(1 - i / 4);
-            if (triedCuts.contains(cell) || contains(footprints, cell.up()) || protectedBlock.test(cell)) continue;
+            if (triedCuts.contains(cell)) continue;
             Vec3d point = Vec3d.ofCenter(cell);
             BlockHitResult seen = body.perceive(point, eye.distanceTo(point) + 0.06).orElse(null);
             if (seen == null || !seen.getBlockPos().equals(cell)
                     || body.hazardAhead(yaw(point.subtract(client.player.getPos())), 1.5)) continue;
-            BlockState state = client.world.getBlockState(seen.getBlockPos());
-            if (naturalObstruction(state) && state.getFluidState().isEmpty() && tools.canHarvest(state)) return seen;
+            if (canCut(seen)) return seen;
         }
         return null;
+    }
+
+    private boolean canCut(BlockHitResult hit) {
+        BlockPos cell = hit.getBlockPos();
+        if (contains(footprints, cell.up()) || protectedBlock.test(cell)
+                || cell.equals(client.player.supportingBlockPos.orElse(null))) return false;
+        BlockState state = client.world.getBlockState(cell);
+        return naturalObstruction(state) && state.getFluidState().isEmpty()
+            && state.getHardness(client.world, cell) >= 0 && tools.canHarvest(state);
     }
 
     private static boolean naturalObstruction(BlockState state) {
@@ -1608,6 +1817,7 @@ final class AgentStallGuard {
     private void startStep(String description) {
         BlockPos footing = client.player.getBlockPos();
         if (footing.equals(navigationLowCeiling)) {
+            lowCeilingFoot = footing.toImmutable();
             departures.reject(footing, footing.up());
             fail("witnessed low mine ceiling rules out a temporary pillar on this footing");
             return;
@@ -1666,6 +1876,7 @@ final class AgentStallGuard {
                     && lowCeiling.getBlockPos().getX() == from.getX() && lowCeiling.getBlockPos().getZ() == from.getZ()
                     && lowCeiling.getPos().y < overhead.y - 0.05
                     && client.world.getBlockState(lowCeiling.getBlockPos()).getFluidState().isEmpty()) {
+                lowCeilingFoot = from;
                 String handback = mineHandback.apply(from);
                 if (handback == null) failStep("visible ceiling blocks the temporary step");
                 else {

@@ -231,6 +231,7 @@ final class AgentProgress {
     private final Predicate<BlockPos> protectedHeadroom = this::protectRecoveryBlock;
     private final Predicate<BlockHitResult> returnableOreFace = this::returnableOreReachable;
     private final Predicate<BlockHitResult> ordinaryOreFace = face -> reachableResourceFace(face.getBlockPos());
+    private final Predicate<BlockHitResult> ordinaryStoneFace = face -> stoneStockFace(face.getBlockPos());
     private final AgentCaves caves;
     private final AgentReturnableMine returnableMine;
     private final SurfaceApproach surfaceApproach = new SurfaceApproach();
@@ -344,6 +345,9 @@ final class AgentProgress {
     private int ignoreCursor;
     private int seekAfter;
     private int pickupUntil;
+    private boolean quarryingStoneStock;
+    private BlockPos stoneCutFoot;
+    private int stoneCutStock;
     private int pickupBlockedUntil;
     private Predicate<ItemStack> pickupBlockedItem;
     private ItemEntity pickupEntity;
@@ -672,6 +676,13 @@ final class AgentProgress {
         // The break buys one local light check, not inventory credit or a path into the pocket.
         if (position.equals(target) && (miningResource == Resource.IRON || miningResource == Resource.DIAMOND)
                 && miningResource.block.test(state)) rememberPickupLight(miningResource.drop);
+        if (quarryingStoneStock && position.equals(target) && Resource.STONE.block.test(state)) {
+            stoneCutFoot = c.player.getBlockPos();
+            stoneCutStock = hands.count(STONE);
+            pickupUntil = tick + 19;
+            quarryingStoneStock = false;
+            target = null;
+        }
         body.observeHeadroomBreak(position);
         caves.changedDry(position);
         stallGuard.broken(position, state);
@@ -930,6 +941,9 @@ final class AgentProgress {
     void tick(AgentEars ears, AgentMacroControl macro) {
         if (win || c.player == null || c.world == null) return;
         tick++;
+        // Observe cargo before a recipe can spend it.
+        if (stoneCutFoot != null && (!stoneCutFoot.equals(c.player.getBlockPos()) || has(STONE, stoneCutStock + 1)))
+            stoneCutFoot = null;
         ordinarySurfaceWork = macro == null || !macro.engaged();
         bootstrapTimber = ordinarySurfaceWork && !has(DEEP_PICK, 1) && !has(STONE_PICK, 1) && !has(WOOD_PICK, 1);
         ordinaryCaveDrops = macro == null;
@@ -4869,6 +4883,14 @@ final class AgentProgress {
 
     private boolean workOre(Resource resource, double range, boolean remember) {
         if (!finishingOreCut(resource) && collectOre(resource, Math.min(7, range))) return true;
+        if (resource == Resource.STONE) {
+            if (!c.player.isOnGround() || !safePickupStance()) return false;
+            // A close cut can still drop cargo into an unseen opening. Give the normal
+            // pickup attempt its turn, then move or use a checked stair instead of
+            // hollowing more of the same front with no inventory gain.
+            if (stoneCutFoot != null) return false;
+            if (target != null && miningResource == resource && !stoneStockFace(target)) target = null;
+        }
         if (target != null && miningResource == resource
             && (range > REACH || targetPoint.squaredDistanceTo(c.player.getEyePos()) <= range * range)) {
             mineTarget(resource);
@@ -4878,6 +4900,7 @@ final class AgentProgress {
         if (hit != null && (tick >= seekAfter || activeTrail() > 1) && reachableResourceFace(hit.getBlockPos())
             && tools.canHarvest(state(hit))) {
             setTarget(hit, resource);
+            quarryingStoneStock = resource == Resource.STONE;
             mineTarget(resource);
             return true;
         }
@@ -4926,7 +4949,8 @@ final class AgentProgress {
             clearOreProbe();
             oreWorld = c.world;
         }
-        BlockHitResult hit = body.find(resource.block, range, ordinaryOreFace).orElse(null);
+        BlockHitResult hit = body.find(resource.block, range,
+            resource == Resource.STONE ? ordinaryStoneFace : ordinaryOreFace).orElse(null);
         if (hit == null || resource == Resource.STONE || !c.player.isOnGround()
             || c.player.isTouchingWater()) return hit;
         BlockPos block = hit.getBlockPos();
@@ -6865,6 +6889,7 @@ final class AgentProgress {
     private void setTarget(BlockHitResult hit, Resource resource) {
         target = hit.getBlockPos();
         miningResource = resource;
+        quarryingStoneStock = false;
         targetPoint = orePoint(hit);
         targetDeadline = tick + 200;
         targetNearest = c.player.getEyePos().distanceTo(targetPoint);
@@ -6880,6 +6905,21 @@ final class AgentProgress {
     private boolean reachableResourceFace(BlockPos position) {
         return !ignored(position) && !position.equals(c.player.getBlockPos().down())
             && (!stallGuard.retryingDistinctWork() || !stallOreTried.contains(position));
+    }
+
+    private boolean stoneStockFace(BlockPos position) {
+        return stoneWithinPickupStance(c.player.getBoundingBox(), position)
+            && reachableResourceFace(position) && !supportsTrail(position);
+    }
+
+    static boolean stoneWithinPickupStance(Box hull, BlockPos block) {
+        // Don't plan loose cargo below our feet. Leave a quarter-block margin inside
+        // vanilla's lateral pickup envelope for spawn offset instead of relying on a
+        // drop at the exact center. This is not proof of the drop's landing or a route.
+        double x = block.getX() + 0.5, z = block.getZ() + 0.5;
+        return block.getY() >= hull.minY && block.getY() <= hull.maxY + 0.5
+            && x > hull.minX - 0.75 && x < hull.maxX + 0.75
+            && z > hull.minZ - 0.75 && z < hull.maxZ + 0.75;
     }
 
     private void mineTarget(Resource resource) {

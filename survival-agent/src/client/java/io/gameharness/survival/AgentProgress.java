@@ -1,5 +1,8 @@
 package io.gameharness.survival;
 
+import static io.gameharness.survival.AgentMineLight.MIN_PICK_USES;
+import static io.gameharness.survival.AgentMineLight.PICK_HANDLES;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -285,6 +288,7 @@ final class AgentProgress {
     private BlockPos tableReturn;
     private BlockPos failedTableReturn;
     private Firing firing = Firing.NONE;
+    private int charcoalHandleReserve = PICK_HANDLES;
     private BlockPos furnaceWitness;
     private BlockPos refusedFurnace, refusedFurnaceFoot;
     private FurnaceScreen furnaceScreen;
@@ -1326,7 +1330,7 @@ final class AgentProgress {
             // Equip the next leg, not the whole expedition before leaving the first tree.
             // Hold back bench and replacement-pick wood as well as the actual fuel logs.
             int fieldReserve = ironPick ? 24 : 12;
-            int kitPlanks = fieldReserve + localTableWood() + 2 * stickBatches(torchRecipes + 4)
+            int kitPlanks = fieldReserve + localTableWood() + 2 * stickBatches(torchRecipes + 2 * PICK_HANDLES)
                 + furnacePlanks(fuelLogs) + 4 * fuelLogs;
             boolean shortTimber = hands.count(PLANK) + 4 * hands.count(LOG) < kitPlanks
                 || hands.count(BURNABLE_LOG) < fuelLogs;
@@ -2319,17 +2323,18 @@ final class AgentProgress {
         // Break up to three blocks per stair step. Budget the next lit leg and
         // leave uses for exposed ore, but don't require an entire second kit.
         int litLeg = Math.min(nextLeg, 7 * Math.max(1, torches - 1));
-        if (remaining < 3 * litLeg + 4 && tick >= refitPickRetry
-                && has(STONE, 3) && affordsWood(localTableWood(), 2)) {
-            refitPickCount = hands.count(STONE_PICK);
-            refitPickUntil = tick + 230;
-            return refitMinedPick();
-        }
-        if (remaining < 4 || depth == DIAMOND_LEVEL && deepUses <= 1 && stoneUses < 4) {
-            if (has(STONE, 3)) makePick("stone_pickaxe", STONE, 3);
+        if (remaining < MIN_PICK_USES
+                || depth == DIAMOND_LEVEL && deepUses <= 1 && stoneUses < MIN_PICK_USES) {
+            if (has(STONE, 3)) requestTable("stone_pickaxe", null, 0, PICK_HANDLES);
             else if (depth == DIAMOND_LEVEL && deepUses <= 1
                 || !workOre(Resource.STONE, REACH - 0.35, false)) seekExpeditionSupplies("a replacement pickaxe");
             return true;
+        }
+        if (remaining < 3 * litLeg + MIN_PICK_USES && tick >= refitPickRetry
+                && has(STONE, 3) && affordsWood(localTableWood(), AgentMineLight.stoneRefitSticks(remaining))) {
+            refitPickCount = hands.count(STONE_PICK);
+            refitPickUntil = tick + 230;
+            return refitMinedPick();
         }
         if (departure) departureKit = true;
         return false;
@@ -2337,13 +2342,14 @@ final class AgentProgress {
 
     private boolean refitMinedPick() {
         if (refitPickCount < 0) return false;
+        int sticks = AgentMineLight.stoneRefitSticks(pickUses(RETURNABLE_PICKS));
         if (hands.count(STONE_PICK) > refitPickCount || tick >= refitPickUntil || !has(STONE, 3)
-                || !affordsWood(localTableWood(), 2)) {
+                || !affordsWood(localTableWood(), sticks)) {
             refitPickCount = -1;
             refitPickRetry = tick + 150;
             return false;
         }
-        requestTable("stone_pickaxe", null, 0, 2);
+        requestTable("stone_pickaxe", null, 0, sticks);
         return true;
     }
 
@@ -2431,7 +2437,7 @@ final class AgentProgress {
     private boolean needsFurnaceLight() {
         if (firing != Firing.CHARCOAL || surfaceDeparture()) return false;
         int torches = hands.count(TORCH);
-        return torches < 2 && (affordsWood(localTableWood(), 3) || canSpareEmergencyStick(torches));
+        return torches < 2 && (affordsWood(localTableWood(), PICK_HANDLES + 1) || canSpareEmergencyStick(torches));
     }
 
     private void handleFurnace(FurnaceScreen screen) {
@@ -2519,7 +2525,8 @@ final class AgentProgress {
         if (firing == Firing.CHARCOAL && !furnaceLoaded && loading != null) {
             // Building or reaching the workshop may have spent stock since the quote.
             // Don't let the native loader fall back to the reserved tool handles.
-            int payable = charcoalBatch(limit, true);
+            int bench = fieldWood.deepFoot == null ? localTableWood() : fieldWood.portableBenchWood();
+            int payable = charcoalBatch(limit, true, bench, charcoalHandleReserve);
             if (payable <= 0) {
                 furnaceNeedsFuel = true;
                 screen.close();
@@ -2768,9 +2775,10 @@ final class AgentProgress {
         if (untried(job, FurnaceSide.STICKS) && firing == Firing.IRON && furnaceIronSticks > 0
                 && !has(STICK, 2) && has(PLANK, 2)) return FurnaceSide.STICKS;
         if (untried(job, FurnaceSide.PICK) && firing == Firing.CHARCOAL && !has(DEEP_PICK, 1)
-                && localStation(table, null) && has(STONE, 3) && affordsWood(0, 2)) {
+                && localStation(table, null) && has(STONE, 3)) {
             int stoneUses = pickUses(STONE_PICK);
-            if (stoneUses > 0 && stoneUses < 12) return FurnaceSide.PICK;
+            if (stoneUses > 0 && stoneUses < 12 && affordsWood(0, AgentMineLight.stoneRefitSticks(stoneUses)))
+                return FurnaceSide.PICK;
         }
         return null;
     }
@@ -2945,14 +2953,16 @@ final class AgentProgress {
                     }
                 }
                 case PICK -> {
-                    if (pickUses(STONE_PICK) < 12 && hands.stableCraftFooting()) {
+                    int stoneUses = pickUses(STONE_PICK);
+                    int sticks = AgentMineLight.stoneRefitSticks(stoneUses);
+                    if (stoneUses < 12 && affordsWood(0, sticks) && hands.stableCraftFooting()) {
                         BlockHitResult bench = body.find(TABLE_BLOCK, 3.75, hit -> hit.getBlockPos().equals(table.position)).orElse(null);
                         if (bench != null) {
                             if (fieldBench.packUntil != 0) fieldBench.leave();
                             tableRecipe = "stone_pickaxe";
                             tableExtra = tableAxe = null;
                             tablePlanks = 0;
-                            tableSticks = 2;
+                            tableSticks = sticks;
                             openStation(table, bench, AgentBody.Contact.INTERACT);
                             return true;
                         }
@@ -3071,7 +3081,7 @@ final class AgentProgress {
         int charcoal = Math.max(0, torchRecipes - hands.count(FUEL));
         int tableWood = has(table.item, 1) ? 0 : 4;
         int plankCost = tablePlanks + 5 + tableWood + furnacePlanks(charcoal);
-        int logsForPlanks = logBatches(plankCost, stickBatches(tableSticks + torchRecipes + 2));
+        int logsForPlanks = logBatches(plankCost, stickBatches(tableSticks + torchRecipes + PICK_HANDLES));
         return (charcoal == 0 || has(BURNABLE_LOG, charcoal))
             && has(LOG, logsForPlanks + charcoal) && hands.singleBoatWoodStock();
     }
@@ -3672,7 +3682,10 @@ final class AgentProgress {
     }
 
     private boolean craftTorches(int reserve) {
-        int batches = torchCraftBatches(reserve);
+        return craftTorchBatches(torchCraftBatches(reserve));
+    }
+
+    private boolean craftTorchBatches(int batches) {
         if (batches <= 0) return false;
         List<String> recipes = woodBatch(0, batches);
         for (int i = 0; i < batches; i++) recipes.add("torch");
@@ -3682,16 +3695,28 @@ final class AgentProgress {
 
     private int torchCraftBatches(int reserve) {
         int held = hands.count(TORCH);
-        int batches = Math.min(Math.min(3, hands.count(FUEL)), torchBatches(reserve, held));
-        while (batches > 0 && !affordsWood(localTableWood(), batches + 2)) batches--;
-        if (batches == 0 && held < reserve && has(FUEL, 1) && canSpareEmergencyStick(held)
-                && (firing != Firing.IRON || furnaceIronSticks == 0)) {
-            // In a dark passage the two planks in hand buy four real sticks.
-            // Make the affordable batch now instead of waiting for hypothetical bench timber.
-            batches = Math.min(Math.min(3, hands.count(FUEL)), torchBatches(reserve, held));
-            while (batches > 0 && !affordsWood(0, batches)) --batches;
+        int batches = availableTorchBatches(reserve, held);
+        return batches == 0 ? 0 : fundedTorchBatches(batches, held, localTableWood(), fieldWood.handleSticks(reserve), true);
+    }
+
+    private int availableTorchBatches(int target, int held) {
+        int wanted = Math.min(3, torchBatches(target, held));
+        return wanted == 0 ? 0 : Math.min(wanted, hands.count(FUEL));
+    }
+
+    private int fundedTorchBatches(int wanted, int held, int bench, int handles, boolean emergencyLight) {
+        var inventory = c.player.getInventory();
+        int wood = 0, sticks = 0;
+        for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+            ItemStack stack = inventory.getStack(slot);
+            if (stack.isEmpty()) continue;
+            if (STICK.test(stack)) sticks += stack.getCount();
+            else if (PLANK.test(stack)) wood += stack.getCount();
+            else if (LOG.test(stack)) wood += 4 * stack.getCount();
         }
-        return batches;
+        boolean emergency = emergencyLight && held <= 3 && (sticks > 0 || wood >= 2)
+            && (firing != Firing.IRON || furnaceIronSticks == 0) && pickUses(RETURNABLE_PICKS) > 6;
+        return AgentMineLight.fundedTorches(wanted, held, wood, sticks, bench, handles, emergency);
     }
 
     private boolean prepareLight(int needed, boolean localTopUp) {
@@ -3702,9 +3727,11 @@ final class AgentProgress {
             seekExpeditionSupplies("wood and light");
             return true;
         }
-        boolean canMakeTorch = affordsWood(localTableWood(), 3) || canSpareEmergencyStick(torches);
+        int bench = localTableWood();
+        int fuel = hands.count(FUEL);
+        boolean canMakeTorch = affordsWood(bench, 1 + PICK_HANDLES) || canSpareEmergencyStick(torches);
         double range = torches > 1 ? SEARCH : REACH - 0.35;
-        if (canMakeTorch && workOre(Resource.COAL, range, false)) return true;
+        if (fuel == 0 && canMakeTorch && workOre(Resource.COAL, range, false)) return true;
         if (torches > 2 && c.player.getBlockPos().equals(refusedCharcoalFoot)) return false;
         // Once inside a lit mine, skip the optional top-up rather than burn the last
         // workshop wood in a furnace while there is still light for another short leg.
@@ -3718,19 +3745,24 @@ final class AgentProgress {
                 nearbyFurnace = true;
             }
         }
-        int fuel = hands.count(FUEL);
         int wanted = AgentMineLight.charcoalNeeded(needed, torches, fuel);
         // If owned coal couldn't be crafted above, the missing input is wood, not more fuel.
         if (fuel == 0) {
             boolean replacement = !nearbyFurnace && canSetLocalFurnace();
             boolean knownFurnace = !nearbyFurnace && charcoalFurnaceOnTrail(replacement);
             boolean canFire = nearbyFurnace || replacement || knownFurnace;
-            int batch = charcoalBatch(wanted, nearbyFurnace || knownFurnace);
+            int handles = fieldWood.handleSticks(Math.min(needed, torches + 4 * wanted));
+            int batch = charcoalBatch(wanted, nearbyFurnace || knownFurnace, bench, handles);
+            if (batch == 0 && torches <= 3 && handles > PICK_HANDLES) {
+                // A low-light leg may need one batch before there is enough wood for a spare pick.
+                handles = PICK_HANDLES;
+                batch = charcoalBatch(1, nearbyFurnace || knownFurnace, bench, handles);
+            }
             // Before paying for a short batch, use an actual local supply if it can
             // support a longer trip. An unseen tree isn't a reason to hold departure.
             if (localTopUp && (canFire || has(STONE, 8)) && Math.abs(batch) < wanted
                 && takeLocalLightTimber()) return true;
-            if (canFire && prepareCharcoal(batch)) return true;
+            if (canFire && prepareCharcoal(batch, handles)) return true;
             if (!canFire && batch != 0 && workOre(Resource.STONE, REACH - 0.35, false)) {
                 status = "gathering local furnace stone";
                 return true;
@@ -3743,7 +3775,7 @@ final class AgentProgress {
                 int missingStone = 8 - hands.count(STONE);
                 if (!canFire && batch != 0 && missingStone > 0
                     && pickUses(STONE_PICK) + pickUses(WOOD_PICK) >= missingStone
-                    && prepareCharcoal(batch)) return true;
+                    && prepareCharcoal(batch, handles)) return true;
             }
         } else if (localTopUp && takeLocalLightTimber()) {
             return true;
@@ -3779,8 +3811,7 @@ final class AgentProgress {
     private boolean canSpareEmergencyStick(int torches) {
         // Convert the available fuel before starting a low-light survey for supplies.
         // A workable pick and the next four torches are worth more than one spare stick.
-        return torches <= 3 && (has(STICK, 1) || affordsWood(0, 3))
-            && pickUses(DEEP_PICK) + pickUses(STONE_PICK) > 6;
+        return torches <= 3 && affordsWood(0, 1) && pickUses(RETURNABLE_PICKS) > 6;
     }
 
     private boolean surveyLocalLight() {
@@ -3820,17 +3851,22 @@ final class AgentProgress {
         return waypoint >= 0 && (!replacement || groundedTrailIndex() - waypoint <= 12);
     }
 
-    private boolean prepareCharcoal(int batch) {
+    private boolean prepareCharcoal(int batch, int handles) {
         if (batch == 0 || has(TORCH, 3) && c.player.getBlockPos().equals(refusedCharcoalFoot)) return false;
         if (batch < 0) {
             status = "reserving workshop wood and preparing charcoal fuel";
             return hands.prepareSmeltFuel(true);
         }
+        charcoalHandleReserve = handles;
         fire(Firing.CHARCOAL, batch);
         return true;
     }
 
     private int charcoalBatch(int wanted, boolean existingFurnace) {
+        return charcoalBatch(wanted, existingFurnace, localTableWood(), PICK_HANDLES);
+    }
+
+    private int charcoalBatch(int wanted, boolean existingFurnace, int bench, int handles) {
         if (wanted == 0) return 0;
         var inventory = c.player.getInventory();
         var fuels = c.world.getFuelRegistry();
@@ -3851,9 +3887,9 @@ final class AgentProgress {
             }
         }
         if (burnable == 0) return 0;
-        int bench = localTableWood();
         int upfront = existingFurnace || has(furnace.item, 1) ? 0 : bench;
-        return new AgentMineLight.Wood(logs, burnable, rawStack, planks, plankHeat, sticks).charcoal(wanted, bench, upfront);
+        return new AgentMineLight.Wood(logs, burnable, rawStack, planks, plankHeat, sticks)
+            .charcoal(wanted, bench, upfront, handles);
     }
 
     private static int furnacePlanks(int batch) {
@@ -4010,6 +4046,7 @@ final class AgentProgress {
     private void finishFire() {
         if (portalSupplies != null) portalSupplies.smelting = false;
         firing = Firing.NONE;
+        charcoalHandleReserve = PICK_HANDLES;
         furnaceLoaded = false;
         furnaceNeedsFuel = false;
         furnaceBlockedFuel = ItemStack.EMPTY;
@@ -4652,10 +4689,10 @@ final class AgentProgress {
 
             int light = AgentMineLight.tripTorches(AgentMineLight.routeSteps(deepFoot.getY(), DIAMOND_LEVEL));
             int torches = hands.count(TORCH);
-            int batches = Math.min(3, Math.min(hands.count(FUEL), torchBatches(light, torches)));
-            int handles = handleSticks();
+            int handles = handleSticks(light);
             int bench = portableBenchWood();
-            if (batches > 0 && affordsWood(bench, batches + handles) && craftTorches(light)) return true;
+            int batches = availableTorchBatches(light, torches);
+            if (batches > 0 && craftTorchBatches(fundedTorchBatches(batches, torches, bench, handles, false))) return true;
             if (bench == 0 && !has(table.item, 1) && fieldBench.pack()) return true;
 
             if ((torches < light || !affordsWood(bench, handles)) && tick < deepUntil) {
@@ -4682,15 +4719,14 @@ final class AgentProgress {
                 }
                 if (torches < light && !has(FUEL, 1)) {
                     int wanted = AgentMineLight.charcoalNeeded(light, torches, 0);
-                    int batch = charcoalBatch(wanted, true);
-                    int charcoal = Math.abs(batch);
+                    int batch = charcoalBatch(wanted, true, bench, handles);
                     // A partial batch belongs to ordinary preparation, where reachable
                     // timber can turn it into a useful trip before the furnace is paid.
-                    if (charcoal == wanted && affordsWood(bench + 4 * charcoal + furnacePlanks(charcoal), charcoal + handles)) {
+                    if (Math.abs(batch) == wanted) {
                         BlockHitResult stove = body.find(FURNACE_BLOCK, 3.5, unreservedFurnaceFace).orElse(null);
                         if (stove != null) {
                             selectVisibleFurnace(stove);
-                            if (prepareCharcoal(batch)) return true;
+                            if (prepareCharcoal(batch, handles)) return true;
                         }
                     }
                 }
@@ -4813,8 +4849,12 @@ final class AgentProgress {
         }
 
         private int handleSticks() {
-            int litSteps = 7 * Math.max(1, Math.min(LOCAL_LIGHT, hands.count(TORCH) + 4 * hands.count(FUEL)) - 2);
-            return pickUses(DEEP_PICK) + pickUses(STONE_PICK) < 3 * litSteps ? 4 : 2;
+            return handleSticks(hands.count(TORCH) + 4 * hands.count(FUEL));
+        }
+
+        private int handleSticks(int light) {
+            int litSteps = 7 * Math.max(1, Math.min(LOCAL_LIGHT, light) - 2);
+            return has(STONE, 3) && pickUses(RETURNABLE_PICKS) < 3 * litSteps ? 2 * PICK_HANDLES : PICK_HANDLES;
         }
 
         private boolean finish() {

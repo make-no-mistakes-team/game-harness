@@ -3,6 +3,7 @@ package io.gameharness.survival;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -33,6 +34,7 @@ import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.GameMode;
 
 /** Measures actual progress; recovery is a bounded normal-input controller, not a new route planner. */
 final class AgentStallGuard {
@@ -63,6 +65,7 @@ final class AgentStallGuard {
     private static final int DEPARTURE_DRIVE_TICKS = 62;
     private static final int DEPARTURE_VIEWS = 2;
     private static final float DEPARTURE_PITCH = 33;
+    private static final int SITUATION_TRAVEL_TICKS = 72, SITUATION_RETURN_AGE = 1_100;
     private static final int PASSAGE_TICKS = 145;
     private static final int PASSAGE_BREAK_SETTLE_TICKS = 8;
     private static final int MAX_PASSAGES = 2;
@@ -162,6 +165,9 @@ final class AgentStallGuard {
     private final AgentHands hands;
     private final AgentTools tools;
     private final AgentWaterEscape water;
+    private final AgentExpedition expedition;
+    private final AgentSituationalRecovery situation;
+    private final BlockPos[] offeredRecoveryFooting;
     private final Predicate<BlockPos> protectedBlock;
     private final Predicate<BlockHitResult> safeSupport;
     private final Consumer<BlockPos> reached;
@@ -186,6 +192,7 @@ final class AgentStallGuard {
     private final ArrayList<FallingBlockEntity> passageFalling = new ArrayList<>(1);
     private final Set<BlockPos> drivenStances = new HashSet<>();
     private final Set<BlockPos> assessedSupports = new HashSet<>();
+    private final Set<BlockPos> failedRecoveryFooting;
     private final int[] inventory = new int[Registries.ITEM.size()];
     private final int[] inventorySample = new int[inventory.length];
     private final Item[] sampledItems = new Item[PlayerInventory.OFF_HAND_SLOT + 1];
@@ -252,10 +259,16 @@ final class AgentStallGuard {
     private boolean passageBroke;
     private long surveyFrame, passageBreakFrame;
     private boolean replanOnAssessment, safeIdle;
+    private BlockPos adviceFoot, methodFoot;
+    private Vec3d methodFeet;
+    private Direction methodBearing;
+    private AgentBody.HorizonTravel methodTravel;
+    private int situationTurnTick = -1, methodSince, methodViews, offeredRecoveryCount;
+    private boolean settlingMethod, methodMotion;
 
     AgentStallGuard(MinecraftClient client, AgentBody body, AgentHands hands, AgentTools tools,
                     Predicate<BlockPos> protectedBlock, Predicate<BlockHitResult> safeSupport,
-                    Consumer<BlockPos> reached, Function<BlockPos, String> mineHandback) {
+                    Consumer<BlockPos> reached, Function<BlockPos, String> mineHandback, AgentExpedition expedition) {
         this.client = client;
         this.body = body;
         this.hands = hands;
@@ -264,6 +277,10 @@ final class AgentStallGuard {
         this.safeSupport = safeSupport;
         this.reached = reached;
         this.mineHandback = mineHandback;
+        this.expedition = expedition;
+        situation = expedition == null ? null : new AgentSituationalRecovery();
+        offeredRecoveryFooting = expedition == null ? null : new BlockPos[16];
+        failedRecoveryFooting = expedition == null ? null : new HashSet<>();
         water = new AgentWaterEscape(client, body, hands, protectedBlock, safeSupport);
     }
 
@@ -516,7 +533,11 @@ final class AgentStallGuard {
             observedQuietAge = player.age;
         }
         // Blocked work has no task inputs to verify. Safety still updates the actual pose above.
-        if (phase == Phase.BLOCKED) return;
+        if (phase == Phase.BLOCKED) {
+            if (situation != null && situation.live(expedition.currentTick()) != null
+                    && inventoryGain(false, bootstrapTimber) == 2) situation.withdraw();
+            return;
+        }
         var receipt = hands.lastCraftReceipt();
         long sequence = receipt == null ? 0 : receipt.sequence();
         boolean crafted = sequence != craftSequence;
@@ -531,6 +552,7 @@ final class AgentStallGuard {
         boolean normal = phase == Phase.WATCH;
         boolean navigation = navigationTurn || phase == Phase.RETRY && navigationRetry;
         int gain = inventoryGain(navigation && !normal, bootstrapTimber);
+        if (gain == 2 && situation != null) situation.withdraw();
         double distance = feet.squaredDistanceTo(anchor);
         boolean newTravel = grounded && novelCells >= 2 && distance >= 4.0;
         boolean knownTravel = grounded && movedCells >= 4 && distance >= 25.0 && awayFromCredits(feet);
@@ -718,6 +740,276 @@ final class AgentStallGuard {
         } else if (phase == Phase.ALTERNATIVE) assessAgain("alternative refused: " + reason);
     }
 
+    AgentExpedition.Offer situationalOffer() {
+        if (situation == null || situationTurnTick != tick || phase == Phase.WATCH) return null;
+        var offer = situation.live(expedition.currentTick());
+        if (offer == null) return null;
+        if (!adviceFoot.equals(client.player.getBlockPos())
+                || offer.options.contains(AgentSituationalRecovery.RETURN) && recentReturn(adviceFoot) == null
+                || offer.options.contains(AgentSituationalRecovery.PASSAGE) && passageDirection(adviceFoot) == null) {
+            situation.withdraw();
+            return null;
+        }
+        return situationalReady() ? offer : null;
+    }
+
+    boolean situationalActive() { return situation != null && situation.active(); }
+
+    String situationalActivity() {
+        return situation == null ? null : situation.activity(expedition.currentTick());
+    }
+
+    List<AgentSituationalRecovery.Receipt> takeSituationalReceipts() {
+        return situation == null ? List.of() : situation.takeReceipts();
+    }
+
+    void endSituationalTurn() {
+        if (situation == null || situationTurnTick == tick) return;
+        if (situation.active() || !situationalInputs() || client.player.hurtTime != 0)
+            interruptSituational("another local task or safety took control");
+        else if (adviceFoot != null && !adviceFoot.equals(client.player.getBlockPos())) situation.withdraw();
+    }
+
+    void resetSituational() {
+        if (situation == null) return;
+        interruptSituational("the player or world changed");
+        situation.reset();
+        failedRecoveryFooting.clear();
+        Arrays.fill(offeredRecoveryFooting, null);
+        offeredRecoveryCount = 0;
+        adviceFoot = methodFoot = null;
+        situationTurnTick = -1;
+    }
+
+    void interruptSituational(String reason) {
+        if (situation == null) return;
+        situation.withdraw();
+        situationTurnTick = -1;
+        if (!situation.active()) return;
+        finishSituational(false, reason);
+        // This can run after safety has issued keys. Retire our intent only.
+        if (phase == Phase.DEPART || phase == Phase.PASSAGE)
+            transition(Phase.ASSESS, "situational recovery yielded to higher-priority local work");
+    }
+
+    /** Called only on the ordinary path, after safety and other protected owners declined. */
+    boolean situationalTurn(Runnable replan) {
+        if (situation == null) return false;
+        situationTurnTick = tick;
+        long now = expedition.currentTick();
+        if (situation.active()) {
+            if (situation.expired(now) || !situationalInputs() || client.player.hurtTime != 0) {
+                interruptSituational(situation.expired(now) ? "the advice expired" : "safe ordinary input was interrupted");
+                return false;
+            }
+            return runSituational();
+        }
+        if (phase == Phase.WATCH || !situationalInputs()) {
+            situation.withdraw();
+            return false;
+        }
+        if (adviceFoot != null && !adviceFoot.equals(client.player.getBlockPos())) situation.withdraw();
+        if (!situationalReady()) return false;
+        if (situation.canOffer() && situationalBoundary()) {
+            BlockPos foot = client.player.getBlockPos();
+            if (alreadyOfferedHere(foot)) return false;
+            adviceFoot = foot.toImmutable();
+            var methods = new ArrayList<AgentExpedition.Option>(3);
+            methods.add(AgentSituationalRecovery.NEW_GROUND);
+            if (recentReturn(adviceFoot) != null) methods.add(AgentSituationalRecovery.RETURN);
+            if (passageDirection(adviceFoot) != null) methods.add(AgentSituationalRecovery.PASSAGE);
+            situation.open(now, methods);
+            offeredRecoveryFooting[offeredRecoveryCount++ % offeredRecoveryFooting.length] = adviceFoot;
+        }
+        if (!situationalBoundary()) return false;
+        var offer = situationalOffer();
+        var advice = expedition.recoveryAdvice(offer);
+        if (advice == null || !situationalPrerequisite(advice.option(), adviceFoot)
+                || !expedition.acceptRecovery(advice, offer)) return false;
+        situation.accept(advice, now);
+        if (blockedReason == null) blockedReason = "repeated local work did not yield settled progress";
+        replan.run();
+        return runSituational();
+    }
+
+    private boolean alreadyOfferedHere(BlockPos foot) {
+        // Retrying ordinary inputs does not make another paid situation out of
+        // the same patch of ground, even if that retry raised a new incident number.
+        for (BlockPos prior : offeredRecoveryFooting)
+            if (prior != null && prior.getSquaredDistance(foot) <= 4) return true;
+        return false;
+    }
+
+    private boolean situationalInputs() {
+        return client.currentScreen == null && client.getOverlay() == null && client.isWindowFocused()
+            && client.interactionManager != null && client.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL
+            && client.getCameraEntity() == client.player && client.options.getPerspective().isFirstPerson()
+            && !client.player.isUsingItem() && !client.player.isOnFire() && !client.player.isTouchingWater()
+            && !client.player.isInLava() && !client.player.hasVehicle() && !body.lavaEmergency()
+            && !client.options.forwardKey.isUnbound() && !hands.busy();
+    }
+
+    private boolean situationalReady() {
+        return situationalInputs() && quietSupport() != null && body.hasRecentView()
+            && client.player.currentScreenHandler == client.player.playerScreenHandler
+            && client.player.currentScreenHandler.getCursorStack().isEmpty();
+    }
+
+    private boolean situationalBoundary() {
+        return phase == Phase.PENDING || phase == Phase.SCOUT && to == null
+            || phase == Phase.ASSESS || phase == Phase.BLOCKED;
+    }
+
+    private boolean situationalPrerequisite(AgentExpedition.Option method, BlockPos foot) {
+        return situationalReady() && (method == AgentSituationalRecovery.NEW_GROUND
+            || method == AgentSituationalRecovery.RETURN && recentReturn(foot) != null
+            || method == AgentSituationalRecovery.PASSAGE && passageDirection(foot) != null);
+    }
+
+    private Direction recentReturn(BlockPos foot) { return recentReturn(foot, null); }
+
+    private Direction recentReturn(BlockPos foot, BlockPos target) {
+        for (int i = flatCrossingCount - 1; i >= Math.max(0, flatCrossingCount - HISTORY); i--) {
+            FlatCrossing leg = flatCrossings[i % HISTORY];
+            if (leg == null) continue;
+            if (tick - leg.tick() > SITUATION_RETURN_AGE) break;
+            if (!leg.next().equals(foot) || !departures.canCross(foot, leg.previous())
+                    || target != null && !target.equals(leg.previous())
+                    || failedRecoveryFooting.contains(leg.previous())
+                    || !foot.equals(adviceFoot) && leg.previous().equals(adviceFoot)) continue;
+            return AgentDryLanding.bearing(foot, leg.previous());
+        }
+        return null;
+    }
+
+    private Direction passageDirection(BlockPos foot) {
+        if (!foot.equals(surveyFoot) || client.options.attackKey.isUnbound()) return null;
+        for (Direction direction : Direction.Type.HORIZONTAL)
+            if ((passageCues & 1 << direction.ordinal()) != 0 && passageEligible(foot, direction)) return direction;
+        return null;
+    }
+
+    private boolean runSituational() {
+        var method = situation.method();
+        if (!situation.started()) {
+            var player = client.player;
+            BlockPos foot = player.getBlockPos();
+            if (!situationalPrerequisite(method, foot)) {
+                finishSituational(false, "the method's local prerequisites no longer held");
+                return false;
+            }
+            situation.start();
+            methodFoot = foot.toImmutable();
+            methodFeet = player.getPos();
+            methodSince = tick;
+            methodViews = 0;
+            methodMotion = settlingMethod = false;
+            if (method == AgentSituationalRecovery.PASSAGE) beginPassage(passageDirection(foot));
+            else if (method == AgentSituationalRecovery.RETURN) methodBearing = recentReturn(foot);
+            else {
+                Direction facing = player.getHorizontalFacing();
+                Direction back = recentReturn(foot);
+                methodBearing = back != null ? back.getOpposite()
+                    : (incidents & 1) == 0 ? facing.rotateYClockwise() : facing.rotateYCounterclockwise();
+                methodTravel = situationalTravel(methodBearing);
+                attempts++;
+                transition(Phase.ASSESS, "trying a short dry departure away from the refused work");
+            }
+        }
+        if (phase == Phase.PASSAGE) clearPassage();
+        else if (phase == Phase.DEPART) {
+            methodMotion |= client.options.forwardKey.isPressed()
+                && horizontalDistance(methodFeet, client.player.getPos()) >= 0.12;
+            depart();
+        } else if (method == AgentSituationalRecovery.RETURN) {
+            if (quietSupport() == null || recentReturn(methodFoot) != methodBearing
+                    || !methodFoot.equals(client.player.getBlockPos()) || tick - methodSince >= DEPARTURE_LOOK_TICKS) {
+                assessAgain("could not recheck the walked dry crossing");
+            } else {
+                float yaw = methodBearing.getPositiveHorizontalDegrees();
+                body.turn(yaw, DEPARTURE_PITCH);
+                if (body.renderedDirection(yaw, DEPARTURE_PITCH, 6)) {
+                    surveyFoot = methodFoot;
+                    int length = visibleDeparture(methodBearing, true);
+                    if (length > 0) beginDeparture(methodBearing, length);
+                }
+            }
+        } else driveSituationalGround();
+        return true;
+    }
+
+    private AgentBody.HorizonTravel situationalTravel(Direction direction) {
+        return AgentBody.HorizonTravel.groundScout(null, methodFeet.add(
+            direction.getOffsetX() * 3.1, 0, direction.getOffsetZ() * 3.1), 0.32);
+    }
+
+    private void driveSituationalGround() {
+        var player = client.player;
+        double distance = horizontalDistance(methodFeet, player.getPos());
+        BlockPos foot = player.getBlockPos();
+        if (methodTravel.moved() && distance >= 1.65 && departures.newLanding(foot)
+                && !failedRecoveryFooting.contains(foot) && safeDryContact() && standingOn(foot)) settlingMethod = true;
+        if (settlingMethod) {
+            body.stopHorizonTravel(methodTravel);
+            if (quietSupport() != null) finishSituationalLanding(foot);
+            else if (tick - methodSince >= 2 * SITUATION_TRAVEL_TICKS)
+                assessAgain("movement did not settle on safe dry footing");
+            return;
+        }
+        if (tick - methodSince < SITUATION_TRAVEL_TICKS) {
+            if (!body.hasRecentView()) return;
+            var turn = body.driveHorizon(methodTravel, false, false);
+            if (turn != AgentBody.HorizonResult.BLOCKED) return;
+        }
+        if (!methodTravel.moved() && methodFoot.equals(player.getBlockPos()) && quietSupport() != null) {
+            var rise = body.ordinaryGrade(Vec3d.ofBottomCenter(methodFoot.offset(methodBearing)));
+            if (rise != null && methodFoot.equals(rise.from()) && rise.bearing() == methodBearing
+                    && departures.canRise(rise.from(), rise.to()) && !failedRecoveryFooting.contains(rise.to())) {
+                body.stopHorizonTravel(methodTravel);
+                methodTravel = null;
+                departureRise = rise;
+                if (!startRise(rise)) transition(Phase.DEPART, "checking the dry top of the visible rise");
+                return;
+            }
+        }
+        if (methodViews++ == 0 && !methodTravel.moved() && methodFoot.equals(player.getBlockPos())
+                && quietSupport() != null) {
+            body.stopHorizonTravel(methodTravel);
+            Direction back = recentReturn(methodFoot);
+            methodBearing = back == methodBearing.getOpposite() ? methodBearing.rotateYClockwise()
+                : methodBearing.getOpposite();
+            methodTravel = situationalTravel(methodBearing);
+            methodSince = tick;
+        } else assessAgain("the bounded departure did not reach different dry footing");
+    }
+
+    private void finishSituationalLanding(BlockPos foot) {
+        double distance = horizontalDistance(methodFeet, client.player.getPos());
+        boolean driven = methodTravel == null ? methodMotion : methodTravel.moved();
+        boolean different = !methodFoot.equals(foot) && !failedRecoveryFooting.contains(foot)
+            && (methodTravel == null || departures.newLanding(foot));
+        boolean landed = safeDryContact() && standingOn(foot);
+        if (!AgentSituationalRecovery.provesLanding(driven, different, landed, distance, methodTravel != null)) {
+            assessAgain("there was no verified voluntary displacement onto different dry footing");
+            return;
+        }
+        body.pauseWork();
+        failedRecoveryFooting.add(methodFoot); // A subsequent retreat cannot simply undo this step.
+        departures.stoodOn(foot);
+        reached.accept(foot);
+        finishSituational(true, "settled on different dry footing, " + Math.round(distance * 10) / 10.0
+            + " blocks from this method's start");
+        retry("settled on different checked footing after the situational method; ordinary work must still produce results");
+    }
+
+    private static double horizontalDistance(Vec3d from, Vec3d to) { return Math.hypot(to.x - from.x, to.z - from.z); }
+
+    private void finishSituational(boolean verified, String evidence) {
+        if (methodTravel != null) body.stopHorizonTravel(methodTravel);
+        methodTravel = null;
+        situation.result(expedition.currentTick(), verified, evidence);
+    }
+
     /** Called only after the existing danger, hands, screen and food owners have declined this tick. */
     boolean takeTurn(Runnable replan, Supplier<String> chooseAlternative, Supplier<Alternative> workAlternative,
                      Runnable releaseAlternative, boolean mineRetryLease, BlockPos witnessedLowCeiling) {
@@ -902,11 +1194,15 @@ final class AgentStallGuard {
     }
 
     private int visibleDeparture(Direction direction) {
+        return visibleDeparture(direction, false);
+    }
+
+    private int visibleDeparture(Direction direction, boolean retreat) {
         BlockPos prior = surveyFoot;
         int length = 0;
         for (int i = 0; i < departurePath.length; i++) {
             BlockPos cell = prior.offset(direction);
-            if (!departures.canCross(prior, cell)) break;
+            if (!departures.canCross(prior, cell) || retreat && recentReturn(prior, cell) != direction) break;
             BlockState top = body.overlandTop(cell.down(), direction, DRY_DANGER);
             if (top == null) break;
             Vec3d inside = Vec3d.ofBottomCenter(cell).add(direction.getOffsetX() * 0.24, 0, direction.getOffsetZ() * 0.24);
@@ -918,7 +1214,7 @@ final class AgentStallGuard {
             length++;
         }
         for (; length > 0; length--) {
-            if (departures.newLanding(departurePath[length - 1])
+            if ((retreat || departures.newLanding(departurePath[length - 1]))
                     && body.overlandLane(surveyFoot, departurePath, departureSupports, length, direction, DRY_DANGER))
                 return length;
         }
@@ -961,24 +1257,30 @@ final class AgentStallGuard {
         for (Direction direction : Direction.Type.HORIZONTAL) {
             int bit = 1 << direction.ordinal();
             if ((passageCues & bit) == 0) continue;
+            if (passageEligible(surveyFoot, direction)) {
+                beginPassage(direction);
+                return true;
+            }
             passageCues &= ~bit;
-            if (!passageEligible(surveyFoot, direction)) continue;
-            passageFrom = surveyFoot;
-            passageTo = passageFrom.offset(direction);
-            triedPassages.add(passageTo);
-            passageBearing = direction;
-            passageSince = tick;
-            passageBreakAt = 0;
-            passageStage = PassageStage.HEAD;
-            passageOpening = new Box(passageTo).expand(0, 1.5, 0);
-            passageCut = null;
-            passageBroke = false;
-            attempts++;
-            transition(Phase.PASSAGE, "checking the witnessed side passage around the low ceiling toward "
-                + passageTo.toShortString());
-            return true;
         }
         return false;
+    }
+
+    private void beginPassage(Direction direction) {
+        passageCues &= ~(1 << direction.ordinal());
+        passageFrom = surveyFoot;
+        passageTo = passageFrom.offset(direction);
+        triedPassages.add(passageTo);
+        passageBearing = direction;
+        passageSince = tick;
+        passageBreakAt = 0;
+        passageStage = PassageStage.HEAD;
+        passageOpening = new Box(passageTo).expand(0, 1.5, 0);
+        passageCut = null;
+        passageBroke = false;
+        attempts++;
+        transition(Phase.PASSAGE, "checking the witnessed side passage around the low ceiling toward "
+            + passageTo.toShortString());
     }
 
     private void clearPassage() {
@@ -1128,6 +1430,10 @@ final class AgentStallGuard {
         if (safe && body.hasRecentView() && foot.equals(ending) && standingOn(ending)
                 && player.getVelocity().horizontalLengthSquared() <= 0.0025
                 && centerMargin(player.getPos(), ending) >= 0.27) {
+            if (situationalActive()) {
+                finishSituationalLanding(ending);
+                return;
+            }
             body.pauseWork();
             reached.accept(ending);
             retry("settled on different witnessed footing at " + ending.toShortString() + "; returning to ordinary play");
@@ -1183,6 +1489,10 @@ final class AgentStallGuard {
                     assessAgain("witnessed rise did not settle onto its exact dry support");
                     return;
                 }
+                if (situationalActive()) {
+                    finishSituationalLanding(tread.to);
+                    return;
+                }
                 body.pauseWork();
                 reached.accept(tread.to);
                 retry("settled on different witnessed footing after a one-block rise; returning to ordinary play");
@@ -1191,6 +1501,7 @@ final class AgentStallGuard {
     }
 
     private void assessAgain(String reason) {
+        if (situationalActive()) finishSituational(false, reason);
         body.pauseWork();
         alternativeCheckAt = tick;
         surveySince = tick;
@@ -1206,6 +1517,7 @@ final class AgentStallGuard {
     }
 
     private void resetWorld() {
+        resetSituational();
         world = client.world;
         water.clearEpisode();
         departures.clear();
@@ -1330,6 +1642,11 @@ final class AgentStallGuard {
         incidents++;
         incidentTick = tick;
         incidentFrom = client.player.getBlockPos().toImmutable();
+        if (situation != null) {
+            situation.incident(incidents, reason);
+            failedRecoveryFooting.clear();
+            failedRecoveryFooting.add(incidentFrom);
+        }
         triedStances.clear();
         rejectedStances.clear();
         triedCuts.clear();
@@ -2092,7 +2409,14 @@ final class AgentStallGuard {
     }
 
     private void nextAttempt(String reason) {
+        recordRecoveryFailure(reason);
         transition(Phase.PENDING, reason);
+    }
+
+    private void recordRecoveryFailure(String reason) {
+        if (situation == null) return;
+        situation.failure(reason);
+        if (quietSupport() != null) failedRecoveryFooting.add(client.player.getBlockPos().toImmutable());
     }
 
     private void fail(String reason) {
@@ -2100,6 +2424,7 @@ final class AgentStallGuard {
         replanOnAssessment = phase == Phase.RETRY || !tookControl;
         if ((phase == Phase.STEP || phase == Phase.SETTLE) && quietSupport() == null)
             reason += "; last observed pose unstable (no settled dry support)";
+        recordRecoveryFailure(reason);
         body.pauseWork();
         observedQuietSupport = quietSupport();
         observedQuietAge = client.player.age;
@@ -2120,7 +2445,10 @@ final class AgentStallGuard {
             departureTread = null;
         }
         phase = next;
-        if (next == Phase.WATCH) blockedReason = null;
+        if (next == Phase.WATCH) {
+            blockedReason = null;
+            if (situation != null) situation.withdraw();
+        }
         entered = tick;
         report = new Report(incidents, attempts, recoveries, failures, next.name().toLowerCase(java.util.Locale.ROOT),
             detail, ++eventSequence, incidentTick);

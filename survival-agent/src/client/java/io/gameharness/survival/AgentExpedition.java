@@ -13,6 +13,7 @@ import java.nio.file.attribute.PosixFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.nio.file.attribute.UserPrincipal;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -32,19 +33,40 @@ final class AgentExpedition {
     private static final Set<String> MARKER_FIELDS = Set.of("v", "run");
     private static final Set<String> ADVICE_FIELDS =
         Set.of("v", "run", "life", "goal", "id", "basisTick", "expiresTick", "need", "option");
+    private static final Set<String> RECOVERY_ADVICE_FIELDS =
+        Set.of("v", "run", "life", "goal", "id", "basisTick", "expiresTick", "need", "option", "subgoal", "steps");
     private static final Set<PosixFilePermission> PRIVATE_FILE = PosixFilePermissions.fromString("rw-------");
     private static final Set<PosixFilePermission> PRIVATE_DIRECTORY = PosixFilePermissions.fromString("rwx------");
 
     record Option(String id, String summary) {}
+    record Recovery(long incident, List<String> history) {
+        Recovery {
+            history = List.copyOf(history);
+            if (incident <= 0 || incident > MAX_SAFE_INTEGER || history.isEmpty() || history.size() > 5
+                    || history.stream().anyMatch(line -> !shortText(line)))
+                throw new IllegalArgumentException("Invalid recovery incident");
+        }
+    }
+    record RecoveryPlan(String subgoal, List<Option> steps) {}
 
     // Identity distinguishes one opening from a later opportunity advertising the same strategies.
     static final class Offer {
         final String need;
         final List<Option> options;
+        final Recovery recovery;
 
         Offer(String need, Option... options) {
+            if (need.equals("situational_recovery")) throw new IllegalArgumentException("Missing recovery incident");
             this.need = need;
             this.options = List.of(options);
+            recovery = null;
+        }
+
+        Offer(Recovery recovery, List<Option> options) {
+            if (options.isEmpty() || options.size() > 8) throw new IllegalArgumentException("Invalid recovery options");
+            need = "situational_recovery";
+            this.recovery = recovery;
+            this.options = List.copyOf(options);
         }
 
         Option option(String id) {
@@ -56,7 +78,7 @@ final class AgentExpedition {
     record Applied(String id, String option, long tick) {}
     record Snapshot(int life, long tick, Offer offer, JsonObject inventory, float health, int food,
                     String activity, Applied applied) {}
-    record Candidate(int life, long basis, long expires, String id, Offer offer, Option option) {
+    record Candidate(int life, long basis, long expires, String id, Offer offer, Option option, RecoveryPlan recovery) {
         boolean current(int currentLife, long now, Offer live) {
             return life == currentLife && offer == live && basis <= now && now <= expires;
         }
@@ -68,11 +90,16 @@ final class AgentExpedition {
         private Applied applied;
 
         Option take(Candidate candidate, int life, long tick, Offer offer, boolean safe) {
-            if (!safe || candidate == null || offer == null || committed.contains(offer)
-                    || !candidate.current(life, tick, offer) || !used.add(candidate.id)) return null;
+            return safe && candidate != null && candidate.recovery == null && accept(candidate, life, tick, offer)
+                ? candidate.option : null;
+        }
+
+        private boolean accept(Candidate candidate, int life, long tick, Offer offer) {
+            if (offer == null || committed.contains(offer) || !candidate.current(life, tick, offer)
+                    || !used.add(candidate.id)) return false;
             committed.add(offer);
             applied = new Applied(candidate.id, candidate.option.id, tick);
-            return candidate.option;
+            return true;
         }
 
         Applied applied() { return applied; }
@@ -148,8 +175,21 @@ final class AgentExpedition {
         this.tick = tick;
     }
 
+    long currentTick() { return tick; }
+
     Option take(Offer offer, boolean safe) {
         return enabled && !closed ? choice.take(candidate, life, tick, offer, safe) : null;
+    }
+
+    Candidate recoveryAdvice(Offer offer) {
+        Candidate latest = candidate;
+        return enabled && !closed && offer != null && latest != null && latest.recovery != null
+            && latest.current(life, tick, offer) ? latest : null;
+    }
+
+    boolean acceptRecovery(Candidate reviewed, Offer offer) {
+        return enabled && !closed && reviewed != null && reviewed.recovery != null
+            && choice.accept(reviewed, life, tick, offer);
     }
 
     boolean hasAdvice(Offer offer) {
@@ -268,6 +308,15 @@ final class AgentExpedition {
                 }
             }
             value.add("options", options);
+            if (snap.offer != null && snap.offer.recovery != null) {
+                Recovery incident = snap.offer.recovery;
+                var recovery = new JsonObject();
+                recovery.addProperty("incident", incident.incident);
+                var history = new JsonArray(incident.history.size());
+                for (String failure : incident.history) history.add(failure);
+                recovery.add("history", history);
+                value.add("recovery", recovery);
+            }
             value.add("inventory", snap.inventory);
             value.addProperty("health", snap.health);
             value.addProperty("food", snap.food);
@@ -293,7 +342,8 @@ final class AgentExpedition {
         Candidate readAdvice() {
             try {
                 JsonObject value = read(advice);
-                if (value == null || !value.keySet().equals(ADVICE_FIELDS) || !header(value)
+                if (value == null || !(value.keySet().equals(ADVICE_FIELDS) || value.keySet().equals(RECOVERY_ADVICE_FIELDS))
+                        || !header(value)
                         || !goal.equals(text(value, "goal"))) return null;
                 long life = integer(value, "life"), tick = integer(value, "basisTick");
                 long until = integer(value, "expiresTick");
@@ -304,10 +354,28 @@ final class AgentExpedition {
                 if (!UUID.matcher(id).matches() || !TOKEN.matcher(need).matches() || !TOKEN.matcher(option).matches()
                         || !basis.offer.need.equals(need)) return null;
                 Option admitted = basis.offer.option(option);
-                return admitted == null ? null : new Candidate(basis.life, tick, until, id, basis.offer, admitted);
+                if (admitted == null) return null;
+                boolean recovery = basis.offer.recovery != null;
+                if (recovery != value.keySet().equals(RECOVERY_ADVICE_FIELDS)) return null;
+                RecoveryPlan plan = recovery ? recoveryPlan(value, basis.offer, admitted) : null;
+                return recovery && plan == null ? null : new Candidate(basis.life, tick, until, id, basis.offer, admitted, plan);
             } catch (RuntimeException invalid) {
                 return null;
             }
+        }
+
+        private static RecoveryPlan recoveryPlan(JsonObject value, Offer offer, Option first) {
+            String subgoal = text(value, "subgoal");
+            var ids = value.getAsJsonArray("steps");
+            if (!shortText(subgoal) || ids.isEmpty() || ids.size() > 3) return null;
+            var steps = new ArrayList<Option>(ids.size());
+            for (var id : ids) {
+                if (!id.isJsonPrimitive() || !id.getAsJsonPrimitive().isString()) return null;
+                Option method = offer.option(id.getAsString());
+                if (method == null || steps.contains(method)) return null;
+                steps.add(method);
+            }
+            return steps.getFirst() == first ? new RecoveryPlan(subgoal, List.copyOf(steps)) : null;
         }
 
         private boolean header(JsonObject value) {
@@ -355,5 +423,18 @@ final class AgentExpedition {
             if (!scalar.isString()) throw new IllegalArgumentException(field);
             return scalar.getAsString();
         }
+    }
+
+    static boolean shortText(String text) {
+        if (text.isBlank() || text.length() > 240) return false;
+        int bytes = 0;
+        for (int i = 0; i < text.length();) {
+            int point = text.codePointAt(i);
+            if (point < 32 || point == 127 || point >= 0xd800 && point <= 0xdfff) return false;
+            bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+            if (bytes > 240) return false;
+            i += Character.charCount(point);
+        }
+        return true;
     }
 }

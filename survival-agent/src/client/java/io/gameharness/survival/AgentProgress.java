@@ -549,7 +549,7 @@ final class AgentProgress {
         this.pendingFurnaceMemory = pendingFurnaceMemory;
         tools = new AgentTools(c, hands);
         stallGuard = new AgentStallGuard(c, body, hands, tools, this::protectRecoveryBlock, this::safeSupport,
-            this::recordStallFooting, this::tryStallMineHandback);
+            this::recordStallFooting, this::tryStallMineHandback, expedition);
         overland = new AgentOverlandSearch(c, body, AgentProgress::dangerous);
         caves = new AgentCaves(c, body, hands, tools, this::recordCaveFooting, this::recordDryCaveFooting,
             this::detachMine, this::recordOneWayCaveLanding, this::knownCaveReturn,
@@ -898,6 +898,7 @@ final class AgentProgress {
     }
 
     void resetExpedition() {
+        stallGuard.resetSituational();
         prospecting = null;
         prospectingOre = null;
         prospected = 0;
@@ -908,6 +909,8 @@ final class AgentProgress {
     }
 
     AgentExpedition.Offer expeditionOffer() {
+        var recovery = stallGuard.situationalOffer();
+        if (recovery != null || stallGuard.situationalActive()) return recovery;
         var ore = prospecting == null ? null : prospecting.live();
         if (ore != null && (prospectingOre == Resource.IRON
                 ? !has(DEEP_PICK, 1) && hands.count(INGOT) + hands.count(RAW_IRON) < 3
@@ -918,6 +921,8 @@ final class AgentProgress {
     String expeditionActivity(boolean fleeing) {
         if (fleeing || body.lavaEmergency() || defense.meleeActive() || defense.rangedActive())
             return "Responding to an immediate threat.";
+        String recovery = stallGuard.situationalActivity();
+        if (recovery != null) return recovery;
         if (firing != Firing.NONE) return "Preparing or using a furnace.";
         if (hands.busy() || c.currentScreen != null) return "Using the inventory or a workstation.";
         if (mealUntil != 0 || forage != null) return "Eating or gathering food.";
@@ -948,6 +953,14 @@ final class AgentProgress {
         status = "looking for nearby drops after respawn";
     }
 
+    void interruptSituationalRecovery() {
+        stallGuard.interruptSituational("a primed creeper took priority");
+    }
+
+    List<AgentSituationalRecovery.Receipt> takeSituationalReceipts() {
+        return stallGuard.takeSituationalReceipts();
+    }
+
     void tick(AgentEars ears, AgentMacroControl macro) {
         if (win || c.player == null || c.world == null) return;
         tick++;
@@ -975,6 +988,7 @@ final class AgentProgress {
                 || ordinarySurfaceWork && localFurnace != null && !localFurnace.lost
                     && localFurnace.watch.active() && !localFurnace.watch.recheckDue(tick), bootstrapTimber);
         advance(ears, macro);
+        stallGuard.endSituationalTurn();
         BlockPos newCaveLight = caves.takeLightReceipt();
         if (newCaveLight != null) stallGuard.stairLightReceipt(newCaveLight);
         returnableMine.interruptIfSkipped();
@@ -1217,6 +1231,11 @@ final class AgentProgress {
                 caves.leaveDrySurvey(tick);
                 return;
             }
+        }
+        if (stallGuard.situationalTurn(stallReplan)) {
+            body.prioritizeMovement();
+            status = stallGuard.status();
+            return;
         }
         if (stallGuard.takeTurn(stallReplan, stallChoose, stallStep, stallRelease,
                 mineRetryLease, returnableMine.witnessedLowCeiling())) {

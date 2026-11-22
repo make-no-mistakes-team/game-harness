@@ -706,6 +706,7 @@ public final class AgentClient implements ClientModInitializer {
         long planningDeadlineNs = fuse == null || macro == null ? 0 : macro.planningIdleDeadlineNanos();
         boolean fleeing = ears.interruptForFuse(hands);
         if (fleeing) {
+            progress.interruptSituationalRecovery();
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             if (macro != null) macro.urgent("evading a primed creeper");
             ears.escape(body);
@@ -985,6 +986,7 @@ public final class AgentClient implements ClientModInitializer {
     private void publishExpedition(ClientPlayerEntity player, boolean offerAllowed, String activity) {
         expedition.begin(1 + respawns, tick);
         var offer = offerAllowed ? progress.expeditionOffer() : null;
+        if (offer != null && offer.recovery != null && renderedScreen != null) offer = null;
         if (!expedition.shouldPublish(offer, activity)) return;
         var counts = new JsonObject();
         if (player != null) {
@@ -1019,7 +1021,9 @@ public final class AgentClient implements ClientModInitializer {
         boolean planningChanged = !planningState.equals(lastPlanningState)
             || !planningEvidence.equals(lastPlanningEvidence) || purposefulTick != lastPurposefulTick;
         boolean ownerChanged = !owner.equals(lastOwner);
-        if (tick % 2 == 0 || ended || boundary || ownerChanged || macro != null && macro.trial())
+        var situationalReceipts = progress.takeSituationalReceipts();
+        if (tick % 2 == 0 || ended || boundary || ownerChanged || !situationalReceipts.isEmpty()
+                || macro != null && macro.trial())
             recordMovement(client, player, status);
         if (ended) closeMovement();
         String handStatus = hands.status();
@@ -1051,7 +1055,8 @@ public final class AgentClient implements ClientModInitializer {
         boolean privateTransition = surveyTransition != null || wallTransition != null;
         boolean touchingWater = player != null && player.isTouchingWater();
         boolean changed = screenChanged || ownerChanged || planningChanged || newReturnableDrop || !status.equals(lastStatus)
-            || !handStatus.equals(lastHands) || stall.eventSequence() != stallSequence || touchingWater != lastTouchingWater;
+            || !handStatus.equals(lastHands) || stall.eventSequence() != stallSequence || touchingWater != lastTouchingWater
+            || !situationalReceipts.isEmpty();
         if (changed || privateTransition || boundary || tick % 20 == 0 || ended || tick == 1) {
             JsonObject event = new JsonObject();
             event.addProperty("tick", tick);
@@ -1108,6 +1113,21 @@ public final class AgentClient implements ClientModInitializer {
                 }
             }
             event.add("inventory", counts);
+            if (!situationalReceipts.isEmpty()) {
+                var receipts = new JsonArray(situationalReceipts.size());
+                for (var recovery : situationalReceipts) {
+                    var proof = new JsonObject();
+                    proof.addProperty("advice", recovery.advice());
+                    proof.addProperty("incident", recovery.incident());
+                    proof.addProperty("method", recovery.method());
+                    proof.addProperty("outcome", recovery.outcome());
+                    proof.addProperty("completed", recovery.completed());
+                    proof.addProperty("total", recovery.total());
+                    proof.addProperty("detail", recovery.detail());
+                    receipts.add(proof);
+                }
+                event.add("situational_recovery", receipts);
+            }
             event.addProperty("yaw_travel", yawTravel);
             event.addProperty("pitch_travel", pitchTravel);
             event.addProperty("sprint_ticks", sprintTicks);

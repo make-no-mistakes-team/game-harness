@@ -37,8 +37,11 @@ To use a strategy advisor, choose **Terra (gpt-6.1-terra)** under
 mining, and threat response from the start. It keeps pursuing the goal while
 Terra thinks, declines to choose, runs out of requests, or cannot connect.
 With a connected account, Terra can see the goal, carried items, health,
-hunger, current activity, and the strategies the player can use. Ordinary
-advice uses text, not screenshots. Requests count toward account usage.
+hunger, current activity, and the strategies the player can use. Routine
+route choices use text. If local work repeatedly fails, the advisor can
+also receive a first-person image from the private game display and a short
+history of failed attempts. The exact image sent is kept with the private
+run evidence. Requests count toward account usage.
 
 From the terminal, select the advisor before the goal:
 
@@ -49,6 +52,10 @@ bun run play:agent --strategy terra --macro-requests 8 diamond 1800
 Advice changes a method at a safe decision point. It cannot authorize a
 click, spend an item, or make the player stop. A native acknowledgment
 means the player used the suggested method, not that it found the resource.
+For a stall, Terra can propose a short subgoal in its own words and up
+to three successive steps. The player checks each step from its current
+position. A picture does not authorize a click or
+prove there is safe ground beyond a ledge. Combat never waits for advice.
 Vanilla inventory or dimension evidence verifies the goal separately.
 Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.
@@ -58,9 +65,10 @@ enough light for the return. When gathering timber on uneven ground,
 it approaches a stance where it can collect the log, not just reach
 the trunk with a swing. It makes the first pick as soon as it can pay
 for the pick and a bench; a shovel or axe joins the batch only when
-the remaining materials cover it. If natural foliage hides the route, the player
-can cut a neighboring leaf while keeping its own support. It must see
-and check the newly exposed footing before stepping down.
+the remaining materials cover it. If leaves hide the route, the player
+can cut a neighboring leaf while keeping its own support. It checks
+the exposed footing before stepping down. Choosing another trunk does
+not send it back onto the same failed collection spot.
 When gathering cobblestone, the player chooses a face close enough to
 collect the drop. If it breaks stone but cannot pick up the drop, it
 must change footing before quarrying another face. It can clear
@@ -68,10 +76,14 @@ settled gravel from beside the column, not from underneath it, and
 waits for falling material to settle. Under a low ceiling with no open
 exit, it can cut a short passage sideways from stable ground. It checks
 the newly exposed floor and headroom before stepping into the opening.
+If a stair is already dark, the player can turn a stick and coal into
+four torches and light its footing before opening the next cave lip.
 
 Incoming damage interrupts work even when knockback puts the player
 in water. The player can look toward a sound or seek a visible dry
 bank. A sound is not permission to swing at an unseen mob.
+If a retreat is blocked, the player can strike a hostile mob it can
+see and reach, including while being knocked back.
 Without a shield, the player can keep moving along a checked retreat
 or take visible solid cover between shots. A single dodge does not
 make it safe to resume mining. During calm inventory work

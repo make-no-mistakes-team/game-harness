@@ -18,6 +18,36 @@ final class AgentOverlandSearch {
     private enum Phase { CENTER, HORIZON, FLOOR, CLEARANCE, DRIVE, STOPPED }
     record Arrival(BlockPos from, BlockPos foot) {}
 
+    static boolean resourceInputAllowed(boolean safe, boolean grounded, boolean driving, boolean previousTurn) {
+        // An interrupted committed tread cannot resume, even if the player is now grounded.
+        return safe && (driving ? previousTurn : grounded);
+    }
+
+    /** A resource gives a direction and a stopping band, never a supporting surface. */
+    record ResourceGoal(Vec3d point, double arrival, double minFootY, double maxFootY) {
+        static final double SETTLE_PAD = 0.09;
+
+        boolean atHeight(double y) { return y >= minFootY && y <= maxFootY; }
+
+        boolean reached(Vec3d feet) {
+            // The real body can settle a fraction short of the nominal tile center.
+            return atHeight(feet.y) && horizontal(feet.x, feet.z) <= arrival + SETTLE_PAD;
+        }
+
+        boolean reached(BlockPos foot) {
+            return atHeight(foot.getY()) && horizontal(foot.getX() + 0.5, foot.getZ() + 0.5) <= arrival;
+        }
+
+        private double horizontal(double x, double z) {
+            return Math.hypot(x - point.x, z - point.z);
+        }
+
+        private double remaining(BlockPos foot) {
+            double height = Math.max(0, Math.max(minFootY - foot.getY(), foot.getY() - maxFootY));
+            return Math.max(0, horizontal(foot.getX() + 0.5, foot.getZ() + 0.5) - arrival) + 1.3 * Math.ceil(height);
+        }
+    }
+
     /** Only actual landings are remembered. A camera turn, offered floor, or motor request is not travel. */
     static final class Course {
         private final LongOpenHashSet walked = new LongOpenHashSet();
@@ -67,6 +97,13 @@ final class AgentOverlandSearch {
                 && !walked.contains(to.asLong());
         }
 
+        boolean offerResource(BlockPos from, BlockPos to, Direction lane, int alreadyProved,
+                              ResourceGoal goal, Predicate<BlockPos> witnessed) {
+            return canExtend(from, to, lane, alreadyProved) && !goal.reached(from)
+                && (goal.reached(to) || goal.remaining(to) + 0.09 < goal.remaining(from))
+                && witnessed.test(to);
+        }
+
         boolean arrived(BlockPos foot) {
             if (!walked.add(foot.asLong())) return false;
             if (crumbs.size() == RETRACE_LIMIT + 1) crumbs.removeFirst();
@@ -100,6 +137,7 @@ final class AgentOverlandSearch {
     private final Course course = new Course();
     private final BlockPos[] path = new BlockPos[MAX_LEG];
     private final BlockState[] supports = new BlockState[MAX_LEG];
+    private final Predicate<BlockPos> witnessFloor = this::witness;
     private Phase phase = Phase.CENTER;
     private Direction lane;
     private BlockPos stance, blockedStance, origin, landmark, returnFoot;
@@ -108,6 +146,7 @@ final class AgentOverlandSearch {
     private long skylineFrame;
     private double farthest;
     private boolean risingView, refused;
+    private ResourceGoal resource;
     private String status = "overland search: preparing to look for supplies";
 
     AgentOverlandSearch(MinecraftClient client, AgentBody body, Predicate<BlockState> dangerous) {
@@ -117,6 +156,8 @@ final class AgentOverlandSearch {
     }
 
     boolean driving() { return phase == Phase.DRIVE; }
+    boolean stopped() { return phase == Phase.STOPPED; }
+    boolean guidingResource(ResourceGoal goal) { return resource != null && resource == goal; }
     boolean guiding(int tick) { return landmark != null && tick < landmarkUntil; }
     boolean owns(BlockPos foot) { return foot.equals(stance) && phase != Phase.STOPPED; }
     boolean leased(int tick) { return stance != null && phase != Phase.STOPPED && tick - since <= DRIVE_TICKS; }
@@ -139,6 +180,7 @@ final class AgentOverlandSearch {
         stance = null;
         landmark = null;
         returnFoot = null;
+        resource = null;
     }
 
     /** Start a new search with a real preferred bearing, not a fictitious witnessed landmark. */
@@ -153,12 +195,18 @@ final class AgentOverlandSearch {
     }
 
     void guide(BlockPos witness, int tick) {
+        resource = null;
         landmark = witness;
         landmarkUntil = tick + 150;
         phase = Phase.CENTER;
         since = tick;
         option = 0;
         returnFoot = null;
+    }
+
+    void guideResource(ResourceGoal goal) {
+        restart(client.player.getHorizontalFacing());
+        resource = goal;
     }
 
     void changed(BlockPos position) {
@@ -205,11 +253,14 @@ final class AgentOverlandSearch {
         if (!body.hasRecentView()) return;
         switch (phase) {
             case CENTER -> {
-                if (!centered(stance, 0.14) || Math.abs(player.getY() - stance.getY()) > 0.055) {
-                    body.centerOnSupport(stance.down());
+                if (resource != null && resource.reached(player.getPos()) && settledMotion()) return;
+                double tolerance = resource != null && resource.reached(stance) ? 0.09 : 0.14;
+                if (!centered(stance, tolerance) || Math.abs(player.getY() - stance.getY()) > 0.055) {
+                    if (resource == null || !body.centerOnGroundedSupport(stance, body.dryCaveContact(stance)))
+                        body.centerOnSupport(stance.down());
                     status = "overland search: centering on the current foothold";
                 } else if (settledMotion()) {
-                    if (risingView || course.newFootings() - lastSkyline >= VIEW_INTERVAL) beginHorizon(tick);
+                    if (resource == null && (risingView || course.newFootings() - lastSkyline >= VIEW_INTERVAL)) beginHorizon(tick);
                     else beginBearing(tick);
                 }
             }
@@ -243,7 +294,7 @@ final class AgentOverlandSearch {
     private void beginBearing(int tick) {
         phase = Phase.FLOOR;
         Direction bearing = preferredBearing();
-        lane = landmark == null ? course.bearing(option) : switch (option) {
+        lane = landmark == null && resource == null ? course.bearing(option) : switch (option) {
             case 0 -> bearing;
             case 1 -> bearing.rotateYClockwise();
             case 2 -> bearing.rotateYCounterclockwise();
@@ -252,12 +303,13 @@ final class AgentOverlandSearch {
         length = 0;
         since = tick;
         status = "overland search: checking a continuous lane " + lane.asString()
-            + (landmark == null ? "" : " toward a witnessed supply landmark");
+            + (landmark == null && resource == null ? "" : " toward a witnessed supply site");
     }
 
     private Direction preferredBearing() {
-        if (landmark == null) return course.horizon();
-        int x = landmark.getX() - stance.getX(), z = landmark.getZ() - stance.getZ();
+        if (landmark == null && resource == null) return course.horizon();
+        double x = resource == null ? landmark.getX() - stance.getX() : resource.point.x - stance.getX() - 0.5;
+        double z = resource == null ? landmark.getZ() - stance.getZ() : resource.point.z - stance.getZ() - 0.5;
         if (Math.abs(x) > Math.abs(z)) return x > 0 ? Direction.EAST : Direction.WEST;
         if (z != 0) return z > 0 ? Direction.SOUTH : Direction.NORTH;
         return course.horizon();
@@ -269,6 +321,10 @@ final class AgentOverlandSearch {
         } else if (++option != 4) {
             beginBearing(tick);
         } else {
+            if (resource != null) {
+                stop("no goalward lane with visible dry footing and clearance");
+                return;
+            }
             returnFoot = course.previous(stance);
             if (returnFoot == null) {
                 stop("no new lane with visible dry footing and clearance");
@@ -285,8 +341,9 @@ final class AgentOverlandSearch {
 
     private void floors(int tick) {
         float yaw = lane.getPositiveHorizontalDegrees();
-        body.turn(yaw, FLOOR_PITCH);
-        if (!body.renderedDirection(yaw, FLOOR_PITCH, 5)) return;
+        float pitch = resource != null && stance.getY() > resource.maxFootY ? 45 : FLOOR_PITCH;
+        body.turn(yaw, pitch);
+        if (!body.renderedDirection(yaw, pitch, 5)) return;
         BlockPos next = stance.offset(lane);
         if (returnFoot != null) {
             if (!witness(returnFoot)) {
@@ -308,7 +365,8 @@ final class AgentOverlandSearch {
     }
 
     private boolean offer(BlockPos from, BlockPos next) {
-        return course.canExtend(from, next, lane, length) && witness(next);
+        return resource == null ? course.canExtend(from, next, lane, length) && witness(next)
+            : course.offerResource(from, next, lane, length, resource, witnessFloor);
     }
 
     private boolean witness(BlockPos next) {
@@ -322,7 +380,7 @@ final class AgentOverlandSearch {
     private void clearance(int tick) {
         float yaw = lane.getPositiveHorizontalDegrees();
         int rise = path[0].getY() - stance.getY();
-        float pitch = rise > 0 ? -6 : FLOOR_PITCH;
+        float pitch = rise > 0 ? -6 : rise < 0 && resource != null ? 45 : FLOOR_PITCH;
         body.turn(yaw, pitch);
         if (!body.renderedDirection(yaw, pitch, 5)) return;
         for (int i = 0; i < length; i++) {
@@ -406,7 +464,7 @@ final class AgentOverlandSearch {
 
     private void stop(String why) {
         phase = Phase.STOPPED;
-        blockedStance = stance;
+        if (resource == null) blockedStance = stance;
         refused = true;
         status = "overland search stopped at " + stance.toShortString() + ": " + why;
     }

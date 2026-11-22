@@ -49,10 +49,16 @@ Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.
 
 The player gathers supplies for the next stretch of mine, keeping
-enough light for the return. From solid footing it can cut a nearby
+enough light for the return. When gathering timber on uneven ground,
+it approaches a stance where it can collect the log, not just reach
+the trunk with a swing. From solid footing it can cut a nearby
 block. It can clear settled gravel from beside the column, not from
 underneath it, and waits for falling material to settle. A cut does
 not authorize a step into the opening.
+
+Incoming damage interrupts work even when knockback puts the player
+in water. The player can look toward a sound or seek a visible dry
+bank. A sound is not permission to swing at an unseen mob.
 
 During ordinary exploration the player can descend one or two blocks onto
 a visible, stable, dry landing with clear body space and no immediate

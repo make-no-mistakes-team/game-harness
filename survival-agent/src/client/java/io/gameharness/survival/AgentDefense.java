@@ -109,10 +109,12 @@ final class AgentDefense {
     private final RangedRetreat rangedRetreat = new RangedRetreat();
     private Vec3d rangedSource, rangedSurveyFrom;
     private BlockPos shelter;
-    private BlockState shelterState;
+    private BlockState shelterState, shelterUpper;
     private Vec3d shelterGoal;
-    private boolean crouchShelter, sheltered;
-    private int shelterScanAfter, shelterUntil, rangedPlacementBy;
+    private boolean sheltered;
+    private RangedWall rangedWall;
+    private String rangedFootingRefusal, rangedWallRefusal;
+    private int shelterScanAfter, shelterUntil, rangedSightAt;
     private float lastShotYaw, lastShotPitch;
     private AgentBody.OrdinaryGrade rangedGradeLook;
     private AgentSurfaceTread rangedGrade;
@@ -551,20 +553,31 @@ final class AgentDefense {
         float away() { return MathHelper.wrapDegrees(from + 180); }
     }
 
-    /** An audible shot can corroborate a hit, but cannot by itself start or indefinitely renew flight. */
+    /** Losing sight while turning away is not a quiet interval after an impact. */
     static final class RangedEpisode {
-        private static final int QUIET_TICKS = 90, SHOT_TO_HIT_TICKS = 18, COVER_QUIET_TICKS = 18;
+        private static final int SHOT_TO_HIT_TICKS = 18, COVER_TICKS = 34, SEPARATED_TICKS = 50;
         private int evidenceAt, coveredSince = -1, heardAt = -SHOT_TO_HIT_TICKS - 1;
+        private int pressureAt, lastHit = -1;
         private boolean active, hit;
 
-        boolean observe(int tick, boolean archerSeen, boolean shot, boolean damaged, boolean behindCover) {
+        boolean observe(int tick, boolean archerSeen, boolean shot, boolean damaged, boolean behindCover,
+                        boolean injured, boolean separated) {
             if (shot) heardAt = tick;
-            boolean recent = active && tick - evidenceAt < QUIET_TICKS;
-            hit = damaged && (archerSeen || recent || heardRecently(tick));
-            if (archerSeen || hit) evidenceAt = tick;
-            if (!behindCover || archerSeen || hit || !recent) coveredSince = -1;
+            hit = damaged && (archerSeen || active || heardRecently(tick));
+            if (hit) lastHit = tick;
+            if (archerSeen || hit) evidenceAt = pressureAt = tick;
+            // A matching shot can extend confirmed pressure, but ambient fire alone cannot
+            // claim movement or keep it forever when there is no new sighting or impact.
+            if (active && shot && tick - evidenceAt < 200) pressureAt = tick;
+            if (!behindCover || archerSeen || hit || !active) coveredSince = -1;
             else if (coveredSince < 0) coveredSince = tick;
-            active = (archerSeen || hit || recent) && (coveredSince < 0 || tick - coveredSince < COVER_QUIET_TICKS);
+            int quiet = lastHit < 0 ? 75 : injured ? 200 : 145;
+            int sincePressure = tick - pressureAt;
+            boolean covered = coveredSince >= 0 && tick - coveredSince >= COVER_TICKS && sincePressure >= COVER_TICKS;
+            active = archerSeen || hit || active && !covered
+                && !(separated && sincePressure >= SEPARATED_TICKS)
+                && (tick - evidenceAt < quiet || sincePressure < 75 && tick - evidenceAt < 260);
+            if (!active) lastHit = -1;
             return active;
         }
 
@@ -573,33 +586,32 @@ final class AgentDefense {
         void reset() {
             active = hit = false;
             heardAt = -SHOT_TO_HIT_TICKS - 1;
-            coveredSince = -1;
+            coveredSince = lastHit = -1;
         }
     }
 
-    /** Retain a rolling dry bearing. A lost tread asks for another rendered view, not a blind stride. */
+    /** One intended direction across many independently proved dry windows, not a string of dodge endpoints. */
     static final class RangedRetreat {
-        private static final float[] TURNS = {44, 82, 103, 0, -44, -82, -103};
-        private float away, bearing, side;
-        private double dirX, dirZ;
-        private int sector, missed, stalled, aimedAt;
-        private Vec3d lastFeet, landing;
-        private boolean advanced, exhausted;
+        private static final float[] TURNS = {0, 36, 68, 90, -36, -68, -90};
+        private float away, surveyBearing, bearing, side;
+        private int sector, aimedAt;
+        private Vec3d lastFeet, riskFrom;
+        private AgentBody.HorizonTravel travel;
+        private double progress;
+        private boolean exhausted;
 
         void start(int tick, float away, float now) {
             this.away = away;
-            side = MathHelper.wrapDegrees(now - away) < 0 ? -1 : 1;
+            float initial = Float.isFinite(away) ? away : now;
+            surveyBearing = initial;
+            side = MathHelper.wrapDegrees(now - initial) < 0 ? -1 : 1;
             sector = 0;
             exhausted = false;
-            if (turnDifference(away, now) <= 105) setBearing(tick, now);
-            else {
-                sector = 1;
-                setBearing(tick, away + side * TURNS[sector++]);
-            }
+            setBearing(tick, turnDifference(initial, now) <= 48 ? now : initial);
         }
 
         void prefer(int tick, float towardCover) {
-            if (turnDifference(away, towardCover) <= 110) {
+            if (!Float.isFinite(away) || turnDifference(away, towardCover) <= 100) {
                 exhausted = false;
                 setBearing(tick, towardCover);
             }
@@ -607,7 +619,7 @@ final class AgentDefense {
 
         void next(int tick) {
             while (sector < TURNS.length) {
-                float candidate = away + side * TURNS[sector++];
+                float candidate = surveyBearing + side * TURNS[sector++];
                 if (turnDifference(candidate, bearing) > 18) {
                     setBearing(tick, candidate);
                     return;
@@ -618,43 +630,44 @@ final class AgentDefense {
 
         private void setBearing(int tick, float requested) {
             bearing = MathHelper.wrapDegrees(requested);
-            double radians = Math.toRadians(bearing);
-            dirX = -Math.sin(radians);
-            dirZ = Math.cos(radians);
             aimedAt = tick;
-            missed = stalled = 0;
-            lastFeet = landing = null;
+            travel = null;
         }
 
-        AgentEmergencyFootwork.Action step(int tick, Vec3d feet, float viewYaw, float viewPitch,
-                                          boolean applied, AgentEmergencyFootwork.Terrain terrain) {
-            landing = null;
-            advanced = applied && lastFeet != null && Math.abs(feet.y - lastFeet.y) < 0.055
-                && (feet.x - lastFeet.x) * dirX + (feet.z - lastFeet.z) * dirZ >= 0.025;
-            if (applied) stalled = advanced ? 0 : stalled + 1;
+        void riskAt(Vec3d feet) {
+            riskFrom = feet;
+            progress = 0;
+        }
+
+        boolean sample(Vec3d feet, boolean applied) {
+            Vec3d from = lastFeet;
             lastFeet = feet;
-            if (exhausted) return AgentEmergencyFootwork.Action.BRACE;
-            if (!aligned(viewYaw, viewPitch)) {
-                if (Float.isFinite(viewYaw) && tick - aimedAt >= 26) next(tick);
-                return AgentEmergencyFootwork.Action.ALIGN;
-            }
-            if (stalled < 3 && !terrain.obstructed(bearing)) landing = terrain.dryLanding(bearing);
-            if (landing != null) {
-                missed = 0;
-                return AgentEmergencyFootwork.Action.DRIVE;
-            }
-            if (++missed >= 2) next(tick);
-            return AgentEmergencyFootwork.Action.ALIGN;
+            if (!applied || from == null || Math.abs(feet.y - from.y) > 0.055
+                    || feet.squaredDistanceTo(from) > 0.31) return false;
+            if (Float.isFinite(away))
+                progress = Math.max(0, progress + projected(from, feet, away));
+            return projected(from, feet, bearing) >= 0.025;
         }
 
-        boolean aligned(float yaw, float pitch) {
-            return turnDifference(yaw, bearing) <= AgentEmergencyFootwork.DRIVE_ALIGNMENT
-                && Math.abs(pitch - AgentEmergencyFootwork.PITCH) <= 8;
+        private static double projected(Vec3d from, Vec3d feet, float heading) {
+            double radians = Math.toRadians(heading);
+            return -(feet.x - from.x) * Math.sin(radians) + (feet.z - from.z) * Math.cos(radians);
+        }
+
+        boolean separated(Vec3d feet) {
+            return riskFrom != null && Float.isFinite(away) && progress >= 10
+                && projected(riskFrom, feet, away) >= 10;
+        }
+
+        AgentBody.HorizonTravel walk(Vec3d feet, Vec3d cover) {
+            if (travel == null || cover == null && feet.squaredDistanceTo(travel.goal) < 9) {
+                Vec3d goal = cover != null ? cover : feet.add(Vec3d.fromPolar(0, bearing).multiply(24));
+                travel = AgentBody.HorizonTravel.rangedRetreat(goal, away, cover == null);
+            }
+            return travel;
         }
 
         float bearing() { return bearing; }
-        boolean advanced() { return advanced; }
-        Vec3d landing() { return landing; }
     }
 
     boolean rangedActive() {
@@ -677,23 +690,31 @@ final class AgentDefense {
         rangedHitNow = hurt && !player.isOnFire() && !player.isTouchingWater() && !meleeHit;
         sheltered = wasActive && seen == null && !rangedHitNow && player.isOnGround() && !player.isTouchingWater()
             && holdsShelter(player.getPos());
-        boolean settled = sheltered && (!crouchShelter || player.isSneaking())
-            && player.getVelocity().horizontalLengthSquared() <= 0.0025;
-        if (!rangedEpisode.observe(tick, seen != null, cue != null, rangedHitNow, settled)) {
+        boolean settled = sheltered && player.getVelocity().horizontalLengthSquared() <= 0.0025;
+        Vec3d feet = player.getPos();
+        rangedRetreatReceipt = wasActive && rangedRetreat.sample(feet, !hurt && player.isOnGround()
+            && !player.isTouchingWater() && tick == rangedDriveTick + 1 && body.appliedEmergencyForward());
+        boolean supportingShot = cue != null && (!wasActive || rangedHitNow || !Float.isFinite(rangedYaw)
+            || turnDifference(cue.yaw(), rangedYaw) <= 45);
+        if (!rangedEpisode.observe(tick, seen != null, supportingShot, rangedHitNow, settled,
+                player.getHealth() <= 10, rangedRetreat.separated(feet))) {
             if (wasActive) clearOrdinaryRanged();
             return false;
         }
         if (!wasActive) {
             rangedCoverTried = false;
-            rangedPlacementBy = 0;
+            rangedFootingRefusal = "no lane checked";
+            rangedWallRefusal = "no supported wall yet";
             shelterScanAfter = tick;
             rangedSurveyFrom = null;
             rangedYaw = Float.NaN;
             rangedPitch = 10;
+            rangedRetreat.sample(feet, false);
         }
         float previous = rangedYaw;
         if (seen != null) {
             rangedSource = seen;
+            rangedSightAt = tick;
             aimRangedDirection(seen.subtract(player.getEyePos()));
         } else if (rangedEpisode.hit) {
             // A new impact contradicts cover of the old line. Audio and physical knockback
@@ -707,13 +728,25 @@ final class AgentDefense {
                 clearShelter();
                 rangedYaw = lastShotYaw;
                 rangedPitch = lastShotPitch;
-            } else if (rangedSource == null && player.getVelocity().horizontalLengthSquared() > 0.0064) {
+            } else if (rangedSource == null && !Float.isFinite(rangedYaw) && player.hurtTime >= 8
+                    && player.getVelocity().y > 0.06 && player.getVelocity().horizontalLengthSquared() > 0.0064) {
                 rangedYaw = MathHelper.wrapDegrees(yaw(player.getVelocity()) + 180);
             }
         }
-        if (Float.isFinite(previous) && (turnDifference(previous, rangedYaw) > 60
-                || seen != null && rangedSurveyFrom != null && turnDifference(rangedRetreat.bearing(), rangedYaw) < 65))
+        if (seen != null || rangedEpisode.hit) rangedRetreat.riskAt(feet);
+        if (rangedEpisode.hit) {
+            stopRangedWalk();
+            rangedWall = null;
+            rangedGrade = null;
+            rangedGradeLook = null;
+        }
+        boolean changedLine = Float.isFinite(rangedYaw)
+            && (!Float.isFinite(previous) || turnDifference(previous, rangedYaw) > 55);
+        if (rangedSurveyFrom != null && (changedLine
+                || seen != null && turnDifference(rangedRetreat.bearing(), rangedYaw) < 65)) {
+            stopRangedWalk();
             rangedSurveyFrom = null;
+        }
         return true;
     }
 
@@ -728,10 +761,12 @@ final class AgentDefense {
     }
 
     private void clearOrdinaryRanged() {
+        stopRangedWalk();
         clearShelter();
         rangedSource = rangedSurveyFrom = null;
         rangedGrade = null;
         rangedGradeLook = null;
+        rangedWall = null;
         rangedCover = null;
         rangedDriveTick = -1;
         sheltered = false;
@@ -784,7 +819,8 @@ final class AgentDefense {
 
     void rangedStep(int tick, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend) {
         boolean ordinary = rangedEpisode.active;
-        coverReceipt = rangedRetreatReceipt = false;
+        coverReceipt = false;
+        if (!ordinary) rangedRetreatReceipt = false;
         markDanger(tick);
         forgetContact();
         body.prioritizeMovement();
@@ -792,9 +828,8 @@ final class AgentDefense {
         status = ordinary ? "withdrawing from ranged danger"
             : rangedAudible ? "responding to a nearby skeleton shot" : "responding to a visible archer";
         // The fall controller has already had priority. Never add a movement key to the impulse.
-        if (ordinary && (rangedEpisode.hit || player.hurtTime > 0 && player.getVelocity().y > 0.06)) {
-            rangedGrade = null;
-            rangedGradeLook = null;
+        if (ordinary && (rangedEpisode.hit || player.hurtTime >= 8
+                || player.hurtTime > 0 && player.getVelocity().y > 0.06)) {
             body.pauseWork();
             body.prioritizeMovement();
             status = "ranged danger; letting the hit impulse settle";
@@ -809,7 +844,7 @@ final class AgentDefense {
         }
         if (ordinary && sheltered) {
             body.pauseWork();
-            if (crouchShelter) body.sneak();
+            body.sneak();
             status = "holding solid cover across the last witnessed shot line";
             return;
         }
@@ -842,7 +877,7 @@ final class AgentDefense {
             }
             if (offhand && safeHand < 0 && (stack.isEmpty() || stack.isIn(ItemTags.SWORDS)
                     || stack.isIn(ItemTags.PICKAXES))) safeHand = slot;
-            if (coverMaterial(stack)) {
+            if (coverMaterial(stack) && (!ordinary || stack.getCount() >= (rangedWall != null && rangedWall.base != null ? 1 : 2))) {
                 if ((spend == null || spend.test(stack)) && (coverSlot < 0 || slot == inventory.selectedSlot))
                     coverSlot = slot;
             }
@@ -856,7 +891,7 @@ final class AgentDefense {
             return;
         }
         if (!offhand && rangedUnderFire && (useBound || rangedCover != null)
-                && tryRangedCover(tick, coverSlot, protectsRoute, spend, false)) return;
+                && tryRangedCover(tick, coverSlot, protectsRoute, spend)) return;
         if (rangedFire.repeated(tick)) {
             evadeRangedFire(tick);
             return;
@@ -873,10 +908,13 @@ final class AgentDefense {
                                        Predicate<ItemStack> spend) {
         var player = client.player;
         Vec3d feet = player.getPos();
-        float away = Float.isFinite(rangedYaw) ? MathHelper.wrapDegrees(rangedYaw + 180) : player.getYaw();
+        float away = Float.isFinite(rangedYaw) ? MathHelper.wrapDegrees(rangedYaw + 180) : Float.NaN;
         if (shelter != null && (body.rangedCoverState(shelter) != shelterState
-                || shelterGoal != null && (tick >= shelterUntil || feet.squaredDistanceTo(shelterGoal) > 5 * 5)))
+                || shelterUpper != null && body.rangedCoverState(shelter.up()) != shelterUpper
+                || shelterGoal != null && (tick >= shelterUntil || feet.squaredDistanceTo(shelterGoal) > 5 * 5))) {
             clearShelter();
+            advanceRangedSurvey(tick);
+        }
         if (rangedSurveyFrom == null) {
             rangedSurveyFrom = feet;
             rangedRetreat.start(tick, away, player.getYaw());
@@ -884,12 +922,17 @@ final class AgentDefense {
         }
         if (shelter == null && rangedSource != null && tick >= shelterScanAfter && body.hasRecentView()) {
             shelterScanAfter = tick + 4;
-            var found = body.visibleRangedCover(pos -> shelterDestination(pos, feet, rangedSource) != null);
+            boolean archerVisible = body.rangedThreatPoint() != null;
+            var found = body.visibleRangedCover(pos -> {
+                Vec3d goal = shelterDestination(pos, feet, rangedSource);
+                return goal != null && (!archerVisible || goal != feet);
+            });
             if (found != null) {
                 shelter = found.getBlockPos();
                 shelterState = body.rangedCoverState(shelter);
                 shelterGoal = shelterDestination(shelter, feet, rangedSource);
-                shelterUntil = tick + 30;
+                shelterUntil = tick + 50;
+                rangedWall = null;
                 if (body.rangedThreatPoint() == null && holdsShelter(feet)) {
                     body.pauseWork();
                     status = "holding solid cover across the last witnessed shot line";
@@ -898,50 +941,64 @@ final class AgentDefense {
                 preferRangedShelter(tick, feet);
             }
         }
-        // A visible natural screen or a usable rolling lane takes precedence over stopping to build.
-        if (rangedCover != null && tryRangedCover(tick, coverSlot, protectsRoute, spend, true)) return;
+        if (rangedWall != null && tryRangedWall(tick, coverSlot, protectsRoute, spend)) return;
         if (rangedGradeLook != null && lookAtRangedGrade(tick)) return;
-        float before = rangedRetreat.bearing();
-        var action = rangedRetreat.step(tick, feet, body.defensiveViewYaw(), body.defensiveViewPitch(),
-            tick == rangedDriveTick + 1 && body.appliedEmergencyForward() && player.hurtTime == 0, body);
-        rangedRetreatReceipt = rangedRetreat.advanced();
-        switch (action) {
-            case ALIGN -> {
-                if (before == rangedRetreat.bearing() && player.hurtTime == 0
-                        && rangedRetreat.aligned(body.defensiveViewYaw(), body.defensiveViewPitch())
-                        && offerRangedGrade(tick, feet)) return;
-                body.turnUrgent(rangedRetreat.bearing(), AgentEmergencyFootwork.PITCH);
-                status = "checking the next dry retreat bearing";
-            }
-            case DRIVE -> {
-                Vec3d landing = rangedRetreat.landing();
-                boolean aimingForShelter = shelterGoal != null && turnDifference(before, yaw(shelterGoal.subtract(feet))) <= 8;
-                if (aimingForShelter) {
-                    Vec3d axis = Vec3d.fromPolar(0, player.getYaw());
-                    double remaining = shelterGoal.subtract(feet).dotProduct(axis);
-                    if (remaining > 0.12 && remaining < feet.distanceTo(landing)) landing = feet.add(axis.multiply(remaining));
-                }
-                body.driveCheckedEmergencyLane(landing, rangedRetreat.bearing(), !aimingForShelter);
-                rangedDriveTick = tick;
-                status = rangedMovementStatus(aimingForShelter);
-            }
-            case BRACE -> {
-                if (rangedSurveyFrom.squaredDistanceTo(feet) >= 0.64) {
-                    rangedSurveyFrom = null;
-                    status = "checking retreat bearings from changed footing";
-                } else if (tryRangedCover(tick, coverSlot, protectsRoute, spend, true)) return;
-                else {
-                    body.pauseWork();
-                    body.sneak();
-                    status = "ranged danger; no usable cover or dry exit witnessed";
-                }
-            }
+        if (rangedRetreat.exhausted && feet.squaredDistanceTo(rangedSurveyFrom) >= 0.64) {
+            rangedSurveyFrom = feet;
+            rangedRetreat.start(tick, away, player.getYaw());
+            rangedCoverTried = false;
         }
+        if (rangedRetreat.exhausted) {
+            if (tryRangedWall(tick, coverSlot, protectsRoute, spend)) return;
+            body.pauseWork();
+            body.sneak();
+            status = "ranged danger; no dry exit: " + rangedFootingRefusal + "; " + rangedWallRefusal;
+            return;
+        }
+        var walk = rangedRetreat.walk(feet, shelterGoal);
+        var result = body.driveHorizon(walk, false, false);
+        if (result == AgentBody.HorizonResult.MOVING) {
+            rangedDriveTick = tick;
+            if (shelterGoal == null && feet.squaredDistanceTo(rangedSurveyFrom) >= 2.56) {
+                rangedSurveyFrom = feet;
+                rangedRetreat.sector = 0;
+                rangedCoverTried = false;
+            }
+            status = rangedMovementStatus(shelterGoal != null);
+            return;
+        }
+        rangedFootingRefusal = body.rangedFootingRefusal();
+        boolean aligned = body.renderedDirection(rangedRetreat.bearing(), walk.gazePitch(), 12);
+        if (aligned && player.hurtTime == 0 && offerRangedGrade(tick, feet)) return;
+        if (result == AgentBody.HorizonResult.ARRIVED || result == AgentBody.HorizonResult.BLOCKED
+                && (aligned || tick - rangedRetreat.aimedAt >= 35)) {
+            if (shelterGoal != null) {
+                clearShelter();
+                shelterScanAfter = tick + 18;
+            }
+            advanceRangedSurvey(tick);
+            // If the unavailable lane already faces a viable support, don't spin
+            // away only to turn back for the wall after checking the other lanes.
+            if (tryRangedWall(tick, coverSlot, protectsRoute, spend)) return;
+        }
+        status = "checking dry retreat footing: " + rangedFootingRefusal;
+    }
+
+    private void stopRangedWalk() {
+        if (rangedRetreat.travel != null) body.stopHorizonTravel(rangedRetreat.travel);
+        rangedRetreat.travel = null;
+    }
+
+    private void advanceRangedSurvey(int tick) {
+        stopRangedWalk();
+        rangedRetreat.next(tick);
     }
 
     private void preferRangedShelter(int tick, Vec3d feet) {
-        if (shelterGoal != null && shelterGoal.squaredDistanceTo(feet) >= 0.04)
+        if (shelterGoal != null && shelterGoal.squaredDistanceTo(feet) >= 0.04) {
+            stopRangedWalk();
             rangedRetreat.prefer(tick, yaw(shelterGoal.subtract(feet)));
+        }
     }
 
     private String rangedMovementStatus(boolean towardCover) {
@@ -955,6 +1012,7 @@ final class AgentDefense {
         // Only the already aligned adjacent column can nominate one ordinary grade.
         var grade = body.ordinaryGrade(feet.add(Vec3d.fromPolar(0, rangedRetreat.bearing()).multiply(2)));
         if (grade == null) return false;
+        stopRangedWalk();
         if (grade.lookOnly()) {
             rangedGradeLook = grade;
             rangedGradeLookBy = tick + 12;
@@ -977,7 +1035,7 @@ final class AgentDefense {
         }
         rangedGradeLook = null;
         if (rangedGrade != null) return stepRangedGrade(tick);
-        rangedRetreat.next(tick);
+        advanceRangedSurvey(tick);
         return false;
     }
 
@@ -987,12 +1045,13 @@ final class AgentDefense {
             case CHECKING, MOVING -> status = "using a witnessed one-block dry tread to retreat";
             case LANDED -> {
                 rangedGrade = null;
-                rangedSurveyFrom = null;
+                rangedSurveyFrom = client.player.getPos();
+                rangedRetreat.sector = 0;
                 status = "landed on a witnessed dry tread; continuing the ranged retreat";
             }
             case REFUSED -> {
                 rangedGrade = null;
-                rangedRetreat.next(tick);
+                advanceRangedSurvey(tick);
                 return false;
             }
         }
@@ -1003,14 +1062,14 @@ final class AgentDefense {
         return shelter != null && shelterState != null && rangedSource != null
             && Vec3d.ofCenter(shelter).squaredDistanceTo(feet) <= 16
             && body.rangedCoverState(shelter) == shelterState
-            && blocksShotLine(new Box(shelter), rangedSource, feet, crouchShelter);
+            && (shelterUpper == null || body.rangedCoverState(shelter.up()) == shelterUpper)
+            && blocksShotLine(coverBox(shelter, shelterUpper != null), rangedSource, feet, false);
     }
 
     private void clearShelter() {
         shelter = null;
-        shelterState = null;
+        shelterState = shelterUpper = null;
         shelterGoal = null;
-        crouchShelter = false;
     }
 
     private static Vec3d shelterDestination(BlockPos pos, Vec3d feet, Vec3d source) {
@@ -1023,8 +1082,7 @@ final class AgentDefense {
         double distance = feet.squaredDistanceTo(target);
         // A candidate bearing is only a preference; the live walker still proves every stride.
         if (distance < 0.04 || distance > 3.8 * 3.8
-                || turnDifference(yaw(target.subtract(feet)), yaw(feet.subtract(source))) > 110
-                || block.expand(0.32, 0, 0.32).raycast(feet.add(0, 1.28, 0), target.add(0, 1.28, 0)).isPresent())
+                || turnDifference(yaw(target.subtract(feet)), yaw(feet.subtract(source))) > 100)
             return null;
         return blocksShotLine(block, source, target, false) ? target : null;
     }
@@ -1084,11 +1142,183 @@ final class AgentDefense {
     boolean confirmedCover() { return coverReceipt; }
     boolean confirmedRangedRetreat() { return rangedRetreatReceipt; }
 
-    private boolean tryRangedCover(int tick, int slot, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend,
-                                   boolean ordinary) {
+    private static final class RangedWall {
+        final BlockPos lower;
+        final int deadline;
+        BlockState base;
+        Block material;
+        int slot, count, issuedAt;
+        boolean groundProved;
+
+        RangedWall(BlockPos lower, int tick) {
+            this.lower = lower;
+            deadline = tick + 44;
+        }
+    }
+
+    static Box coverBox(BlockPos lower, boolean twoHigh) {
+        Box box = new Box(lower);
+        return twoHigh ? box.stretch(0, 1, 0) : box;
+    }
+
+    private boolean tryRangedWall(int tick, int slot, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend) {
+        var player = client.player;
+        Vec3d feet = player.getPos();
+        var wall = rangedWall;
+        if (player.isOnFire() || player.isInLava()) {
+            rangedWall = null;
+            rangedWallRefusal = "fire interrupts wall placement";
+            return false;
+        }
+        if (wall == null) {
+            if (shelter != null || rangedCoverTried) return false;
+            if (slot < 0 || client.options.sneakKey.isUnbound()) {
+                rangedWallRefusal = "no usable two-block hotbar stack and crouch";
+                return false;
+            }
+            if (rangedSource == null || tick - rangedSightAt > 100) {
+                rangedWallRefusal = "no recent witnessed shot line for a wall";
+                return false;
+            }
+            if (player.hurtTime != 0 || player.getVelocity().horizontalLengthSquared() > 0.0025
+                    || rangedEpisode.heardRecently(tick)) {
+                rangedWallRefusal = "too exposed or unstable to stop and build";
+                return false;
+            }
+            // Geometry can nominate one face to inspect, but only a rendered, supported
+            // wall site can spend dirt. Don't turn into fire while a dry exit is available.
+            Direction side = Direction.fromHorizontalDegrees(yaw(rangedSource.subtract(feet)));
+            BlockPos lower = player.getBlockPos().offset(side);
+            if (!usableRangedWall(lower, feet, protectsRoute)) {
+                rangedWallRefusal = "adjacent wall would not cover the body";
+                return false;
+            }
+            var floor = rangedWallFloor(lower);
+            boolean visible = canSeeEmptyWall(lower, floor);
+            if (!visible && !rangedRetreat.exhausted) return false;
+            wall = new RangedWall(lower, tick);
+            wall.groundProved = visible;
+            rangedCoverTried = true;
+            rangedWall = wall;
+            stopRangedWalk();
+        }
+
+        if (tick >= wall.deadline || player.getVelocity().horizontalLengthSquared() > 0.0025
+                || !usableRangedWall(wall.lower, feet, protectsRoute))
+            return refuseRangedWall("wall site no longer reachable or protective");
+        if (!wall.groundProved && rangedEpisode.heardRecently(tick))
+            return refuseRangedWall("a new shot interrupted the wall survey");
+
+        if (!wall.groundProved) {
+            Vec3d preview = Vec3d.ofBottomCenter(wall.lower).add(0, 0.55, 0);
+            var floor = rangedWallFloor(wall.lower);
+            if (!canSeeEmptyWall(wall.lower, floor)) {
+                if (body.renderedAim(preview, 5) && body.hasRecentView())
+                    return refuseRangedWall("wall lacks a visible solid base and two clear cells");
+                body.aimUrgent(preview);
+                status = "checking the base and height of a possible dirt screen";
+                return true;
+            }
+            wall.groundProved = true;
+        }
+
+        boolean upper = wall.base != null;
+        BlockPos cell = upper ? wall.lower.up() : wall.lower;
+        body.sneak();
+        if (wall.material != null) {
+            Vec3d point = Vec3d.ofCenter(cell);
+            var actual = body.perceive(point, 3).orElse(null);
+            if (actual != null && cell.equals(actual.getBlockPos())
+                    && player.getInventory().getStack(wall.slot).getCount() < wall.count) {
+                var state = body.rangedCoverState(cell);
+                if (state != null && state.isOf(wall.material)) {
+                    if (upper) {
+                        shelter = wall.lower;
+                        shelterState = wall.base;
+                        shelterUpper = state;
+                        coverReceipt = holdsShelter(feet);
+                        rangedWall = null;
+                        if (!coverReceipt) {
+                            clearShelter();
+                            return refuseRangedWall("placed blocks do not cover current footing");
+                        }
+                        status = "confirmed two placed blocks screening the last witnessed shot line";
+                        return true;
+                    }
+                    wall.base = state;
+                    wall.material = null;
+                    status = "confirmed the base; one low block is not cover";
+                    return true;
+                }
+            }
+            if (tick - wall.issuedAt >= 10) return refuseRangedWall("vanilla did not confirm the cover placement");
+            body.aimUrgent(point);
+            status = "checking the placed block and hotbar count";
+            return true;
+        }
+
+        if (slot < 0) return refuseRangedWall("no permitted hotbar block remains for the wall");
+        if (upper && body.rangedCoverState(wall.lower) != wall.base)
+            return refuseRangedWall("the placed base changed before the upper block");
+        var floor = rangedWallFloor(cell);
+        Vec3d point = Vec3d.ofBottomCenter(cell).add(0, -0.035, 0);
+        if (floor == null || body.dryRouteClear(Vec3d.ofCenter(cell)) != AgentBody.DryRouteSample.CLEAR) {
+            // Aim to keep both the top and the prospective cell inside the rendered view.
+            body.aimUrgent(point.add(0, 0.23, 0));
+            status = "checking the exact supported face for the " + (upper ? "upper block" : "base block");
+            return true;
+        }
+        ItemStack stack = player.getMainHandStack();
+        boolean equipped = coverMaterial(stack) && stack.getCount() >= (upper ? 1 : 2)
+            && (spend == null || spend.test(stack));
+        if (!equipped) selectRangedSlot(slot, tick);
+        Block material = equipped ? ((BlockItem) stack.getItem()).getBlock() : null;
+        boolean placement = equipped && player.isSneaking()
+            && body.canPlaceRangedCoverAcross(floor, material.getDefaultState());
+        if (!placement && equipped && player.isSneaking()) {
+            var selected = body.selectedFace();
+            if (selected != null && selected.getSide() == Direction.UP && selected.getBlockPos().equals(floor.getBlockPos()))
+                return refuseRangedWall("vanilla refuses placement at the selected wall face");
+        }
+        var preparation = !equipped ? AgentBody.Preparation.EQUIPMENT
+            : placement ? AgentBody.Preparation.READY : AgentBody.Preparation.STANCE;
+        status = upper ? "aiming to stack the top of the ranged screen" : "aiming to place the supported screen base";
+        if (body.useContact(floor, AgentBody.Contact.PLACE, preparation)) {
+            wall.material = material;
+            wall.slot = player.getInventory().selectedSlot;
+            wall.count = stack.getCount();
+            wall.issuedAt = tick;
+        }
+        return true;
+    }
+
+    private boolean usableRangedWall(BlockPos lower, Vec3d feet, Predicate<BlockPos> protectsRoute) {
+        return rangedSource != null && !protectsRoute.test(lower) && !protectsRoute.test(lower.up())
+            && !client.player.getBoundingBox().expand(0.08).intersects(coverBox(lower, true))
+            && blocksShotLine(coverBox(lower, true), rangedSource, feet, false);
+    }
+
+    private boolean canSeeEmptyWall(BlockPos lower, BlockHitResult floor) {
+        return floor != null && body.dryRouteClear(Vec3d.ofCenter(lower)) == AgentBody.DryRouteSample.CLEAR
+            && body.dryRouteClear(Vec3d.ofCenter(lower.up())) == AgentBody.DryRouteSample.CLEAR;
+    }
+
+    private BlockHitResult rangedWallFloor(BlockPos cell) {
+        Vec3d point = Vec3d.ofBottomCenter(cell).add(0, -0.035, 0);
+        var hit = body.dryRouteFloor(point, cell.down());
+        return hit != null && body.rangedCoverState(hit.getBlockPos()) != null ? hit : null;
+    }
+
+    private boolean refuseRangedWall(String reason) {
+        rangedWall = null;
+        rangedWallRefusal = reason;
+        status = "ranged danger; " + reason;
+        return false;
+    }
+
+    private boolean tryRangedCover(int tick, int slot, Predicate<BlockPos> protectsRoute, Predicate<ItemStack> spend) {
         var player = client.player;
         if (rangedCover != null) {
-            if (ordinary) body.sneak();
             Vec3d point = Vec3d.ofCenter(rangedCover);
             BlockHitResult receipt = body.perceive(point, 3).orElse(null);
             if (receipt != null && receipt.getBlockPos().equals(rangedCover)
@@ -1096,16 +1326,6 @@ final class AgentDefense {
                     && player.getInventory().getStack(rangedCoverSlot).getCount() < rangedCoverCount) {
                 status = "confirmed a placed block of ranged cover";
                 coverReceipt = true;
-                if (ordinary) {
-                    shelter = rangedCover;
-                    shelterState = body.rangedCoverState(shelter);
-                    crouchShelter = true;
-                    shelterGoal = null;
-                    coverReceipt = holdsShelter(player.getPos());
-                    if (!coverReceipt) clearShelter();
-                    status = coverReceipt ? "placed a solid block across the last witnessed shot line"
-                        : "placed a block; the witnessed shot line is not covered";
-                }
                 rangedCover = null;
                 return true;
             } else if (tick < rangedCoverUntil) {
@@ -1115,45 +1335,28 @@ final class AgentDefense {
             return coverReceipt || rangedCover != null;
         }
         if (rangedCoverTried || slot < 0 || !Float.isFinite(rangedYaw)
-                || (ordinary ? rangedSource == null || player.hurtTime != 0 : rangedPitch < 0 || rangedPitch > 60)
+                || rangedPitch < 0 || rangedPitch > 60
                 || player.getVelocity().horizontalLengthSquared() > 0.0064) return false;
         var direction = Direction.fromHorizontalDegrees(rangedYaw);
         if (Math.abs(MathHelper.wrapDegrees(direction.getPositiveHorizontalDegrees() - rangedYaw)) > 23) return false;
         BlockPos cover = player.getBlockPos().offset(direction);
-        if (ordinary && !blocksShotLine(new Box(cover), rangedSource, player.getPos(), true)) {
-            cover = cover.up();
-            if (!blocksShotLine(new Box(cover), rangedSource, player.getPos(), true)) return false;
-        }
         if (protectsRoute.test(cover) || player.getBoundingBox().expand(0.08).intersects(new Box(cover))) return false;
         Vec3d point = Vec3d.ofBottomCenter(cover).add(0, -0.035, 0);
-        if (ordinary) {
-            if (rangedPlacementBy == 0) rangedPlacementBy = tick + 15;
-            if (tick >= rangedPlacementBy) {
-                rangedCoverTried = true;
-                return false;
-            }
-        }
         BlockHitResult floor = body.terrain(point, player.getEyePos().distanceTo(point) + 0.08).orElse(null);
         if (floor == null || !floor.getBlockPos().equals(cover.down()) || floor.getSide() != Direction.UP
                 || Math.abs(floor.getPos().y - cover.getY()) > 0.05
                 || body.dryRouteClear(Vec3d.ofCenter(cover)) != AgentBody.DryRouteSample.CLEAR) {
-            if (!ordinary || body.renderedAim(point, 7)) return false;
-            body.aimUrgent(point);
-            status = "checking for a supported cover placement with a carried block";
-            return true;
+            return false;
         }
         var support = client.world.getBlockState(floor.getBlockPos());
         if (support.isOf(Blocks.MAGMA_BLOCK) || !support.getFluidState().isEmpty()
-                || ordinary && AgentBody.dryCaveDanger(support)
                 || !Block.isShapeFullCube(support.getCollisionShape(client.world, floor.getBlockPos()))) return false;
         ItemStack selected = player.getMainHandStack();
         boolean equipped = coverMaterial(selected) && (spend == null || spend.test(selected));
         if (!equipped) selectRangedSlot(slot, tick);
-        if (ordinary) body.sneak();
         status = "aiming at a witnessed face for ranged cover";
         var preparation = !equipped ? AgentBody.Preparation.EQUIPMENT
-            : player.isSneaking() && (!ordinary || body.canPlaceStationAcross(floor))
-                ? AgentBody.Preparation.READY : AgentBody.Preparation.STANCE;
+            : player.isSneaking() ? AgentBody.Preparation.READY : AgentBody.Preparation.STANCE;
         if (body.useContact(floor, AgentBody.Contact.PLACE, preparation)) {
             rangedCoverTried = true;
             rangedCover = cover;
@@ -1161,8 +1364,7 @@ final class AgentDefense {
             rangedCoverUntil = tick + 10;
             rangedCoverSlot = player.getInventory().selectedSlot;
             rangedCoverCount = player.getMainHandStack().getCount();
-            status = ordinary ? "requesting one supported block across the witnessed shot line"
-                : "placing one block between the ledge and ranged fire";
+            status = "placing one block between the ledge and ranged fire";
         }
         return true;
     }

@@ -218,10 +218,12 @@ final class AgentVisibleHorizon {
     private final Track[] tracks = new Track[bearings.length];
     private AgentBody.HorizonView memoView;
     private Stance memoStance;
+    private final BearingCheck<AgentBody.HorizonTravel, Window> checkedRangedStride = (travel, yaw, wade) ->
+        rangedWindow(travel, yaw, memoStance);
     private int targetCount, trackCount;
     private Refusal stanceRefusal;
     private double known, braking;
-    private Refusal refusal;
+    private Refusal refusal, driveRefusal;
     private long refusals;
     private IdleAim idleAim;
     private boolean previewing;
@@ -314,6 +316,7 @@ final class AgentVisibleHorizon {
     void reportDrive(Refusal stage, Window window, boolean terminal) {
         boolean failedSelection = stage == null && window == null;
         if (failedSelection) stage = refusal == null ? Refusal.OUTSIDE_RENDERED_BEARING : refusal;
+        driveRefusal = stage;
         long details = failedSelection ? refusals : 0;
         double offered = window == null ? failedSelection ? known : Double.NaN : window.knownDistance;
         double stopping = window == null ? failedSelection ? braking : Double.NaN : window.brakingDistance;
@@ -324,6 +327,7 @@ final class AgentVisibleHorizon {
 
     Evidence takePreviewEvidence() { return preview.take(); }
     Evidence takeDriveEvidence() { return drive.take(); }
+    Refusal driveRefusal() { return driveRefusal; }
     Evidence takeWadeEvidence() { return wade.take(); }
 
     void reportWade(String stage, Refusal reason) {
@@ -462,9 +466,27 @@ final class AgentVisibleHorizon {
 
     Window dryKeyWindow(AgentBody.HorizonTravel travel, float yaw, float goal, float yawStep, float blocked,
                         boolean left, boolean right) {
-        if (!prepare(travel.target)) return null;
+        if (!prepare(travel.target, travel.ranged())) return null;
         dryStride.begin(travel, memoView);
-        return selectDryKeys(travel.target, yaw, goal, yawStep, blocked, left, right, checkedDryStride);
+        return travel.ranged()
+            ? selectDryKeys(travel, yaw, goal, yawStep, blocked, left, right, checkedRangedStride)
+            : selectDryKeys(travel.target, yaw, goal, yawStep, blocked, left, right, checkedDryStride);
+    }
+
+    Window rangedSprintWindow(AgentBody.HorizonTravel travel, float yaw, float yawStep, boolean sprinting) {
+        var stance = memoStance;
+        // If sprint has not latched yet, the walking attribute does not include its 30% boost.
+        if (!sprinting) stance = new Stance(stance.x, stance.y, stance.z, stance.radius, stance.velocity,
+            stance.acceleration * 1.35, stance.drag, stance.wet, stance.contact);
+        var start = rangedWindow(travel, yaw, stance);
+        if (start == null || start.knownDistance < start.brakingDistance + 0.20) return null;
+        if (Math.abs(yawStep) <= 0.01) return start;
+        var end = rangedWindow(travel, yaw + yawStep, stance);
+        if (end == null) return null;
+        double reach = Math.min(start.knownDistance, end.knownDistance);
+        double brake = Math.max(start.brakingDistance, end.brakingDistance);
+        return reach < brake + 0.20 ? null : new Window(null, yaw, reach, brake, Medium.DRY, start.frame,
+            start.ageTicks, start.displacement, null, false);
     }
 
     void stopDryStride(AgentBody.HorizonTravel travel) { dryStride.stop(travel); }
@@ -597,10 +619,14 @@ final class AgentVisibleHorizon {
     }
 
     private boolean prepare(Target target) {
+        return prepare(target, false);
+    }
+
+    private boolean prepare(Target target, boolean bearingOnly) {
         refusal = null;
         refusals = 0;
         known = braking = Double.NaN;
-        if (target == null) {
+        if (target == null && !bearingOnly) {
             reject(Refusal.TARGET_NOT_RENDERED, null);
             return false;
         }
@@ -609,12 +635,12 @@ final class AgentVisibleHorizon {
             reject(body.horizonViewRefusal(), null);
             return false;
         }
-        if (target.view.world() != view.world() || target.view.player() != view.player()) {
+        if (target != null && (target.view.world() != view.world() || target.view.player() != view.player())) {
             reject(Refusal.WORLD_OR_CAMERA_UNAVAILABLE, null);
             return false;
         }
-        if (view.tick() - target.view.tick() > TARGET_TICKS
-                || view.feet().squaredDistanceTo(target.view.feet()) > TARGET_TRAVEL * TARGET_TRAVEL) {
+        if (target != null && (view.tick() - target.view.tick() > TARGET_TICKS
+                || view.feet().squaredDistanceTo(target.view.feet()) > TARGET_TRAVEL * TARGET_TRAVEL)) {
             reject(Refusal.TARGET_EXPIRED, null);
             return false;
         }
@@ -652,13 +678,22 @@ final class AgentVisibleHorizon {
     }
 
     private Window checkedWindow(Target target, float yaw, boolean allowWade, boolean stride) {
+        return checkedWindow(target, target.point(), yaw, allowWade, stride, memoStance);
+    }
+
+    private Window rangedWindow(AgentBody.HorizonTravel travel, float yaw, Stance stance) {
+        if (Math.abs(MathHelper.wrapDegrees(yaw - travel.rangedAway)) > 100)
+            return reject(Refusal.OUTSIDE_RENDERED_BEARING, null);
+        return checkedWindow(null, travel.goal, yaw, false, true, stance);
+    }
+
+    private Window checkedWindow(Target target, Vec3d goal, float yaw, boolean allowWade, boolean stride, Stance stance) {
         var view = memoView;
-        var stance = memoStance;
         if (!Float.isFinite(yaw) || !body.horizonBearingInView(view, yaw))
             return reject(Refusal.OUTSIDE_RENDERED_BEARING, null);
         double radians = Math.toRadians(yaw);
         double dx = -Math.sin(radians), dz = Math.cos(radians);
-        double toX = target.point().x - stance.x, toZ = target.point().z - stance.z;
+        double toX = goal.x - stance.x, toZ = goal.z - stance.z;
         double progress = dx * toX + dz * toZ;
         if (progress <= 0.05) return reject(Refusal.NO_GOAL_GRADE_OR_MATERIAL_FACE, null);
         Track track = stride ? trace(dryStride, stance, dx, dz) : observedTrack(stance, yaw, dx, dz);

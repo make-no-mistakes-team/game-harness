@@ -13,6 +13,7 @@ import java.util.function.Supplier;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.FallingBlock;
 import net.minecraft.block.LeavesBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.DeathScreen;
@@ -110,6 +111,7 @@ final class AgentProgress {
     private static final Predicate<ItemStack> INGOT = item(Items.IRON_INGOT);
     private static final Predicate<ItemStack> DIAMOND = item(Items.DIAMOND);
     private static final Predicate<ItemStack> TORCH = item(Items.TORCH);
+    private static final Predicate<ItemStack> SHIELD = item(Items.SHIELD);
     private static final Predicate<ItemStack> BUILDING = stack -> STONE.test(stack) || stack.isOf(Items.DIRT)
         || stack.isOf(Items.COBBLESTONE) || stack.isOf(Items.COBBLED_DEEPSLATE) || PLANK.test(stack);
     private static final Predicate<ItemStack> FOOD = stack -> stack.contains(DataComponentTypes.FOOD)
@@ -364,6 +366,7 @@ final class AgentProgress {
     private boolean ordinarySurfaceWork;
     private int nextLoadoutCheck;
     private boolean ordinaryCaveDrops;
+    private final NightWorksite nightSite = new NightWorksite();
     private BlockHitResult timberWitness;
     private final Predicate<BlockHitResult> reachableTrunk = hit -> timberCandidate(hit) && timberInReach(hit);
     private BlockHitResult timberCollectionFace;
@@ -910,6 +913,7 @@ final class AgentProgress {
     void afterRespawn() {
         mineResite.reset();
         defense.resetOrdinaryRanged();
+        nightSite.reset();
         rangedOwnsLocalWork = false;
         dropReclaim = new DropReclaim();
         status = "looking for nearby drops after respawn";
@@ -971,6 +975,7 @@ final class AgentProgress {
         previousHealth = health;
         if (hurt) body.interruptHorizonWade(AgentVisibleHorizon.Refusal.WADE_HEALTH_CHANGED);
         boolean escaping = escapeDanger(ears, hurt, macro == null, macroEngaged, safetySpend);
+        if (hurt || escaping) nightSite.interrupt();
         if ((hurt || escaping) && dropReclaim != null) dropReclaim.cancel();
         if (escaping) {
             body.interruptHorizonWade(c.player.isTouchingWater() && c.player.getAir() < 70 ? AgentVisibleHorizon.Refusal.DEEP_WATER
@@ -992,6 +997,7 @@ final class AgentProgress {
         if ((defense.meleeActive() || defense.ordinaryRangedActive()
                 || !caves.controlsShortFall(tick) && !mineResite.controlsShortFall())
                 && fall.step(safetySpend)) {
+            nightSite.interrupt();
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.SOURCE_UNGROUNDED);
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
@@ -1014,6 +1020,7 @@ final class AgentProgress {
             stallGuard.resumeAfterRangedDanger(stallRelease);
         }
         if (defense.rangedActive() && !defense.meleeNeedsShore()) {
+            nightSite.interrupt();
             // Macro cancellation can release body commands, so settle ownership before bracing.
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             if (macroEngaged) macro.urgent("responding to a nearby ranged threat");
@@ -1049,6 +1056,7 @@ final class AgentProgress {
             return;
         }
         if (defense.meleeActive()) {
+            nightSite.interrupt();
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             interruptHands();
             if (macroEngaged) macro.urgent("responding to nearby melee danger");
@@ -1075,6 +1083,7 @@ final class AgentProgress {
         if ((plannedShallows || lostShallows != null || stallGuard.controlsWaterRecovery())
                 && stallGuard.takeWaterTurn(plannedShallows || lostShallows == null && !macroEngaged && caves.controlsWater(tick),
                     lostShallows, stallReplan, stallRelease)) {
+            nightSite.interrupt();
             body.prioritizeMovement();
             status = stallGuard.status();
             if (macroEngaged) macro.urgent(status);
@@ -1097,6 +1106,7 @@ final class AgentProgress {
             status = macro.status();
             return;
         }
+        if (ordinaryCaveDrops) nightSite.observe();
         if (hands.busy()) {
             returnableMine.waitForEquipment(hands.jobGeneration());
             return;
@@ -1114,6 +1124,7 @@ final class AgentProgress {
         }
         if (defense.checkZombieCue(ears, tick, nextFoot != null || returnableMine.active()
                 || c.options.attackKey.isPressed() && c.interactionManager.isBreakingBlock())) {
+            nightSite.interrupt();
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             body.prioritizeMovement();
             stallGuard.priorityAim();
@@ -1132,8 +1143,14 @@ final class AgentProgress {
         }
         if (stallGuard.takeWaterTurn(lostShallows == null && (caves.controlsWater(tick) || plannedShallows),
                 lostShallows, stallReplan, stallRelease)) {
+            nightSite.interrupt();
             body.prioritizeMovement();
             status = stallGuard.status();
+            return;
+        }
+        if (nightSite.recoiling()) {
+            body.pauseWork();
+            status = "releasing night work while recovering from damage";
             return;
         }
         if (caves.drivingShallowDrop()) {
@@ -1235,6 +1252,7 @@ final class AgentProgress {
         boolean ironPick = has(DEEP_PICK, 1);
         boolean stonePick = has(STONE_PICK, 1);
         boolean woodPick = has(WOOD_PICK, 1);
+        if (ordinaryCaveDrops && (stonePick || woodPick) && !ironPick && nightSite.step()) return;
         if (needsTimberKit()) fieldWood.observeSurfaceWood();
         if (!timberReady) {
             if ((stonePick || ironPick) && surfaceDeparture() && has(TORCH, 4) && has(STONE, 32)
@@ -1252,7 +1270,7 @@ final class AgentProgress {
             // A continuation without a local trail is not necessarily outdoors.
             // Only top up a launch kit at an actual open stance. Underground,
             // the mining and workshop orders request their own missing inputs.
-            if (longGoal && surfaceDeparture() && (stonePick || woodPick || ironPick)
+            if (longGoal && surfaceDeparture() && !nightSite.guarding() && (stonePick || woodPick || ironPick)
                 && (woodPickupPending() || timberDropUntil != 0 || timberExitFrom != null || shortTimber)) {
                 if (woodPickupPending() || timberDropUntil != 0 || timberExitFrom != null) seekTimber();
                 else if (!has(AXE, 1) && affordsWood(localTableWood(), 2)) {
@@ -1278,7 +1296,8 @@ final class AgentProgress {
         }
         if (!stonePick && !ironPick) {
             if (has(STONE, 3)) makePick("stone_pickaxe", STONE, 3);
-            else if (!has(SHOVEL, 1) && affordsWood(table.position != null || has(table.item, 1) ? 1 : 5, 2)) {
+            else if (!nightSite.guarding() && !has(SHOVEL, 1)
+                    && affordsWood(table.position != null || has(table.item, 1) ? 1 : 5, 2)) {
                 requestTable("wooden_shovel", null, 1, 2);
             } else gatherStone();
             return;
@@ -1739,6 +1758,427 @@ final class AgentProgress {
 
     private boolean surfaceDeparture() {
         return !departureKit && resumeIndex < 0 && supplyEgress.outdoors();
+    }
+
+    /** One bounded local search; the ordinary workshop and mine take over on real footing. */
+    private final class NightWorksite {
+        private record Wall(BlockPos feet, BlockState low, BlockState high) {}
+
+        private final AgentNightWorksite cue = new AgentNightWorksite();
+        private final Predicate<BlockHitResult> localOre = this::sideOre;
+        private BlockPos origin, source, foot, settled, rejected;
+        private Direction back, settledBearing;
+        private Wall backWall, sideWall, settledBack, settledSide;
+        private BlockState roof, settledRoof;
+        private ClientWorld world;
+        private int lastBodyTurn, skyCheck, glanceAt, surveyAt, siteCheck, views, attempts, deadline;
+        private int moveSince, inspectAt, fallbackUntil;
+        private float surveyYaw;
+        private boolean glanced, bank, headOpened, opened, fallbackUsed;
+
+        void reset() {
+            interrupt();
+            cue.clear();
+            world = c.world;
+            settled = rejected = null;
+            settledBack = settledSide = null;
+            settledRoof = null;
+            glanced = fallbackUsed = false;
+            lastBodyTurn = skyCheck = glanceAt = surveyAt = siteCheck = views = attempts = 0;
+        }
+
+        void interrupt() {
+            if (foot != null && bank) rejected = foot;
+            origin = source = foot = null;
+            sideWall = backWall = null;
+            roof = null;
+            moveSince = inspectAt = 0;
+            headOpened = opened = false;
+            if (fallbackUntil != 0) {
+                fallbackUntil = 0;
+                overland.interrupt();
+            }
+        }
+
+        private boolean early() {
+            return ordinaryCaveDrops && c.interactionManager != null
+                && c.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL
+                && !departureKit && activeTrail() <= 1 && nextFoot == null
+                && resumeIndex < 0 && !returnableMine.active() && !caves.active() && !caves.routingDry();
+        }
+
+        private boolean vulnerable() {
+            return c.player.getArmor() == 0 && !has(SHIELD, 1)
+                && !c.player.getOffHandStack().isOf(Items.SHIELD);
+        }
+
+        void observe() {
+            if (world != c.world) reset();
+            int turn = body.actionTick();
+            // Creeper safety can own the entire client turn before Progress runs.
+            if (lastBodyTurn != 0 && lastBodyTurn != turn - 1) interrupt();
+            lastBodyTurn = turn;
+            if (!early() || tick < skyCheck || !dryFieldFooting() || !vulnerable()) return;
+            skyCheck = tick + 6;
+            BlockPos standing = c.player.getBlockPos();
+            BlockState contact = body.dryCaveContact(standing);
+            if (contact == null) return;
+            var sky = body.renderedSurfaceSky();
+            if (sky == AgentNightWorksite.Sky.DARK && !surfaceContact(contact)
+                    && (body.supplyPerspective(c.player.getYaw()) & AgentBody.SUPPLY_OPEN) == 0) return;
+            cue.observe(sky, standing, tick);
+            if (sky == AgentNightWorksite.Sky.BRIGHT) {
+                interrupt();
+                settled = rejected = null;
+                settledBack = settledSide = null;
+                settledRoof = null;
+                surveyAt = views = attempts = 0;
+                fallbackUsed = false;
+                glanced = true;
+            }
+        }
+
+        boolean guarding() {
+            return early() && cue.darkAt(c.player.getBlockPos(), tick) && vulnerable()
+                && !has(DEEP_PICK, 1) && (has(WOOD_PICK, 1) || has(STONE_PICK, 1));
+        }
+
+        private boolean settledAt(BlockPos standing) {
+            return standing.equals(settled) && centered(standing) && dryFieldFooting() && body.dryCaveContact(standing) != null
+                && retains(settledBack) && retains(settledSide)
+                && (settledRoof == null || c.world.getBlockState(standing.up(2)) == settledRoof);
+        }
+
+        private boolean surfaceContact(BlockState contact) {
+            return supplyEgress.outdoors() || contact.isOf(Blocks.GRASS_BLOCK)
+                || contact.isOf(Blocks.PODZOL) || contact.isOf(Blocks.MYCELIUM);
+        }
+
+        Direction mineBearing(BlockPos standing) {
+            return guarding() && settledAt(standing) ? settledBearing : null;
+        }
+
+        boolean recoiling() { return c.player.hurtTime > 0 && guarding(); }
+
+        boolean step() {
+            if (!early() || !vulnerable()) {
+                interrupt();
+                return false;
+            }
+            BlockPos standing = c.player.getBlockPos();
+            if (!dryFieldFooting() || c.player.hurtTime > 0 || c.player.hasVehicle()
+                    || firing != Firing.NONE || tableRecipe != null) return false;
+            if (!guarding()) {
+                interrupt();
+                BlockState contact = body.dryCaveContact(standing);
+                // A single sky check at a known forest/surface stance, never a tour of a dark passage.
+                if (!glanced && contact != null && surfaceContact(contact)) {
+                    if (glanceAt == 0) {
+                        glanceAt = tick;
+                        surveyYaw = c.player.getYaw();
+                    }
+                    if (tick - glanceAt <= 18) {
+                        body.turn(surveyYaw, -38);
+                        status = "checking the visible sky before opening the first mine";
+                        return true;
+                    }
+                    glanced = true;
+                }
+                return false;
+            }
+            glanced = true;
+            if (settledAt(standing)) {
+                return has(FUEL, 1) && craftTorches(4);
+            }
+            if (settled != null) return false; // An ordinary departure is not another worksite relocation.
+            if (foot != null) return work(standing);
+            if (fallbackUntil != 0) {
+                if (tick < fallbackUntil && origin != null && standing.getSquaredDistance(origin) < 9
+                        && !overland.stopped()) {
+                    stepOverland();
+                    return true;
+                }
+                interrupt();
+                views = 0; // One observation at the new actual footing, not another panorama.
+            }
+            if (attempts < 2 && tick >= siteCheck) {
+                siteCheck = tick + 4;
+                if (find(standing)) return true;
+            }
+            if (fallbackUsed || views >= 2 || attempts >= 2) return false;
+            if (surveyAt == 0) {
+                surveyAt = tick;
+                surveyYaw = c.player.getYaw();
+            }
+            float bearing = surveyYaw + (views == 0 ? 0 : 42);
+            body.turn(bearing, 9);
+            if (body.renderedDirection(bearing, 9, 7) || tick - surveyAt >= 22) {
+                views++;
+                surveyAt = tick;
+            }
+            status = "looking briefly for a stable corner or bank for night work";
+            return true;
+        }
+
+        private boolean find(BlockPos standing) {
+            if (!body.hasRecentView() || body.dryCaveContact(standing) == null) return false;
+            if (centered(standing) && corner(standing, standing)) return true;
+            for (Direction lane : Direction.Type.HORIZONTAL) {
+                BlockPos nearby = standing.offset(lane);
+                if (floor(nearby) != null && clearBody(nearby) && corner(standing, nearby)) return true;
+            }
+            if (bank(standing, standing)) return true;
+            for (Direction lane : Direction.Type.HORIZONTAL) {
+                BlockPos nearby = standing.offset(lane);
+                if (floor(nearby) != null && clearBody(nearby) && bank(standing, nearby)) return true;
+            }
+            return false;
+        }
+
+        private boolean bank(BlockPos standing, BlockPos approach) {
+            for (Direction lane : Direction.Type.HORIZONTAL) {
+                BlockPos cell = approach.offset(lane);
+                if (cell.equals(standing)) continue;
+                if (cell.equals(rejected)) continue;
+                BlockState cap = wallCell(cell.up(2), 0.12);
+                if (cap == null || !cuttable(cell.up(), 0.52, lane) || !cuttable(cell, 0.86, lane)) continue;
+                select(standing, approach, cell, lane, null, null, cap, true);
+                return true;
+            }
+            return false;
+        }
+
+        private boolean corner(BlockPos standing, BlockPos candidate) {
+            if (candidate.equals(rejected)) return false;
+            for (Direction dir : Direction.Type.HORIZONTAL) {
+                Wall rear = wall(candidate, dir);
+                if (rear == null) continue;
+                if (returnableFace(rear.feet, rear.low) != AgentReturnableMine.Face.MINEABLE
+                        && returnableFace(rear.feet.up(), rear.high) != AgentReturnableMine.Face.MINEABLE) continue;
+                Wall side = flank(candidate, dir);
+                if (side == null) continue;
+                BlockState cap = wallCell(candidate.up(2), 0.10);
+                boolean overhead = cap != null
+                    || body.dryCaveSpace(Vec3d.ofCenter(candidate.up(2), 0.50)) == AgentBody.DryRouteSample.CLEAR;
+                if (AgentNightWorksite.corner(true, overhead, true, true) != AgentNightWorksite.Cover.CORNER)
+                    continue;
+                select(standing, standing, candidate, dir, rear, side, cap, false);
+                return true;
+            }
+            return false;
+        }
+
+        private void select(BlockPos from, BlockPos approach, BlockPos where, Direction dir,
+                            Wall rear, Wall side, BlockState cap, boolean dig) {
+            origin = from;
+            source = approach;
+            foot = where;
+            back = dir;
+            backWall = rear;
+            sideWall = side;
+            roof = cap;
+            bank = dig;
+            attempts++;
+            deadline = tick + 128;
+            body.pauseWork();
+            overland.interrupt();
+            stallGuard.ordinarySetup();
+            var cover = dig ? AgentNightWorksite.Cover.BANK : AgentNightWorksite.Cover.CORNER;
+            status = cue.action(from, tick, true, true, cover, false) == AgentNightWorksite.Action.OPEN
+                ? "choosing a witnessed solid bank for a night work pocket"
+                : "choosing a witnessed natural corner for night work";
+        }
+
+        private boolean work(BlockPos standing) {
+            if (tick > deadline || !standing.equals(origin) && !standing.equals(source) && !standing.equals(foot)
+                    || backWall != null && !retains(backWall) || sideWall != null && !retains(sideWall)
+                    || roof != null && c.world.getBlockState(foot.up(2)) != roof) return refuse();
+            if (!standing.equals(source) && !standing.equals(foot)) {
+                status = "approaching a witnessed side face on a checked dry step";
+                return walkTo(standing, source);
+            }
+            if (bank && !opened) {
+                if (!standing.equals(source)) return refuse();
+                if (!hands.stableCraftFooting()) return true;
+                if (!headOpened) {
+                    if (!open(foot.up(), 0.52)) return true;
+                    headOpened = true;
+                }
+                if (!open(foot, 0.81)) return true;
+                opened = true; // Two fresh empty-cell views, not a landing or a cover receipt.
+                moveSince = 0;
+            }
+            if (standing.equals(foot) && centered(foot) && hands.stableCraftFooting()
+                    && body.dryCaveContact(standing) != null) {
+                if (bank) {
+                    if (backWall == null) backWall = wall(foot, back);
+                    if (sideWall == null) sideWall = flank(foot, back);
+                    if (AgentNightWorksite.pocket(true, opened, roof != null, backWall != null, sideWall != null)
+                            != AgentNightWorksite.Cover.POCKET) {
+                        if (inspectAt == 0) inspectAt = tick;
+                        int age = tick - inspectAt;
+                        if (age >= 42) return refuse();
+                        Direction check = backWall == null ? back : age < 17 ? back.rotateYClockwise()
+                            : back.rotateYCounterclockwise();
+                        body.turn(check.getPositiveHorizontalDegrees(), 16);
+                        status = "checking the entered pocket's back and flank, not claiming cover";
+                        return true;
+                    }
+                }
+                var cover = bank ? AgentNightWorksite.Cover.POCKET : AgentNightWorksite.Cover.CORNER;
+                if (cue.action(standing, tick, vulnerable(), true, cover, true) != AgentNightWorksite.Action.WORK)
+                    return refuse();
+                settled = foot;
+                settledBearing = back;
+                settledBack = backWall;
+                settledSide = sideWall;
+                settledRoof = roof;
+                origin = source = foot = null;
+                backWall = sideWall = null;
+                roof = null;
+                headOpened = opened = false;
+                moveSince = inspectAt = 0;
+                surfaceApproach.abandon();
+                body.turn(settledBearing.getPositiveHorizontalDegrees(), 10);
+                status = "settled in the witnessed night work pocket; preparing ordinary workshop supplies";
+                return true;
+            }
+            status = bank ? "checking the dry step into the opened night pocket"
+                : "moving to the checked corner for night work";
+            return walkTo(standing, foot);
+        }
+
+        private boolean centered(BlockPos cell) {
+            return c.player.getPos().squaredDistanceTo(cell.getX() + 0.5, cell.getY(), cell.getZ() + 0.5)
+                <= 0.27 * 0.27;
+        }
+
+        private boolean walkTo(BlockPos standing, BlockPos goal) {
+            if (moveSince == 0) moveSince = tick;
+            if (tick - moveSince > 33) return refuse();
+            Vec3d center = Vec3d.ofBottomCenter(goal);
+            if (body.driveObservedStep(center)) {
+                rememberMotion();
+                return true;
+            }
+            if (standing.equals(goal)) return true; // Braking from the same proved step.
+            Vec3d aim = center.add(0, 0.74, 0);
+            BlockHitResult landing = floor(goal);
+            body.aim(aim);
+            if (landing != null && clearBody(goal)
+                    && body.emergencyLaneClear(center, c.player.getWidth() * 0.5)
+                    && body.beginObservedStep(landing, center)) rememberMotion();
+            return true;
+        }
+
+        private boolean open(BlockPos cell, double height) {
+            Vec3d point = Vec3d.ofCenter(cell, height);
+            if (body.dryCaveSpace(point) == AgentBody.DryRouteSample.CLEAR) return true;
+            BlockHitResult hit = face(cell, height);
+            status = "cutting a stationary side recess below a witnessed stable roof";
+            body.aim(point);
+            if (hit != null && hit.getSide() == back.getOpposite()
+                    && returnableFace(cell, state(hit)) == AgentReturnableMine.Face.MINEABLE) {
+                body.aimContact(hit, AgentBody.Contact.MINE);
+                if (readyForMine(state(hit))) body.mine(hit);
+            }
+            return false;
+        }
+
+        private BlockHitResult floor(BlockPos cell) {
+            BlockHitResult hit = body.dryRouteFloor(Vec3d.ofCenter(cell.down(), 0.95), cell.down());
+            return hit != null && safeSupport(hit) ? hit : null;
+        }
+
+        private boolean clearBody(BlockPos cell) {
+            return body.dryCaveSpace(Vec3d.ofCenter(cell, 0.60)) == AgentBody.DryRouteSample.CLEAR
+                && body.dryCaveSpace(Vec3d.ofCenter(cell.up(), 0.62)) == AgentBody.DryRouteSample.CLEAR;
+        }
+
+        private BlockHitResult face(BlockPos cell, double height) {
+            Vec3d point = Vec3d.ofCenter(cell, height);
+            BlockHitResult hit = terrain(point, c.player.getBlockInteractionRange());
+            return hit != null && cell.equals(hit.getBlockPos()) ? hit : null;
+        }
+
+        private BlockState wallCell(BlockPos cell, double height) {
+            BlockHitResult hit = face(cell, height);
+            if (hit == null) return null;
+            BlockState shown = state(hit);
+            return AgentNightWorksite.stableCover(c.world, cell, shown) ? shown : null;
+        }
+
+        private Wall wall(BlockPos stand, Direction side) {
+            BlockPos cell = stand.offset(side);
+            BlockState high = wallCell(cell.up(), 0.55);
+            if (high == null) return null;
+            BlockState low = wallCell(cell, 0.84);
+            return low == null ? null : new Wall(cell, low, high);
+        }
+
+        private Wall flank(BlockPos stand, Direction dir) {
+            Direction right = dir.rotateYClockwise(), left = dir.rotateYCounterclockwise();
+            Wall witness = wall(stand, right);
+            return witness != null ? witness : wall(stand, left);
+        }
+
+        /** Only rechecks already witnessed blocks; they never supply a new candidate. */
+        private boolean retains(Wall wall) {
+            return wall != null && c.world.getBlockState(wall.feet) == wall.low
+                && c.world.getBlockState(wall.feet.up()) == wall.high;
+        }
+
+        private boolean cuttable(BlockPos cell, double height, Direction into) {
+            BlockHitResult hit = face(cell, height);
+            return hit != null && hit.getSide() == into.getOpposite()
+                && returnableFace(cell, state(hit)) == AgentReturnableMine.Face.MINEABLE;
+        }
+
+        private boolean refuse() {
+            if (foot != null) rejected = foot;
+            interrupt();
+            return false;
+        }
+
+        private boolean sideOre(BlockHitResult hit) {
+            BlockPos block = hit.getBlockPos();
+            return hit.getSide().getAxis().isHorizontal() && reachableResourceFace(block)
+                && block.getY() >= c.player.getBlockY() && tools.canHarvest(state(hit))
+                && !protectRecoveryBlock(block) && !supportsTrail(block)
+                // Only a physics veto above a nominated visible cut, never a candidate search.
+                && !(c.world.getBlockState(block.up()).getBlock() instanceof FallingBlock);
+        }
+
+        boolean guardExcavation(Resource resource) {
+            BlockPos standing = c.player.getBlockPos();
+            if (!guarding() || settledAt(standing)) return false;
+            double reach = Math.min(REACH - 0.5, c.player.getBlockInteractionRange());
+            BlockHitResult side = target != null && miningResource == resource ? perceive(targetPoint, reach) : null;
+            if (side != null && side.getBlockPos().equals(target) && sideOre(side)) {
+                mineTarget(resource);
+                return true;
+            }
+            if (collectOre(resource, 2.65)) return true;
+            side = body.find(resource.block, reach, localOre).orElse(null);
+            if (side != null) {
+                if (!side.getBlockPos().equals(target)) setTarget(side, resource);
+                mineTarget(resource);
+                return true;
+            }
+            if (!fallbackUsed) {
+                fallbackUsed = true;
+                fallbackUntil = tick + 100;
+                origin = standing;
+                overland.restart(c.player.getHorizontalFacing());
+                stepOverland();
+                return true;
+            }
+            // The bounded worksite diversion is spent. Keep normal terrain exploration
+            // looking for useful ground rather than repeatedly relocating a workshop.
+            status = "seeking useful rock rather than opening an exposed night staircase";
+            explore();
+            return true;
+        }
     }
 
     private int launchLight() {
@@ -4285,8 +4725,15 @@ final class AgentProgress {
             workReturnableMine(c.player.getBlockPos(), depth);
             return;
         }
+        if (resource == Resource.STONE && nightSite.mineBearing(c.player.getBlockPos()) != null) {
+            // Open the first stone leg inward rather than leaving the proved corner
+            // to chase a more distant surface face.
+            if (!collectOre(resource, 2.2)) excavate(depth, null);
+            return;
+        }
         double range = resource != Resource.STONE && (surfaceDeparture() || !has(TORCH, 2))
             ? REACH - 0.35 : SEARCH;
+        if (nightSite.guardExcavation(resource)) return;
         if (workOre(resource, range, resource != Resource.STONE)) return;
         if (resource != Resource.STONE && prepareMining(depth)) return;
         if (resource != Resource.STONE && hands.count(TORCH) + 4 * hands.count(FUEL) < LOCAL_LIGHT
@@ -7276,7 +7723,8 @@ final class AgentProgress {
             legLength++;
             return;
         }
-        if (nextFoot == null && (surfaceApproach.step(standing) || !c.player.isOnGround())) return;
+        Direction guardedBearing = nextFoot == null ? nightSite.mineBearing(standing) : null;
+        if (nextFoot == null && (guardedBearing == null && surfaceApproach.step(standing) || !c.player.isOnGround())) return;
         boolean returnableDescent = nextFoot == null && toward == null && !lavaProspecting
             && (standing.getY() > depth || returnableMine.unjoined())
             && (sought == Resource.DIAMOND || sought == Resource.IRON) && (has(DEEP_PICK, 1) || has(STONE_PICK, 1));
@@ -7295,12 +7743,13 @@ final class AgentProgress {
         if (trail.isEmpty()) {
             dugSteps.clear();
             appendGrounded(standing, false);
-            digDirection = c.player.getHorizontalFacing();
+            digDirection = guardedBearing == null ? c.player.getHorizontalFacing() : guardedBearing;
             branchTurns = failedDirections = legLength = stairLength = deadEnds = litIndex = 0;
             torchAttempt = torchFace = torchUsed = 0;
             closedDig.clear();
         }
         BlockPos current = trail.getLast();
+        if (guardedBearing != null) digDirection = guardedBearing;
         if (returnableDescent) {
             workReturnableMine(current, depth, preferExcavation);
             return;

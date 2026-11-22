@@ -60,9 +60,15 @@ Incoming damage interrupts work even when knockback puts the player
 in water. The player can look toward a sound or seek a visible dry
 bank. A sound is not permission to swing at an unseen mob.
 Without a shield, the player can keep moving along a checked retreat
-or take visible solid cover between shots. During calm inventory work
+or take visible solid cover between shots. A single dodge does not
+make it safe to resume mining. During calm inventory work
 it can move carried building blocks into a spare hotbar slot without
 selecting them or replacing a tool.
+
+On an exposed night start without protection, the player can gather
+wood for a basic pick, then look for a sheltered side of the terrain
+where it can keep working. A cut in a hillside is not proof of cover:
+the player must reach dry footing and see the solid back and flank.
 
 During ordinary exploration the player can descend one or two blocks onto
 a visible, stable, dry landing with clear body space and no immediate

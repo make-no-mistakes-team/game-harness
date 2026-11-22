@@ -250,7 +250,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private BlockPos horizonPulseContact;
     private int horizonAppliedTick = -2;
     private int horizonSide;
-    private boolean horizonForward, horizonSneak, horizonWade;
+    private boolean horizonForward, horizonSneak, horizonWade, horizonSprint;
     private float horizonHeading;
     private double horizonReach;
     private AgentVisibleHorizon.Window horizonKeyWindow;
@@ -403,7 +403,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         horizonIntent = null;
         reconInputGrant = null;
         horizonKeyWindow = null;
-        horizonForward = horizonSneak = horizonWade = false;
+        horizonForward = horizonSneak = horizonWade = horizonSprint = false;
         horizonSide = 0;
         reachJump = false;
         routeJumps = true;
@@ -676,7 +676,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 attack = mining.equals(contact.pos) && contact.admits(hit);
             }
         }
-        boolean sprintRequested = !rolling && !pickupWalk && advance && fast && !crouch && ground == Ground.CLEAR;
+        boolean sprintRequested = advance && !crouch && (rolling ? horizonSprint
+            : !pickupWalk && fast && ground == Ground.CLEAR);
         if (advance || retreat || rolling && horizonSide != 0 || pickupSide != 0) {
             float heading = rolling ? horizonHeading : player.getYaw() + (pickupWalk ? pickupInput.yawOffset : retreat ? 180 : 0);
             double reach = rolling ? horizonReach
@@ -780,7 +781,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         }
         if (jump && stepJump) lastStepJump = tick;
         ownsKeys = true;
-        if (advance && emergencyWalk && !options.forwardKey.isUnbound()) emergencyDriveTick = tick;
+        if (advance && (emergencyWalk || rolling && horizonIntent.ranged) && !options.forwardKey.isUnbound())
+            emergencyDriveTick = tick;
         options.forwardKey.setPressed(advance);
         options.backKey.setPressed(retreat);
         if (pickupWalk) visibleHorizon.reportPickup(pickupTarget,
@@ -1002,6 +1004,16 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         var player = client.player;
         var placement = new ItemPlacementContext(player, Hand.MAIN_HAND, player.getMainHandStack(), now);
         return placement.getBlockPos().equals(placementCell(now));
+    }
+
+    boolean canPlaceRangedCoverAcross(BlockHitResult support, BlockState material) {
+        BlockHitResult now = selectedFace();
+        if (!sameBlockFace(support, now) || now.isInsideBlock()) return false;
+        var player = client.player;
+        var placement = new ItemPlacementContext(player, Hand.MAIN_HAND, player.getMainHandStack(), now);
+        BlockPos cell = placementCell(now);
+        return placement.getBlockPos().equals(cell) && placement.canPlace()
+            && client.world.canPlace(material, cell, ShapeContext.absent());
     }
 
     static BlockPos placementCell(BlockHitResult support) {
@@ -1537,6 +1549,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         final boolean allowWade;
         private final AgentVisibleHorizon.ContactPulse pulse;
         private final boolean groundScout;
+        private final boolean ranged, rangedSprint;
+        final float rangedAway;
         private int stoppedAt = -1, precisionTicks;
         private boolean issued, beenDriven, wet, wadeStarted;
         private boolean glanceUsed, glancing;
@@ -1555,17 +1569,33 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
         private HorizonTravel(AgentVisibleHorizon.Target target, Vec3d goal, double arrival, boolean allowWade,
                               boolean allowPulse, boolean groundScout) {
+            this(target, goal, arrival, allowWade, allowPulse, groundScout, false, false, Float.NaN);
+        }
+
+        private HorizonTravel(AgentVisibleHorizon.Target target, Vec3d goal, double arrival, boolean allowWade,
+                              boolean allowPulse, boolean groundScout, boolean ranged, boolean rangedSprint,
+                              float rangedAway) {
             this.target = target;
             this.goal = goal;
             this.arrival = arrival;
             this.allowWade = allowWade;
             pulse = allowPulse ? new AgentVisibleHorizon.ContactPulse() : null;
             this.groundScout = groundScout;
+            this.ranged = ranged;
+            this.rangedSprint = rangedSprint;
+            this.rangedAway = rangedAway;
         }
 
         static HorizonTravel groundScout(AgentVisibleHorizon.Target target, Vec3d goal, double arrival) {
             return new HorizonTravel(target, goal, arrival, false, false, true);
         }
+
+        /** The direction supplies intent only. Each actual forward key still needs a dry window. */
+        static HorizonTravel rangedRetreat(Vec3d goal, float away, boolean allowSprint) {
+            return new HorizonTravel(null, goal, 0.20, false, false, false, true, allowSprint, away);
+        }
+
+        boolean ranged() { return ranged; }
 
         boolean moved() { return motion != null && motion.moved(); }
         boolean progressed() { return motion != null && motion.progressed; }
@@ -1633,9 +1663,10 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         Vec3d feet = player.getPos();
         Vec3d from = horizonAppliedFrom;
         boolean continuous = travel.motion.observe(from, feet, travel.issued && !horizonAppliedPulse, player.horizontalCollision,
-            player.hurtTime == 0 && !player.hasVehicle() && !player.isOnFire() && !player.isInLava());
+            (travel.ranged ? player.hurtTime < 8 : player.hurtTime == 0)
+                && !player.hasVehicle() && !player.isOnFire() && !player.isInLava());
         travel.wet |= player.isTouchingWater();
-        if (travel.groundScout) return; // A view-only trip is not a retained reversible route.
+        if (travel.groundScout || travel.ranged) return; // Neither is a retained reversible work route.
         if (!continuous || !travel.beenDriven || !horizonAppliedDry || !player.isOnGround() || player.isTouchingWater()) {
             travel.dryContacts = 0;
             travel.dryFrom = travel.dryTo = null;
@@ -1788,7 +1819,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         if (horizonIntent != travel) return;
         horizonIntent = null;
         horizonKeyWindow = null;
-        horizonForward = horizonSneak = horizonWade = false;
+        horizonForward = horizonSneak = horizonWade = horizonSprint = false;
         horizonSide = 0;
         if (gaitSteering) {
             gaitSteering = steering = false;
@@ -1877,7 +1908,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         Vec3d feet = player.getPos();
         double dx = travel.goal.x - feet.x, dz = travel.goal.z - feet.z;
         double distance = Math.hypot(dx, dz);
-        if (travel.motion == null) travel.motion = new HorizonMotion(feet, travel.goal, travel.groundScout);
+        if (travel.motion == null) travel.motion = new HorizonMotion(feet, travel.goal, travel.groundScout || travel.ranged);
         if (!travel.motion.valid) return horizonBlocked(Refusal.MOTION_INTERRUPTED);
         horizonIntent = travel;
         if (travel.moved() && player.isOnGround() && !player.isTouchingWater()
@@ -1940,7 +1971,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         if (window == null) return horizonWait(travel, null, null);
         if (window.medium() != chosen.medium() || player.isTouchingWater() && !wade)
             return horizonWait(travel, Refusal.WATER_NOT_ALLOWED, window);
-        if (player.isSprinting()) return horizonWait(travel, Refusal.INPUT_COASTING, window);
+        if (player.isSprinting() && !travel.rangedSprint) return horizonWait(travel, Refusal.INPUT_COASTING, window);
         double known = window.knownDistance();
         double braking = window.brakingDistance();
         boolean contactOnly = window.contactOnly();
@@ -1967,6 +1998,18 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         var pace = horizonPace(known, braking, goal, wade, contactOnly);
         if (pace == HorizonPace.SLOW && (travel.precisionTicks >= 3 || client.options.sneakKey.isUnbound()))
             pace = HorizonPace.COAST;
+        if (travel.rangedSprint && pace == HorizonPace.WALK && lateral == 0 && goal > 2.5
+                && player.getHungerManager().getFoodLevel() > 6 && !client.options.sprintKey.isUnbound()
+                && Math.abs(steeringTurn) <= 3) {
+            var sprint = visibleHorizon.rangedSprintWindow(travel, actual, steeringTurn, player.isSprinting());
+            if (sprint != null) {
+                known = sprint.knownDistance();
+                braking = sprint.brakingDistance();
+                window = sprint;
+                horizonSprint = true;
+            }
+        }
+        if (player.isSprinting() && !horizonSprint) return horizonWait(travel, Refusal.INPUT_COASTING, window);
         if (pace == HorizonPace.COAST) {
             horizonWade = wade;
             return horizonWait(travel, Refusal.INPUT_COASTING, window);
@@ -2041,6 +2084,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private HorizonResult horizonBlocked(Refusal stage) {
         visibleHorizon.reportDrive(stage, null, true);
         return HorizonResult.BLOCKED;
+    }
+
+    String rangedFootingRefusal() {
+        var reason = visibleHorizon.driveRefusal();
+        return reason == null ? "no checked dry foothold" : reason.key;
     }
 
     void sneak() { sneaking = true; }
@@ -3037,6 +3085,29 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return (roofSeen ? SUPPLY_ROOF : 0) | (wallSeen ? SUPPLY_WALL : 0);
     }
 
+    /** Admit the client sky's visible luminance only through open rays in this first-person render. */
+    AgentNightWorksite.Sky renderedSurfaceSky() {
+        if (!hasView() || client.player.isTouchingWater()
+                || client.world.getDimensionEffects().getSkyType()
+                    != net.minecraft.client.render.DimensionEffects.SkyType.NORMAL)
+            return AgentNightWorksite.Sky.UNKNOWN;
+        float pitch = MathHelper.clamp(observedPitch - 24, -65, -24);
+        int clear = 0;
+        for (int offset = -14; offset <= 14 && raysLeft > 0; offset += 14) {
+            Vec3d end = eye.add(client.player.getRotationVector(pitch, observedYaw + offset).multiply(MAX_RANGE));
+            if (!inView(end)) continue;
+            raysLeft--;
+            // An unlit roof still occludes the sky; unlike a lit first hit, a raw miss is required.
+            if (raycast(end, Ray.FLUIDS).getType() == HitResult.Type.MISS && ++clear == 2) {
+                float brightness = client.world.getSkyBrightness(client.getRenderTickCounter().getTickDelta(true));
+                if (brightness <= 0.30f) return AgentNightWorksite.Sky.DARK;
+                if (brightness >= 0.43f) return AgentNightWorksite.Sky.BRIGHT;
+                break;
+            }
+        }
+        return AgentNightWorksite.Sky.UNKNOWN;
+    }
+
     /** Frustum preview only; no outside-view raycast or new world observation. */
     boolean macroRetainsView(Vec3d point, Vec3d feet, float yaw, float pitch) {
         if (!hasView()) return false;
@@ -3900,14 +3971,10 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     void driveCheckedEmergencyLane(Vec3d landing, float bearing) {
-        driveCheckedEmergencyLane(landing, bearing, true);
-    }
-
-    void driveCheckedEmergencyLane(Vec3d landing, float bearing, boolean allowSprint) {
         var player = client.player;
         Vec3d velocity = player.getVelocity();
         double shown = Math.sqrt(landing.squaredDistanceTo(player.getPos()));
-        boolean sprint = allowSprint && AgentDefense.MeleeRecovery.canSprint(shown, Math.sqrt(velocity.horizontalLengthSquared()),
+        boolean sprint = AgentDefense.MeleeRecovery.canSprint(shown, Math.sqrt(velocity.horizontalLengthSquared()),
             player.getHungerManager().getFoodLevel(), player.isSprinting());
         driveEmergencyLane(landing, bearing, AgentEmergencyFootwork.PITCH, sprint);
         checkedEmergencyWalk = true;
@@ -4942,18 +5009,21 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         rangedThreatPoint = null;
         if (!hasView()) return Optional.empty();
         double max = range(distance);
-        threats.begin(max * max);
         if (!(max > 0)) return Optional.empty();
-        double nearestArcher = max * max;
-        for (LivingEntity candidate : client.world.getEntitiesByClass(LivingEntity.class, entityArea(max),
+        double closeSquared = max * max;
+        threats.begin(closeSquared);
+        double archerRange = watchArchers ? range(Math.max(distance, 14)) : max;
+        double nearestArcher = archerRange * archerRange;
+        for (LivingEntity candidate : client.world.getEntitiesByClass(LivingEntity.class, entityArea(archerRange),
                 entity -> entity instanceof Monster && availableEntity(entity))) {
             if (raysLeft <= 0) break;
             Vec3d center = candidate.getBoundingBox().getCenter();
             double d = center.squaredDistanceTo(eye);
             if (candidate instanceof EndermanEntity enderman) {
-                if (d <= max * max) observeEnderman(enderman, center, d);
+                if (d <= closeSquared) observeEnderman(enderman, center, d);
             } else {
                 boolean archer = watchArchers && d <= nearestArcher && candidate instanceof RangedAttackMob
+                    && (d <= closeSquared || candidate.isUsingItem())
                     && (candidate.isHolding(Items.BOW) || candidate.isHolding(Items.CROSSBOW));
                 if (!archer && !threats.couldSelect(d)) continue;
                 Vec3d visible = visibleEntityPoint(candidate, center);

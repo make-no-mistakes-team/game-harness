@@ -233,7 +233,7 @@ final class AgentStallGuard {
     private int proof, probeSince, driveSince, routeLength, routeIndex, cutCount, itemBefore;
     private boolean cutFinished;
     private StepStage stepStage;
-    private boolean stepLeafTried;
+    private int stepLeafHeight;
     private int stepSince;
     private float stepHealth;
     private Block stepBlock;
@@ -2171,7 +2171,7 @@ final class AgentStallGuard {
             return;
         }
         stepTried = true;
-        stepLeafTried = false;
+        stepLeafHeight = 0;
         from = client.player.getBlockPos().toImmutable();
         stepStage = StepStage.CENTER;
         stepAim = null;
@@ -2222,9 +2222,10 @@ final class AgentStallGuard {
                     && lowCeiling.getBlockPos().getX() == from.getX() && lowCeiling.getBlockPos().getZ() == from.getZ()
                     && lowCeiling.getPos().y < overhead.y - 0.05
                     && client.world.getBlockState(lowCeiling.getBlockPos()).getFluidState().isEmpty()) {
-                if (!stepLeafTried && !contains(footprints, lowCeiling.getBlockPos().up())
+                int height = lowCeiling.getBlockPos().getY() - from.getY();
+                if (height > stepLeafHeight && !contains(footprints, lowCeiling.getBlockPos().up())
                         && body.beginStepLeaf(lowCeiling, protectedBlock)) {
-                    stepLeafTried = true;
+                    stepLeafHeight = height;
                     stepStage = StepStage.CLEAR_LEAF;
                     transition(Phase.STEP, "clearing one witnessed overhead leaf before rechecking the jump");
                     return;

@@ -146,8 +146,11 @@ final class AgentHeadroom {
     }
 
     static boolean stepLeaf(BlockPos foot, BlockHitResult face, BlockState state) {
+        BlockPos cap = face.getBlockPos();
+        int height = cap.getY() - foot.getY();
         return face.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK && face.getSide() == Direction.DOWN
-            && face.getBlockPos().equals(foot.up(2)) && AgentSupplyEgress.naturalDryLeaf(state);
+            && cap.getX() == foot.getX() && cap.getZ() == foot.getZ()
+            && (height == 2 || height == 3) && AgentSupplyEgress.naturalDryLeaf(state);
     }
 
     boolean step(int now, AgentTools tools, Predicate<BlockPos> protectedBlock) {

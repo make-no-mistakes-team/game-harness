@@ -28,6 +28,12 @@ final class CanopyPassageTest {
         BlockPos cap = FOOT.up(2);
         var hit = new BlockHitResult(Vec3d.ofBottomCenter(cap), Direction.DOWN, cap, false);
         assertTrue(AgentHeadroom.stepLeaf(FOOT, hit, leaf));
+        BlockPos upper = FOOT.up(3);
+        assertTrue(AgentHeadroom.stepLeaf(FOOT,
+            new BlockHitResult(Vec3d.ofBottomCenter(upper), Direction.DOWN, upper, false), leaf));
+        BlockPos beyondJump = FOOT.up(4);
+        assertFalse(AgentHeadroom.stepLeaf(FOOT,
+            new BlockHitResult(Vec3d.ofBottomCenter(beyondJump), Direction.DOWN, beyondJump, false), leaf));
         assertFalse(AgentHeadroom.stepLeaf(FOOT.east(), hit, leaf));
         assertFalse(AgentHeadroom.stepLeaf(FOOT, top(cap), leaf));
         assertFalse(AgentHeadroom.stepLeaf(FOOT, hit, leaf.with(Properties.WATERLOGGED, true)));

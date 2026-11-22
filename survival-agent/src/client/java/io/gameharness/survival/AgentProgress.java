@@ -14,7 +14,6 @@ import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.FallingBlock;
-import net.minecraft.block.LeavesBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.DeathScreen;
 import net.minecraft.client.gui.screen.ingame.CraftingScreen;
@@ -363,7 +362,7 @@ final class AgentProgress {
     private BlockPos pickupLightFoot;
     private boolean timberReady;
     private boolean departureKit;
-    private boolean ordinarySurfaceWork;
+    private boolean ordinarySurfaceWork, bootstrapTimber;
     private int nextLoadoutCheck;
     private boolean ordinaryCaveDrops;
     private final NightWorksite nightSite = new NightWorksite();
@@ -402,6 +401,7 @@ final class AgentProgress {
     private boolean timberNear;
     private int timberScan;
     private int timberLeafCuts;
+    private final List<BlockPos> triedTimberLeaves = new ArrayList<>(4);
     private int timberApproachSince;
     private final SupplyEgress supplyEgress = new SupplyEgress();
     private Vec3d timberBank;
@@ -677,9 +677,15 @@ final class AgentProgress {
         caves.changedDry(position);
         stallGuard.broken(position, state);
         surfaceApproach.broken(position, state);
+        boolean aperture = false;
+        if (timberCuttingLeaves && timberChop != null && position.equals(timberChop.getBlockPos())
+                && AgentSupplyEgress.naturalDryLeaf(state)) {
+            aperture = surfaceApproach.bootstrapBroken(position);
+            if (!aperture && surfaceApproach.canopy.active() == null) timberLeafCuts++;
+        }
         returnableMine.observeBreak(position, state);
         supplyEgress.observeBreak(position, state);
-        overland.changed(position);
+        if (!aperture) overland.changed(position);
         mineResite.changed(position);
         memory.forgetOwnedWorkbench(c.world, position);
         if (c.world == oreWorld) forgetOre(position);
@@ -914,6 +920,9 @@ final class AgentProgress {
         mineResite.reset();
         defense.resetOrdinaryRanged();
         nightSite.reset();
+        surfaceApproach.abandonBootstrapPassage();
+        surfaceApproach.canopy.reset();
+        surfaceApproach.canopyGroundChecks.clear();
         rangedOwnsLocalWork = false;
         dropReclaim = new DropReclaim();
         status = "looking for nearby drops after respawn";
@@ -923,6 +932,7 @@ final class AgentProgress {
         if (win || c.player == null || c.world == null) return;
         tick++;
         ordinarySurfaceWork = macro == null || !macro.engaged();
+        bootstrapTimber = ordinarySurfaceWork && !has(DEEP_PICK, 1) && !has(STONE_PICK, 1) && !has(WOOD_PICK, 1);
         ordinaryCaveDrops = macro == null;
         hands.allowOrdinaryLoadout(ordinaryCaveDrops);
         observeStairLight();
@@ -937,9 +947,10 @@ final class AgentProgress {
         stallGuard.navigationSurveyReceipt(caves.drySurveyEvidence());
         stallGuard.observe(tick, confirmedFrameBlocks(), mealsEaten, status,
             returnableMine.hasProgressLease() || supplyEgress.active() || overland.leased(tick) || mineResite.leased()
+                || surfaceApproach.canopy.active() != null
                 || defense.ordinaryRangedActive()
                 || ordinarySurfaceWork && localFurnace != null && !localFurnace.lost
-                    && localFurnace.watch.active() && !localFurnace.watch.recheckDue(tick));
+                    && localFurnace.watch.active() && !localFurnace.watch.recheckDue(tick), bootstrapTimber);
         advance(ears, macro);
         BlockPos newCaveLight = caves.takeLightReceipt();
         if (newCaveLight != null) stallGuard.stairLightReceipt(newCaveLight);
@@ -1159,6 +1170,7 @@ final class AgentProgress {
             return;
         }
         if (stepLocalFurnaceWatch()) return;
+        if (!surfaceApproach.canopyRecovery && surfaceApproach.workBootstrapPassage()) return;
         // Keep a declared ordinary leg through vanilla momentum. The inventory/craft stage
         // itself correctly refuses moving footing; it cannot own the continuation here.
         if (overland.driving() && timberCollectionGoal == null && pickupLogGoal == null && !mineResite.active()) {
@@ -1481,6 +1493,8 @@ final class AgentProgress {
             resource = stallTimber();
             if (resource != null) return resource;
         }
+        String canopy = surfaceApproach.stallBootstrapPassage();
+        if (canopy != null) return canopy;
         return stallKnownRoute();
     }
 
@@ -1606,6 +1620,7 @@ final class AgentProgress {
     private void releaseStallAlternative() {
         if (stallWork == null) return;
         stallWork = null;
+        if (surfaceApproach.canopyRecovery) surfaceApproach.abandonBootstrapPassage();
         target = null;
         timberChop = null;
         clearPickup();
@@ -5095,7 +5110,7 @@ final class AgentProgress {
                     return true;
                 }
                 timberCanopyPeeking = true;
-                if (timberLeafCuts == 0 && horizontalDistance(feet, timberCanopy) <= 3.5
+                if (!bootstrapTimber && triedTimberLeaves.isEmpty() && horizontalDistance(feet, timberCanopy) <= 3.5
                     && timberCanopy.y >= feet.y + 1) {
                     body.aim(timberCanopy);
                     if (!body.aligned(timberCanopy)) return true;
@@ -5119,6 +5134,7 @@ final class AgentProgress {
             timberCanopyUntil = tick + 145;
             timberCanopyPeeking = false;
             timberLeafCuts = 0;
+            triedTimberLeaves.clear();
             approachGoal = null;
             return true;
         }
@@ -5140,6 +5156,20 @@ final class AgentProgress {
 
     private void seekTimber(String supplies) {
         seekTimber(supplies, false);
+    }
+
+    private boolean bootstrapCanopy(BlockPos from) {
+        return bootstrapCanopy(from, false);
+    }
+
+    private boolean bootstrapCanopy(BlockPos from, boolean connectedReturn) {
+        return AgentSupplyEgress.canopyContact(bootstrapSupport(from), bootstrapTimber, connectedReturn);
+    }
+
+    private BlockState bootstrapSupport(BlockPos from) {
+        if (!bootstrapTimber || !safePickupStance() || c.player.getHealth() < 10 || resumeIndex >= 0
+                || !from.down().equals(c.player.supportingBlockPos.orElse(null))) return null;
+        return body.dryCaveContact(from);
     }
 
     private void seekTimber(String supplies, boolean localOnly) {
@@ -5199,21 +5229,26 @@ final class AgentProgress {
         if (timberWitness != null && tendTimber()) return;
         if (startReachableTimber(true)) return;
         if (localOnly) return;
-        if (!overland.owns(player.getBlockPos()) && supplyEgress.seek(supplies)) return;
-        boolean bootstrap = ordinarySurfaceWork && !has(WOOD_PICK, 1) && !has(STONE_PICK, 1) && !has(DEEP_PICK, 1);
-        if (expedition != null && bootstrap && applyWoodPreference()) return;
+        BlockPos foot = player.getBlockPos();
+        boolean canopy = bootstrapCanopy(foot);
+        if (!canopy && !overland.owns(foot) && supplyEgress.seek(supplies)) return;
+        if (expedition != null && bootstrapTimber && applyWoodPreference()) return;
         BlockHitResult log = body.find(state -> state.isIn(BlockTags.LOGS), 22, this::timberCandidate).orElse(null);
         if (log != null) {
             witnessTimber(log);
             tendTimber();
             return;
         }
-        if (surveyTimber()) {
+        if (canopy && timberCanopy != null) {
+            rememberTimberSite(exhaustedCanopies, BlockPos.ofFloored(timberCanopy));
+            timberCanopy = null;
+        }
+        if (!canopy && (!bootstrapTimber || !overland.owns(foot)) && surveyTimber()) {
             overland.interrupt();
             return;
         }
         if (!ordinarySurfaceWork) return;
-        if (bootstrap && (woodPreference != WOODLAND || tick >= woodPreferenceUntil) && seekSurfaceSupply()) return;
+        if (bootstrapTimber && (woodPreference != WOODLAND || tick >= woodPreferenceUntil) && seekSurfaceSupply()) return;
         stepOverland();
     }
 
@@ -5334,7 +5369,14 @@ final class AgentProgress {
 
     private void stepOverland() {
         boolean resource = overland.guidingResource(timberCollectionGoal) || overland.guidingResource(pickupLogGoal);
-        overland.step(tick);
+        BlockPos foot = c.player.getBlockPos();
+        boolean canopy = pickupLogGoal == null && bootstrapCanopy(foot);
+        overland.step(tick, canopy);
+        var blockedLane = overland.takeCanopyLaneRefusal();
+        if (canopy && blockedLane != null)
+            surfaceApproach.noteBootstrapLane(blockedLane.foot(), blockedLane.bearing(), blockedLane.lowerTop(), blockedLane.riser());
+        if (canopy && overland.canopyLanesExhausted(foot) && surfaceApproach.beginBootstrapPassage(foot, null, false))
+            return;
         status = overland.status();
         if (overland.leased(tick)) stallGuard.navigationWork();
         var arrival = overland.takeArrival();
@@ -5351,6 +5393,7 @@ final class AgentProgress {
         timberShelfCheckedFrom = null;
         timberNear = false;
         timberLeafCuts = timberScan = timberApproachSince = 0;
+        triedTimberLeaves.clear();
         timberSeekTick = tick;
         timberWorkUntil = tick + TIMBER_WORK_TICKS;
         approachGoal = null;
@@ -5444,6 +5487,7 @@ final class AgentProgress {
             overland.guideResource(goal);
         }
         stepOverland();
+        if (surfaceApproach.canopy.active() != null) return true;
         if (overland.stopped() || !overland.guidingResource(goal))
             return finishTimber("no witnessed dry collection stance for this trunk");
         return true;
@@ -5687,7 +5731,12 @@ final class AgentProgress {
                 return surfaceReady(from, yaw, "confirmed walkable woodland");
             if (collectLocalDrop(LOG) || collectLocalDrop(PLANK))
                 return ready("ordinary pickup from connected footing");
-            return handoffTimber(true);
+            if (handoffTimber(true)) return true;
+            if (bootstrapCanopy(from, returning || walkedReturn)) {
+                unknownFoot = from;
+                return ready("handing the canopy footing to ordinary timber travel");
+            }
+            return false;
         }
 
         private boolean handoffTimber(boolean searchView) {
@@ -6319,6 +6368,7 @@ final class AgentProgress {
             if (distance <= 5.3 && timberApproachSince == 0) timberApproachSince = tick;
             if ((timberApproachSince == 0 || tick - timberApproachSince < 48)
                 && approachOrdinary(timberWitness, base, 2.10, false) != Walk.BLOCKED) return true;
+            if (surfaceApproach.cutTimberMask(timberAim(timberWitness))) return true;
             if (distance > 5.3)
                 return startTimberReposition(yaw(base.subtract(feet))) || finishTimber("timber target exhausted: approach blocked");
         }
@@ -6355,8 +6405,9 @@ final class AgentProgress {
                 chopFromTimberStance(hit);
                 return true;
             }
-            if (timberLeafCuts < 2 && (y == next.getY() || y == next.getY() + 1) && isTimberPassage(hit)
-                && hit.getBlockPos().getSquaredDistance(next) <= 4) mask = hit;
+            if (timberLeafCuts < 2 && triedTimberLeaves.size() < 4 && (y == next.getY() || y == next.getY() + 1)
+                    && !triedTimberLeaves.contains(hit.getBlockPos()) && isTimberPassage(hit)
+                    && hit.getBlockPos().getSquaredDistance(next) <= 4) mask = hit;
         }
         if (timberLastCut == null) {
             Vec3d point = timberAim(timberWitness);
@@ -6371,8 +6422,13 @@ final class AgentProgress {
         if (timberLastCut != null && eye.squaredDistanceTo(above) < reach * reach
             && body.clearTerrain(above)) return finishTimber(null);
         if (mask != null) {
-            beginTimberChop(mask, true);
-            return true;
+            BlockPos foot = c.player.getBlockPos();
+            if (bootstrapTimber) {
+                if (surfaceApproach.cutTimberMask(foot, mask)) return true;
+            } else {
+                beginTimberChop(mask, true);
+                return true;
+            }
         }
         // A high, visibly out-of-reach face is not a chopping target. Try the lower views first.
         if (timberScan >= 1 && distance <= reach + 0.45) {
@@ -6556,11 +6612,13 @@ final class AgentProgress {
             BlockPos block = obstacle.getBlockPos();
             BlockState material = state(obstacle);
             if (!block.equals(cell) || protectRecoveryBlock(block)
-                || !material.isIn(BlockTags.DIRT) && !material.isIn(BlockTags.LEAVES))
+                || !AgentSupplyEgress.naturalDryLeaf(material) && (bootstrapTimber || !material.isIn(BlockTags.DIRT)))
                 return rejectTimberExit("shelf clearance blocked");
+            if (bootstrapTimber)
+                return surfaceApproach.cutTimberMask(timberExitFrom, obstacle) || rejectTimberExit("shelf clearance blocked");
             status = "timber reposition: clearing a visible dirt or leaf obstruction";
             body.aimContact(obstacle, AgentBody.Contact.MINE);
-            if (readyForMine(material)) body.mine(obstacle);
+            if (hands.stableCraftFooting() && readyForMine(material)) body.mine(obstacle);
             return true;
         }
         Vec3d toward = landing.subtract(c.player.getPos());
@@ -6647,7 +6705,8 @@ final class AgentProgress {
     }
 
     private boolean isTimberPassage(BlockHitResult hit) {
-        return timberInReach(hit) && state(hit).isIn(BlockTags.LEAVES) && !timberUnderfoot(hit.getBlockPos());
+        return timberInReach(hit) && AgentSupplyEgress.naturalDryLeaf(state(hit))
+            && !surfaceApproach.protectedCanopyLeaf(hit.getBlockPos());
     }
 
     private boolean timberUnderfoot(BlockPos block) {
@@ -6676,14 +6735,16 @@ final class AgentProgress {
         timberAttack = 0;
         timberAlignUntil = tick + 34;
         timberChopUntil = tick + 110;
-        if (leaves) timberLeafCuts++;
+        if (leaves && surfaceApproach.canopy.active() == null) triedTimberLeaves.add(hit.getBlockPos());
     }
 
     private boolean continueTimberAttack() {
         if (timberChop == null || timberAttack == 0 || timberAttack != tick - 1
                 || tick - timberAttackWitnessTick > 3 || tick >= timberChopUntil) return false;
         BlockPos block = timberChop.getBlockPos();
-        if (timberUnderfoot(block) || !body.continueMine(block)) return false;
+        if (timberUnderfoot(block)
+                || timberCuttingLeaves && (!hands.stableCraftFooting() || surfaceApproach.protectedCanopyLeaf(block))
+                || !body.continueMine(block)) return false;
         // Bridge a short render gap only for the exact target already being mined.
         timberSeekTick = tick;
         attackTimber(true);
@@ -6710,10 +6771,15 @@ final class AgentProgress {
             timberScan = 0;
             return;
         }
+        if (timberCuttingLeaves && !hands.stableCraftFooting()) return;
         body.aim(timberChopPoint);
         BlockHitResult hit = perceive(timberChopPoint, c.player.getEyePos().distanceTo(timberChopPoint) + 0.08);
         if (hit != null && hit.getBlockPos().equals(block)) {
             BlockState material = state(hit);
+            if (timberCuttingLeaves && !isTimberPassage(hit)) {
+                timberChop = null;
+                return;
+            }
             if (material.isIn(timberCuttingLeaves ? BlockTags.LEAVES
                     : timberCuttingPlanks ? BlockTags.PLANKS : BlockTags.LOGS)) {
                 if (!timberInReach(hit)) {
@@ -7382,14 +7448,21 @@ final class AgentProgress {
 
     /** A new surface mine starts from walked ground, not from the top of a tree or scaffold. */
     private final class SurfaceApproach {
+        private static final int APERTURE_TICKS = 50, GROUND_CHECK_LIMIT = 16;
+        private record CanopyGround(BlockPos from, BlockPos to) {}
+
         private final BlockPos[] visited = new BlockPos[24];
         private final List<BlockPos> route = new ArrayList<>(24);
         private final List<BlockPos> rejected = new ArrayList<>(16);
         private final List<BlockPos> triedLeaves = new ArrayList<>(6);
+        private final AgentSupplyEgress.CanopyPassage canopy = new AgentSupplyEgress.CanopyPassage();
+        private final Set<CanopyGround> canopyGroundChecks = new HashSet<>();
         private BlockPos entrance, from, to;
-        private BlockPos cut;
+        private BlockPos cut, routeCut;
         private Vec3d cutAim;
-        private boolean natural;
+        private boolean natural, canopyRecovery;
+        private int canopySince;
+        private long apertureFrame;
         private int view, since, proof, cuts, cutSince, visitedCursor, backtracks, equippedCheck;
         private float surveyYaw;
 
@@ -7398,7 +7471,154 @@ final class AgentProgress {
         }
 
         private void abandon() {
-            from = to = cut = null;
+            from = to = cut = routeCut = null;
+            abandonBootstrapPassage();
+        }
+
+        private boolean protectedCanopyLeaf(BlockPos leaf) {
+            return protectRecoveryBlock(leaf) || overland.walkedSupport(leaf);
+        }
+
+        private void noteBootstrapLane(BlockPos foot, Direction bearing, boolean lowerTop, BlockPos riser) {
+            BlockPos side = foot.offset(bearing);
+            for (int height = 1; height >= 0; height--) {
+                BlockPos leaf = side.up(height);
+                if (leaf.equals(riser) || protectedCanopyLeaf(leaf) || !canopy.available(foot, leaf)) continue;
+                var hit = perceive(Vec3d.ofCenter(leaf), 2.5);
+                if (hit != null && hit.getBlockPos().equals(leaf) && timberInReach(hit)
+                        && AgentSupplyEgress.canopyLeaf(foot, bearing, hit, state(hit), false)
+                        && (height == 1 || body.overlandTop(leaf, bearing, AgentProgress::dangerous) == null)) {
+                    canopy.offer(foot, bearing, hit, lowerTop);
+                    return;
+                }
+            }
+        }
+
+        private boolean cutTimberMask(Vec3d trunk) {
+            BlockPos foot = c.player.getBlockPos();
+            if (bootstrapSupport(foot) == null || !hands.stableCraftFooting()) return false;
+            return cutTimberMask(foot, perceive(trunk, SEARCH));
+        }
+
+        private boolean cutTimberMask(BlockPos foot, BlockHitResult hit) {
+            if (hit == null || !timberInReach(hit)) return false;
+            BlockPos leaf = hit.getBlockPos();
+            Direction bearing = AgentSurfaceTread.prospectLevelBearing(foot, leaf);
+            if (bearing == null || !AgentSupplyEgress.canopyLeaf(foot, bearing, hit, state(hit), protectedCanopyLeaf(leaf))
+                    || leaf.getY() == foot.getY() && body.overlandTop(leaf, bearing, AgentProgress::dangerous) != null)
+                return false;
+            canopy.offer(foot, bearing, hit, false);
+            return beginBootstrapPassage(foot, bearing, false);
+        }
+
+        private boolean beginBootstrapPassage(BlockPos foot, Direction bearing, boolean recovery) {
+            if (timberChop != null || bootstrapSupport(foot) == null || !hands.stableCraftFooting() || !body.hasRecentView()) return false;
+            var plan = bearing == null ? canopy.begin(foot) : canopy.begin(foot, bearing);
+            if (plan == null) return false;
+            if (protectedCanopyLeaf(plan.face().getBlockPos())
+                    || body.hazardAhead(plan.bearing().getPositiveHorizontalDegrees(), 1.5)) {
+                canopy.finish();
+                return false;
+            }
+            if (ordinaryApproach != null) {
+                body.stopHorizonTravel(ordinaryApproach);
+                ordinaryApproach = null;
+            }
+            body.pauseWork();
+            canopyRecovery = recovery;
+            canopySince = tick;
+            beginTimberChop(plan.face(), true);
+            status = "settled on the canopy; lining up a witnessed leaf passage";
+            return true;
+        }
+
+        private boolean workBootstrapPassage() {
+            var plan = canopy.active();
+            if (plan == null) return false;
+            BlockPos leaf = plan.face().getBlockPos();
+            if (bootstrapSupport(plan.foot()) == null || protectedCanopyLeaf(leaf)
+                    || body.hazardAhead(plan.bearing().getPositiveHorizontalDegrees(), 1.5)) {
+                abandonBootstrapPassage();
+                return false;
+            }
+            if (canopy.opened()) {
+                body.pauseWork();
+                if (!hands.stableCraftFooting()) {
+                    if (tick - canopySince < APERTURE_TICKS) return true;
+                    abandonBootstrapPassage();
+                    return false;
+                }
+                if ((!body.hasRecentView() || body.renderedFrame() <= apertureFrame) && tick - canopySince < APERTURE_TICKS)
+                    return true;
+                overland.recheckCanopyBranch(plan.foot(), plan.bearing());
+                if (timberWitness != null) {
+                    timberNear = false;
+                    timberScan = timberApproachSince = 0;
+                    timberWorkUntil = tick + TIMBER_WORK_TICKS;
+                }
+                abandonBootstrapPassage();
+                return false;
+            }
+            if (timberChop == null || tick - canopySince >= APERTURE_TICKS) {
+                abandonBootstrapPassage();
+                return false;
+            }
+            stallGuard.navigationWork();
+            if (hands.stableCraftFooting()) {
+                if (body.hasRecentView()) chopTimber();
+                else continueTimberAttack();
+            }
+            return true;
+        }
+
+        private boolean bootstrapBroken(BlockPos leaf) {
+            if (timberAttack == 0 || !canopy.broken(leaf)) return false;
+            apertureFrame = body.renderedFrame();
+            return true;
+        }
+
+        private void abandonBootstrapPassage() {
+            var plan = canopy.active();
+            if (plan != null && timberCuttingLeaves && timberChop != null
+                    && timberChop.getBlockPos().equals(plan.face().getBlockPos())) timberChop = null;
+            canopy.finish();
+            canopyRecovery = false;
+        }
+
+        private String stallBootstrapPassage() {
+            BlockPos foot = c.player.getBlockPos();
+            if (portal != null && portal.locallyStopped() || !bootstrapCanopy(foot) || !hands.stableCraftFooting()) return null;
+            float yaw = body.defensiveViewYaw();
+            for (Direction bearing : Direction.Type.HORIZONTAL) {
+                if (bearingDistance(yaw, bearing.getPositiveHorizontalDegrees()) > 37) continue;
+                BlockPos side = foot.offset(bearing);
+                if (canopyGroundChecks.size() < GROUND_CHECK_LIMIT) {
+                    // Prefer a lower natural tread, but require the same native reverse/sweep proof as stock travel.
+                    for (int grade = -1; grade <= 1; grade++) {
+                        BlockPos landing = side.up(grade);
+                        if (!overland.untriedCanopyTread(foot, landing, bearing)
+                                || stallGuard.refusedCrossing(foot, landing)) continue;
+                        var check = new CanopyGround(foot, landing);
+                        if (canopyGroundChecks.contains(check)) continue;
+                        var edge = body.witnessedOrdinaryTread(foot, landing, bearing);
+                        if (edge == null) continue;
+                        var floor = edge.lower().equals(landing) ? edge.lowerSupport() : edge.upperSupport();
+                        if (!naturalGround(floor)) continue;
+                        canopyGroundChecks.add(check);
+                        overland.recheckCanopyBranch(foot, bearing);
+                        stallWork = () -> AgentStallGuard.Alternative.REPLAN;
+                        return "taking a newly witnessed reversible tread toward dry ground";
+                    }
+                }
+                noteBootstrapLane(foot, bearing, false, null);
+            }
+            if (!beginBootstrapPassage(foot, null, true)) return null;
+            stallWork = () -> {
+                boolean opened = canopy.opened();
+                if (workBootstrapPassage()) return AgentStallGuard.Alternative.WORKING;
+                return opened ? AgentStallGuard.Alternative.REPLAN : AgentStallGuard.Alternative.REFUSED;
+            };
+            return "opening a witnessed side passage through the canopy";
         }
 
         private boolean checkEquippedMine() {
@@ -7436,7 +7656,7 @@ final class AgentProgress {
                     && (body.supplyPerspective(c.player.getYaw()) & AgentBody.SUPPLY_OPEN) == 0) return false;
             status = "checking for walkable ground before starting a surface mine";
             if (c.player.isTouchingWater()) {
-                to = cut = null;
+                to = cut = routeCut = null;
                 explore();
                 return true;
             }
@@ -7446,7 +7666,7 @@ final class AgentProgress {
                 recordStance(standing);
                 rejected.clear();
                 from = standing;
-                to = cut = null;
+                to = cut = routeCut = null;
                 view = 0;
                 since = tick;
                 surveyYaw = c.player.getYaw();
@@ -7589,7 +7809,7 @@ final class AgentProgress {
             }
             status = "clearing a witnessed leaf from the route to ground";
             body.aimContact(obstruction, AgentBody.Contact.MINE);
-            if (tools.readyFor(state)) body.mine(obstruction);
+            if (hands.stableCraftFooting() && tools.readyFor(state) && body.mine(obstruction)) routeCut = leaf;
         }
 
         private boolean cutSightline() {
@@ -7624,16 +7844,14 @@ final class AgentProgress {
                 BlockState observed = state(seen);
                 if (eligibleLeaf(cut, observed)) {
                     body.aimContact(seen, AgentBody.Contact.MINE);
-                    if (tools.readyFor(observed)) body.mine(seen);
+                    if (hands.stableCraftFooting() && tools.readyFor(observed)) body.mine(seen);
                 }
             }
             return true;
         }
 
         private boolean eligibleLeaf(BlockPos leaf, BlockState state) {
-            return cuts < 6 && !protectRecoveryBlock(leaf) && state.isIn(BlockTags.LEAVES)
-                && state.getFluidState().isEmpty() && state.contains(LeavesBlock.PERSISTENT)
-                && !state.get(LeavesBlock.PERSISTENT);
+            return cuts < 6 && !protectedCanopyLeaf(leaf) && AgentSupplyEgress.naturalDryLeaf(state);
         }
 
         private boolean traverse() {
@@ -7667,7 +7885,7 @@ final class AgentProgress {
 
         private void reject() {
             rejected.add(to);
-            to = null;
+            to = routeCut = null;
             since = tick;
         }
 
@@ -7676,7 +7894,10 @@ final class AgentProgress {
             if (position.equals(cut)) {
                 cuts++;
                 cut = null;
-            } else if (to != null && proof < 4 && sameStem(position, to)) cuts++;
+            } else if (position.equals(routeCut)) {
+                cuts++;
+                routeCut = null;
+            }
         }
     }
 

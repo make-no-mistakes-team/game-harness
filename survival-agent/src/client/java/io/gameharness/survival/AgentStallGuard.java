@@ -427,7 +427,8 @@ final class AgentStallGuard {
             && now - (furnaceSeen == 0 ? furnaceSince : furnaceSeen) <= FURNACE_UPDATE_TICKS;
     }
 
-    void observe(int now, int confirmedFrameBlocks, int confirmedMeals, String activity, boolean navigationLease) {
+    void observe(int now, int confirmedFrameBlocks, int confirmedMeals, String activity, boolean navigationLease,
+                 boolean bootstrapTimber) {
         tick = now;
         if (world != client.world) resetWorld();
         water.observe();
@@ -500,7 +501,7 @@ final class AgentStallGuard {
         settledNavigationSurvey = navigationSurvey;
         boolean normal = phase == Phase.WATCH;
         boolean navigation = navigationTurn || phase == Phase.RETRY && navigationRetry;
-        int gain = inventoryGain(navigation && !normal);
+        int gain = inventoryGain(navigation && !normal, bootstrapTimber);
         double distance = feet.squaredDistanceTo(anchor);
         boolean newTravel = grounded && novelCells >= 2 && distance >= 4.0;
         boolean knownTravel = grounded && movedCells >= 4 && distance >= 25.0 && awayFromCredits(feet);
@@ -1049,7 +1050,7 @@ final class AgentStallGuard {
     }
 
     /** Compare total owned items, not slot order, selected hotbar, damage, or in-flight GUI transfers. */
-    private int inventoryGain(boolean navigation) {
+    private int inventoryGain(boolean navigation, boolean bootstrapTimber) {
         if (hands.busy() || client.currentScreen != null) return 0;
         var owned = client.player.getInventory();
         int kinds = 0;
@@ -1069,7 +1070,9 @@ final class AgentStallGuard {
             for (int i = 0; i < kinds; i++) {
                 int id = sampledIds[i];
                 if (inventorySample[id] <= inventory[id]) continue;
-                if (navigation ? navigationSupply(sampledItems[i]) : taskItem(sampledItems[i])) {
+                Item item = sampledItems[i];
+                if (bootstrapTimber && item == Items.STICK) continue;
+                if (navigation ? navigationSupply(item) : taskItem(item)) {
                     gain = 2;
                     break;
                 }

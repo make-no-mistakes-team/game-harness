@@ -17,6 +17,7 @@ final class AgentOverlandSearch {
 
     private enum Phase { CENTER, HORIZON, FLOOR, CLEARANCE, DRIVE, STOPPED }
     record Arrival(BlockPos from, BlockPos foot) {}
+    record CanopyLaneRefusal(BlockPos foot, Direction bearing, boolean lowerTop, BlockPos riser) {}
 
     static boolean resourceInputAllowed(boolean safe, boolean grounded, boolean driving, boolean previousTurn) {
         // An interrupted committed tread cannot resume, even if the player is now grounded.
@@ -97,6 +98,10 @@ final class AgentOverlandSearch {
                 && !walked.contains(to.asLong());
         }
 
+        boolean walkedSupport(BlockPos support) {
+            return walked.contains(support.up().asLong());
+        }
+
         boolean offerResource(BlockPos from, BlockPos to, Direction lane, int alreadyProved,
                               ResourceGoal goal, Predicate<BlockPos> witnessed) {
             return canExtend(from, to, lane, alreadyProved) && !goal.reached(from)
@@ -141,11 +146,14 @@ final class AgentOverlandSearch {
     private Phase phase = Phase.CENTER;
     private Direction lane;
     private BlockPos stance, blockedStance, origin, landmark, returnFoot;
+    private BlockPos canopyBranchFoot, shownRiser;
+    private Direction canopyBranch;
+    private CanopyLaneRefusal canopyRefusal;
     private Arrival arrival;
     private int option, length, since, skylineViews, lastSkyline, legs, landmarkUntil;
     private long skylineFrame;
     private double farthest;
-    private boolean risingView, refused;
+    private boolean risingView, refused, triedLower, canopyLeg;
     private ResourceGoal resource;
     private String status = "overland search: preparing to look for supplies";
 
@@ -162,6 +170,31 @@ final class AgentOverlandSearch {
     boolean owns(BlockPos foot) { return foot.equals(stance) && phase != Phase.STOPPED; }
     boolean leased(int tick) { return stance != null && phase != Phase.STOPPED && tick - since <= DRIVE_TICKS; }
     String status() { return status; }
+    boolean walkedSupport(BlockPos block) { return course.walkedSupport(block); }
+    boolean untriedCanopyTread(BlockPos foot, BlockPos to, Direction bearing) {
+        return course.canExtend(foot, to, bearing, 0);
+    }
+
+    CanopyLaneRefusal takeCanopyLaneRefusal() {
+        var result = canopyRefusal;
+        canopyRefusal = null;
+        return result;
+    }
+
+    boolean canopyLanesExhausted(BlockPos foot) {
+        return foot.equals(stance) && (stopped() || returnFoot != null && !driving());
+    }
+
+    /** A newly opened or independently re-witnessed branch changes the heading, not the walked course. */
+    void recheckCanopyBranch(BlockPos foot, Direction bearing) {
+        if (foot.equals(blockedStance)) blockedStance = null;
+        canopyBranchFoot = foot;
+        canopyBranch = bearing;
+        returnFoot = null;
+        stance = null;
+        phase = Phase.CENTER;
+        refused = false;
+    }
 
     Arrival takeArrival() {
         Arrival result = arrival;
@@ -181,6 +214,9 @@ final class AgentOverlandSearch {
         landmark = null;
         returnFoot = null;
         resource = null;
+        canopyBranchFoot = null;
+        canopyBranch = null;
+        canopyRefusal = null;
     }
 
     /** Start a new search with a real preferred bearing, not a fictitious witnessed landmark. */
@@ -217,6 +253,10 @@ final class AgentOverlandSearch {
     }
 
     void step(int tick) {
+        step(tick, false);
+    }
+
+    void step(int tick, boolean canopy) {
         var player = client.player;
         BlockPos foot = player.getBlockPos();
         if (driving()) {
@@ -234,6 +274,7 @@ final class AgentOverlandSearch {
             return;
         }
         if (!foot.equals(stance)) {
+            if (!foot.equals(canopyBranchFoot)) canopyBranch = null;
             stance = foot.toImmutable();
             if (origin == null) origin = stance;
             course.start(stance, player.getHorizontalFacing());
@@ -246,7 +287,7 @@ final class AgentOverlandSearch {
         if (tick - since > LOOK_TICKS) {
             if (phase == Phase.CENTER) stop("could not settle at a full support center");
             else if (phase == Phase.HORIZON) beginBearing(tick);
-            else if (returnFoot == null) nextBearing(tick);
+            else if (returnFoot == null) refuseBearing(tick, canopy && body.hasRecentView());
             else stop("could not re-witness the last walked connection");
             return;
         }
@@ -265,8 +306,8 @@ final class AgentOverlandSearch {
                 }
             }
             case HORIZON -> horizon(tick);
-            case FLOOR -> floors(tick);
-            case CLEARANCE -> clearance(tick);
+            case FLOOR -> floors(tick, canopy);
+            case CLEARANCE -> clearance(tick, canopy);
             default -> throw new IllegalStateException("Unexpected surface-search phase " + phase);
         }
     }
@@ -294,19 +335,22 @@ final class AgentOverlandSearch {
     private void beginBearing(int tick) {
         phase = Phase.FLOOR;
         Direction bearing = preferredBearing();
-        lane = landmark == null && resource == null ? course.bearing(option) : switch (option) {
+        lane = landmark == null && resource == null && canopyBranch == null ? course.bearing(option) : switch (option) {
             case 0 -> bearing;
             case 1 -> bearing.rotateYClockwise();
             case 2 -> bearing.rotateYCounterclockwise();
             default -> bearing.getOpposite();
         };
         length = 0;
+        triedLower = false;
+        shownRiser = null;
         since = tick;
         status = "overland search: checking a continuous lane " + lane.asString()
             + (landmark == null && resource == null ? "" : " toward a witnessed supply site");
     }
 
     private Direction preferredBearing() {
+        if (canopyBranch != null) return canopyBranch;
         if (landmark == null && resource == null) return course.horizon();
         double x = resource == null ? landmark.getX() - stance.getX() : resource.point.x - stance.getX() - 0.5;
         double z = resource == null ? landmark.getZ() - stance.getZ() : resource.point.z - stance.getZ() - 0.5;
@@ -339,7 +383,7 @@ final class AgentOverlandSearch {
         }
     }
 
-    private void floors(int tick) {
+    private void floors(int tick, boolean canopy) {
         float yaw = lane.getPositiveHorizontalDegrees();
         float pitch = resource != null && stance.getY() > resource.maxFootY ? 45 : FLOOR_PITCH;
         body.turn(yaw, pitch);
@@ -350,14 +394,18 @@ final class AgentOverlandSearch {
                 nextBearing(tick);
                 return;
             }
+        } else if (canopy && !triedLower && !client.options.jumpKey.isUnbound() && offer(stance, next.down())) {
+            triedLower = true;
         } else if (offer(stance, next)) {
             for (int i = 1; i < MAX_LEG; i++) {
                 BlockPos farther = next.offset(lane);
                 if (!offer(next, farther)) break;
                 next = farther;
             }
-        } else if (!offer(stance, next.up()) && !offer(stance, next.down())) {
-            nextBearing(tick);
+        } else if (offer(stance, next.up())) {
+            shownRiser = next;
+        } else if (triedLower || !offer(stance, next.down())) {
+            refuseBearing(tick, canopy);
             return;
         }
         phase = Phase.CLEARANCE;
@@ -377,7 +425,7 @@ final class AgentOverlandSearch {
         return true;
     }
 
-    private void clearance(int tick) {
+    private void clearance(int tick, boolean canopy) {
         float yaw = lane.getPositiveHorizontalDegrees();
         int rise = path[0].getY() - stance.getY();
         float pitch = rise > 0 ? -6 : rise < 0 && resource != null ? 45 : FLOOR_PITCH;
@@ -392,10 +440,18 @@ final class AgentOverlandSearch {
             }
         }
         while (length > 0 && !body.overlandLane(stance, path, supports, length, lane, dangerous)) length--;
+        if (length > 0 && canopy && !reversibleCanopyGrade(path[0])) length = 0;
         if (length == 0) {
-            nextBearing(tick);
+            if (canopy && rise < 0 && triedLower && returnFoot == null) {
+                // A blocked descent must not hide a usable level or rising tread on the same bearing.
+                phase = Phase.FLOOR;
+                since = tick;
+            } else {
+                refuseBearing(tick, canopy);
+            }
             return;
         }
+        canopyLeg = canopy;
         phase = Phase.DRIVE;
         since = tick;
         status = returnFoot != null ? "overland search: returning one checked step to a different branch"
@@ -403,6 +459,19 @@ final class AgentOverlandSearch {
             : rise < 0 ? "overland search: stepping down to the witnessed landing"
             : "overland search: walking " + length + " connected blocks " + lane.asString();
         drive(tick, stance);
+    }
+
+    private void refuseBearing(int tick, boolean canopy) {
+        if (canopy && returnFoot == null) canopyRefusal = new CanopyLaneRefusal(stance, lane, triedLower, shownRiser);
+        nextBearing(tick);
+    }
+
+    private boolean reversibleCanopyGrade(BlockPos to) {
+        boolean descending = stance.getY() > to.getY();
+        if (stance.getY() == to.getY()) return true;
+        return !client.options.jumpKey.isUnbound() && (descending
+            ? AgentSurfaceTread.reverseClear(client, stance, to, lane)
+            : AgentSurfaceTread.reverseClear(client, to, stance, lane.getOpposite()));
     }
 
     private void drive(int tick, BlockPos foot) {
@@ -413,7 +482,8 @@ final class AgentOverlandSearch {
             return;
         }
         if (!body.hasRecentView()) return;
-        if (!body.overlandLane(stance, path, supports, length, lane, dangerous)) {
+        if (!body.overlandLane(stance, path, supports, length, lane, dangerous)
+                || canopyLeg && !reversibleCanopyGrade(path[0])) {
             abandonLeg(tick, foot, "the observed lane changed or the player left its sweep");
             return;
         }
@@ -434,6 +504,7 @@ final class AgentOverlandSearch {
             if (!settledMotion()) return;
             BlockPos from = stance;
             stance = to;
+            if (!to.equals(canopyBranchFoot)) canopyBranch = null;
             phase = Phase.CENTER;
             since = tick;
             option = 0;

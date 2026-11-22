@@ -1,11 +1,17 @@
 package io.gameharness.survival;
 
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiPredicate;
+import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.LeavesBlock;
+import net.minecraft.registry.tag.BlockTags;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
@@ -67,6 +73,95 @@ final class AgentSupplyEgress {
     void reset() {
         finish();
         refusals.clear();
+    }
+
+    static boolean naturalDryLeaf(BlockState state) {
+        return state.isIn(BlockTags.LEAVES) && state.getFluidState().isEmpty()
+            && state.contains(LeavesBlock.PERSISTENT) && !state.get(LeavesBlock.PERSISTENT);
+    }
+
+    static boolean canopyContact(BlockState support, boolean bootstrap, boolean returning) {
+        return bootstrap && !returning && support != null && naturalDryLeaf(support);
+    }
+
+    static boolean canopyLeaf(BlockPos from, Direction lane, BlockHitResult hit, BlockState state, boolean protectedCell) {
+        return !protectedCell && hit.getType() == HitResult.Type.BLOCK && !hit.isInsideBlock()
+            && AgentSurfaceTread.prospectLevelCell(from, hit.getBlockPos(), lane) && naturalDryLeaf(state);
+    }
+
+    /** Keep finite, exact leaf premises separate from a successful cut or a traversed lane. */
+    static final class CanopyPassage {
+        private static final int MAX_CUTS = 6, MAX_CUTS_FROM_FOOT = 2, MAX_ATTEMPTS = 12;
+        record Candidate(BlockPos foot, Direction bearing, BlockHitResult face, boolean lowerTop) {}
+
+        private final Candidate[] branches = new Candidate[Direction.values().length];
+        private final Set<BlockPos> attempts = new HashSet<>();
+        private final Map<BlockPos, Integer> cutsFromFoot = new HashMap<>();
+        private BlockPos footing;
+        private Candidate active;
+        private boolean opened;
+        private int cuts;
+
+        boolean available(BlockPos foot, BlockPos leaf) {
+            return cuts < MAX_CUTS && attempts.size() < MAX_ATTEMPTS && !attempts.contains(leaf)
+                && cutsFromFoot.getOrDefault(foot, 0) < MAX_CUTS_FROM_FOOT;
+        }
+
+        void offer(BlockPos foot, Direction lane, BlockHitResult face, boolean lowerTop) {
+            if (!available(foot, face.getBlockPos())) return;
+            if (!foot.equals(footing)) {
+                Arrays.fill(branches, null);
+                footing = foot.toImmutable();
+            }
+            branches[lane.ordinal()] = new Candidate(footing, lane, face, lowerTop);
+        }
+
+        Candidate begin(BlockPos foot) {
+            if (!foot.equals(footing) || active != null) return null;
+            Candidate best = null;
+            for (Candidate branch : branches) {
+                if (branch == null || !available(foot, branch.face.getBlockPos())) continue;
+                if (best == null || branch.lowerTop && !best.lowerTop) best = branch;
+            }
+            return take(best);
+        }
+
+        Candidate begin(BlockPos foot, Direction lane) {
+            return foot.equals(footing) ? take(branches[lane.ordinal()]) : null;
+        }
+
+        private Candidate take(Candidate candidate) {
+            if (active != null || candidate == null || !available(candidate.foot, candidate.face.getBlockPos())) return null;
+            attempts.add(candidate.face.getBlockPos().toImmutable());
+            branches[candidate.bearing.ordinal()] = null;
+            return active = candidate;
+        }
+
+        Candidate active() { return active; }
+        boolean opened() { return opened; }
+        int cuts() { return cuts; }
+
+        boolean broken(BlockPos leaf) {
+            if (active == null || opened || !leaf.equals(active.face.getBlockPos())) return false;
+            opened = true;
+            cuts++;
+            cutsFromFoot.merge(active.foot, 1, Integer::sum);
+            return true;
+        }
+
+        void finish() {
+            active = null;
+            opened = false;
+        }
+
+        void reset() {
+            finish();
+            footing = null;
+            Arrays.fill(branches, null);
+            attempts.clear();
+            cutsFromFoot.clear();
+            cuts = 0;
+        }
     }
 
     /** A lit adjacent soil tread and clear passage suffice; a leaf ceiling does not make it a cave. */

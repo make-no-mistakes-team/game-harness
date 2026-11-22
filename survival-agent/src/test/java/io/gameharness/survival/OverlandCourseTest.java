@@ -64,6 +64,23 @@ final class OverlandCourseTest {
     }
 
     @Test
+    void anIntentionalResiteStartsASeparateCheckedCourse() {
+        var course = new AgentOverlandSearch.Course();
+        var start = BlockPos.ORIGIN;
+        course.start(start, Direction.EAST);
+        assertTrue(course.arrived(start.east()));
+
+        course.restart(Direction.NORTH);
+        course.start(start, Direction.WEST);
+        assertEquals(Direction.NORTH, course.bearing(0), "the departure has a retained bearing");
+        assertNull(course.previous(start), "old supply travel is not a join to the new departure");
+        assertEquals(0, course.newFootings(), "a new direction did not move the actor");
+        assertFalse(course.canExtend(start, start.north().down(2), Direction.NORTH, 0));
+        assertTrue(course.arrived(start.north()));
+        assertEquals(1, course.newFootings());
+    }
+
+    @Test
     void aCulDeSacPermitsBoundedRetracingWithoutClaimingNewTravel() {
         var course = new AgentOverlandSearch.Course();
         var start = BlockPos.ORIGIN;

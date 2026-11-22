@@ -37,6 +37,14 @@ final class AgentOverlandSearch {
             }
         }
 
+        void restart(Direction bearing) {
+            horizon = bearing;
+            side = bearing.rotateYClockwise();
+            walked.clear();
+            crumbs.clear();
+            newFootings = 0;
+        }
+
         Direction horizon() { return horizon; }
         int newFootings() { return newFootings; }
 
@@ -131,6 +139,17 @@ final class AgentOverlandSearch {
         stance = null;
         landmark = null;
         returnFoot = null;
+    }
+
+    /** Start a new search with a real preferred bearing, not a fictitious witnessed landmark. */
+    void restart(Direction bearing) {
+        interrupt();
+        course.restart(bearing);
+        blockedStance = origin = null;
+        refused = risingView = false;
+        arrival = null;
+        legs = lastSkyline = 0;
+        farthest = 0;
     }
 
     void guide(BlockPos witness, int tick) {

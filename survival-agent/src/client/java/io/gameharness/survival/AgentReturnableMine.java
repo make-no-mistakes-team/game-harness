@@ -224,6 +224,14 @@ final class AgentReturnableMine {
         return client.world == world && client.player == player && detachedRim != null;
     }
 
+    /** Abandon the old worksite without admitting any connection to its detached rim. */
+    void resited(BlockPos foot) {
+        if (client.world != world || client.player != player || active() || !dryGroundAt(foot)) return;
+        detachedRim = relocationRefused = null;
+        detachedLevel = false;
+        relocationRefusal = null;
+    }
+
     String status() { return status; }
     int depth() { return depth; }
     BlockPos witnessedLowCeiling() { return client.player == player && client.world == world ? reverseCeiling : null; }

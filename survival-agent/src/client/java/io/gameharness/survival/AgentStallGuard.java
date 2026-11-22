@@ -252,6 +252,7 @@ final class AgentStallGuard {
             ? report.detail() : "stall recovery: " + report.detail();
     }
     boolean ownsRecovery() { return phase != Phase.WATCH && phase != Phase.RETRY; }
+    boolean exhaustedDryRecovery() { return phase == Phase.BLOCKED && safeIdle; }
     boolean retryingDistinctWork() { return phase == Phase.RETRY && blockedReason != null; }
     boolean waitingForEvidence() { return phase == Phase.BLOCKED || phase == Phase.ASSESS
         || phase == Phase.WATER && water.blocked(); }
@@ -281,6 +282,20 @@ final class AgentStallGuard {
         if (phase == Phase.WATCH) return;
         recoveries++;
         transition(Phase.WATCH, "returned to witnessed shaft footing with a different descending branch");
+    }
+
+    /** Give the next mine start a regular work window, without crediting ore or a recovery result. */
+    void mineResited() {
+        markUseful(client.player.getPos());
+        if (phase != Phase.WATCH) transition(Phase.WATCH, "left the exhausted mine area on checked footing");
+    }
+
+    void mineDepartureRefused(String reason) {
+        if (phase == Phase.WATCH) skillBlocked(reason);
+        else {
+            blockedReason = reason;
+            assessAgain(reason);
+        }
     }
 
     /** A previously walked cell may offer a different approach, but charge each actual support only once per incident. */

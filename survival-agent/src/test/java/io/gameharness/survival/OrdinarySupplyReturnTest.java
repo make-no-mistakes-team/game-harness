@@ -1,6 +1,8 @@
 package io.gameharness.survival;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
 import net.minecraft.util.math.BlockPos;
@@ -36,6 +38,61 @@ final class OrdinarySupplyReturnTest {
         assertEquals(AgentProgress.FurnaceSite.RETURN, AgentProgress.furnaceSite(false, false, 13, false));
         assertEquals(AgentProgress.FurnaceSite.PAID, AgentProgress.furnaceSite(true, false, disconnected, true));
         assertEquals(AgentProgress.FurnaceSite.PAID, AgentProgress.furnaceSite(true, true, 3, true));
+    }
+
+    @Test
+    void shallowRetriesExhaustThePatchButDepthAndOreReallyAdvanceTheMine() {
+        var foot = MINE.withY(50);
+        var mine = new AgentProgress.MineSetback();
+        mine.begin(50, 0);
+        mine.exhausted(foot);
+        assertFalse(mine.ready(false), "one exhausted site still leaves ordinary recovery");
+        assertTrue(mine.ready(true), "explicit refusal followed by exhausted recovery is enough");
+        mine.depth(49);
+        mine.exhausted(foot.north().up());
+        assertTrue(mine.ready(false), "a shallow oscillation does not renew mining");
+        assertFalse(mine.material(0), "kit or slot changes without ore do not renew mining");
+        assertTrue(mine.ready(false));
+        mine.depth(47);
+        assertFalse(mine.ready(true), "genuinely deeper settled work clears the setback");
+        mine.exhausted(foot.down(3));
+        mine.material(1);
+        assertFalse(mine.ready(true), "actual ore gain clears the setback");
+    }
+
+    @Test
+    void mineResiteRetreatNeedsAnExactContactAndContinuousDryGrades() {
+        var foot = new BlockPos(-20, 50, 33);
+        var trail = List.of(foot.west().up(3).south(3), foot.up(2).south(3),
+            foot.up().south(3), foot.south(2), foot.up().south(), foot);
+        assertEquals(-1, AgentProgress.mineRetreatTarget(trail, 5, foot.east(), (from, to) -> true),
+            "being next to a saved foot is not a join");
+        assertEquals(2, AgentProgress.mineRetreatTarget(trail, 5, foot, (from, to) -> true),
+            "a same-column vertical discontinuity cannot be used as a stair");
+        assertEquals(0, AgentProgress.mineRetreatTarget(trail.subList(2, 6), 3, foot, (from, to) -> true),
+            "the exact joined grades, including a downward return tread, remain retrace candidates");
+        assertEquals(-1, AgentProgress.mineRetreatTarget(trail, 5, foot,
+            (from, to) -> !to.equals(foot.south(2))), "a refused lane cannot be skipped");
+    }
+
+    @Test
+    void nativeResiteNeedsPhysicalDistanceAndDoesNotCreditDepthOrOre() {
+        var foot = MINE.withY(50);
+        var newSite = foot.north(6).down(6);
+        var mine = new AgentProgress.MineSetback();
+        mine.begin(50, 2);
+        mine.exhausted(foot);
+        mine.exhausted(foot.north());
+        assertTrue(mine.ready(false)); // No strategy mailbox or model.
+        mine.retire();
+        assertFalse(mine.resited(foot.north(2)));
+        assertTrue(mine.ready(false), "a neighboring landing is not a different mine start");
+        assertTrue(mine.resited(newSite));
+        assertTrue(mine.retired(foot));
+        assertFalse(mine.ready(false));
+        mine.exhausted(newSite);
+        mine.depth(47);
+        assertFalse(mine.ready(true), "physical relocation did not advance the mining depth checkpoint");
     }
 
     private static int anchor(List<BlockPos> trail, BlockPos actor) {

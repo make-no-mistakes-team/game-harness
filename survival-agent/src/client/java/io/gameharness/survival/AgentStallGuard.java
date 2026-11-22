@@ -200,7 +200,7 @@ final class AgentStallGuard {
     private boolean inventoryKnown, dark, lampTried, stepTried, backtrackTried, tookControl, priorityAim;
     private boolean cookBurning, cooked;
     private boolean glanceTried, glancing, explicitRefusal;
-    private boolean waterBlockedReported;
+    private boolean waterBlockedReported, emergencyWater;
     private int waterAttempts;
     private boolean mineHandedBack;
     private boolean workBroke, resourceBroke, stairLit, surfaceStep;
@@ -551,6 +551,20 @@ final class AgentStallGuard {
     /** Incidental immersion is not a failed dry stance and must not enter the dry-only assessment. */
     boolean controlsWaterRecovery() { return phase == Phase.WATER; }
 
+    AgentWaterEscape.Result takeEmergencyWaterTurn(Runnable replan, Runnable releaseAlternative) {
+        if (client.player.hasVehicle() || !client.player.isTouchingWater() && phase != Phase.WATER)
+            return AgentWaterEscape.Result.INTERRUPTED;
+        if (phase != Phase.WATER || !emergencyWater) {
+            if (phase == Phase.ALTERNATIVE) releaseAlternative.run();
+            tookControl = true;
+            blockedReason = null;
+            replan.run();
+            water.startEmergency();
+            beginWaterRecovery(true);
+        }
+        return stepWaterRecovery();
+    }
+
     boolean takeWaterTurn(boolean planned, AgentVisibleHorizon.Refusal lostShallows, Runnable replan,
                           Runnable releaseAlternative) {
         if (planned || client.player.hasVehicle()) {
@@ -570,30 +584,38 @@ final class AgentStallGuard {
             blockedReason = null;
             replan.run();
             water.start(lostShallows == null);
-            waterAttempts = 0;
-            waterBlockedReported = false;
-            transition(Phase.WATER, water.status());
+            beginWaterRecovery(false);
         }
+        return stepWaterRecovery() != AgentWaterEscape.Result.INTERRUPTED;
+    }
+
+    private void beginWaterRecovery(boolean emergency) {
+        emergencyWater = emergency;
+        waterAttempts = 0;
+        waterBlockedReported = false;
+        transition(Phase.WATER, water.status());
+    }
+
+    private AgentWaterEscape.Result stepWaterRecovery() {
         AgentWaterEscape.Result result = water.step();
-        attempts += water.attempts() - waterAttempts;
+        if (!emergencyWater) attempts += water.attempts() - waterAttempts;
         waterAttempts = water.attempts();
         if (result == AgentWaterEscape.Result.LANDED) {
-            recoveries++;
+            if (!emergencyWater) recoveries++;
             markUseful(client.player.getPos());
             water.clearEpisode();
             // A wet crossing is not a walked dry edge. Ordinary work can record the new footing.
-            transition(Phase.WATCH, water.status() + "; returning control to ordinary play");
+            transition(Phase.WATCH, emergencyWater ? water.status() : water.status() + "; returning control to ordinary play");
         } else if (result == AgentWaterEscape.Result.INTERRUPTED) {
             water.clearEpisode();
-            transition(Phase.PENDING, "water recovery released without a settled landing");
-            return false;
+            transition(emergencyWater ? Phase.WATCH : Phase.PENDING, "water recovery released without a settled landing");
         } else {
-            if (result == AgentWaterEscape.Result.BLOCKED && !waterBlockedReported) failures++;
+            if (!emergencyWater && result == AgentWaterEscape.Result.BLOCKED && !waterBlockedReported) failures++;
             waterBlockedReported = result == AgentWaterEscape.Result.BLOCKED;
             if (!report.detail().equals(water.status()) || report.attempts() != attempts || report.failures() != failures)
                 transition(Phase.WATER, water.status());
         }
-        return true;
+        return result;
     }
 
     /** Actual danger, fall or feeding behavior retains the camera; it is not a search sweep. */

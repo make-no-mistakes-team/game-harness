@@ -27,7 +27,8 @@ final class AgentWaterEscape {
     private static final int STALLED_TICKS = 32, DRIFT_TICKS = 9, MAX_DRIVES = 5, MAX_EPISODE_TICKS = 390;
     private static final int DRIVE_TICKS = 44, NO_GAIN_TICKS = 15, RECHECK_TICKS = 39, DRY_TICKS = 5;
     private static final int LIP_TICKS = 15;
-    private static final int MIN_START_AIR = 150, MIN_WORK_AIR = 105;
+    private static final int MIN_START_AIR = 150;
+    static final int MIN_WORK_AIR = 105;
     private static final double[] DISTANCES = {0.90, 1.51, 2.15};
     private static final int[] FAN = {0, -29, 29};
     private static final Direction[] PLUG_FACES = {
@@ -56,7 +57,7 @@ final class AgentWaterEscape {
     private int sector, proofAt, actionAt, gainAt, lipAt, attempts, drives, dryLossAt, itemBefore, evidenceCount;
     private float firstYaw;
     private double driftX, driftZ, bestDistance, originalDistance;
-    private boolean lowView, edited, useIssued, confirmedPlug, undoFinished, sawFrame, renderedScan, allowEdits;
+    private boolean lowView, edited, useIssued, confirmedPlug, undoFinished, sawFrame, renderedScan, allowEdits, emergency;
     private Lane target, pocket;
     private Plug plug, observedPlug;
     private Block placedBlock;
@@ -124,13 +125,29 @@ final class AgentWaterEscape {
     }
 
     void start(boolean allowEdits) {
+        start(allowEdits, false);
+    }
+
+    /** Damage needs a bank now, not a stall diagnosis or a flow edit. */
+    void startEmergency() {
+        start(false, true);
+    }
+
+    private void start(boolean allowEdits, boolean emergency) {
         tried.clear();
         attempts = drives = 0;
         edited = false;
         this.allowEdits = allowEdits;
+        this.emergency = emergency;
         origin = player.getPos();
         began = body.actionTick();
-        beginDrift(began);
+        if (emergency) {
+            body.pauseWork();
+            driftX = driftZ = 0;
+            dryLossAt = 0;
+            sawFrame = renderedScan = false;
+            beginScan(began, "checking for a witnessed bank after damage");
+        } else beginDrift(began);
         lastActionTick = began - 1;
     }
 
@@ -232,7 +249,8 @@ final class AgentWaterEscape {
         }
         float yaw = firstYaw + sector * 90;
         float pitch = lowView ? 48 : 27;
-        body.turnScan(yaw, pitch);
+        if (emergency) body.turnUrgent(yaw, pitch);
+        else body.turnScan(yaw, pitch);
         if (!body.renderedDirection(yaw, pitch, 11) && now - entered < 33) return Result.WORKING;
         if (body.renderedDirection(yaw, pitch, 15)) {
             renderedScan = true;

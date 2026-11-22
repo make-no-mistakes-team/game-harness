@@ -10,13 +10,14 @@ import net.minecraft.sound.SoundCategory;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
-/** The same cue stream as vanilla's subtitles, reduced to coarse bearings. */
+/** Public vanilla sound playback and subtitles, reduced to coarse bearings. */
 final class AgentEars implements SoundInstanceListener {
     private static final long FRESH_ZOMBIE_NANOS = 900_000_000L;
     private static final long FRESH_SHOT_NANOS = 700_000_000L;
+    private static final long FRESH_MELEE_NANOS = 550_000_000L;
 
     record RangedCue(float yaw, float pitch, long heardAt) {}
-    record MeleeCue(float yaw, long heardAt, boolean near) {}
+    record MeleeCue(float yaw, long heardAt) {}
 
     enum ZombieCue {
         GROAN("checking a nearby zombie groan"),
@@ -55,10 +56,6 @@ final class AgentEars implements SoundInstanceListener {
         boolean fuse = id.equals("entity.creeper.primed");
         boolean explosion = id.equals("entity.generic.explode") && lastFuseNs != 0
             && System.nanoTime() - lastFuseNs < 4_000_000_000L;
-        boolean subtitled = sounds.getSubtitle() != null && client.options.getShowSubtitles().getValue();
-        if (!subtitled && (!(fuse || explosion) || sound.getVolume() <= 0
-                || client.options.getSoundVolume(SoundCategory.MASTER) <= 0
-                || client.options.getSoundVolume(sound.getCategory()) <= 0)) return;
         boolean shot = id.equals("entity.skeleton.shoot") && escapeTicks == 0;
         ZombieCue cue = switch (id) {
             case "entity.zombie.ambient" -> ZombieCue.GROAN;
@@ -68,6 +65,10 @@ final class AgentEars implements SoundInstanceListener {
         boolean melee = escapeTicks == 0 && (cue != null || id.equals("entity.husk.ambient")
             || id.equals("entity.husk.hurt") || id.equals("entity.spider.ambient"));
         if (!fuse && !explosion && !shot && !melee) return;
+        boolean subtitled = sounds.getSubtitle() != null && client.options.getShowSubtitles().getValue();
+        if (!subtitled && (!(fuse || explosion || melee) || sound.getVolume() <= 0
+                || client.options.getSoundVolume(SoundCategory.MASTER) <= 0
+                || client.options.getSoundVolume(sound.getCategory()) <= 0)) return;
         var ear = client.getSoundManager().getListenerTransform().position();
         double dx = ear.x - sound.getX(), dy = ear.y - sound.getY(), dz = ear.z - sound.getZ();
         double audible = Math.min(fuse ? 12 : explosion ? 32 : shot ? 14 : 6, range);
@@ -94,8 +95,8 @@ final class AgentEars implements SoundInstanceListener {
         } else if (dx * dx + dz * dz >= 0.09) {
             float bearing = coarseBearing(-dx, -dz);
             long heard = System.nanoTime();
-            meleeCue = new MeleeCue(bearing, heard, distance <= 4.5 * 4.5);
-            if (cue != null && client.currentScreen == null && AgentDefense.criticallyHurt(client.player)) {
+            if (distance <= 4.5 * 4.5) meleeCue = new MeleeCue(bearing, heard);
+            if (subtitled && cue != null && client.currentScreen == null && AgentDefense.criticallyHurt(client.player)) {
                 towardZombie = bearing;
                 zombieHeardAt = heard;
                 zombieCue = cue;
@@ -138,8 +139,7 @@ final class AgentEars implements SoundInstanceListener {
 
     MeleeCue recentMeleeCue() {
         MeleeCue cue = meleeCue;
-        return cue != null && client.options.getShowSubtitles().getValue()
-            && System.nanoTime() - cue.heardAt() <= 3_000_000_000L ? cue : null;
+        return cue != null && System.nanoTime() - cue.heardAt() <= FRESH_MELEE_NANOS ? cue : null;
     }
 
     RangedCue takeFreshRangedCue() {

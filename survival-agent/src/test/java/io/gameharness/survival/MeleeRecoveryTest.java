@@ -3,45 +3,85 @@ package io.gameharness.survival;
 import org.junit.jupiter.api.Test;
 
 import static io.gameharness.survival.AgentDefense.MeleeRecovery.Evidence.*;
+import static io.gameharness.survival.AgentDefense.MeleeRecovery.Footing.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 final class MeleeRecoveryTest {
     @Test
     void freshDamageOwnsRecoveryDespiteRepeatedMissingCombatFrames() {
         var recovery = new AgentDefense.MeleeRecovery();
-        assertTrue(recovery.observe(100, IMPACT, false, false));
-        assertTrue(recovery.observe(115, NONE, false, false));
-        assertTrue(recovery.observe(120, IMPACT, false, false));
-        assertTrue(recovery.observe(155, NONE, false, false));
-        assertFalse(recovery.observe(185, NONE, false, false));
+        assertTrue(recovery.observe(100, IMPACT, false, false, DRY));
+        assertTrue(recovery.observe(115, NONE, false, false, DRY));
+        assertTrue(recovery.observe(120, IMPACT, false, false, DRY));
+        assertTrue(recovery.observe(155, NONE, false, false, DRY));
+        assertFalse(recovery.observe(185, NONE, false, false, DRY));
     }
 
     @Test
     void underEquippedContactActsBeforeDamageAndSeparatingDoesNotEraseAFreshHit() {
         var recovery = new AgentDefense.MeleeRecovery();
-        assertTrue(recovery.observe(200, CONTACT, false, false));
-        assertTrue(recovery.observe(206, IMPACT, false, true));
-        assertTrue(recovery.observe(228, NONE, false, true));
-        assertFalse(recovery.observe(240, NONE, false, true));
+        assertTrue(recovery.observe(200, CONTACT, false, false, DRY));
+        assertTrue(recovery.observe(206, IMPACT, false, true, DRY));
+        assertTrue(recovery.observe(228, NONE, false, true, DRY));
+        assertFalse(recovery.observe(240, NONE, false, true, DRY));
     }
 
     @Test
     void noContactDoesNotClaimAnIdleTick() {
         var recovery = new AgentDefense.MeleeRecovery();
-        assertFalse(recovery.observe(10, NONE, true, false));
-        assertFalse(recovery.observe(11, AMBIENT, true, false));
+        assertFalse(recovery.observe(10, NONE, true, false, DRY));
+        assertFalse(recovery.observe(11, AMBIENT, true, false, WET));
+        assertFalse(recovery.needsShore());
     }
 
     @Test
     void repeatedCriticalImpactsKeepOwnershipWithoutInventingSeparation() {
         // Ordinary campaign: 7.708 -> 5.708 HP, then 3.708 -> 1.708.
         var recovery = new AgentDefense.MeleeRecovery();
-        assertTrue(recovery.observe(665, IMPACT, false, false));
-        assertFalse(recovery.observe(729, AMBIENT, false, false));
-        assertTrue(recovery.observe(1679, IMPACT, true, false));
-        assertTrue(recovery.observe(1700, IMPACT, true, false));
-        assertTrue(recovery.observe(1788, NONE, true, false));
-        assertFalse(recovery.observe(1800, AMBIENT, true, false));
+        assertTrue(recovery.observe(665, IMPACT, false, false, DRY));
+        assertFalse(recovery.observe(729, AMBIENT, false, false, DRY));
+        assertTrue(recovery.observe(1679, IMPACT, true, false, DRY));
+        assertTrue(recovery.observe(1700, IMPACT, true, false, DRY));
+        assertTrue(recovery.observe(1788, NONE, true, false, DRY));
+        assertFalse(recovery.observe(1800, AMBIENT, true, false, DRY));
+    }
+
+    @Test
+    void wetCaveHitRetainsEscapeAcrossKnockbackAboveWaterUntilTheDryBankSettles() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        assertTrue(recovery.observe(20172, IMPACT, true, false, DRY));
+        assertTrue(recovery.observe(20184, NONE, true, false, WET));
+        assertTrue(recovery.needsShore());
+        assertTrue(recovery.observe(20196, IMPACT, true, false, UNSETTLED));
+        assertTrue(recovery.needsShore());
+        assertTrue(recovery.observe(20208, NONE, true, false, WET));
+        assertTrue(recovery.observe(20318, NONE, true, false, WET));
+        assertTrue(recovery.observe(20319, NONE, true, false, DRY));
+        assertTrue(recovery.needsShore());
+        recovery.leaveShore(true);
+        assertFalse(recovery.needsShore());
+        assertFalse(recovery.observe(20324, NONE, true, false, DRY));
+    }
+
+    @Test
+    void firstUnlocatedHitInWaterStartsEmergencyWithoutAmbientCueOrStall() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        assertTrue(recovery.observe(100, IMPACT, true, false, WET));
+        assertTrue(recovery.needsShore());
+        assertTrue(recovery.observe(112, NONE, true, false, WET));
+        assertTrue(recovery.needsShore());
+        assertFalse(recovery.observe(113, NONE, true, false, VEHICLE));
+        assertFalse(recovery.needsShore());
+    }
+
+    @Test
+    void aSettledBankReturnsControlOnlyAfterQuietWithoutCloseContact() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        assertTrue(recovery.observe(100, IMPACT, true, false, WET));
+        recovery.leaveShore(true);
+        assertTrue(recovery.observe(118, NONE, true, false, DRY));
+        assertTrue(recovery.observe(132, CONTACT, true, false, DRY));
+        assertFalse(recovery.observe(133, AMBIENT, true, false, DRY));
     }
 
     @Test

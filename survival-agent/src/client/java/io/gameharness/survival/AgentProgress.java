@@ -980,7 +980,8 @@ final class AgentProgress {
             interruptHands();
         }
         int priorLandings = fall.waterSuccesses() + fall.boatSuccesses();
-        if (!caves.controlsShortFall(tick) && !mineResite.controlsShortFall() && fall.step(safetySpend)) {
+        if ((defense.meleeActive() || !caves.controlsShortFall(tick) && !mineResite.controlsShortFall())
+                && fall.step(safetySpend)) {
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.SOURCE_UNGROUNDED);
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
@@ -998,7 +999,7 @@ final class AgentProgress {
             status = "releasing the screen and hands during a fall";
             return;
         }
-        if (defense.rangedActive()) {
+        if (defense.rangedActive() && !defense.meleeNeedsShore()) {
             // Macro cancellation can release body commands, so settle ownership before bracing.
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
             if (macroEngaged) macro.urgent("responding to a nearby ranged threat");
@@ -1019,7 +1020,13 @@ final class AgentProgress {
             if (macroEngaged) macro.urgent("responding to nearby melee danger");
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
-            defense.meleeStep(tick, AgentBody::dryCaveDanger, safetySpend);
+            AgentWaterEscape.Result shore = AgentWaterEscape.Result.INTERRUPTED;
+            if (defense.meleeNeedsShore()) {
+                shore = stallGuard.takeEmergencyWaterTurn(stallReplan, stallRelease);
+                defense.meleeWaterStep(shore, stallGuard.status(), tick, safetySpend);
+            }
+            if (shore == AgentWaterEscape.Result.INTERRUPTED)
+                defense.meleeStep(tick, AgentBody::dryCaveDanger, safetySpend);
             if (macroEngaged && defense.confirmedMeleeRetreat())
                 macro.safetyEffect("confirmed voluntary retreat on a witnessed dry lane");
             stallGuard.priorityAim();
@@ -9143,10 +9150,11 @@ final class AgentProgress {
         boolean creeper = threat instanceof CreeperEntity;
         // Defer to the actual fall controller before issuing a ranged brace. Avoid the
         // generic damage turn/backtrack when a ranged shot is the corroborating cue.
-        if (!creeper && defense.observeRanged(ears, threat, hurt, tick)) return false;
-        if (!creeper
-                && defense.observeMelee(ears, threat, hurt,
-                    c.player.getHealth() <= 10 && wantsHealingMeal(), tick, safetySpend)) return false;
+        boolean ranged = !creeper && defense.observeRanged(ears, threat, hurt, tick);
+        boolean melee = defense.observeMelee(ears, creeper ? null : threat,
+            hurt && !creeper && (!ranged || c.player.isTouchingWater()),
+            c.player.getHealth() <= 10 && wantsHealingMeal(), tick, safetySpend);
+        if (!creeper && (ranged || melee)) return false;
         if (hurt && c.currentScreen instanceof HandledScreen<?>) {
             defense.forgetContact();
             interruptHands();

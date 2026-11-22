@@ -204,6 +204,12 @@ final class AgentStallGuard {
             return AgentSurfaceTread.ordinaryGrade(grade.edge(), grade.from(), tick);
         }
 
+        AgentSurfaceTread descentTread(AgentBody.OrdinaryGrade grade, long tick) {
+            if (grade == null || grade.lookOnly() || grade.to().getY() != grade.from().getY() - 1
+                    || !newLanding(grade.to()) || !canCross(grade.from(), grade.to())) return null;
+            return AgentSurfaceTread.ordinaryGrade(grade.edge(), grade.from(), tick);
+        }
+
         void stoodOn(BlockPos foot) {
             if (newLanding(foot)) stood[contacts++ % stood.length] = foot.toImmutable();
         }
@@ -800,8 +806,8 @@ final class AgentStallGuard {
         clearAngles();
         if (phase == Phase.STEP && (shaftContinuation || stepStage == StepStage.JUMP || stepStage == StepStage.LAND))
             interruptStep("safety behavior interrupted the temporary jump or placement");
-        else if (phase == Phase.DEPART && departureRise != null)
-            transition(Phase.ASSESS, "safety behavior interrupted the witnessed rise; waiting for dry contact");
+        else if (phase == Phase.DEPART && gradeDeparture())
+            transition(Phase.ASSESS, "safety behavior interrupted the witnessed grade; waiting for dry contact");
         else if (phase == Phase.PASSAGE)
             assessAgain("safety behavior interrupted the witnessed side passage");
     }
@@ -1141,8 +1147,8 @@ final class AgentStallGuard {
         navigationLowCeiling = witnessedLowCeiling;
         if (phase == Phase.WATCH) return false;
         if (client.player.isTouchingWater() || client.player.hasVehicle()) {
-            if (phase == Phase.DEPART && departureRise != null)
-                transition(Phase.ASSESS, "left dry contact during the witnessed rise");
+            if (phase == Phase.DEPART && gradeDeparture())
+                transition(Phase.ASSESS, "left dry contact during the witnessed grade");
             else if (phase == Phase.PASSAGE)
                 assessAgain("left dry contact while checking the witnessed side passage");
             return false;
@@ -1287,7 +1293,7 @@ final class AgentStallGuard {
         if (surveySector >= 4) {
             Direction facing = client.player.getHorizontalFacing();
             rememberPassage(facing);
-            if (offerAlternative(choose) || offerDeparture(facing) || offerShaftReturn(facing)
+            if (offerAlternative(choose) || offerDeparture(facing) || offerShaftSideExit(facing)
                     || offerRiseDeparture() || offerPassage() || !mineRetryLease && offerShaftStep(foot)) return true;
             idleAtAssessment(true, "no distinct witnessed work or safe departure");
             return true;
@@ -1337,7 +1343,7 @@ final class AgentStallGuard {
                 beginDeparture(surveyBearing, length);
                 return;
             }
-            if (offerShaftReturn(surveyBearing)) return;
+            if (offerShaftSideExit(surveyBearing)) return;
         }
         if (surveyViews >= DEPARTURE_VIEWS || tick - surveySince >= DEPARTURE_LOOK_TICKS) {
             surveySector++;
@@ -1352,11 +1358,24 @@ final class AgentStallGuard {
         return true;
     }
 
-    private boolean offerShaftReturn(Direction direction) {
-        if (!shaftClimb.readyOn(surveyFoot) || recentReturn(surveyFoot) != direction) return false;
-        int length = visibleDeparture(direction, true);
-        if (length == 0) return false;
-        beginDeparture(direction, length);
+    private boolean offerShaftSideExit(Direction direction) {
+        if (!shaftClimb.readyOn(surveyFoot)) return false;
+        if (recentReturn(surveyFoot) == direction) {
+            int length = visibleDeparture(direction, true);
+            if (length > 0) {
+                beginDeparture(direction, length);
+                return true;
+            }
+        }
+        var grade = body.ordinaryGrade(Vec3d.ofBottomCenter(surveyFoot.offset(direction)));
+        if (grade == null || !grade.from().equals(surveyFoot) || grade.bearing() != direction
+                || triedStances.contains(grade.to())) return false;
+        var descent = departures.descentTread(grade, tick);
+        if (descent == null) return false;
+        triedStances.add(descent.to);
+        departureTread = descent;
+        attempts++;
+        transition(Phase.DEPART, "leaving temporary footing via a witnessed dry descent to " + descent.to.toShortString());
         return true;
     }
 
@@ -1585,9 +1604,11 @@ final class AgentStallGuard {
             + departurePath[length - 1].toShortString());
     }
 
+    private boolean gradeDeparture() { return departureRise != null || departureTread != null; }
+
     private void depart() {
-        if (departureRise != null) {
-            departRise();
+        if (gradeDeparture()) {
+            departGrade();
             return;
         }
         var player = client.player;
@@ -1627,7 +1648,7 @@ final class AgentStallGuard {
         assessAgain("level departure no longer has a safe stopping lane");
     }
 
-    private void departRise() {
+    private void departGrade() {
         var player = client.player;
         if (departureTread == null) {
             var cue = departureRise;
@@ -1650,10 +1671,10 @@ final class AgentStallGuard {
         var tread = departureTread;
         switch (tread.step(client, body, tick)) {
             case CHECKING, MOVING -> { }
-            case REFUSED -> assessAgain("witnessed rise stopped: " + tread.refusal());
+            case REFUSED -> assessAgain("witnessed grade stopped: " + tread.refusal());
             case LANDED -> {
                 if (!safeDryContact() || !standingOn(tread.to)) {
-                    assessAgain("witnessed rise did not settle onto its exact dry support");
+                    assessAgain("witnessed grade did not settle onto its exact dry support");
                     return;
                 }
                 if (situationalActive()) {
@@ -1662,7 +1683,7 @@ final class AgentStallGuard {
                 }
                 body.pauseWork();
                 reached.accept(tread.to);
-                retry("settled on different witnessed footing after a one-block rise; returning to ordinary play");
+                retry("settled on different witnessed footing after a one-block grade; returning to ordinary play");
             }
         }
     }

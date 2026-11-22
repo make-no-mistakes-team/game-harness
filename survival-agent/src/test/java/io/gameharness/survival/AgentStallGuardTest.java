@@ -2,6 +2,7 @@ package io.gameharness.survival;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.item.Item;
 import net.minecraft.item.Items;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
@@ -219,6 +220,22 @@ final class AgentStallGuardTest {
     }
 
     @Test
+    void freshDryDescentCanLeaveTheRaisedFootingInsteadOfBuildingHigher() {
+        var exits = new AgentStallGuard.Departures();
+        var foot = new BlockPos(0, 64, 0);
+        var floor = foot.east().down(2);
+        var grade = gradeFromTop(foot, Direction.EAST, floor, Blocks.GRASS_BLOCK.getDefaultState(), true);
+
+        var tread = exits.descentTread(grade, 61);
+        assertNotNull(tread);
+        assertEquals(foot, tread.from);
+        assertEquals(foot.east().down(), tread.to);
+        assertFalse(tread.returning, "use the normal checked descent motor instead of a pillar");
+        exits.reject(foot, tread.to);
+        assertNull(exits.descentTread(grade, 62), "do not repeat a refused descent");
+    }
+
+    @Test
     void onlyADebitedBlockUnderTheExactRaisedFootCanEarnAnotherStep() {
         var shaft = new AgentStallGuard.ShaftClimb();
         var base = new BlockPos(0, 55, 0);
@@ -267,11 +284,30 @@ final class AgentStallGuardTest {
         int reusable = AgentStallGuard.stepMaterialPriority(Items.COBBLESTONE);
         assertTrue(reusable > 0);
         assertEquals(reusable, AgentStallGuard.stepMaterialPriority(Items.COBBLED_DEEPSLATE));
-        for (var fill : new net.minecraft.item.Item[]{Items.ANDESITE, Items.DIORITE, Items.GRANITE, Items.TUFF, Items.DIRT})
+        for (var fill : new Item[]{Items.ANDESITE, Items.DIORITE, Items.GRANITE, Items.TUFF, Items.DIRT})
             assertTrue(AgentStallGuard.stepMaterialPriority(fill) > reusable);
-        for (var unsafe : new net.minecraft.item.Item[]{Items.GRAVEL, Items.SAND, Items.TUFF_SLAB, Items.TORCH,
+        for (var unsafe : new Item[]{Items.GRAVEL, Items.SAND, Items.TUFF_SLAB, Items.TORCH,
                 Items.FURNACE, Items.WATER_BUCKET})
             assertEquals(0, AgentStallGuard.stepMaterialPriority(unsafe));
+    }
+
+    @Test
+    void recentVisibleWaterOrLavaByTheJumpKeepsItOutOfDryRecovery() {
+        var hazards = new AgentHazards();
+        var jump = new Box(0.05, 55, 0.05, 0.95, 58.08, 0.95);
+        var water = new BlockPos(1, 55, 0);
+        var lava = new BlockPos(0, 57, 1);
+        Vec3d eye = new Vec3d(0.5, 56.62, 0.5);
+        hazards.observe(new BlockHitResult(Vec3d.ofCenter(water), Direction.WEST, water, false),
+            AgentHazards.kind(Blocks.WATER.getDefaultState()), eye, 2, 10);
+        assertTrue(hazards.fluidNear(jump, 0.36, 11));
+        assertFalse(hazards.lavaNear(jump, 0.36, 11));
+        assertFalse(hazards.fluidNear(jump, 0.36, 43), "a stale view is not a current edge");
+
+        hazards.observe(new BlockHitResult(Vec3d.ofCenter(lava), Direction.NORTH, lava, false),
+            AgentHazards.kind(Blocks.LAVA.getDefaultState()), eye, 2, 43);
+        assertTrue(hazards.fluidNear(jump, 0.36, 44), "the safety query also covers upper lava");
+        assertFalse(hazards.fluidNear(jump.offset(3, 0, 0), 0.36, 44));
     }
 
     private static AgentBody.OrdinaryGrade riseFromTop(BlockPos from, Direction direction, BlockState surface,

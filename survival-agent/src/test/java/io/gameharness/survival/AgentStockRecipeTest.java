@@ -20,6 +20,20 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 final class AgentStockRecipeTest {
+    @Test void optionalToolsCannotDelayAnAffordableFirstPick() {
+        // Two logs and two sticks already cover a table and pick. No optional tool fits.
+        assertEquals(AgentProgress.PickExtras.NONE,
+            AgentProgress.PickExtras.choose(true, 1, 2 * 4 - 4 - 3, 2, true, true));
+        // With three logs and three sticks, adding the axe would require one extra plank.
+        assertEquals(AgentProgress.PickExtras.SHOVEL,
+            AgentProgress.PickExtras.choose(true, 5, 3 * 4 - 4 - 3, 3, true, true));
+        assertEquals(AgentProgress.PickExtras.BOTH,
+            AgentProgress.PickExtras.choose(true, 9, 4 * 4 - 4 - 3, 2, true, true));
+        // Wood alone cannot fund a stone axe after the stone pick and shovel are accounted for.
+        assertEquals(AgentProgress.PickExtras.SHOVEL,
+            AgentProgress.PickExtras.choose(false, 3, 12, 6, true, true));
+    }
+
     @BeforeAll
     static void initializeVanilla() { VanillaTestResources.initialize(); }
 

@@ -1301,7 +1301,8 @@ final class AgentProgress {
             return;
         }
         if (!woodPick && !stonePick && !ironPick) {
-            if (woodPickupPending() || timberDropUntil != 0 || timberExitFrom != null) seekTimber();
+            boolean ready = hands.stableCraftFooting() && affordsWood(localTableWood() + (has(STONE, 3) ? 0 : 3), 2);
+            if (!ready && (woodPickupPending() || timberDropUntil != 0 || timberExitFrom != null)) seekTimber();
             else if (has(STONE, 3)) makePick("stone_pickaxe", STONE, 3);
             else makePick("wooden_pickaxe", PLANK, 3);
             return;
@@ -2973,29 +2974,40 @@ final class AgentProgress {
             && has(LOG, logsForPlanks + charcoal) && hands.singleBoatWoodStock();
     }
 
+    enum PickExtras {
+        NONE(false, false), SHOVEL(true, false), AXE(false, true), BOTH(true, true);
+        final boolean shovel, axe;
+        PickExtras(boolean shovel, boolean axe) { this.shovel = shovel; this.axe = axe; }
+
+        // Remaining wood excludes the pick head and any bench that still has to be made.
+        static PickExtras choose(boolean wooden, int headMaterial, int remainingWood, int sticks,
+                                boolean wantShovel, boolean wantAxe) {
+            boolean shovel = wantShovel && headMaterial >= 1
+                && remainingWood >= (wooden ? 1 : 0) + 2 * Math.ceilDiv(Math.max(0, 4 - sticks), 4);
+            int heads = 3 + (shovel ? 1 : 0);
+            int handles = 4 + (shovel ? 2 : 0);
+            boolean axe = wantAxe && headMaterial >= heads
+                && remainingWood >= (wooden ? heads : 0) + 2 * Math.ceilDiv(Math.max(0, handles - sticks), 4);
+            return shovel ? (axe ? BOTH : SHOVEL) : (axe ? AXE : NONE);
+        }
+    }
+
     private void makePick(String recipe, Predicate<ItemStack> ingredient, int quantity) {
         int plankCost = ingredient == PLANK ? quantity : 0;
         if (ingredient != PLANK && !has(ingredient, quantity)) return;
         String extra = null;
-        if (!goal.equals("wooden_pickaxe") && !has(SHOVEL, 1)) {
-            if (recipe.equals("wooden_pickaxe")) {
-                extra = "wooden_shovel";
-                plankCost++;
-            } else if (recipe.equals("stone_pickaxe") && has(STONE, 4) && !goal.equals("stone_pickaxe")) {
-                extra = "stone_shovel";
-            }
-        }
-        int sticks = extra == null ? 2 : 4;
         String axe = null;
-        if (needsTimberKit() && !timberReady && !has(AXE, 1)) {
-            if (recipe.equals("wooden_pickaxe")) {
-                plankCost += 3;
-                axe = "wooden_axe";
-            } else if (recipe.equals("stone_pickaxe") && has(STONE, quantity + (extra == null ? 3 : 4))) {
-                axe = "stone_axe";
-            }
+        int sticks = 2;
+        boolean wooden = ingredient == PLANK;
+        if (wooden || ingredient == STONE) {
+            int wood = hands.count(PLANK) + 4 * hands.count(LOG) - plankCost - localTableWood();
+            var extras = PickExtras.choose(wooden, wooden ? wood : hands.count(STONE) - quantity, wood, hands.count(STICK),
+                !goal.equals("wooden_pickaxe") && (wooden || !goal.equals("stone_pickaxe")) && !has(SHOVEL, 1),
+                needsTimberKit() && !timberReady && !has(AXE, 1));
+            if (extras.shovel) { extra = wooden ? "wooden_shovel" : "stone_shovel"; if (wooden) plankCost++; sticks += 2; }
+            if (extras.axe) { axe = wooden ? "wooden_axe" : "stone_axe"; if (wooden) plankCost += 3; sticks += 2; }
         }
-        requestTable(recipe, extra, axe, plankCost, sticks + (axe == null ? 0 : 2));
+        requestTable(recipe, extra, axe, plankCost, sticks);
     }
 
     private boolean needsTimberKit() {

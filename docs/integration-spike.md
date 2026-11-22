@@ -56,7 +56,9 @@ saved campaign. Ordinary advisory play does not create skill-trial worlds.
 The player gathers supplies for the next stretch of mine, keeping
 enough light for the return. When gathering timber on uneven ground,
 it approaches a stance where it can collect the log, not just reach
-the trunk with a swing. If natural foliage hides the route, the player
+the trunk with a swing. It makes the first pick as soon as it can pay
+for the pick and a bench; a shovel or axe joins the batch only when
+the remaining materials cover it. If natural foliage hides the route, the player
 can cut a neighboring leaf while keeping its own support. It must see
 and check the newly exposed footing before stepping down.
 From solid footing it can cut a nearby

@@ -14,6 +14,16 @@ final class OverlandCourseTest {
     static void initializeVanilla() { VanillaTestResources.initialize(); }
 
     @Test
+    void aRefusedResourceApproachStaysParkedUntilTheFootingOrTaskChanges() {
+        var canopy = new BlockPos(2, 70, 3);
+        var lower = canopy.east().down();
+        assertTrue(AgentOverlandSearch.refusedHere(canopy, null, true, canopy));
+        assertFalse(AgentOverlandSearch.refusedHere(lower, null, true, canopy));
+        assertFalse(AgentOverlandSearch.refusedHere(canopy, null, false, canopy));
+        assertTrue(AgentOverlandSearch.refusedHere(lower, lower, false, canopy));
+    }
+
+    @Test
     void keepsTheHorizonAfterARealDetourAndDoesNotRecycleItsFootprints() {
         var course = new AgentOverlandSearch.Course();
         var start = new BlockPos(0, 67, 0);

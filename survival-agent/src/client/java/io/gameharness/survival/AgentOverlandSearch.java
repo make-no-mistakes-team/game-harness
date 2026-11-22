@@ -331,6 +331,11 @@ final class AgentOverlandSearch {
         step(tick, false, false);
     }
 
+    static boolean refusedHere(BlockPos foot, BlockPos blockedStance, boolean stopped, BlockPos stance) {
+        // A resource refusal belongs to this approach, not the global blocked-footing map.
+        return foot.equals(blockedStance) || stopped && foot.equals(stance);
+    }
+
     void step(int tick, boolean canopy, boolean scoutTimber) {
         var player = client.player;
         BlockPos foot = player.getBlockPos();
@@ -344,7 +349,8 @@ final class AgentOverlandSearch {
             status = "overland search: waiting for settled dry footing";
             return;
         }
-        if (foot.equals(blockedStance)) {
+        if (refusedHere(foot, blockedStance, stopped(), stance)) {
+            stance = foot;
             phase = Phase.STOPPED;
             return;
         }

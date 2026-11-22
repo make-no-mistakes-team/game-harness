@@ -603,6 +603,31 @@ final class AgentStallGuard {
     /** Incidental immersion is not a failed dry stance and must not enter the dry-only assessment. */
     boolean controlsWaterRecovery() { return phase == Phase.WATER; }
 
+    boolean takeWalkedWaterReturn(List<BlockPos> walked, Runnable replan, Runnable releaseAlternative) {
+        if (client.player.hasVehicle()) return false;
+        prepareOrdinaryWater(replan, releaseAlternative);
+        water.startReturn(walked);
+        beginWaterRecovery(false);
+        return stepWaterRecovery() != AgentWaterEscape.Result.INTERRUPTED;
+    }
+
+    boolean takeAirTurn(Runnable replan, Runnable releaseAlternative) {
+        if (client.player.hasVehicle() || !client.player.isTouchingWater()) return false;
+        if (phase != Phase.WATER) {
+            prepareOrdinaryWater(replan, releaseAlternative);
+            water.startForAir();
+            beginWaterRecovery(false);
+        }
+        return stepWaterRecovery() != AgentWaterEscape.Result.INTERRUPTED;
+    }
+
+    private void prepareOrdinaryWater(Runnable replan, Runnable releaseAlternative) {
+        if (phase == Phase.ALTERNATIVE) releaseAlternative.run();
+        tookControl = true;
+        blockedReason = null;
+        replan.run();
+    }
+
     AgentWaterEscape.Result takeEmergencyWaterTurn(Runnable replan, Runnable releaseAlternative) {
         if (client.player.hasVehicle() || !client.player.isTouchingWater() && phase != Phase.WATER)
             return AgentWaterEscape.Result.INTERRUPTED;
@@ -619,7 +644,7 @@ final class AgentStallGuard {
 
     boolean takeWaterTurn(boolean planned, AgentVisibleHorizon.Refusal lostShallows, Runnable replan,
                           Runnable releaseAlternative) {
-        if (planned || client.player.hasVehicle()) {
+        if ((planned && !water.retracing()) || client.player.hasVehicle()) {
             if (phase == Phase.WATER) {
                 water.clearEpisode();
                 transition(Phase.WATCH, "releasing recovery to controlled water transit");
@@ -631,10 +656,7 @@ final class AgentStallGuard {
             if (phase == Phase.WATCH) detect(lostShallows != null
                 ? "the witnessed shallow crossing was preempted: " + lostShallows.key
                 : "no useful horizontal movement in water");
-            if (phase == Phase.ALTERNATIVE) releaseAlternative.run();
-            tookControl = true;
-            blockedReason = null;
-            replan.run();
+            prepareOrdinaryWater(replan, releaseAlternative);
             water.start(lostShallows == null);
             beginWaterRecovery(false);
         }

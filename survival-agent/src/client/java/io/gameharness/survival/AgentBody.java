@@ -565,10 +565,10 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         boolean advance = forward && (!steering
             || Math.abs(MathHelper.wrapDegrees(goalYaw(player, player.getEyePos()) - player.getYaw())) <= 28);
         boolean retreat = backward;
-        boolean dive = swimmingDown && player.isTouchingWater() && player.getAir() >= 70;
+        boolean dive = swimmingDown && player.isTouchingWater() && (wetEscapeWalk || player.getAir() >= 70);
         boolean crouch = sneaking || dive;
-        boolean jump = jumping || !dive && (player.isSubmergedInWater()
-            || !wetEscapeWalk && (advance || retreat) && player.isTouchingWater());
+        boolean jump = jumping || !dive && !wetEscapeWalk && (player.isSubmergedInWater()
+            || (advance || retreat) && player.isTouchingWater());
         boolean stepJump = false;
         Ground ground = Ground.CLEAR;
         boolean rolling = horizonIntent != null;
@@ -699,7 +699,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 horizonSide = 0;
                 pickupSide = 0;
                 horizonWade = false;
-                jump = !rolling && !pickupWalk && !dive && player.isSubmergedInWater();
+                jump = !rolling && !pickupWalk && !dive && !wetEscapeWalk && player.isSubmergedInWater();
             }
         } else if (jump && !player.isTouchingWater()) {
             Vec3d motion = player.getVelocity();
@@ -4952,10 +4952,23 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 .stretch(0, Math.max(0.16, rise + 0.05), 0));
     }
 
+    /** Prevent automatic buoyancy input even while turning to recheck an exit. */
+    void holdWetEscape() { wetEscapeWalk = true; }
+
+    /** Mechanical veto on one already witnessed step down, not a probe for new cave cells. */
+    boolean wetEscapeDrop(double drop) {
+        var player = client.player;
+        return hasView() && !lavaEmergency && player.isTouchingWater()
+            && !player.hasVehicle() && !player.isInLava() && !player.isOnFire()
+            && !hazards.lavaNear(player.getBoundingBox(), 0.32, tick)
+            && client.world.isSpaceEmpty(player, player.getBoundingBox().contract(1e-5, 0, 1e-5)
+                .stretch(0, -drop, 0));
+    }
+
     /** Stay level in a low passage. Jump only to breathe or climb a proved lip. */
     void driveWetEscape(boolean climb) {
         walkDown(false);
-        wetEscapeWalk = true;
+        holdWetEscape();
         if (climb) jump();
     }
 

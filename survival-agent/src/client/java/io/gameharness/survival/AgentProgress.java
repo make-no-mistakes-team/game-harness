@@ -1128,6 +1128,11 @@ final class AgentProgress {
         // Higher danger/fall/defense owners have already declined. Merely
         // touching water does not cancel an actual, still-witnessed shallow
         // crossing. Losing that exact envelope transfers to water safety now.
+        if (!macroEngaged && supplyEgress.retreatFlood()) {
+            nightSite.interrupt();
+            body.prioritizeMovement();
+            return;
+        }
         boolean plannedShallows = body.horizonControlsWater();
         var lostShallows = body.horizonWaterLoss();
         if ((plannedShallows || lostShallows != null || stallGuard.controlsWaterRecovery())
@@ -5703,7 +5708,7 @@ final class AgentProgress {
         private int benchBefore, benchCollectUntil, connectors, builds, buildBefore, anchorChoice;
         private long revealedFrame;
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
-        private boolean triedLower, built, mineDeparture;
+        private boolean triedLower, built, mineDeparture, floodWarning;
 
         boolean active() { return world == c.world && order.active(); }
 
@@ -5787,6 +5792,7 @@ final class AgentProgress {
             bearing = direction;
             walked.clear();
             walked.add(order.foot());
+            floodWarning = false;
             firstRefusal = lastRefusal = null;
             to = armedCut = packedBench = null;
             driving = 0;
@@ -5808,6 +5814,19 @@ final class AgentProgress {
             boolean consumed = workStep();
             if (active()) stallGuard.navigationWork();
             return consumed;
+        }
+
+        boolean retreatFlood() {
+            if (!active() || c.player.isInLava() || c.player.hasVehicle()) return false;
+            boolean wet = c.player.isTouchingWater();
+            if (!wet && !floodWarning) return false;
+            stop(wet ? "flood reached the last walked footing" : "water opened above the crossing");
+            interruptHands();
+            boolean retreat = walked.size() >= 2
+                ? stallGuard.takeWalkedWaterReturn(walked, stallReplan, stallRelease)
+                : wet && stallGuard.takeAirTurn(stallReplan, stallRelease);
+            if (retreat) status = stallGuard.status();
+            return true;
         }
 
         private boolean airborne() {
@@ -6371,6 +6390,7 @@ final class AgentProgress {
                     && (state(cover).getBlock() instanceof net.minecraft.block.FallingBlock || dangerous(state(cover))
                         || !state(cover).getFluidState().isEmpty())) {
                 order.considered(cover.getBlockPos());
+                floodWarning = state(cover).isOf(Blocks.WATER);
                 return refuse("visible falling material or fluid over " + cell.toShortString());
             }
             body.aimContact(hit, AgentBody.Contact.MINE);
@@ -10353,6 +10373,14 @@ final class AgentProgress {
             defense.forgetContact();
             defense.markDanger(tick);
             interruptHands();
+            if (!macroEngaged) {
+                if (!supplyEgress.retreatFlood()) {
+                    stallGuard.takeAirTurn(stallReplan, stallRelease);
+                    status = stallGuard.status();
+                }
+                body.prioritizeMovement();
+                return true;
+            }
             status = "surfacing for air";
             body.jump();
             body.walk(true);

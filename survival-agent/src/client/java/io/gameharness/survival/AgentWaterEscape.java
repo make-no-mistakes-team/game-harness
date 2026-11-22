@@ -1,7 +1,9 @@
 package io.gameharness.survival;
 
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
@@ -27,6 +29,8 @@ final class AgentWaterEscape {
     private static final int STALLED_TICKS = 32, DRIFT_TICKS = 9, MAX_DRIVES = 5, MAX_EPISODE_TICKS = 390;
     private static final int DRIVE_TICKS = 44, NO_GAIN_TICKS = 15, RECHECK_TICKS = 39, DRY_TICKS = 5;
     private static final int LIP_TICKS = 15;
+    private static final int RETURN_LEGS = 8, RETURN_TICKS = 48, SURFACE_TICKS = 26;
+    private static final int RETURN_PROOF_TICKS = 8;
     private static final int MIN_START_AIR = 150;
     static final int MIN_WORK_AIR = 105;
     private static final double[] DISTANCES = {0.90, 1.51, 2.15};
@@ -37,10 +41,40 @@ final class AgentWaterEscape {
     private static final Predicate<ItemStack> FILL = stack -> stack.isOf(Items.DIRT);
 
     enum Result { WORKING, BLOCKED, LANDED, INTERRUPTED }
-    private enum Phase { DRIFT, SCAN, DRIVE, PLUG, DRAIN, UNPLUG, BLOCKED }
+    enum Phase { RETURN, SURFACE, DRIFT, SCAN, DRIVE, PLUG, DRAIN, UNPLUG, BLOCKED }
     private record Lane(Vec3d landing, BlockPos floor, BlockState support, boolean bank, double score) {}
     private record Plug(BlockPos cell, Vec3d water, BlockHitResult attachment) {}
     private record Sight(Vec3d point, AgentBody.WetEscapeMedium medium) {}
+
+    /** Only actual settled crossings supply this chain. It contains no claim about the current waterline. */
+    static final class ReturnCorridor {
+        private final List<BlockPos> walked;
+        private int cursor;
+
+        ReturnCorridor(List<BlockPos> walked) {
+            this.walked = List.copyOf(walked.subList(Math.max(0, walked.size() - RETURN_LEGS - 1), walked.size()));
+            cursor = this.walked.size() - 1;
+        }
+
+        BlockPos from() { return walked.get(cursor); }
+        BlockPos to() { return walked.get(cursor - 1); }
+
+        boolean arrived(Vec3d feet) {
+            Vec3d landing = Vec3d.ofBottomCenter(to());
+            return distance(feet, landing) <= 0.24 && Math.abs(feet.y - landing.y) <= 0.25;
+        }
+
+        boolean needsDescent(Vec3d feet, Vec3d landing) {
+            return feet.y > Math.max(from().getY(), to().getY()) + 0.24
+                || distance(feet, landing) <= 0.22 && feet.y > landing.y + 0.22;
+        }
+
+        boolean next() {
+            if (cursor <= 1) return false;
+            cursor--;
+            return true;
+        }
+    }
 
     private final MinecraftClient client;
     private final AgentBody body;
@@ -59,6 +93,10 @@ final class AgentWaterEscape {
     private double driftX, driftZ, bestDistance, originalDistance;
     private boolean lowView, edited, useIssued, confirmedPlug, undoFinished, sawFrame, renderedScan, allowEdits, emergency;
     private Lane target, pocket;
+    private ReturnCorridor returnWay;
+    private boolean urgentAir, retreatWet, checkedInputs;
+    private Vec3d breathingPoint;
+    private final Function<Vec3d, AgentBody.WetEscapeMedium> returnSight = this::sample;
     private Plug plug, observedPlug;
     private Block placedBlock;
     private String status = "";
@@ -110,6 +148,7 @@ final class AgentWaterEscape {
     String status() { return status; }
     int attempts() { return attempts; }
     boolean blocked() { return phase == Phase.BLOCKED; }
+    boolean retracing() { return returnWay != null; }
 
     void broken(BlockPos position, BlockState state) {
         if (phase == Phase.UNPLUG && confirmedPlug && position.equals(plug.cell()) && state.isOf(placedBlock))
@@ -122,32 +161,54 @@ final class AgentWaterEscape {
         plug = observedPlug = null;
         origin = null;
         wetAnchor = null;
+        returnWay = null;
+        breathingPoint = null;
     }
 
     void start(boolean allowEdits) {
-        start(allowEdits, false);
+        reset(allowEdits, false);
+        beginDrift(began);
     }
 
     /** Damage needs a bank now, not a stall diagnosis or a flow edit. */
     void startEmergency() {
-        start(false, true);
+        reset(false, true);
+        body.pauseWork();
+        beginScan(began, "checking for a witnessed bank after damage");
     }
 
-    private void start(boolean allowEdits, boolean emergency) {
+    /** Start at the last dry crossing, before waiting for a generic stall or buoyancy. */
+    void startReturn(List<BlockPos> walked) {
+        reset(false, false);
+        body.pauseWork();
+        checkedInputs = true;
+        returnWay = new ReturnCorridor(walked);
+        retreatWet = player.isTouchingWater();
+        beginReturn(began);
+    }
+
+    /** Air takes priority over ordinary work, not over a verified stroke already in progress. */
+    void startForAir() {
+        reset(false, false);
+        body.pauseWork();
+        checkedInputs = true;
+        beginSurface(began);
+    }
+
+    private void reset(boolean allowEdits, boolean emergency) {
         tried.clear();
         attempts = drives = 0;
         edited = false;
+        urgentAir = checkedInputs = false;
+        returnWay = null;
+        breathingPoint = null;
         this.allowEdits = allowEdits;
         this.emergency = emergency;
         origin = player.getPos();
         began = body.actionTick();
-        if (emergency) {
-            body.pauseWork();
-            driftX = driftZ = 0;
-            dryLossAt = 0;
-            sawFrame = renderedScan = false;
-            beginScan(began, "checking for a witnessed bank after damage");
-        } else beginDrift(began);
+        driftX = driftZ = 0;
+        dryLossAt = 0;
+        sawFrame = renderedScan = false;
         lastActionTick = began - 1;
     }
 
@@ -166,6 +227,17 @@ final class AgentWaterEscape {
         int gap = now - lastActionTick;
         lastActionTick = now;
         if (origin == null || player.hasVehicle()) return Result.INTERRUPTED;
+        if (player.isTouchingWater() && player.getAir() < MIN_WORK_AIR && !urgentAir) {
+            urgentAir = checkedInputs = true;
+            allowEdits = false;
+            if (phase == Phase.SCAN && pocket != null && drives < MAX_DRIVES) startDrive(now, pocket);
+            else if (interruptForAir(phase)) {
+                body.pauseWork();
+                beginSurface(now);
+            }
+        }
+        if (phase == Phase.RETURN) return retreat(now);
+        if (checkedInputs) body.holdWetEscape();
         if (dryTicks >= DRY_TICKS) {
             status = "water recovery: settled dry footing at " + player.getBlockPos().toShortString();
             body.pauseWork();
@@ -176,18 +248,13 @@ final class AgentWaterEscape {
             return now - dryLossAt <= 12 ? Result.WORKING : Result.INTERRUPTED;
         }
         dryLossAt = 0;
-        if (player.getAir() < MIN_WORK_AIR) {
-            // The urgent owner still gets the earlier low-air turn. Never dive for recovery.
-            if (phase != Phase.BLOCKED && phase != Phase.DRAIN && phase != Phase.UNPLUG) beginDrift(now);
-            body.jump();
-            status = "water recovery: preserving air before another directional action";
-            return phase == Phase.BLOCKED ? Result.BLOCKED : Result.WORKING;
-        }
         if (phase == Phase.BLOCKED) return reconsider(now);
-        if (gap > 1 && phase != Phase.PLUG && phase != Phase.DRAIN && phase != Phase.UNPLUG) beginDrift(now);
+        if (gap > 1 && !checkedInputs
+                && phase != Phase.PLUG && phase != Phase.DRAIN && phase != Phase.UNPLUG) beginDrift(now);
         if (now - began >= MAX_EPISODE_TICKS && phase != Phase.DRAIN && phase != Phase.UNPLUG)
             return block(now, "bounded escape ended without dry footing");
         switch (phase) {
+            case SURFACE -> surface(now);
             case DRIFT -> measure(now);
             case SCAN -> { return scan(now); }
             case DRIVE -> drive(now);
@@ -197,6 +264,146 @@ final class AgentWaterEscape {
             default -> { }
         }
         return Result.WORKING;
+    }
+
+    static boolean interruptForAir(Phase phase) {
+        return phase != Phase.RETURN && phase != Phase.DRIVE && phase != Phase.SURFACE;
+    }
+
+    private void beginReturn(int now) {
+        phase = Phase.RETURN;
+        entered = gainAt = now;
+        proofAt = now - RETURN_PROOF_TICKS - 1;
+        bestDistance = player.getPos().distanceTo(Vec3d.ofBottomCenter(returnWay.to()));
+        status = "water recovery: rechecking the walked exit toward " + returnWay.to().toShortString();
+    }
+
+    private Result retreat(int now) {
+        boolean wet = player.isTouchingWater();
+        if (wet && !retreatWet) proofAt = now - RETURN_PROOF_TICKS - 1;
+        retreatWet |= wet;
+        body.holdWetEscape();
+        Vec3d feet = player.getPos(), landing = Vec3d.ofBottomCenter(returnWay.to());
+        double remaining = feet.distanceTo(landing);
+        if (remaining < bestDistance - 0.06) {
+            gainAt = now;
+            bestDistance = remaining;
+        }
+        if (returnWay.arrived(feet)) {
+            if (!wet && (retreatWet ? dryTicks >= DRY_TICKS : dryGround())) {
+                status = "water recovery: settled dry footing on the walked exit at " + returnWay.to().toShortString();
+                body.pauseWork();
+                return Result.LANDED;
+            }
+            if (wet && returnWay.next()) beginReturn(now);
+            else if (wet) beginSurface(now);
+            return Result.WORKING;
+        }
+        if (now - began >= MAX_EPISODE_TICKS || now - entered >= RETURN_TICKS
+                || now - gainAt >= 30 || distance(feet, landing) > 2.28
+                || feet.y < landing.y - 1.04) {
+            if (!wet) return Result.INTERRUPTED;
+            beginSurface(now);
+            return Result.WORKING;
+        }
+
+        BlockPos from = returnWay.from(), to = returnWay.to();
+        float yaw = yaw(feet, landing);
+        double horizontal = distance(feet, landing);
+        if (wet && returnWay.needsDescent(feet, landing)) {
+            // Lower back toward the last occupied height. Do not ascend into the
+            // new opening, and don't force a diagonal stroke through the stair lip.
+            float pitch = 83;
+            float exit = yaw(Vec3d.ofBottomCenter(from), landing);
+            body.turnUrgent(exit, pitch);
+            if (body.renderedDirection(exit, pitch, 15) && body.wetEscapeDrop(0.18)
+                    && open(sample(feet.add(0, -0.19, 0)))) {
+                body.swimDown();
+                status = "water recovery: descending the rechecked return corridor";
+            }
+            return Result.WORKING;
+        }
+        double rise = landing.y - feet.y;
+        if (horizontal <= 0.20 || rise > 1.04) return Result.WORKING;
+        double width = player.getWidth() * 0.5 - 0.06;
+        double sideX = (landing.z - feet.z) / horizontal * width;
+        double sideZ = (feet.x - landing.x) / horizontal * width;
+        Vec3d opening = landing.add(0, MathHelper.clamp(feet.y - landing.y + 0.74, 0.65, 1.83), 0);
+        float pitch = (float) Math.toDegrees(Math.atan2(player.getEyeY() - opening.y, horizontal));
+        body.turnUrgent(yaw, pitch);
+        if (!body.renderedDirection(yaw, pitch, 14) || !returnOpening(opening, sideX, sideZ, returnSight, wet))
+            return Result.WORKING;
+        AgentBody.WetEscapeMedium low = sample(landing.add(0, 0.10, 0));
+        if (returnMedium(low, wet)) {
+            if (wet) proofAt = now;
+            else {
+                // Dry admission still needs a currently dry landing and its full support.
+                BlockHitResult floor = body.wetEscapeFloor(landing.add(0, -0.021, 0));
+                if (floor != null && floor.getBlockPos().equals(to.down()) && safeSupport.test(floor))
+                    proofAt = now;
+            }
+        } else if (low != UNSEEN) {
+            proofAt = now - RETURN_PROOF_TICKS - 1;
+            return Result.WORKING;
+        }
+        if (now - proofAt > RETURN_PROOF_TICKS) return Result.WORKING;
+        if (!wet && to.getY() > from.getY()) {
+            if (body.dryRouteVeto(from, to) == AgentBody.DryRouteVeto.CLEAR)
+                body.driveDryRoute(from, to, Direction.fromHorizontalDegrees(yaw));
+            return Result.WORKING;
+        }
+        boolean lift = rise > 0.035 && rise <= 1.04 && body.wetEscapeRise(rise);
+        if (lift) body.jump();
+        if (!body.wetEscapeSweep(landing, 0, 0, 0)) return Result.WORKING;
+        body.driveWetEscape(lift);
+        status = "water recovery: retracing the rechecked walked exit toward " + to.toShortString();
+        return Result.WORKING;
+    }
+
+    static boolean returnOpening(Vec3d mid, double sideX, double sideZ,
+                                 Function<Vec3d, AgentBody.WetEscapeMedium> see, boolean inWater) {
+        return returnMedium(see.apply(mid), inWater) && returnMedium(see.apply(mid.add(sideX, 0, sideZ)), inWater)
+            && returnMedium(see.apply(mid.add(-sideX, 0, -sideZ)), inWater);
+    }
+
+    private static boolean returnMedium(AgentBody.WetEscapeMedium medium, boolean inWater) {
+        return medium == AIR || inWater && water(medium);
+    }
+
+    private void beginSurface(int now) {
+        phase = Phase.SURFACE;
+        entered = now;
+        breathingPoint = null;
+        firstYaw = player.getYaw();
+        status = "water recovery: checking for reachable air above the current position";
+    }
+
+    private void surface(int now) {
+        if (!player.isSubmergedInWater() || now - entered >= SURFACE_TICKS) {
+            beginScan(now, "checking alternate banks and air pockets");
+            return;
+        }
+        body.turnUrgent(firstYaw, -83);
+        if (!body.renderedDirection(firstYaw, -83, 16)) return;
+        // Only a positive AIR observation through the column opens the upward stroke.
+        // A roof (or darkness/occlusion) never causes a jump plus blind forward.
+        if (breathingPoint == null) {
+            Vec3d eye = player.getEyePos();
+            Vec3d near = eye.add(0, 0.44, 0);
+            Vec3d far = eye.add(0, 0.90, 0);
+            if (sample(near) == AIR) breathingPoint = near;
+            else if (sample(far) == AIR) breathingPoint = far;
+            else {
+                beginScan(now, "air above is not witnessed; checking alternate banks and air pockets");
+                return;
+            }
+        }
+        double rise = breathingPoint.y - player.getEyeY();
+        if (rise >= -0.08 && distance(player.getEyePos(), breathingPoint) < 0.27
+                && sample(breathingPoint) == AIR && body.wetEscapeRise(rise)) {
+            body.jump();
+            status = "water recovery: rising toward witnessed air";
+        }
     }
 
     private void measure(int now) {
@@ -233,7 +440,7 @@ final class AgentWaterEscape {
         sawFrame |= body.hasRecentView();
         if (sector == 4 || drives >= MAX_DRIVES) {
             if (pocket != null && drives < MAX_DRIVES) startDrive(now, pocket);
-            else if (observedPlug != null && !edited) {
+            else if (observedPlug != null && allowEdits && !edited) {
                 plug = observedPlug;
                 edited = true;
                 useIssued = confirmedPlug = undoFinished = false;
@@ -249,7 +456,7 @@ final class AgentWaterEscape {
         }
         float yaw = firstYaw + sector * 90;
         float pitch = lowView ? 48 : 27;
-        if (emergency) body.turnUrgent(yaw, pitch);
+        if (emergency || checkedInputs) body.turnUrgent(yaw, pitch);
         else body.turnScan(yaw, pitch);
         if (!body.renderedDirection(yaw, pitch, 11) && now - entered < 33) return Result.WORKING;
         if (body.renderedDirection(yaw, pitch, 15)) {
@@ -521,6 +728,7 @@ final class AgentWaterEscape {
 
     private Result block(int now, String reason) {
         body.pauseWork();
+        if (checkedInputs) body.holdWetEscape();
         phase = Phase.BLOCKED;
         blockedAt = player.getPos();
         entered = now;
@@ -542,7 +750,10 @@ final class AgentWaterEscape {
         tried.clear();
         drives = 0;
         began = now;
-        beginDrift(now);
+        if (checkedInputs) {
+            body.holdWetEscape();
+            beginScan(now, "rechecking alternate refuges after a change in the water corridor");
+        } else beginDrift(now);
         return Result.WORKING;
     }
 

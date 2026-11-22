@@ -1,5 +1,6 @@
 package io.gameharness.survival;
 
+import java.util.function.Predicate;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.FallingBlock;
 import net.minecraft.util.hit.BlockHitResult;
@@ -10,7 +11,7 @@ import net.minecraft.util.math.Vec3d;
 
 /** One adjacent downhill landing. Its swept volume and neutral coast confer no reverse edge. */
 record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, BlockPos to, BlockState lower,
-                       Direction bearing, Vec3d from, Vec3d center, float yaw) {
+                       Direction bearing, Vec3d from, Vec3d center, float yaw, boolean ordinary) {
     static final int MAX_DROP = 2;
     private static final double EARLY_LIP_MARGIN = 0.035;
     private static final double STOP_MARGIN = 0.11;
@@ -18,6 +19,7 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
     private static final double GROUND_DRAG = 0.55;
     private static final double AIR_DRAG = 0.91;
     private static final int AIR_TICKS = 10;
+    private static final double CAVE_SIDE_PAD = 0.015, CAVE_ALONG_PAD = 0.003, BOUNDARY = 1e-5;
 
     int height() { return source.getY() - to().getY(); }
 
@@ -32,8 +34,13 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
     }
 
     static Vec3d caveTopAim(BlockPos source, Direction bearing, int drop) {
+        return caveTopAim(source, bearing, drop, false);
+    }
+
+    static Vec3d caveTopAim(BlockPos source, Direction bearing, int drop, boolean farther) {
+        double inset = farther ? 0.37 : 0.18;
         return Vec3d.ofBottomCenter(source.offset(bearing).down(drop))
-            .add(0.18 * bearing.getOffsetX(), -0.032, 0.18 * bearing.getOffsetZ());
+            .add(inset * bearing.getOffsetX(), -0.032, inset * bearing.getOffsetZ());
     }
 
     /** Only the exact lit top reached by the look; collisions may veto it but never nominate it. */
@@ -62,6 +69,79 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
             .stretch(bearing.getOffsetX() * overhang, 0, bearing.getOffsetZ() * overhang);
     }
 
+    enum CaveMotion { SOURCE, LANDING, RANGE, UPPER_COLLISION, LOWER_COLLISION, UPPER_HAZARD, LOWER_HAZARD }
+
+    boolean overlapsLip(Vec3d feet, double radius) {
+        return along(feet.x, feet.z) < 0.5 + radius;
+    }
+
+    private double along(double x, double z) {
+        return (x - source.getX() - 0.5) * bearing.getOffsetX() + (z - source.getZ() - 0.5) * bearing.getOffsetZ();
+    }
+
+    private boolean inCaveLane(double x, double z, double radius) {
+        double distance = along(x, z);
+        double across = (x - source.getX() - 0.5) * bearing.getOffsetZ() - (z - source.getZ() - 0.5) * bearing.getOffsetX();
+        return distance >= -0.42 && distance <= STOPPING_END && Math.abs(across) + radius + CAVE_SIDE_PAD < 0.5;
+    }
+
+    /**
+     * Follow normal vanilla ground/air drag and the two already proved flat tops. Extra
+     * collisions and fluids may veto the trace, never change its prediction into a new route.
+     * Only the first checked forward tick is issued; the rest is either a preview or neutral.
+     */
+    CaveMotion caveCoast(Vec3d feet, Vec3d velocity, double radius, double height, double gravity, boolean grounded,
+                        int presses, double ax, double az, Predicate<Box> clear, Predicate<Box> dry) {
+        double x = feet.x, y = feet.y, z = feet.z, lip = source.getY(), lower = to.getY();
+        if (!inCaveLane(x, z, radius) || y < lower - BOUNDARY || y > lip + BOUNDARY
+                || velocity.y > 0.003 || velocity.y < -0.65) return CaveMotion.RANGE;
+        double vx = velocity.x, vy = velocity.y, vz = velocity.z;
+        double rx = radius + (bearing.getAxis() == Direction.Axis.X ? CAVE_ALONG_PAD : CAVE_SIDE_PAD);
+        double rz = radius + (bearing.getAxis() == Direction.Axis.Z ? CAVE_ALONG_PAD : CAVE_SIDE_PAD);
+        for (int i = 0; i < 32; ++i) {
+            vx = Math.abs(vx) < 0.003 ? 0 : vx;
+            vz = Math.abs(vz) < 0.003 ? 0 : vz;
+            if (i < presses && grounded && y >= lip - BOUNDARY && along(x, z) < 0.5 + radius) {
+                vx += ax;
+                vz += az;
+            }
+            double topY = y >= lip - BOUNDARY && along(x, z) < 0.5 + radius ? lip : lower;
+            // Vanilla moves vertically before horizontally, and samples drag before moving.
+            double freeY = y + Math.min(0, vy), nextY = Math.max(topY, freeY);
+            double nextX = x + vx, nextZ = z + vz;
+            if (!inCaveLane(nextX, nextZ, radius)) return CaveMotion.RANGE;
+            if (clear != null) {
+                Box body = new Box(x - rx, nextY, z - rz, x + rx, nextY + height + CAVE_ALONG_PAD, z + rz);
+                if (nextY != y) {
+                    CaveMotion veto = caveVolume(body.stretch(0, y - nextY, 0), nextY >= lip - BOUNDARY, clear, dry);
+                    if (veto != null) return veto;
+                }
+                CaveMotion veto = caveVolume(body.stretch(vx, 0, vz), nextY >= lip - BOUNDARY, clear, dry);
+                if (veto != null) return veto;
+            }
+            boolean floorContact = freeY < topY;
+            if (i + 1 >= presses && vx == 0 && vz == 0) {
+                if (nextY == lower && along(x, z) >= 0.5) return CaveMotion.LANDING;
+                if (nextY == lip && along(x, z) < 0.5 + radius) return CaveMotion.SOURCE;
+            }
+            double drag = grounded ? 0.6f * 0.91f : 0.91f;
+            x = nextX;
+            y = nextY;
+            z = nextZ;
+            vx *= drag;
+            vz *= drag;
+            vy = ((floorContact ? 0 : vy) - gravity) * 0.98f;
+            grounded = floorContact;
+        }
+        return CaveMotion.RANGE;
+    }
+
+    private static CaveMotion caveVolume(Box box, boolean upper, Predicate<Box> clear, Predicate<Box> dry) {
+        if (!dry.test(box)) return upper ? CaveMotion.UPPER_HAZARD : CaveMotion.LOWER_HAZARD;
+        if (!clear.test(box)) return upper ? CaveMotion.UPPER_COLLISION : CaveMotion.LOWER_COLLISION;
+        return null;
+    }
+
     /**
      * Check the next key plus neutral coast. Ground drag is the rounded-up
      * normal-support drag; assume air drag slightly before body contact can
@@ -69,19 +149,10 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
      */
     static boolean stoppingFits(BlockPos source, Direction bearing, Vec3d feet, Vec3d velocity,
                                 double ax, double az, double radius) {
-        return stoppingFits(source, bearing, feet, velocity, ax, az, radius, false);
-    }
-
-    boolean neutralCoastFits(Vec3d feet, Vec3d velocity, double radius) {
-        return stoppingFits(source, bearing, feet, velocity, 0, 0, radius, true);
-    }
-
-    private static boolean stoppingFits(BlockPos source, Direction bearing, Vec3d feet, Vec3d velocity,
-                                        double ax, double az, double radius, boolean airborne) {
         int dx = bearing.getOffsetX(), dz = bearing.getOffsetZ();
         double x = feet.x - source.getX() - 0.5, z = feet.z - source.getZ() - 0.5;
         double vx = velocity.x + ax, vz = velocity.z + az;
-        int air = airborne ? 1 : 0;
+        int air = 0;
         for (int i = 0; i < 22; ++i) {
             x += vx;
             z += vz;

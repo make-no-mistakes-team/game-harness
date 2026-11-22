@@ -2,6 +2,7 @@ package io.gameharness.survival;
 
 import com.google.gson.JsonParser;
 import java.util.Set;
+import java.util.function.Predicate;
 import net.minecraft.block.Blocks;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.ItemStack;
@@ -181,6 +182,45 @@ final class FootholdGeometryTest {
     }
 
     @Test
+    void ordinaryOneDownUsesTheActualCoastInsideATightDeadEnd() {
+        var from = new BlockPos(0, 30, 0);
+        var to = from.east().down();
+        var feet = Vec3d.ofBottomCenter(from).add(0.34, 0, 0);
+        var velocity = new Vec3d(0, -0.0784, 0);
+        var top = new BlockHitResult(Vec3d.ofBottomCenter(to), Direction.UP, to.down(), false);
+        var stone = Blocks.STONE.getDefaultState();
+        var landing = new AgentDryLanding(from, stone, top, to, stone, Direction.EAST,
+            feet, Vec3d.ofBottomCenter(to), -90, true);
+        var lip = new Box(from.down());
+        var floor = new Box(to.down());
+        var roof = new Box(0, 32, 0, 2, 33, 1);
+        var farWall = new Box(2, 29, 0, 3, 32, 1);
+        var obstruction = new Box(to.up(2));
+        var lowerRidge = new Box(1.6, 29, 0, 1.7, 29.125, 1);
+        var risingWater = new Box(to);
+        var lowCeiling = new Box(0, 31, 0, 1, 32, 1);
+        Predicate<Box> corridor = box ->
+            !box.intersects(lip) && !box.intersects(floor) && !box.intersects(roof) && !box.intersects(farWall);
+
+        assertTrue(AgentDryLanding.receivingSweep(to, from.getY(), Direction.EAST, 0.60, 1.80).intersects(farWall),
+            "the old all-column sweep reached a wall that the player never touches");
+        assertEquals(AgentDryLanding.CaveMotion.LANDING, landing.caveCoast(feet, velocity,
+            0.30, 1.80, 0.08, true, 3, 0.098, 0, corridor, box -> true));
+        assertEquals(AgentDryLanding.CaveMotion.UPPER_COLLISION, landing.caveCoast(feet, velocity,
+            0.30, 1.80, 0.08, true, 3, 0.098, 0, box -> corridor.test(box) && !box.intersects(lowCeiling), box -> true));
+        assertEquals(AgentDryLanding.CaveMotion.UPPER_COLLISION, landing.caveCoast(feet, velocity,
+            0.30, 1.80, 0.08, true, 3, 0.098, 0, box -> corridor.test(box) && !box.intersects(obstruction), box -> true));
+        assertEquals(AgentDryLanding.CaveMotion.LOWER_COLLISION, landing.caveCoast(feet, velocity,
+            0.30, 1.80, 0.08, true, 3, 0.098, 0, box -> corridor.test(box) && !box.intersects(lowerRidge), box -> true));
+        assertEquals(AgentDryLanding.CaveMotion.LOWER_HAZARD, landing.caveCoast(feet, velocity,
+            0.30, 1.80, 0.08, true, 3, 0.098, 0, corridor, box -> !box.intersects(risingWater)));
+        assertEquals(AgentDryLanding.CaveMotion.RANGE, landing.caveCoast(new Vec3d(1.42, 29.9, 0.5),
+            new Vec3d(0.16, -0.16, 0), 0.30, 1.80, 0.08, false, 0, 0, 0, null, null));
+        assertFalse(AgentDryLanding.caveTop(from, Direction.EAST, 1, null, stone),
+            "a clear coast is not a substitute for a visible top");
+    }
+
+    @Test
     void oneWayDropReceiptNeedsSettledContactWithTheExactWitnessedTop() {
         var from = new BlockPos(0, 30, 0);
         var to = from.east().down(2);
@@ -188,10 +228,7 @@ final class FootholdGeometryTest {
         var stone = Blocks.STONE.getDefaultState();
         var top = new BlockHitResult(center, Direction.UP, to.down(), false);
         var landing = new AgentDryLanding(from, stone, top, to, stone, Direction.EAST,
-            Vec3d.ofBottomCenter(from), center, -90);
-        var airborne = Vec3d.ofBottomCenter(from).add(0.91, -0.7, 0);
-        assertTrue(landing.neutralCoastFits(airborne, new Vec3d(0.06, -0.34, 0), 0.30));
-        assertFalse(landing.neutralCoastFits(airborne, new Vec3d(0.11, -0.34, 0), 0.30));
+            Vec3d.ofBottomCenter(from), center, -90, true);
         assertTrue(landing.settled(center, to.down(), stone, 0.001, true));
         assertFalse(landing.settled(center, to.down(), stone, 0.003, true), "still sliding");
         assertFalse(landing.settled(center, to.down(), stone, 0, false), "airborne or no longer safely dry");

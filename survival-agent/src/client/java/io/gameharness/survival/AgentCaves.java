@@ -13,6 +13,7 @@ import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.EntityPose;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.tag.BlockTags;
@@ -56,7 +57,7 @@ final class AgentCaves {
         long peekFrame = -1, placementFrame;
         BlockHitResult top;
         AgentDryLanding drop;
-        boolean oneWay, separated;
+        boolean fartherTop, oneWay, separated;
         String refusal;
 
         ShallowEntry(BlockState support, int height) {
@@ -176,9 +177,7 @@ final class AgentCaves {
     boolean controlsShortFall(int tick) {
         if (!drivingShallowDrop() || shelfMotorTick + 1 != body.actionTick()
                 || tick - phaseSince >= 30 || player.isOnGround()) return false;
-        var landing = shallow.drop;
-        return body.dryLandingClear(landing)
-            && landing.neutralCoastFits(player.getPos(), player.getVelocity(), player.getWidth() * 0.5);
+        return body.dryLandingClear(shallow.drop);
     }
 
     boolean shallowEntry() { return active() && shallow != null; }
@@ -705,12 +704,16 @@ final class AgentCaves {
     }
 
     private boolean lookShallow(int tick) {
-        if (body.caveLipFooting(stance) != shallow.support
-                || body.hazardAhead(opening.getPositiveHorizontalDegrees(), 1.65))
-            return refuseShallow(tick, "the takeoff no longer has safe dry contact");
+        if (body.hazardAhead(opening.getPositiveHorizontalDegrees(), 1.65))
+            return refuseShallow(tick, AgentBody.CaveLandingRefusal.LAVA.detail());
+        if (body.caveLipFooting(stance) != shallow.support) {
+            var veto = stance.down().equals(player.supportingBlockPos.orElse(null))
+                && world.getBlockState(stance.down()) == shallow.support
+                ? AgentBody.CaveLandingRefusal.CONTROLS : AgentBody.CaveLandingRefusal.SOURCE;
+            return refuseShallow(tick, veto.detail());
+        }
         int age = tick - phaseSince;
         int drop = shallow.height;
-        Vec3d aim = AgentDryLanding.caveTopAim(stance, opening, drop);
         if (shallow.peekFrame < 0) {
             look(Vec3d.ofBottomCenter(stance.offset(opening)), 75);
             if (age < 18 && along(player.getPos().subtract(Vec3d.ofBottomCenter(stance)), opening) < 0.26) {
@@ -719,17 +722,32 @@ final class AgentCaves {
             }
             shallow.peekFrame = body.renderedFrame();
         }
+        Vec3d aim = AgentDryLanding.caveTopAim(stance, opening, drop, shallow.fartherTop);
         body.aim(aim);
-        if (player.isSneaking() || player.getVelocity().horizontalLengthSquared() > 0.0025
-                || body.renderedFrame() <= shallow.peekFrame || !body.renderedAim(aim, 8)
-                || !body.dryRoutePointInView(aim) || body.dryRouteRaysSpent())
-            return age < 32 || refuseShallow(tick, "the supported downward look did not settle");
+        if (player.getPose() != EntityPose.STANDING || player.isSneaking()) {
+            if (age < 32) return true;
+            if (!player.isSneaking() && !world.isSpaceEmpty(player, player.getDimensions(EntityPose.STANDING).getBoxAt(player.getPos())))
+                return refuseShallow(tick, "no standing room on the proved takeoff");
+            return refuseShallow(tick, AgentBody.CaveLandingRefusal.CONTROLS.detail());
+        }
+        if (player.getVelocity().horizontalLengthSquared() > 0.0025)
+            return age < 32 || refuseShallow(tick, "peek speed did not settle on the proved lip");
+        if (body.renderedFrame() <= shallow.peekFrame || !body.renderedAim(aim, 8) || body.dryRouteRaysSpent())
+            return age < 32 || refuseShallow(tick, AgentBody.CaveLandingRefusal.FLOOR_RENDER.detail());
 
+        var check = body.caveDryLanding(stance, opening, drop, shallow.support, aim);
+        var landing = check.landing();
+        if (landing == null) {
+            var veto = check.refusal();
+            if (!shallow.fartherTop && veto.mayTryAnotherPoint() && age < 32) {
+                shallow.fartherTop = true;
+                shallow.peekFrame = body.renderedFrame();
+                body.aim(AgentDryLanding.caveTopAim(stance, opening, drop, true));
+                return true;
+            }
+            return refuseShallow(tick, veto.detail());
+        }
         BlockPos bottom = stance.offset(opening).down(drop);
-        var top = body.dryRouteFloor(aim, bottom.down());
-        var landing = body.caveDryLanding(stance, opening, drop, shallow.support, top);
-        if (landing == null)
-            return refuseShallow(tick, "no visible stable dry " + drop + "-block landing with a clear body sweep");
         boolean known = knownDryReturn.test(stance, bottom);
         if (known || permitsOneWay.test(drop)) {
             shallow.drop = landing;
@@ -738,7 +756,7 @@ final class AgentCaves {
             return true;
         }
         if (drop == 1) return refuseShallow(tick, "no verified return or usable escape supplies");
-        shallow.top = top;
+        shallow.top = landing.top();
         highBottom = bottom;
         return startWater(stance.offset(opening), tick) || alternatives(tick);
     }
@@ -768,12 +786,19 @@ final class AgentCaves {
         status = shallow.oneWay ? "taking a witnessed " + landing.height() + "-block dry drop; no verified return"
             : "walking off the witnessed lip and coasting onto the return-connected dry shelf";
         if (tick - phaseSince >= 30 || feet.y < landing.to().getY() - 0.055)
-            return refuseShallow(tick, "the dry shelf did not settle as expected");
+            return refuseShallow(tick, shallow.refusal == null ? "the dry shelf did not settle as expected" : shallow.refusal);
         if (!player.isOnGround() || feet.y < stance.getY() - 0.055) return true; // Neutral air and landing.
-        if ((shallow.oneWay ? !permitsOneWay.test(landing.height()) : !knownDryReturn.test(stance, landing.to()))
-                || !body.dryLandingClear(landing))
-            return refuseShallow(tick, "the lower shelf or the descent prerequisites changed before takeoff");
-        body.driveDryLanding(landing);
+        if (landing.overlapsLip(feet, player.getWidth() * 0.5)
+                && (shallow.oneWay ? !permitsOneWay.test(landing.height()) : !knownDryReturn.test(stance, landing.to())))
+            return refuseShallow(tick, "the verified return or escape supplies changed before takeoff");
+        var veto = body.driveCaveDryLanding(landing);
+        if (veto == null) {
+            shallow.refusal = null;
+        } else if (veto == AgentBody.CaveLandingRefusal.ALIGNMENT
+                || veto == AgentBody.CaveLandingRefusal.FLOOR_RECHECK || veto == AgentBody.CaveLandingRefusal.RANGE) {
+            shallow.refusal = veto.detail();
+            status = "waiting on the proved cave lip: " + shallow.refusal;
+        } else return refuseShallow(tick, veto.detail());
         return true;
     }
 

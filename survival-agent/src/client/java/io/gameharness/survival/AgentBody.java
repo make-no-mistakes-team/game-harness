@@ -174,6 +174,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private Vec3d dryFooting;
     private AgentWalkedRoute walkedRoutes;
     private final BlockPos.Mutable walkedProbe = new BlockPos.Mutable();
+    private final Predicate<Box> caveLandingSpace = this::caveLandingSpaceEmpty;
+    private final Predicate<Box> caveLandingDry = this::caveLandingVolumeDry;
     private int dryFootingTick;
     private Vec3d previousDryFooting;
     private int previousDryFootingTick;
@@ -2194,14 +2196,14 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     /** A passed-in candidate is just a ray direction until its exact lit point and face are seen. */
     BlockHitResult horizonWitness(BlockHitResult witness) {
-        return horizonWitness(witness, false);
+        return horizonWitness(witness, false, Ray.SIGHT);
     }
 
     BlockHitResult horizonRecheck(BlockHitResult witness) {
-        return horizonWitness(witness, true);
+        return horizonWitness(witness, true, Ray.SIGHT);
     }
 
-    private BlockHitResult horizonWitness(BlockHitResult witness, boolean recheck) {
+    private BlockHitResult horizonWitness(BlockHitResult witness, boolean recheck, Ray ray) {
         if (witness == null || witness.getType() != HitResult.Type.BLOCK || witness.isInsideBlock()) return null;
         Vec3d point = witness.getPos();
         double distance = eye.distanceTo(point);
@@ -2220,7 +2222,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         --horizonWitnessRays;
         double inset = 0.022 / distance;
         var hit = litRay(point.add((point.x - eye.x) * inset, (point.y - eye.y) * inset,
-            (point.z - eye.z) * inset), Ray.SIGHT);
+            (point.z - eye.z) * inset), ray);
         return sameBlockFace(witness, hit) && !hit.isInsideBlock()
             && point.squaredDistanceTo(hit.getPos()) < 0.0064 ? hit : null;
     }
@@ -2672,11 +2674,74 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return true;
     }
 
-    AgentDryLanding caveDryLanding(BlockPos source, Direction bearing, int drop, BlockState upper, BlockHitResult top) {
-        if (upper == null || !dryLandingControls() || caveLipFooting(source) != upper || top == null
-                || !AgentDryLanding.caveTop(source, bearing, drop, top, client.world.getBlockState(top.getBlockPos())))
-            return null;
-        return dryLandingGeometry(source, upper, client.player.getPos(), top, bearing, false);
+    enum CaveLandingRefusal {
+        FLOOR_RENDER("no fresh rendered floor ray became available"),
+        FLOOR_OUT_OF_VIEW("floor witness outside the current rendered view"),
+        FLOOR_MISSING("no floor top on the nominated ray"),
+        FLOOR_MASKED("another block or face masked the nominated floor top"),
+        FLOOR_DARK("the floor ray supplied no lit witness"),
+        FLOOR_FLUID("fluid intercepted the floor ray"),
+        FLOOR_UNSAFE("the witnessed floor is not a stable dry full top with normal traction"),
+        FLOOR_CHANGED("the witnessed floor changed before landing"),
+        FLOOR_RECHECK("the exact lit floor witness is no longer visible"),
+        CONTROLS("standing dry-walk controls or pose unavailable"),
+        SOURCE("actual takeoff support does not match the proved lip"),
+        UPPER_COLLISION("upper body path intersects a block or entity"),
+        LOWER_COLLISION("lower receiving body path intersects a block or entity"),
+        UPPER_HAZARD("fluid or hazard in the upper body path"),
+        LOWER_HAZARD("fluid or hazard in the lower receiving path"),
+        LAVA("visible lava in the descent lane"),
+        RANGE("speed, fall distance or stopping range exceeds the proved shelf"),
+        ALIGNMENT("forward bearing has not settled");
+
+        private final String detail;
+        CaveLandingRefusal(String detail) { this.detail = detail; }
+        String detail() { return detail; }
+
+        boolean mayTryAnotherPoint() {
+            return this == FLOOR_OUT_OF_VIEW || this == FLOOR_MISSING || this == FLOOR_MASKED || this == FLOOR_DARK;
+        }
+    }
+
+    record CaveLandingCheck(AgentDryLanding landing, CaveLandingRefusal refusal) {}
+
+    CaveLandingCheck caveDryLanding(BlockPos source, Direction bearing, int drop, BlockState upper, Vec3d aim) {
+        if (!hasView() || raysLeft <= 0) return new CaveLandingCheck(null, CaveLandingRefusal.FLOOR_RENDER);
+        if (!inView(aim)) return new CaveLandingCheck(null, CaveLandingRefusal.FLOOR_OUT_OF_VIEW);
+        --raysLeft;
+        BlockHitResult top = raycast(aim, Ray.TERRAIN);
+        if (top.getType() == HitResult.Type.MISS)
+            return new CaveLandingCheck(null, lit(aim.x, aim.y + 0.05, aim.z)
+                ? CaveLandingRefusal.FLOOR_MISSING : CaveLandingRefusal.FLOOR_DARK);
+        if (!inView(top.getPos())) return new CaveLandingCheck(null, CaveLandingRefusal.FLOOR_OUT_OF_VIEW);
+        if (!litFace(top)) return new CaveLandingCheck(null, CaveLandingRefusal.FLOOR_DARK);
+        BlockPos floor = top.getBlockPos(), to = source.offset(bearing).down(drop);
+        BlockState lower = client.world.getBlockState(floor);
+        if (!lower.getFluidState().isEmpty()) {
+            hazards.observe(top, AgentHazards.kind(lower), eye, eye.squaredDistanceTo(top.getPos()), tick);
+            return new CaveLandingCheck(null, CaveLandingRefusal.FLOOR_FLUID);
+        }
+        if (!AgentDryLanding.shape(source, to, bearing)) return new CaveLandingCheck(null, CaveLandingRefusal.RANGE);
+        if (!floor.equals(to.down()) || top.getSide() != Direction.UP || top.isInsideBlock())
+            return new CaveLandingCheck(null, CaveLandingRefusal.FLOOR_MASKED);
+        if (!AgentDryLanding.caveTop(source, bearing, drop, top, lower) || !stableDryRouteTop(floor, lower))
+            return new CaveLandingCheck(null, CaveLandingRefusal.FLOOR_UNSAFE);
+        var player = client.player;
+        if (!ordinaryCaveLandingControls()) return new CaveLandingCheck(null, CaveLandingRefusal.CONTROLS);
+        if (upper == null || caveLipFooting(source) != upper) return new CaveLandingCheck(null, CaveLandingRefusal.SOURCE);
+        Vec3d center = Vec3d.ofBottomCenter(to), from = player.getPos();
+        var landing = new AgentDryLanding(source, upper, top, to, lower, bearing, from, center,
+            heading(center.x - from.x, center.z - from.z), true);
+        CaveLandingRefusal veto = caveLandingPrerequisites(landing);
+        if (veto != null) return new CaveLandingCheck(null, veto);
+        // Use the first viable takeoff prefix, then test its real collision shapes.
+        // This preview never commits its future key presses.
+        for (int presses = 0; presses <= 8; ++presses) {
+            if (caveLandingCoast(landing, presses, landing.yaw(), false) != AgentDryLanding.CaveMotion.LANDING) continue;
+            veto = caveMotionRefusal(caveLandingCoast(landing, presses, landing.yaw(), true));
+            return veto == null ? new CaveLandingCheck(landing, null) : new CaveLandingCheck(null, veto);
+        }
+        return new CaveLandingCheck(null, CaveLandingRefusal.RANGE);
     }
 
     private AgentDryLanding dryLandingFromTop(BlockPos source, BlockState upper, Vec3d from, BlockHitResult top,
@@ -2689,7 +2754,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             if (source.getY() > to.getY()) dryLandingEvidence = DryLandingEvidence.FALL_BOUND;
             return null;
         }
-        AgentDryLanding landing = dryLandingGeometry(source, upper, from, top, travel, true);
+        AgentDryLanding landing = dryLandingGeometry(source, upper, from, top, travel);
         if (landing == null) return null;
         dryLandingEvidence = DryLandingEvidence.PICKUP;
         if (!macroNoVisiblePickup(landing.center(), to.getY(), source.getY())) return null;
@@ -2698,14 +2763,14 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     private AgentDryLanding dryLandingGeometry(BlockPos source, BlockState upper, Vec3d from, BlockHitResult top,
-                                               Direction travel, boolean reportSweep) {
+                                               Direction travel) {
         BlockPos floor = top.getBlockPos(), to = floor.up();
         BlockState lower = client.world.getBlockState(floor);
         if (!normalDryTraction(lower) || !stableDryRouteTop(floor, lower) || dryCaveDanger(lower)) return null;
         Vec3d center = Vec3d.ofBottomCenter(to);
         var landing = new AgentDryLanding(source, upper, top, to, lower, travel, from, center,
-            heading(center.x - from.x, center.z - from.z));
-        if (reportSweep) dryLandingEvidence = DryLandingEvidence.SWEEP;
+            heading(center.x - from.x, center.z - from.z), false);
+        dryLandingEvidence = DryLandingEvidence.SWEEP;
         return dryLandingClear(landing) ? landing : null;
     }
 
@@ -2723,6 +2788,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     /** Mechanical vetoes on the exact witnessed top, source contact and connecting body envelope. */
     boolean dryLandingClear(AgentDryLanding landing) {
+        if (landing.ordinary()) return caveDryLandingRefusal(landing) == null;
         if (!dryLandingControls()) return false;
         var player = client.player;
         BlockPos from = landing.source(), to = landing.to(), floor = landing.top().getBlockPos();
@@ -2747,8 +2813,74 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             dryGradeVolume(upper) && client.world.isSpaceEmpty(player, upper);
     }
 
+    private boolean ordinaryCaveLandingControls() {
+        return dryLandingControls() && !client.player.isSneaking() && !client.player.hasNoGravity() && !client.player.isInLava();
+    }
+
+    private CaveLandingRefusal caveLandingPrerequisites(AgentDryLanding landing) {
+        if (!ordinaryCaveLandingControls()) return CaveLandingRefusal.CONTROLS;
+        var player = client.player;
+        var feet = player.getPos();
+        BlockPos source = landing.source().down(), floor = landing.top().getBlockPos();
+        if (client.world.getBlockState(source) != landing.upper()) return CaveLandingRefusal.SOURCE;
+        if (client.world.getBlockState(floor) != landing.lower()) return CaveLandingRefusal.FLOOR_CHANGED;
+        if (player.isOnGround()) {
+            BlockPos contact = player.supportingBlockPos.orElse(null);
+            if (feet.y >= landing.source().getY() - 0.055) {
+                // Vanilla can retain grounded contact for the tick whose horizontal move clears the lip.
+                if (!source.equals(contact) && (contact != null || landing.overlapsLip(feet, player.getWidth() * 0.5)))
+                    return CaveLandingRefusal.SOURCE;
+            } else if (!floor.equals(contact)) return CaveLandingRefusal.FLOOR_CHANGED;
+        }
+        if (player.getAttributeValue(EntityAttributes.SAFE_FALL_DISTANCE) < landing.height() + 0.35
+                || player.fallDistance > landing.height() + 0.05)
+            return CaveLandingRefusal.RANGE;
+        double distance = Math.hypot(landing.center().x - feet.x, landing.center().z - feet.z);
+        return hazardAhead(landing.yaw(), Math.max(0.35, distance + 0.25)) ? CaveLandingRefusal.LAVA : null;
+    }
+
+    private boolean caveLandingSpaceEmpty(Box box) {
+        return client.world.isSpaceEmpty(client.player, box);
+    }
+
+    private boolean caveLandingVolumeDry(Box box) {
+        // An unloaded neighbor cannot establish clearance for part of the swept hull.
+        int x0 = MathHelper.floor(box.minX) >> 4, x1 = MathHelper.floor(box.maxX - 1e-5) >> 4;
+        int z0 = MathHelper.floor(box.minZ) >> 4, z1 = MathHelper.floor(box.maxZ - 1e-5) >> 4;
+        var world = client.world;
+        for (int x = x0; x <= x1; ++x)
+            for (int z = z0; z <= z1; ++z)
+                if (!world.isChunkLoaded(x, z)) return false;
+        return dryGradeVolume(box);
+    }
+
+    private AgentDryLanding.CaveMotion caveLandingCoast(AgentDryLanding landing, int presses, float yaw, boolean geometry) {
+        var player = client.player;
+        float angle = yaw * MathHelper.RADIANS_PER_DEGREE;
+        double step = presses == 0 ? 0 : player.getMovementSpeed() * 0.98f;
+        return landing.caveCoast(player.getPos(), player.getVelocity(), player.getWidth() * 0.5, player.getHeight(),
+            player.getFinalGravity(), player.isOnGround(), presses, -MathHelper.sin(angle) * step, MathHelper.cos(angle) * step,
+            geometry ? caveLandingSpace : null, geometry ? caveLandingDry : null);
+    }
+
+    private static CaveLandingRefusal caveMotionRefusal(AgentDryLanding.CaveMotion motion) {
+        return switch (motion) {
+            case SOURCE, LANDING -> null;
+            case RANGE -> CaveLandingRefusal.RANGE;
+            case UPPER_COLLISION -> CaveLandingRefusal.UPPER_COLLISION;
+            case LOWER_COLLISION -> CaveLandingRefusal.LOWER_COLLISION;
+            case UPPER_HAZARD -> CaveLandingRefusal.UPPER_HAZARD;
+            case LOWER_HAZARD -> CaveLandingRefusal.LOWER_HAZARD;
+        };
+    }
+
+    CaveLandingRefusal caveDryLandingRefusal(AgentDryLanding landing) {
+        CaveLandingRefusal prerequisites = caveLandingPrerequisites(landing);
+        return prerequisites != null ? prerequisites : caveMotionRefusal(caveLandingCoast(landing, 0, landing.yaw(), true));
+    }
+
     boolean dryLandingSeen(AgentDryLanding landing) {
-        return horizonRecheck(landing.top()) != null;
+        return horizonWitness(landing.top(), true, landing.ordinary() ? Ray.TERRAIN : Ray.SIGHT) != null;
     }
 
     /** Leave the proved lip on foot, then coast: never manufacture a mid-air step or reversal. */
@@ -2757,6 +2889,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     boolean driveDryLanding(AgentDryLanding landing, boolean keepView) {
+        if (landing.ordinary()) return driveCaveDryLanding(landing) == null;
         var player = client.player;
         if (!player.isOnGround() || player.getY() < landing.source().getY() - 0.055) return false;
         double dx = landing.center().x - player.getX(), dz = landing.center().z - player.getZ();
@@ -2776,6 +2909,27 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         dryRouteWalk = true;
         walkDownTo(landing.center());
         return true;
+    }
+
+    /** A checked neutral coast owns the fall; only advance while it still ends on the source. */
+    CaveLandingRefusal driveCaveDryLanding(AgentDryLanding landing) {
+        CaveLandingRefusal veto = caveLandingPrerequisites(landing);
+        if (veto != null) return veto;
+        var player = client.player;
+        var coast = caveLandingCoast(landing, 0, landing.yaw(), true);
+        if (coast != AgentDryLanding.CaveMotion.SOURCE) return caveMotionRefusal(coast);
+        if (!player.isOnGround()) return CaveLandingRefusal.SOURCE;
+        float pitch = (float) Math.toDegrees(Math.atan2(player.getEyeY() - landing.top().getPos().y,
+            Math.hypot(landing.top().getPos().x - player.getX(), landing.top().getPos().z - player.getZ())));
+        turnFixed(landing.yaw(), Math.min(77, pitch));
+        if (Math.abs(MathHelper.wrapDegrees(player.getYaw() - landing.yaw())) > 0.7)
+            return CaveLandingRefusal.ALIGNMENT;
+        if (!dryLandingSeen(landing)) return CaveLandingRefusal.FLOOR_RECHECK;
+        veto = caveMotionRefusal(caveLandingCoast(landing, 1, player.getYaw(), true));
+        if (veto != null) return veto;
+        dryRouteWalk = true;
+        walkDownTo(landing.center());
+        return null;
     }
 
     private AgentVisibleHorizon.Patch horizonSurface(BlockPos floor, double contactY) {

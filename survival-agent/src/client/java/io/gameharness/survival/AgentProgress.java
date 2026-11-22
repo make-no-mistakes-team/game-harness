@@ -1254,7 +1254,7 @@ final class AgentProgress {
                 return;
             }
         }
-        if (stallGuard.situationalTurn(stallReplan)) {
+        if (!firstStone.witnessedProbeWork() && stallGuard.situationalTurn(stallReplan)) {
             body.prioritizeMovement();
             status = stallGuard.status();
             return;
@@ -5857,6 +5857,7 @@ final class AgentProgress {
         private final AgentSupplyEgress order = new AgentSupplyEgress();
         private final BiPredicate<BlockPos, Direction> woodlandLane = this::woodlandLaneClear;
         private final Predicate<BlockPos> witnessedDryFlood = this::witnessedDryFloodCell;
+        private boolean firstStoneExit;
         private ClientWorld world;
         private BlockPos openFoot, unknownFoot, to, armedCut, packedBench;
         private BlockPos floodOpening, floodWater;
@@ -5951,6 +5952,12 @@ final class AgentProgress {
             driving = 0;
         }
 
+        boolean leaveDepletedQuarry() {
+            boolean handled = seek("a different stone worksite and replacement timber");
+            firstStoneExit = handled && active();
+            return handled;
+        }
+
         boolean canYieldToWorkshop() {
             return driving == 0 && proof != Proof.FOOTHOLD_RECEIPT
                 && (packedBench == null || has(table.item, benchBefore + 1) || tick >= benchCollectUntil);
@@ -5963,6 +5970,7 @@ final class AgentProgress {
 
         private void start(Direction direction, int end, boolean resite) {
             mineDeparture = resite;
+            firstStoneExit = false;
             deadline = end;
             bearing = direction;
             walked.clear();
@@ -6107,6 +6115,18 @@ final class AgentProgress {
             if (body.lavaEmergency() || body.macroLavaNear()) return false;
             if (tick < handoffAfter) return handoffTimber(false);
             handoffAfter = tick + 5;
+            if (firstStoneExit) {
+                if (has(STONE, 3)) {
+                    if (affordsWood(localTableWood(), 2)) return ready("stone pick materials collected on the way out");
+                } else {
+                    var stone = findOre(Resource.STONE, REACH - 0.35);
+                    if (stone != null && stoneStockFace(stone.getBlockPos()) && tools.canHarvest(state(stone))) {
+                        setTarget(stone, Resource.STONE);
+                        quarryingStoneStock = true;
+                        return ready("collectible stone exposed on the supply stair");
+                    }
+                }
+            }
             float yaw = body.defensiveViewYaw();
             if (body.dryCaveContact(from) != null && order.handoffWoodland(body.dryCaveProbeView(),
                     Direction.fromHorizontalDegrees(yaw), woodlandLane))
@@ -7297,8 +7317,10 @@ final class AgentProgress {
         boolean canSpendOnCover(int uses) { return uses > 3 - stock; }
 
         boolean canDeepen(int uses, boolean retired) {
-            return !retired && !wornQuarry && decorative < DECORATIVE_LIMIT && canSpendOnCover(uses);
+            return !retired && !depleted() && canSpendOnCover(uses);
         }
+
+        boolean depleted() { return wornQuarry || decorative >= DECORATIVE_LIMIT; }
     }
 
     /** Bootstrap needs stone items, not depth. All new routes are lit, dry and at most one block of grade per tread. */
@@ -7321,7 +7343,7 @@ final class AgentProgress {
         private int view, viewUntil, probeUntil, probeCheckAt, probeHeight, starterSteps, sideProbes, travelTick, walkUntil;
         private BlockPos cutting;
         private int lastProbeContact;
-        private boolean started, exhausted, backtracking;
+        private boolean started, exhausted, backtracking, triedSupplyExit;
 
         boolean working() {
             return probeTo != null || tread != null || walkUntil != 0 || target != null && quarryingStoneStock;
@@ -7364,6 +7386,7 @@ final class AgentProgress {
         private void beginPatch(BlockPos standing, Direction direction, int stock, int uses, boolean continuingInventory) {
             started = true;
             exhausted = false;
+            triedSupplyExit = false;
             forward = direction;
             budget.begin(stock, continuingInventory ? hands.count(DECORATIVE_ROCK) : 0, uses);
             starterSteps = sideProbes = 0;
@@ -7464,6 +7487,12 @@ final class AgentProgress {
                 remember(retired, standing);
             }
             if (beginBacktrack(standing)) return;
+            // An overland search only changes lanes. A worn first pick in an
+            // enclosed, depleted pocket may instead need the checked supply stair.
+            if (!triedSupplyExit && budget.depleted() && !supplyEgress.outdoors()) {
+                triedSupplyExit = true;
+                if (supplyEgress.leaveDepletedQuarry()) return;
+            }
             if (!standing.equals(refusedDeparture)) {
                 departure = standing;
                 route.restart(forward.rotateYClockwise());

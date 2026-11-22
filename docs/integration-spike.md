@@ -87,8 +87,12 @@ collect the drop. If it breaks stone but cannot pick up the drop, it
 changes footing before quarrying another face. Andesite and similar rock
 do not count toward a pickaxe. If a short prospect yields only those
 blocks, the miner tries different ground with uses left on its pick.
-It can clear
-settled gravel from beside the column, not from underneath it, and
+In an enclosed quarry it can use the supply stair to reach another
+worksite, stopping if it finds collectible stone on the way.
+If a short shaft is clear overhead, the player can build upward with
+spare rock. It checks for a side exit after each landing rather than
+building a tower with no way off.
+It can clear settled gravel from beside the column, not from underneath it, and
 waits for falling material to settle. Under a low ceiling with no open
 exit, it can cut a short passage sideways from stable ground. It checks
 the newly exposed floor and headroom before stepping into the opening.

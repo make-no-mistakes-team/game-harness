@@ -628,6 +628,14 @@ final class AgentStallGuard {
             transition(Phase.ASSESS, "safety behavior interrupted the witnessed rise; waiting for dry contact");
     }
 
+    /** Time spent on emergency inputs is not failed ordinary work or a recovery receipt. */
+    void resumeAfterRangedDanger(Runnable releaseAlternative) {
+        if (phase == Phase.WATER || blockedReason != null) return;
+        if (phase == Phase.ALTERNATIVE) releaseAlternative.run();
+        markUseful(client.player.getPos());
+        if (phase != Phase.WATCH) transition(Phase.WATCH, "returning local control after ranged danger");
+    }
+
     private void sampleAngles(float yaw) {
         float delta = MathHelper.wrapDegrees(yaw - previousYaw);
         previousYaw = yaw;

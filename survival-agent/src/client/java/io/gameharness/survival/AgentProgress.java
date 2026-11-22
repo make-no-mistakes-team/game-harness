@@ -244,6 +244,7 @@ final class AgentProgress {
     private final CaveRetreat caveRetreat = new CaveRetreat();
     private int caveLookUntil, caveOpenings, caveFootsteps;
     private final AgentDefense defense;
+    private boolean rangedOwnsLocalWork;
     private final AgentPortal portal;
     private final FieldIgnition fieldIgnition;
     private final PortalSupplies portalSupplies;
@@ -361,6 +362,7 @@ final class AgentProgress {
     private boolean timberReady;
     private boolean departureKit;
     private boolean ordinarySurfaceWork;
+    private int nextLoadoutCheck;
     private boolean ordinaryCaveDrops;
     private BlockHitResult timberWitness;
     private final Predicate<BlockHitResult> reachableTrunk = hit -> timberCandidate(hit) && timberInReach(hit);
@@ -907,6 +909,8 @@ final class AgentProgress {
 
     void afterRespawn() {
         mineResite.reset();
+        defense.resetOrdinaryRanged();
+        rangedOwnsLocalWork = false;
         dropReclaim = new DropReclaim();
         status = "looking for nearby drops after respawn";
     }
@@ -916,6 +920,7 @@ final class AgentProgress {
         tick++;
         ordinarySurfaceWork = macro == null || !macro.engaged();
         ordinaryCaveDrops = macro == null;
+        hands.allowOrdinaryLoadout(ordinaryCaveDrops);
         observeStairLight();
         if (ordinarySurfaceWork) {
             restoreLocalFurnace();
@@ -928,6 +933,7 @@ final class AgentProgress {
         stallGuard.navigationSurveyReceipt(caves.drySurveyEvidence());
         stallGuard.observe(tick, confirmedFrameBlocks(), mealsEaten, status,
             returnableMine.hasProgressLease() || supplyEgress.active() || overland.leased(tick) || mineResite.leased()
+                || defense.ordinaryRangedActive()
                 || ordinarySurfaceWork && localFurnace != null && !localFurnace.lost
                     && localFurnace.watch.active() && !localFurnace.watch.recheckDue(tick));
         advance(ears, macro);
@@ -964,7 +970,7 @@ final class AgentProgress {
         boolean hurt = health < previousHealth;
         previousHealth = health;
         if (hurt) body.interruptHorizonWade(AgentVisibleHorizon.Refusal.WADE_HEALTH_CHANGED);
-        boolean escaping = escapeDanger(ears, hurt, macroEngaged, safetySpend);
+        boolean escaping = escapeDanger(ears, hurt, macro == null, macroEngaged, safetySpend);
         if ((hurt || escaping) && dropReclaim != null) dropReclaim.cancel();
         if (escaping) {
             body.interruptHorizonWade(c.player.isTouchingWater() && c.player.getAir() < 70 ? AgentVisibleHorizon.Refusal.DEEP_WATER
@@ -983,7 +989,8 @@ final class AgentProgress {
             interruptHands();
         }
         int priorLandings = fall.waterSuccesses() + fall.boatSuccesses();
-        if ((defense.meleeActive() || !caves.controlsShortFall(tick) && !mineResite.controlsShortFall())
+        if ((defense.meleeActive() || defense.ordinaryRangedActive()
+                || !caves.controlsShortFall(tick) && !mineResite.controlsShortFall())
                 && fall.step(safetySpend)) {
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.SOURCE_UNGROUNDED);
             if (dropReclaim != null) dropReclaim.cancel();
@@ -1002,6 +1009,10 @@ final class AgentProgress {
             status = "releasing the screen and hands during a fall";
             return;
         }
+        if (rangedOwnsLocalWork && !defense.ordinaryRangedActive()) {
+            rangedOwnsLocalWork = false;
+            stallGuard.resumeAfterRangedDanger(stallRelease);
+        }
         if (defense.rangedActive() && !defense.meleeNeedsShore()) {
             // Macro cancellation can release body commands, so settle ownership before bracing.
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.HAZARD);
@@ -1009,6 +1020,26 @@ final class AgentProgress {
             interruptHands();
             if (dropReclaim != null) dropReclaim.cancel();
             caves.interruptLight();
+            if (defense.ordinaryRangedActive()) {
+                if (!rangedOwnsLocalWork) {
+                    rangedOwnsLocalWork = true;
+                    body.pauseWork();
+                    if (ordinaryApproach != null) body.stopHorizonTravel(ordinaryApproach);
+                    ordinaryApproach = null;
+                    overland.interrupt();
+                    surfaceApproach.abandon();
+                    defense.stopZombieLook();
+                }
+                if (c.player.isTouchingWater() || stallGuard.controlsWaterRecovery()) {
+                    var shore = stallGuard.takeEmergencyWaterTurn(stallReplan, stallRelease);
+                    if (shore != AgentWaterEscape.Result.INTERRUPTED) {
+                        body.prioritizeMovement();
+                        stallGuard.priorityAim();
+                        status = stallGuard.status();
+                        return;
+                    }
+                }
+            }
             defense.rangedStep(tick, protectedHeadroom, safetySpend);
             if (macroEngaged && defense.confirmedCover()) macro.safetyEffect(defense.status());
             if (macroEngaged && defense.confirmedRangedRetreat())
@@ -9241,7 +9272,8 @@ final class AgentProgress {
         return true;
     }
 
-    private boolean escapeDanger(AgentEars ears, boolean hurt, boolean macroEngaged, Predicate<ItemStack> safetySpend) {
+    private boolean escapeDanger(AgentEars ears, boolean hurt, boolean ordinary, boolean macroEngaged,
+                                 Predicate<ItemStack> safetySpend) {
         if (hurt) defense.markDanger(tick);
         BlockPos workFoot = supplyEgress.to != null ? supplyEgress.to : nextFoot;
         if (workFoot != null && body.lavaBreachesDig(workFoot)) body.beginLavaEscape();
@@ -9289,11 +9321,12 @@ final class AgentProgress {
             return true;
         }
         LivingEntity threat = body.threat(8, defense.meleeAttacker(tick),
-            !c.player.isOnFire() && (hurt || defense.recentMeleeImpact(tick))).orElse(null);
+            !c.player.isOnFire() && (hurt || defense.recentMeleeImpact(tick)), ordinary).orElse(null);
         boolean creeper = threat instanceof CreeperEntity;
         // Defer to the actual fall controller before issuing a ranged brace. Avoid the
         // generic damage turn/backtrack when a ranged shot is the corroborating cue.
-        boolean ranged = !creeper && defense.observeRanged(ears, threat, hurt, tick);
+        boolean ranged = !creeper && (ordinary ? defense.observeOrdinaryRanged(ears, threat, hurt, tick)
+            : defense.observeRanged(ears, threat, hurt, tick));
         boolean melee = defense.observeMelee(ears, creeper ? null : threat,
             hurt && !creeper && (!ranged || c.player.isTouchingWater()),
             c.player.getHealth() <= 10 && wantsHealingMeal(), tick, safetySpend);
@@ -9358,8 +9391,16 @@ final class AgentProgress {
 
     private boolean prepareDefense() {
         if (!(goal.equals("diamond") || portal != null) || nextFoot != null || firing != Firing.NONE
-                || !c.player.isOnGround() || c.player.isTouchingWater() || !defense.canPrepare(tick)
-                || !has(DEEP_PICK, 1)) return false;
+                || !c.player.isOnGround() || c.player.isTouchingWater() || !defense.canPrepare(tick)) return false;
+        if (ordinaryCaveDrops && tick >= nextLoadoutCheck && target == null && timberChop == null
+                && !returnableMine.active() && !c.interactionManager.isBreakingBlock()) {
+            nextLoadoutCheck = tick + 160;
+            if (hands.readyUtilityBlocks()) {
+                status = "moving building blocks to a free hotbar slot";
+                return true;
+            }
+        }
+        if (!has(DEEP_PICK, 1)) return false;
         int reserve = (has(PORTAL_BUCKET, 1) ? 0 : 3) + (has(IGNITER, 1) ? 0 : 1);
         int sparePlanks = hands.count(PLANK) + 4 * hands.count(LOG) - localTableWood();
         boolean beforePortal = !portalStarted && (portal == null || !has(DIAMOND, 3) && !has(DIAMOND_PICK, 1));

@@ -63,7 +63,7 @@ final class AgentHands {
     private static final int SCREEN_REVISION_MASK = 0x7fff;
     static final int SMELT_TICKS = 200;
 
-    private enum Job { CRAFT, SMELT, EQUIP }
+    private enum Job { CRAFT, SMELT, EQUIP, STOW_BLOCKS }
 
     private enum Mode { TAKE, HALF, RESULT, QUICK_RESULT, ONE, PUT, STORE, SWAP, CLEAR_BOOK }
 
@@ -191,6 +191,7 @@ final class AgentHands {
     private int craftIndex;
     private ItemStack equipStack = ItemStack.EMPTY;
     private int equipSource, hotbar;
+    private boolean ordinaryLoadout;
     private boolean inventoryNeeded, planned, storeResult, resultStored, previousFailure;
     private KeyBinding pendingKey;
     private long deadline, keyDeadline, resultDeadline;
@@ -210,6 +211,52 @@ final class AgentHands {
 
     boolean busy() {
         return job != null;
+    }
+
+    void allowOrdinaryLoadout(boolean enabled) { ordinaryLoadout = enabled; }
+
+    /** The chosen stack is moved, never selected or spent. A full hotbar is left alone. */
+    static int utilitySlots(int selected, net.minecraft.inventory.Inventory inventory) {
+        int destination = -1, source = -1, largest = 0;
+        for (int i = 0; i < PlayerInventory.HOTBAR_SIZE; i++) {
+            ItemStack stack = inventory.getStack(i);
+            if (AgentDefense.coverMaterial(stack)) return -1;
+            if (destination < 0 && i != selected && stack.isEmpty()) destination = i;
+        }
+        if (destination < 0) return -1;
+        for (int i = PlayerInventory.HOTBAR_SIZE; i < PlayerInventory.MAIN_SIZE; i++) {
+            ItemStack stack = inventory.getStack(i);
+            if (stack.getCount() > largest && AgentDefense.coverMaterial(stack)) {
+                largest = stack.getCount();
+                source = i;
+            }
+        }
+        return source < 0 ? -1 : source * PlayerInventory.HOTBAR_SIZE + destination;
+    }
+
+    boolean readyUtilityBlocks() {
+        return !busy() && !holdsWorkInventory() && c.currentScreen == null && stowBlocks(null);
+    }
+
+    private boolean stowBlocks(HandledScreen<?> owned) {
+        if (!ordinaryLoadout || !stableCraftFooting() || !c.isWindowFocused() || c.getOverlay() != null
+                || c.player.hurtTime != 0 || c.player.isUsingItem() || c.player.isOnFire()
+                || Screen.hasShiftDown() || physicalButtonDown(c.getWindow())
+                || owned == null && (c.options.inventoryKey.isUnbound() ||
+                    !c.player.currentScreenHandler.getCursorStack().isEmpty())
+                || owned != null && (!ownsScreen() || !cleanGrid(owned) ||
+                    !owned.getScreenHandler().getCursorStack().isEmpty() ||
+                    ((AgentHandledScreenAccess) owned).agent$cursorDragging())) return false;
+        var inv = c.player.getInventory();
+        int pair = utilitySlots(inv.selectedSlot, inv);
+        if (pair < 0 || c.options.hotbarKeys[pair % PlayerInventory.HOTBAR_SIZE].isUnbound()) return false;
+        if (owned != null) finish("done", false); // The recipe receipt already settled. Keep the vanilla screen open.
+        start(Job.STOW_BLOCKS, "ready utility blocks", owned);
+        equipSource = pair / PlayerInventory.HOTBAR_SIZE;
+        hotbar = pair % PlayerInventory.HOTBAR_SIZE;
+        equipStack = inv.getStack(equipSource).copy();
+        inventoryNeeded = true;
+        return true;
     }
 
     boolean holdsWorkInventory() {
@@ -943,7 +990,7 @@ final class AgentHands {
             return;
         }
         if (screen == null) {
-            if (job == Job.CRAFT && !stableCraftFooting()) {
+            if ((job == Job.CRAFT || job == Job.STOW_BLOCKS) && !stableCraftFooting()) {
                 finish("lost dry footing before opening the inventory");
                 return;
             }
@@ -969,8 +1016,10 @@ final class AgentHands {
             finish("window not available");
             return;
         }
-        if (scopedSmelt && (Screen.hasShiftDown() || physicalButtonDown(c.getWindow()))) {
-            finish("another input gesture took the furnace pointer");
+        if ((scopedSmelt || job == Job.STOW_BLOCKS) && (Screen.hasShiftDown() || physicalButtonDown(c.getWindow())
+                || job == Job.STOW_BLOCKS && (player.hurtTime > 0 || !stableCraftFooting() ||
+                    click == null && ((AgentHandledScreenAccess) screen).agent$cursorDragging()))) {
+            finish("inventory input no longer available");
             return;
         }
         if (click != null) {
@@ -1036,6 +1085,10 @@ final class AgentHands {
             closeScreen();
             inventoryNeeded = false;
             selectHotbar(now);
+        } else if (job == Job.STOW_BLOCKS) {
+            var inv = player.getInventory();
+            finish(inv.getStack(equipSource).isEmpty() && ItemStack.areEqual(inv.getStack(hotbar), equipStack)
+                ? "done" : "stack did not settle in the hotbar");
         } else {
             finish("done");
         }
@@ -1548,9 +1601,10 @@ final class AgentHands {
                     && slot.canInsert(cursor) && slot.canTakeItems(c.player);
             case CLEAR_BOOK -> false;
         };
-        if (job == Job.EQUIP && slot.getIndex() == equipSource
+        if ((job == Job.EQUIP || job == Job.STOW_BLOCKS) && slot.getIndex() == equipSource
                 && (step.mode == Mode.TAKE || equipStack.isEmpty()))
             allowed &= ItemStack.areEqual(stack, equipStack);
+        if (job == Job.STOW_BLOCKS) allowed &= c.player.getInventory().getStack(hotbar).isEmpty();
         if (!allowed || !slot.isEnabled()) finish("slot not ready for gesture");
         else {
             click = new Click(clickMotion, step, null, cursor, stack);
@@ -1643,6 +1697,7 @@ final class AgentHands {
         craftStorage = null;
         craftSettleDeadline = 0;
         if (craftBudget != null || craftIndex == crafts.length) {
+            if (craftBudget == null && stowBlocks(screen)) return;
             finish("done", true, craftBudget != null && screen instanceof InventoryScreen
                 && !((AgentHandledScreenAccess) screen).agent$cursorDragging());
         } else {
@@ -1743,6 +1798,7 @@ final class AgentHands {
         Slot source = storageSlot(handler, equipSource), dest = storageSlot(handler, hotbar);
         if (source == null || dest == null || !handler.getCursorStack().isEmpty()) return false;
         ItemStack tool = source.getStack(), previous = dest.getStack();
+        if (job == Job.STOW_BLOCKS && (!previous.isEmpty() || hotbar == c.player.getInventory().selectedSlot)) return false;
         if (!ItemStack.areEqual(tool, equipStack) || same(tool, previous)) return false;
         if (tool.isEmpty()) {
             if (previous.isEmpty()) return false;

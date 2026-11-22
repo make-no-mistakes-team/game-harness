@@ -26,6 +26,7 @@ import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityPose;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.ai.RangedAttackMob;
 import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.effect.StatusEffects;
 import net.minecraft.entity.mob.Angerable;
@@ -284,6 +285,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private Entity striking;
     private LivingEntity shielding;
     private Vec3d raisedShieldBearing;
+    private Vec3d rangedThreatPoint;
     private float rangedShieldYaw = Float.NaN;
     private Item armor;
     private AgentFaceAim contact;
@@ -3898,13 +3900,31 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     void driveCheckedEmergencyLane(Vec3d landing, float bearing) {
+        driveCheckedEmergencyLane(landing, bearing, true);
+    }
+
+    void driveCheckedEmergencyLane(Vec3d landing, float bearing, boolean allowSprint) {
         var player = client.player;
         Vec3d velocity = player.getVelocity();
         double shown = Math.sqrt(landing.squaredDistanceTo(player.getPos()));
-        boolean sprint = AgentDefense.MeleeRecovery.canSprint(shown, Math.sqrt(velocity.horizontalLengthSquared()),
+        boolean sprint = allowSprint && AgentDefense.MeleeRecovery.canSprint(shown, Math.sqrt(velocity.horizontalLengthSquared()),
             player.getHungerManager().getFoodLevel(), player.isSprinting());
         driveEmergencyLane(landing, bearing, AgentEmergencyFootwork.PITCH, sprint);
         checkedEmergencyWalk = true;
+    }
+
+    /** Capture only a solid block face already returned by a lit first-person ray. */
+    BlockHitResult visibleRangedCover(Predicate<BlockPos> offersShelter) {
+        return horizonCue(state -> !dryCaveDanger(state) && !state.isIn(BlockTags.LEAVES), 4.5,
+            hit -> hit.getSide().getAxis().isHorizontal() && rangedCoverState(hit.getBlockPos()) != null
+                && offersShelter.test(hit.getBlockPos()));
+    }
+
+    /** Mechanical recheck at a witnessed or actually placed block, not a new observation. */
+    BlockState rangedCoverState(BlockPos pos) {
+        BlockState state = client.world.getBlockState(pos);
+        return !dryCaveDanger(state) && !state.isIn(BlockTags.LEAVES)
+            && Block.isShapeFullCube(state.getCollisionShape(client.world, pos)) ? state : null;
     }
 
     void braceForFuse(float toward) {
@@ -4918,11 +4938,13 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return hit != null && hit.getBlockPos().equals(pos);
     }
 
-    Optional<LivingEntity> threat(double distance, LivingEntity lastAttacker, boolean impact) {
+    Optional<LivingEntity> threat(double distance, LivingEntity lastAttacker, boolean impact, boolean watchArchers) {
+        rangedThreatPoint = null;
         if (!hasView()) return Optional.empty();
         double max = range(distance);
         threats.begin(max * max);
         if (!(max > 0)) return Optional.empty();
+        double nearestArcher = max * max;
         for (LivingEntity candidate : client.world.getEntitiesByClass(LivingEntity.class, entityArea(max),
                 entity -> entity instanceof Monster && availableEntity(entity))) {
             if (raysLeft <= 0) break;
@@ -4930,9 +4952,17 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             double d = center.squaredDistanceTo(eye);
             if (candidate instanceof EndermanEntity enderman) {
                 if (d <= max * max) observeEnderman(enderman, center, d);
-            } else if (threats.couldSelect(d)) {
+            } else {
+                boolean archer = watchArchers && d <= nearestArcher && candidate instanceof RangedAttackMob
+                    && (candidate.isHolding(Items.BOW) || candidate.isHolding(Items.CROSSBOW));
+                if (!archer && !threats.couldSelect(d)) continue;
                 Vec3d visible = visibleEntityPoint(candidate, center);
                 if (visible == null) continue;
+                if (archer) {
+                    nearestArcher = d;
+                    Vec3d launch = candidate.getEyePos().add(0, -0.10, 0);
+                    rangedThreatPoint = clearPoint(launch, Ray.SIGHT) ? launch : visible;
+                }
                 if ((candidate instanceof SpiderEntity || candidate instanceof PiglinEntity || candidate instanceof Angerable)
                         && candidate != lastAttacker && !(impact && visiblyCorroboratesMeleeImpact(candidate))) continue;
                 threats.observeHostile(candidate, visible, d);
@@ -4972,6 +5002,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     Vec3d threatPoint() { return threats.aim(); }
+    Vec3d rangedThreatPoint() { return rangedThreatPoint; }
 
     Optional<ItemEntity> dropped(Predicate<ItemStack> matches, double distance) {
         return visibleEntity(ItemEntity.class, entity -> matches.test(entity.getStack()), distance);

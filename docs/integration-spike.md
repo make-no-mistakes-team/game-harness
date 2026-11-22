@@ -59,6 +59,10 @@ not authorize a step into the opening.
 Incoming damage interrupts work even when knockback puts the player
 in water. The player can look toward a sound or seek a visible dry
 bank. A sound is not permission to swing at an unseen mob.
+Without a shield, the player can keep moving along a checked retreat
+or take visible solid cover between shots. During calm inventory work
+it can move carried building blocks into a spare hotbar slot without
+selecting them or replacing a tool.
 
 During ordinary exploration the player can descend one or two blocks onto
 a visible, stable, dry landing with clear body space and no immediate

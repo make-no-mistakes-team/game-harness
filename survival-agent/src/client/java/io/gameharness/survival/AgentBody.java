@@ -5464,6 +5464,14 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return EdgeStanceResult.WORKING;
     }
 
+    /** No walk key or new sight on an unmatched frame. Keep the crouch that the next inward step requires. */
+    void holdEdgeStance(EdgeStance stance) {
+        var player = client.player;
+        if (edgeStanceControls() && stance.holds(player.supportingBlockPos.orElse(null), player.getPos(),
+                player.getBoundingBox()) && !stance.settled(player.getPos()))
+            sneak();
+    }
+
     private boolean edgeStanceControls() {
         if (lavaEmergency || !client.isWindowFocused() || client.getOverlay() != null
                 || client.options.getAutoJump().getValue() || client.options.forwardKey.isUnbound()

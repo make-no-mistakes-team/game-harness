@@ -221,6 +221,12 @@ final class AgentOrdinaryNavigator {
 
     boolean driving(Job owner) { return job == owner && driving(); }
 
+    /** An inward shift on actual support is also a movement turn, even before the next route edge. */
+    boolean centering(Job owner, int tick) {
+        return job == owner && world == client.world && player == client.player && edgeStance != null
+            && !stanceRefused && tick - stanceSince < STANCE_TICKS;
+    }
+
     /** Pay only for an existing request. This observes terrain but never turns or drives. */
     void prepareObservation(Job owner, int tick) {
         if (lookAt == NO_CELL || job != owner || world != client.world || player != client.player) return;
@@ -335,6 +341,7 @@ final class AgentOrdinaryNavigator {
         }
         if (travel.crossing && !travel.observe(player.getPos())) reject("discontinuous motion", Integer.MAX_VALUE);
         if (!inputs || !body.hasRecentView()) {
+            if (inputs && centering(requested, tick)) body.holdEdgeStance(edgeStance);
             if (from != null && travel.expired(tick, along())) {
                 progressBound(tick, body.ordinaryRoutePhysicalContact(from));
                 stage = "waiting for render after edge bound";

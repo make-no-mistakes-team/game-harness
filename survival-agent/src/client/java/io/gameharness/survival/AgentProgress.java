@@ -1359,7 +1359,8 @@ final class AgentProgress {
         // Keep a declared ordinary leg through vanilla momentum. The inventory/craft stage
         // itself correctly refuses moving footing; it cannot own the continuation here.
         if (ordinaryRouteTick == tick - 1 && !mineResite.active()) {
-            if (ordinarySurfaceWork && ordinaryRouteJob == Job.TIMBER && navigator.driving(Job.TIMBER)
+            if (ordinarySurfaceWork && ordinaryRouteJob == Job.TIMBER
+                    && (navigator.driving(Job.TIMBER) || navigator.centering(Job.TIMBER, tick))
                     && safePickupStance() && nextFoot == null && !oreProbeReturning) {
                 if (timberResourceTick == tick - 1) timberResourceTick = tick;
                 if (ordinaryRouteBand != null) navigate(Job.TIMBER, ordinaryRouteBand);

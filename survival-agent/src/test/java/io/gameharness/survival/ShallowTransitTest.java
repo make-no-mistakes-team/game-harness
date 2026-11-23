@@ -10,6 +10,7 @@ import static io.gameharness.survival.AgentShallowTransit.Turn.LANDED;
 import static io.gameharness.survival.AgentShallowTransit.Turn.RECOVER;
 import static io.gameharness.survival.AgentVisibleHorizon.Refusal.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 final class ShallowTransitTest {
@@ -41,6 +42,19 @@ final class ShallowTransitTest {
         assertEquals(COAST, transit.check(pose(179, 463, 2.39, 0.07, false), bed),
             "a dry bank with residual movement is not a settled travel receipt");
         assertEquals(LANDED, transit.check(pose(180, 464, 2.43, 0.03, false), bed));
+    }
+
+    @Test
+    void landingInWaterBelowAnIssuedWadeDoesNotEarnItsContactOrAnotherStroke() {
+        var transit = issue(true, false);
+        var lowerWater = new AgentShallowTransit.Pose(world, actor, owner, 154, 425,
+            new Vec3d(0.5, 63, 1.05), Vec3d.ZERO, new BlockPos(0, 62, 1),
+            0.31, true, 20, null, 0.10, 0.024, 0.8);
+        var bed = new Bed();
+        assertEquals(RECOVER, transit.check(lowerWater, bed));
+        assertEquals(WADE_DRIFT, transit.reason());
+        assertFalse(transit.touchedWater(), "wet body contact below the issued lane belongs to recovery, not transit");
+        assertEquals(WADE_DRIFT, transit.inputVeto(lowerWater, bed, 0));
     }
 
     @Test

@@ -195,6 +195,24 @@ final class VisibleHorizonTest {
     }
 
     @Test
+    void stillWaterAndABankBelowTheCrownDoNotAuthorizeAWade() {
+        var crown = AgentVisibleHorizon.Patch.dry(70, 0.6);
+        var water = AgentVisibleHorizon.Patch.water(63, 0.34, Vec3d.ZERO);
+        var shore = AgentVisibleHorizon.Patch.dry(63, 0.6);
+        var stance = new AgentVisibleHorizon.Stance(0.65, 70, 0.5, 0.31,
+            Vec3d.ZERO, 0.1, crown.drag(), false, new BlockPos(0, 69, 0));
+        var offered = AgentVisibleHorizon.trace((x, z) -> z != 0 ? null : switch (x) {
+            case 0 -> crown;
+            case 1 -> water;
+            case 2, 3 -> shore;
+            default -> null;
+        }, stance, 1, 0);
+        assertEquals(UNKNOWN, offered.medium());
+        assertEquals(AgentVisibleHorizon.Refusal.SURFACE_HEIGHT, offered.refusal());
+        assertTrue(offered.known() < offered.braking(), "not even a dry stopping path exists on that bearing");
+    }
+
+    @Test
     void deepWaterOutflowCausticTopsAndUnprovedHeightChangesAreNotOrdinarySupport() {
         assertNull(AgentVisibleHorizon.Patch.water(0, 1.05, Vec3d.ZERO));
         assertEquals(AgentVisibleHorizon.Refusal.DEEP_WATER, AgentVisibleHorizon.Patch.waterRefusal(1.05, Vec3d.ZERO));

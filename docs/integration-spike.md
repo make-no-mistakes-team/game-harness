@@ -136,6 +136,9 @@ four torches and light its footing before opening the next cave lip.
 On the supply stair, it looks for a nearby visible torch mount before
 turning back. It keeps one torch in reserve and rechecks the crossing
 after seeing the placed torch and counting the item spent.
+Once it lands on the same solid tread it checked before the jump, it
+can keep looking toward the next cut. A slip, a changed block, or a
+landing on a different tread calls for a fresh footing check.
 If the opening fills with visible water, or no reachable face can be
 found after checking it from the tread, the player tries another
 direction instead of sweeping the pick back and forth over the hole.
@@ -157,8 +160,9 @@ If none is visible, it searches from new reachable ground rather than
 resuming the stone job. From a safe stand beside an oak or dark oak it
 can try several leaves for an apple; breaking a leaf does not mean food
 dropped. A visible meal takes priority over trying another leaf.
-An empty view does not authorize an attack.
-It prefers safe food to rotten flesh. It can eat without turning away
+An audible chicken can prompt one look from a stop. Only a visible adult
+on safe ground is a hunting target. Safe food takes priority over raw
+chicken and rotten flesh. The player can eat without turning away
 from the scene unless the use key would interact with an entity or
 place the food as a block. Pickup, eating and health recovery are
 separate outcomes. Reopening a world with low health and too little

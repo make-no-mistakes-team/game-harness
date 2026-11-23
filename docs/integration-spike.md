@@ -109,6 +109,12 @@ not send it back onto the same failed collection spot.
 A wooden pick is not a reason to keep walking along treetops looking
 for stone. From a confirmed canopy the player can look down for a dry
 tread before starting another overland search.
+When looking for its first log, the player can open a neighboring leaf
+column without removing the block under its feet. It checks for wood
+and a no-damage route first. If those options run out, a healthy, fed
+player can step down to a visible dry landing at a predicted cost of
+at most one heart. An unclear path or a nearby threat rules it out.
+Landing and collecting wood are separate events.
 Seeing sky or a log through the mouth of a shaft is not enough to
 finish an ascent. The player looks for ground it can walk onto, or
 timber it can cut and collect from its current tread.

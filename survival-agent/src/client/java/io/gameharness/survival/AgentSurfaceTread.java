@@ -25,6 +25,88 @@ final class AgentSurfaceTread {
     enum ReturnClearance { CLEAR, DAMP, OVERHEAD, OBSTRUCTION }
     enum RecallPolicy { ISOLATED, ORDINARY }
 
+    /** The canopy-only, budgeted branch; it cannot construct an ordinary or reversible edge. */
+    static final class MeasuredDescent {
+        private static final int PROOF_TICKS = 38, MOTION_TICKS = 45, RECEIPT_TICKS = 8;
+        private final AgentDryLanding.Measured drop;
+        private final long started;
+        private long driving = -1, contactSince = -1;
+        private int motorTick;
+        private Vec3d previous;
+        private float observedHealth, damageTaken;
+        private String refusal;
+        private boolean committed, airborne;
+
+        MeasuredDescent(AgentDryLanding.Measured drop, long tick) {
+            this.drop = drop;
+            started = tick;
+        }
+
+        boolean inFlight() { return driving >= 0; }
+        String refusal() { return refusal; }
+        float damageTaken() { return damageTaken; }
+
+        boolean landingContact(MinecraftClient client, AgentBody body) {
+            return inFlight() && airborne && body.measuredLandingContact(drop);
+        }
+
+        boolean controlsFall(MinecraftClient client, AgentBody body, long tick) {
+            return inFlight() && !client.player.isOnGround() && tick - driving < MOTION_TICKS
+                && motorTick + 1 == body.actionTick() && body.measuredFallCoast(drop);
+        }
+
+        Result step(MinecraftClient client, AgentBody body, long tick) {
+            var player = client.player;
+            if (!inFlight() && tick - started > PROOF_TICKS)
+                return refuse("the measured takeoff lost its rendered top or settled alignment");
+            if (inFlight()) {
+                float health = player.getHealth();
+                damageTaken += Math.max(0, observedHealth - health);
+                observedHealth = health;
+                if (damageTaken > drop.damage()) return refuse("observed HP loss exceeded the measured descent budget");
+                if (tick - driving >= MOTION_TICKS) return refuse("the measured descent failed to settle on its witnessed top");
+                Vec3d feet = player.getPos();
+                boolean contact = landingContact(client, body);
+                double dy = feet.y - previous.y, dx = feet.x - previous.x, dz = feet.z - previous.z;
+                int elapsed = body.actionTick() - motorTick;
+                if ((elapsed != 1 && !(contact && elapsed > 0 && elapsed <= 3))
+                        || (contactSince < 0 && (dy > 1e-5 || dy < -1.4 || dx * dx + dz * dz > 0.30 * 0.30)))
+                    return refuse("the measured descent lost its contiguous vanilla body movement");
+                previous = feet;
+                motorTick = body.actionTick();
+                if (contact) {
+                    if (contactSince < 0) contactSince = tick;
+                    // Touchdown may itself cause hurtTime. Finish from exact body contact
+                    // and the actual client health updates, with no extra movement key.
+                    return tick - contactSince >= RECEIPT_TICKS && player.getVelocity().horizontalLengthSquared() <= 0.0001
+                        ? Result.LANDED : Result.MOVING;
+                }
+                if (contactSince >= 0 || airborne && player.isOnGround())
+                    return refuse("the measured descent lost its exact landing support");
+                if (!player.isOnGround()) airborne = committed = true;
+                if (committed) return body.measuredFallCoast(drop) ? Result.MOVING
+                    : refuse("changed support, threat, or body path vetoed the measured coast");
+            }
+            var motor = body.driveMeasuredDrop(drop);
+            if (motor == AgentBody.OrdinaryMotor.VETO)
+                return refuse("health, hunger, danger, changed support, or the stopping envelope vetoed the measured takeoff");
+            if (motor == AgentBody.OrdinaryMotor.ALIGN) return inFlight() ? Result.MOVING : Result.CHECKING;
+            if (!inFlight()) {
+                driving = tick;
+                previous = player.getPos();
+                observedHealth = player.getHealth();
+                motorTick = body.actionTick();
+            }
+            if (motor == AgentBody.OrdinaryMotor.COAST) committed = true;
+            return Result.MOVING;
+        }
+
+        private Result refuse(String why) {
+            refusal = why;
+            return Result.REFUSED;
+        }
+    }
+
     final Edge edge;
     final boolean returning;
     final BlockPos from, to;

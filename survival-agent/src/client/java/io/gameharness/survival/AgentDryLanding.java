@@ -20,8 +20,124 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
     private static final double AIR_DRAG = 0.91;
     private static final int AIR_TICKS = 10;
     private static final double CAVE_SIDE_PAD = 0.015, CAVE_ALONG_PAD = 0.003, BOUNDARY = 1e-5;
+    static final int MAX_MEASURED_DAMAGE = 2;
+    private static final int MAX_MEASURED_HEIGHT = 8;
+    private static final double MEASURED_PAD = 0.025;
 
     int height() { return source.getY() - to().getY(); }
+
+    /** 1.21.4 LivingEntity.computeFallDamage, with the normal Block landing multiplier of 1. */
+    static int measuredDamage(float distance, double safeFall, double multiplier) {
+        if (!Float.isFinite(distance) || distance < 0 || !Float.isFinite((float) safeFall) || safeFall < 0
+                || !Double.isFinite(multiplier) || multiplier < 0) return Integer.MAX_VALUE;
+        double raw = (distance - (float) safeFall) * multiplier;
+        return Math.max(0, (int) Math.ceil(raw));
+    }
+
+    static boolean measuredBudget(float health, float maxHealth, int food, int damage,
+                                  boolean recentDamage, boolean nearbyThreat, boolean recovered) {
+        return Float.isFinite(health) && Float.isFinite(maxHealth) && health >= Math.max(16, maxHealth * 0.8f)
+            && food >= 18 && damage >= 0 && damage <= MAX_MEASURED_DAMAGE && health - damage >= 14
+            && !recentDamage && !nearbyThreat && recovered;
+    }
+
+    static Direction measuredBearing(BlockPos from, BlockPos to) {
+        int drop = from.getY() - to.getY();
+        if (drop <= MAX_DROP || drop > MAX_MEASURED_HEIGHT) return null;
+        int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ();
+        if (dx == 0 && dz != 0 && Math.abs(dz) <= 2) return dz > 0 ? Direction.SOUTH : Direction.NORTH;
+        if (dz == 0 && dx != 0 && Math.abs(dx) <= 2) return dx > 0 ? Direction.EAST : Direction.WEST;
+        return null;
+    }
+
+    static boolean measuredTop(BlockPos from, Direction bearing, BlockHitResult hit) {
+        return bearing != null && hit != null && !hit.isInsideBlock() && AgentBody.matchesDryRouteTop(hit, hit.getBlockPos())
+            && measuredBearing(from, hit.getBlockPos().up()) == bearing;
+    }
+
+    /** A separate one-way permission. It is not a dry-cave edge or a remembered short tread. */
+    record Measured(BlockPos from, BlockState upper, BlockHitResult top, BlockPos to, BlockState lower,
+                    Direction bearing, int damage) {
+        boolean supports(BlockState currentUpper, BlockState currentLower) {
+            return upper == currentUpper && lower == currentLower;
+        }
+
+        CaveMotion coast(Vec3d feet, Vec3d velocity, double radius, double height, double gravity, boolean grounded,
+                         float accumulated, double safeFall, double multiplier, double ax, double az,
+                         Predicate<Box> clear, Predicate<Box> dry) {
+            return trace(feet, velocity, radius, height, gravity, grounded, accumulated, safeFall, multiplier,
+                ax == 0 && az == 0 ? 0 : 1, ax, az, clear, dry);
+        }
+
+        /**
+         * Predict vanilla's vertical-then-horizontal move, sampled drag and complete neutral stop.
+         * Only the two witnessed tops may support the prediction. Other geometry can only veto it.
+         */
+        CaveMotion trace(Vec3d feet, Vec3d velocity, double radius, double height, double gravity, boolean grounded,
+                         float accumulated, double safeFall, double multiplier, int presses, double ax, double az,
+                         Predicate<Box> clear, Predicate<Box> dry) {
+            double x = feet.x, y = feet.y, z = feet.z, lip = from.getY(), floor = to.getY();
+            double vx = velocity.x, vy = velocity.y, vz = velocity.z;
+            double end = along(from, bearing, to.getX() + 0.5, to.getZ() + 0.5);
+            double stop = end + 0.5 - radius - MEASURED_PAD;
+            if (clear == null || dry == null || !Double.isFinite(gravity) || Math.abs(gravity - 0.08) > 1e-6
+                    || !Double.isFinite(radius) || radius <= 0 || !Double.isFinite(height) || height <= 0
+                    || !Double.isFinite(vy) || vy > 0 || vy < -1.4 || !Float.isFinite(accumulated) || accumulated < 0
+                    || !Double.isFinite(y) || y < floor - BOUNDARY || y > lip + BOUNDARY
+                    || measuredDamage((float) (lip - floor), safeFall, multiplier) > damage
+                    || damage > MAX_MEASURED_DAMAGE || !inCaveLane(from, bearing, x, z, radius + 0.01, stop))
+                return CaveMotion.RANGE;
+            double rx = radius + (bearing.getAxis() == Direction.Axis.X ? CAVE_ALONG_PAD : MEASURED_PAD);
+            double rz = radius + (bearing.getAxis() == Direction.Axis.Z ? CAVE_ALONG_PAD : MEASURED_PAD);
+            for (int i = 0; i < 36; ++i) {
+                vx = Math.abs(vx) < 0.003 ? 0 : vx;
+                vz = Math.abs(vz) < 0.003 ? 0 : vz;
+                double distance = along(from, bearing, x, z);
+                boolean onLip = y >= lip - BOUNDARY && distance < 0.5 + radius;
+                if (i < presses && grounded && onLip) {
+                    vx += ax;
+                    vz += az;
+                }
+                double freeY = y + vy;
+                boolean receiving = distance > end - 0.5 - radius + MEASURED_PAD;
+                double top = onLip ? lip : receiving ? floor : Double.NEGATIVE_INFINITY;
+                double nextY = Math.max(top, freeY);
+                double nextX = x + vx, nextZ = z + vz;
+                double nextDistance = along(from, bearing, nextX, nextZ);
+                if (!inCaveLane(from, bearing, nextX, nextZ, radius + 0.01, stop)
+                        || nextY < floor - BOUNDARY || !onLip && nextDistance < distance - BOUNDARY)
+                    return CaveMotion.RANGE;
+
+                Box body = new Box(x - rx, nextY, z - rz, x + rx, nextY + height + CAVE_ALONG_PAD, z + rz);
+                if (nextY != y) {
+                    CaveMotion veto = caveVolume(body.stretch(0, y - nextY, 0), nextY >= lip - BOUNDARY, clear, dry);
+                    if (veto != null) return veto;
+                }
+                CaveMotion veto = caveVolume(body.stretch(vx, 0, vz), nextY >= lip - BOUNDARY, clear, dry);
+                if (veto != null) return veto;
+                boolean contact = freeY < top;
+                if (!contact && nextY < y) accumulated += (float) (y - nextY);
+                // Vanilla accumulates float displacements before floor contact. Preserve the full geometric
+                // height too, and reject extra carried fall distance rather than rounding it down at a boundary.
+                if (measuredDamage(Math.max((float) (lip - floor), accumulated + 0.0001f), safeFall, multiplier) > damage)
+                    return CaveMotion.RANGE;
+                if (i + 1 >= presses && vx == 0 && vz == 0 && contact) {
+                    if (nextY == floor && distance >= end - 0.44) return CaveMotion.LANDING;
+                    if (nextY == lip && distance <= 0.5 + radius - MEASURED_PAD) return CaveMotion.SOURCE;
+                    return CaveMotion.RANGE;
+                }
+                double drag = grounded ? 0.6f * 0.91f : 0.91f;
+                x = nextX;
+                y = nextY;
+                z = nextZ;
+                vx *= drag;
+                vz *= drag;
+                vy = ((contact ? 0 : vy) - gravity) * 0.98f;
+                grounded = contact;
+            }
+            return CaveMotion.RANGE;
+        }
+    }
 
     static boolean shape(BlockPos from, BlockPos to, Direction bearing) {
         int drop = from.getY() - to.getY();

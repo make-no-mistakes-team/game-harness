@@ -156,6 +156,82 @@ final class FootholdGeometryTest {
     }
 
     @Test
+    void measuredVanillaDropBudgetDoesNotDependOnArmorOrAuthorizeShortLanes() {
+        assertEquals(0, AgentDryLanding.measuredDamage(3, 3, 1));
+        assertEquals(1, AgentDryLanding.measuredDamage(4, 3, 1));
+        assertEquals(2, AgentDryLanding.measuredDamage(5, 3, 1));
+        assertEquals(3, AgentDryLanding.measuredDamage(5.001f, 3, 1));
+        assertEquals(2, AgentDryLanding.measuredDamage(6, 2, 0.5));
+        assertEquals(3, AgentDryLanding.measuredDamage(4, 2.5, 1.5));
+        assertTrue(AgentDryLanding.measuredBudget(16, 20, 18, 2, false, false, true));
+        assertFalse(AgentDryLanding.measuredBudget(15.99f, 20, 20, 1, false, false, true));
+        assertFalse(AgentDryLanding.measuredBudget(20, 20, 17, 1, false, false, true));
+        assertFalse(AgentDryLanding.measuredBudget(20, 20, 20, 3, false, false, true));
+        assertFalse(AgentDryLanding.measuredBudget(20, 20, 20, 1, true, false, true));
+        assertFalse(AgentDryLanding.measuredBudget(20, 20, 20, 1, false, true, true));
+        assertFalse(AgentDryLanding.measuredBudget(20, 20, 20, 1, false, false, false));
+        var from = new BlockPos(0, 65, 0);
+        assertNull(AgentDryLanding.measuredBearing(from, from.east().down(2)));
+        assertFalse(AgentDryLanding.shape(from, from.east().down(4), Direction.EAST));
+        assertFalse(AgentSurfaceTread.ordinaryRecallGeometry(from, from.east().down(4)));
+    }
+
+    @Test
+    void measuredFallRequiresARealSweptAndSettlingEnvelope() {
+        var from = new BlockPos(0, 65, 0);
+        var to = from.east().down(4);
+        var stone = Blocks.STONE.getDefaultState();
+        var hit = new BlockHitResult(Vec3d.ofBottomCenter(to), Direction.UP, to.down(), false);
+        var landing = new AgentDryLanding.Measured(from, stone, hit, to, stone, Direction.EAST, 1);
+        assertFalse(AgentDryLanding.measuredTop(from, Direction.EAST, null));
+        assertTrue(AgentDryLanding.measuredTop(from, Direction.EAST, hit));
+        assertFalse(landing.supports(stone, Blocks.SAND.getDefaultState()));
+        assertFalse(landing.supports(Blocks.SAND.getDefaultState(), stone));
+        var lip = new Box(from.down());
+        var shelf = new Box(to.down());
+        Predicate<Box> clear = box -> !box.intersects(lip) && !box.intersects(shelf);
+        var feet = new Vec3d(1.24, 65, 0.5);
+        var rest = new Vec3d(0, -0.0784, 0);
+        assertEquals(AgentDryLanding.CaveMotion.SOURCE,
+            landing.coast(feet, rest, 0.30, 1.8, 0.08, true, 0, 3, 1, 0, 0, clear, box -> true));
+        assertEquals(AgentDryLanding.CaveMotion.LANDING,
+            landing.coast(feet, rest, 0.30, 1.8, 0.08, true, 0, 3, 1, 0.098, 0, clear, box -> true));
+        var obstruction = new Box(1.4, 61.6, 0.3, 1.8, 61.8, 0.7);
+        assertEquals(AgentDryLanding.CaveMotion.LOWER_COLLISION,
+            landing.coast(feet, rest, 0.30, 1.8, 0.08, true, 0, 3, 1, 0.098, 0,
+                box -> clear.test(box) && !box.intersects(obstruction), box -> true));
+        assertEquals(AgentDryLanding.CaveMotion.LOWER_HAZARD,
+            landing.coast(feet, rest, 0.30, 1.8, 0.08, true, 0, 3, 1, 0.098, 0,
+                clear, box -> !box.intersects(obstruction)));
+        assertEquals(AgentDryLanding.CaveMotion.RANGE,
+            landing.coast(feet, rest, 0.30, 1.8, 0.08, true, 0, 3, 1, 0.098, 0, null, box -> true));
+        assertEquals(AgentDryLanding.CaveMotion.RANGE,
+            landing.coast(feet, new Vec3d(0, 0.02, 0), 0.30, 1.8, 0.08, true, 0, 3, 1,
+                0.098, 0, clear, box -> true), "never launch upward");
+        assertEquals(AgentDryLanding.CaveMotion.RANGE,
+            landing.coast(feet, rest, 0.30, 1.8, 0.01, true, 0, 3, 1, 0.098, 0, clear, box -> true));
+
+        var far = from.east(2).down(5);
+        var farTop = new BlockHitResult(Vec3d.ofBottomCenter(far), Direction.UP, far.down(), false);
+        var farther = new AgentDryLanding.Measured(from, stone, farTop, far, stone, Direction.EAST, 2);
+        Predicate<Box> farClear = box -> !box.intersects(lip) && !box.intersects(new Box(far.down()));
+        assertEquals(AgentDryLanding.CaveMotion.LANDING,
+            farther.coast(new Vec3d(1.29, 65, 0.5), new Vec3d(0.12, -0.0784, 0),
+                0.30, 1.8, 0.08, true, 0, 3, 1, 0.098, 0, farClear, box -> true));
+        assertEquals(AgentDryLanding.CaveMotion.RANGE,
+            farther.coast(new Vec3d(1.29, 65, 0.5), rest, 0.30, 1.8, 0.08, true,
+                0, 3, 1, 0.098, 0, farClear, box -> true), "a visible farther top is not reachable from rest");
+        assertEquals(AgentDryLanding.CaveMotion.RANGE,
+            farther.coast(new Vec3d(2.67, 60.2, 0.5), new Vec3d(0.09, -0.25, 0),
+                0.30, 1.8, 0.08, false, 4.8f, 3, 1, 0, 0, farClear, box -> true),
+            "even contact on the known top is unsafe if its neutral stop runs beyond the edge");
+        assertEquals(AgentDryLanding.CaveMotion.RANGE,
+            farther.coast(new Vec3d(2.10, 60.2, 0.5), new Vec3d(0.03, -0.25, 0),
+                0.30, 1.8, 0.08, false, 5.01f, 3, 1, 0, 0, farClear, box -> true),
+            "the live accumulated fall may exceed the geometric budget");
+    }
+
+    @Test
     void onlyTheExactVisibleStableDryTopCanAuthorizeEdgeCentering() {
         var tread = new BlockPos(-15, 36, -22);
         var edge = new Vec3d(-14.52, 37, -20.98);

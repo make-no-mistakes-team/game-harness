@@ -17,6 +17,7 @@ import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.FallingBlock;
+import net.minecraft.block.LeavesBlock;
 import net.minecraft.block.ShapeContext;
 import net.minecraft.block.SnowBlock;
 import net.minecraft.client.MinecraftClient;
@@ -27,8 +28,10 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityPose;
+import net.minecraft.entity.FallingBlockEntity;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.TntEntity;
 import net.minecraft.entity.ai.RangedAttackMob;
 import net.minecraft.entity.attribute.EntityAttributes;
 import net.minecraft.entity.effect.StatusEffects;
@@ -37,6 +40,9 @@ import net.minecraft.entity.mob.EndermanEntity;
 import net.minecraft.entity.mob.Monster;
 import net.minecraft.entity.mob.PiglinEntity;
 import net.minecraft.entity.mob.SpiderEntity;
+import net.minecraft.entity.player.PlayerEntity;
+import net.minecraft.entity.projectile.ProjectileEntity;
+import net.minecraft.entity.vehicle.TntMinecartEntity;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.BoatItem;
@@ -59,6 +65,7 @@ import net.minecraft.util.math.Vec3d;
 import net.minecraft.util.shape.VoxelShape;
 import net.minecraft.util.shape.VoxelShapes;
 import net.minecraft.world.BlockView;
+import net.minecraft.world.GameMode;
 import net.minecraft.world.RaycastContext;
 import net.minecraft.world.World;
 import org.joml.Matrix4f;
@@ -191,6 +198,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private double ordinaryFlatReach;
     private final Predicate<Box> caveLandingSpace = this::caveLandingSpaceEmpty;
     private final Predicate<Box> caveLandingDry = this::caveLandingVolumeDry;
+    private final Predicate<Box> measuredLandingSpace = this::measuredLandingSpaceEmpty;
+    private final Predicate<Box> measuredLandingDry = this::measuredLandingVolumeDry;
+    private float measuredLastHealth, measuredRestHealth;
+    private int measuredHurtTick = -100, measuredLaunchTick = -100, measuredRestFood;
+    private boolean measuredForwardKey, measuredLaunchKey;
     private int dryFootingTick;
     private Vec3d previousDryFooting;
     private int previousDryFootingTick;
@@ -374,6 +386,14 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             horizonWaterLoss = null;
             hazardWorld = client.world;
             hazardPlayer = client.player;
+            measuredLastHealth = Float.NaN;
+            measuredHurtTick = measuredLaunchTick = -100;
+            measuredRestHealth = measuredRestFood = 0;
+        }
+        if (client.player != null) {
+            float health = client.player.getHealth();
+            if (client.player.hurtTime > 0 || health < measuredLastHealth) measuredHurtTick = tick;
+            measuredLastHealth = health;
         }
         boolean available = ready();
         if (client.player != null && client.player.isAlive() && client.player.isInLava()) beginLavaEscape();
@@ -421,6 +441,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         emergencyWalk = false;
         checkedEmergencyWalk = false;
         dryRouteWalk = false;
+        measuredForwardKey = measuredLaunchKey = false;
         ordinaryRiseKey = false;
         ordinaryFlatKey = FlatKey.NONE;
         wetEscapeWalk = false;
@@ -806,6 +827,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         } else {
             releaseRowKeys();
         }
+        if (measuredForwardKey && (jump || crouch || attack || use || retreat || !player.isOnGround())) advance = false;
         // A second forward press can start vanilla sprint even with the sprint key up.
         // A paced approach can coast at the lip; don't turn its next pulse into a double-tap.
         if (advance && !options.forwardKey.isPressed()) {
@@ -830,6 +852,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         // A staged ordinary rise must not become a walk into the riser when a
         // final safety or input gate rejected its takeoff.
         if (ordinaryRiseKey && (!advance || !jump)) advance = jump = false;
+        if (measuredLaunchKey && advance && !jump && !crouch) recordMeasuredLaunch();
         if (jump && stepJump) lastStepJump = tick;
         ownsKeys = true;
         if (advance && (emergencyWalk || rolling && horizonIntent.ranged) && !options.forwardKey.isUnbound())
@@ -3260,6 +3283,10 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     private boolean caveLandingVolumeDry(Box box) {
+        return loadedLandingVolume(box) && dryGradeVolume(box);
+    }
+
+    private boolean loadedLandingVolume(Box box) {
         // An unloaded neighbor cannot establish clearance for part of the swept hull.
         int x0 = MathHelper.floor(box.minX) >> 4, x1 = MathHelper.floor(box.maxX - 1e-5) >> 4;
         int z0 = MathHelper.floor(box.minZ) >> 4, z1 = MathHelper.floor(box.maxZ - 1e-5) >> 4;
@@ -3267,7 +3294,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         for (int x = x0; x <= x1; ++x)
             for (int z = z0; z <= z1; ++z)
                 if (!world.isChunkLoaded(x, z)) return false;
-        return dryGradeVolume(box);
+        return true;
     }
 
     private AgentDryLanding.CaveMotion caveLandingCoast(AgentDryLanding landing, int presses, float yaw, boolean geometry) {
@@ -3346,6 +3373,187 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         dryRouteWalk = true;
         walkDownTo(landing.center());
         return null;
+    }
+
+    /** Admit only a rendered lower top after the ordinary actor has exhausted its no-damage route. */
+    AgentDryLanding.Measured measuredDrop(BlockPos from, BlockHitResult renderedTop) {
+        if (!measuredDropBodySafe() || renderedTop == null || !ordinaryRoutePhysicalContact(from)
+                || client.player.fallDistance != 0) return null;
+        BlockPos to = renderedTop.getBlockPos().up();
+        Direction bearing = AgentDryLanding.measuredBearing(from, to);
+        if (!AgentDryLanding.measuredTop(from, bearing, renderedTop) || !measuredTopSeen(renderedTop)) return null;
+        var player = client.player;
+        int damage = AgentDryLanding.measuredDamage(from.getY() - to.getY(),
+            player.getAttributeValue(EntityAttributes.SAFE_FALL_DISTANCE),
+            player.getAttributeValue(EntityAttributes.FALL_DAMAGE_MULTIPLIER));
+        BlockState upper = client.world.getBlockState(from.down()), lower = client.world.getBlockState(to.down());
+        var candidate = new AgentDryLanding.Measured(from, upper, renderedTop, to, lower, bearing, damage);
+        if (!measuredDropBudget(candidate) || !measuredDropSupports(candidate)) return null;
+
+        float yaw = bearing.getPositiveHorizontalDegrees();
+        // A plan may preview several walking ticks. Every prefix must still have a safe
+        // neutral stop, including if a frame, input or the next decision is lost.
+        for (int presses = 0; presses <= 8; ++presses) {
+            var motion = measuredCoast(candidate, presses, yaw);
+            if (motion == AgentDryLanding.CaveMotion.LANDING) return candidate;
+            if (motion != AgentDryLanding.CaveMotion.SOURCE) return null;
+        }
+        return null;
+    }
+
+    private boolean measuredTopSeen(BlockHitResult top) {
+        if (!ordinaryRouteViewCurrent() || raysLeft <= 0 || !inView(top.getPos())) return false;
+        Vec3d point = top.getPos();
+        double distance = eye.distanceTo(point);
+        if (distance < 0.05 || distance > 12) return false;
+        double inset = 0.035 / distance;
+        var hit = visibleHit(point.add((point.x - eye.x) * inset, (point.y - eye.y) * inset,
+            (point.z - eye.z) * inset), Ray.TERRAIN);
+        return AgentBody.matchesDryRouteTop(hit, top.getBlockPos()) && !hit.isInsideBlock()
+            && inView(hit.getPos()) && point.squaredDistanceTo(hit.getPos()) < 0.0064;
+    }
+
+    private boolean measuredDropBodySafe() {
+        if (!ready() || lavaEmergency || !client.isWindowFocused() || client.getOverlay() != null
+                || client.interactionManager == null || client.interactionManager.getCurrentGameMode() != GameMode.SURVIVAL
+                || client.options.forwardKey.isUnbound() || client.options.getAutoJump().getValue()) return false;
+        var player = client.player;
+        return dryLandingInputs(false) && !player.isSneaking() && !player.isGliding() && !player.isUsingRiptide()
+            && !player.hasNoGravity() && !player.isInLava() && !player.isFrozen() && !player.isInsideWall()
+            && player.getStatusEffects().isEmpty() && player.getAbsorptionAmount() == 0
+            && Math.abs(player.getFinalGravity() - 0.08) <= 1e-6
+            && Math.abs(player.getAttributeValue(EntityAttributes.MOVEMENT_SPEED) - 0.1) <= 1e-6
+            && Math.abs(player.getMovementSpeed() - 0.1f) <= 1e-6;
+    }
+
+    private boolean measuredDropBudget(AgentDryLanding.Measured drop) {
+        var player = client.player;
+        float health = player.getHealth(), maxHealth = player.getMaxHealth();
+        int food = player.getHungerManager().getFoodLevel();
+        boolean recovered = tick - measuredLaunchTick >= 80
+            && health >= measuredRestHealth && food >= measuredRestFood;
+        return AgentDryLanding.measuredBudget(health, maxHealth, food, drop.damage(),
+            tick - measuredHurtTick <= 40, measuredDropThreat(drop), recovered);
+    }
+
+    private void recordMeasuredLaunch() {
+        var player = client.player;
+        measuredLaunchTick = tick;
+        measuredRestHealth = player.getHealth();
+        measuredRestFood = player.getHungerManager().getFoodLevel();
+    }
+
+    private boolean measuredDropThreat(AgentDryLanding.Measured drop) {
+        // Safety-only veto around an already witnessed route; never nominates targets or support.
+        Box area = new Box(drop.from()).union(new Box(drop.to())).expand(6, 4, 6);
+        return !client.world.getOtherEntities(client.player, area, entity -> entity.isAlive()
+            && (entity instanceof Monster || entity instanceof PlayerEntity || entity instanceof TntEntity
+                || entity instanceof TntMinecartEntity || entity instanceof FallingBlockEntity
+                || entity instanceof ProjectileEntity && !entity.isOnGround())).isEmpty();
+    }
+
+    private boolean measuredDropSupports(AgentDryLanding.Measured drop) {
+        BlockPos from = drop.from().down(), to = drop.to().down();
+        if (!client.world.isChunkLoaded(from.getX() >> 4, from.getZ() >> 4)
+                || !client.world.isChunkLoaded(to.getX() >> 4, to.getZ() >> 4)
+                || !drop.supports(client.world.getBlockState(from), client.world.getBlockState(to))
+                || !measuredSupportMaterial(drop.upper()) || !measuredSupportMaterial(drop.lower())
+                || !stableDryRouteTop(from, drop.upper()) || !stableDryRouteTop(to, drop.lower())) return false;
+        // The trailing footprint can also sample these cells for friction or impact.
+        // Neither cell is used as support or to extend the landing.
+        return measuredApron(from.offset(drop.bearing())) && measuredApron(to.offset(drop.bearing().getOpposite()));
+    }
+
+    private boolean measuredApron(BlockPos pos) {
+        if (!client.world.isChunkLoaded(pos.getX() >> 4, pos.getZ() >> 4)) return false;
+        var state = client.world.getBlockState(pos);
+        return measuredPassable(state) || measuredSupportMaterial(state) && stableDryRouteTop(pos, state);
+    }
+
+    private static boolean measuredSupportMaterial(BlockState state) {
+        if (dryCaveDanger(state) || !normalDryTraction(state) || state.getBlock().getVelocityMultiplier() != 1.0f)
+            return false;
+        // Only ordinary vanilla supports with Block.onLandedUpon behavior. In particular
+        // hay, slime, honey, farms, ice and falling sand/gravel do not qualify.
+        return state.getBlock().getClass() == Block.class || AgentFoodWork.forageGround(state)
+            || state.isIn(BlockTags.LOGS)
+            || state.isIn(BlockTags.LEAVES) && (state.get(LeavesBlock.PERSISTENT)
+                || state.get(LeavesBlock.DISTANCE) < LeavesBlock.MAX_DISTANCE);
+    }
+
+    private static boolean measuredPassable(BlockState state) {
+        return state.isAir() || state.getFluidState().isEmpty() && (state.isOf(Blocks.SHORT_GRASS)
+            || state.isOf(Blocks.TALL_GRASS) || state.isOf(Blocks.FERN) || state.isOf(Blocks.LARGE_FERN));
+    }
+
+    private boolean measuredLandingSpaceEmpty(Box box) {
+        return client.world.getWorldBorder().contains(box) && caveLandingSpaceEmpty(box);
+    }
+
+    private boolean measuredLandingVolumeDry(Box box) {
+        if (!loadedLandingVolume(box)) return false;
+        for (int x = MathHelper.floor(box.minX); x <= MathHelper.floor(box.maxX - 1e-5); x++)
+            for (int z = MathHelper.floor(box.minZ); z <= MathHelper.floor(box.maxZ - 1e-5); z++)
+                for (int y = MathHelper.floor(box.minY); y <= MathHelper.floor(box.maxY - 1e-5); y++)
+                    if (!measuredPassable(client.world.getBlockState(walkedProbe.set(x, y, z)))) return false;
+        return true;
+    }
+
+    private AgentDryLanding.CaveMotion measuredCoast(AgentDryLanding.Measured drop, int presses, float yaw) {
+        var player = client.player;
+        float angle = yaw * MathHelper.RADIANS_PER_DEGREE;
+        float speed = player.getMovementSpeed() * (0.21600002f / (0.6f * 0.6f * 0.6f)) * 0.98f;
+        return drop.trace(player.getPos(), player.getVelocity(), player.getWidth() * 0.5,
+            player.getHeight(), player.getFinalGravity(), player.isOnGround(), player.fallDistance,
+            player.getAttributeValue(EntityAttributes.SAFE_FALL_DISTANCE),
+            player.getAttributeValue(EntityAttributes.FALL_DAMAGE_MULTIPLIER),
+            presses, -MathHelper.sin(angle) * speed, MathHelper.cos(angle) * speed, measuredLandingSpace, measuredLandingDry);
+    }
+
+    boolean measuredFallCoast(AgentDryLanding.Measured drop) {
+        return measuredDropBodySafe() && measuredDropSupports(drop) && !measuredDropThreat(drop)
+            && !hazardAhead(drop.bearing().getPositiveHorizontalDegrees(), 2.65)
+            && measuredCoast(drop, 0, drop.bearing().getPositiveHorizontalDegrees()) == AgentDryLanding.CaveMotion.LANDING;
+    }
+
+    boolean measuredLandingContact(AgentDryLanding.Measured drop) {
+        var player = client.player;
+        return player != null && client.world != null && ordinaryRoutePhysicalContact(drop.to())
+            && !player.isTouchingWater() && !player.isInLava() && !player.isOnFire() && !player.hasVehicle()
+            && measuredDropSupports(drop) && measuredLandingSpaceEmpty(player.getBoundingBox())
+            && measuredLandingVolumeDry(player.getBoundingBox());
+    }
+
+    /** Issue at most one ordinary grounded forward tick; no jump, sprint or midair corrections. */
+    OrdinaryMotor driveMeasuredDrop(AgentDryLanding.Measured drop) {
+        if (!measuredDropBodySafe() || !measuredDropSupports(drop)
+                || hazardAhead(drop.bearing().getPositiveHorizontalDegrees(), 2.65)) return OrdinaryMotor.VETO;
+        var player = client.player;
+        float yaw = drop.bearing().getPositiveHorizontalDegrees();
+        var coast = measuredCoast(drop, 0, yaw);
+        if (coast == AgentDryLanding.CaveMotion.LANDING) {
+            if (measuredDropThreat(drop)) return OrdinaryMotor.VETO;
+            if (tick - measuredLaunchTick >= 80) recordMeasuredLaunch();
+            return OrdinaryMotor.COAST;
+        }
+        if (coast != AgentDryLanding.CaveMotion.SOURCE || !player.isOnGround()
+                || !drop.from().down().equals(player.supportingBlockPos.orElse(null))
+                || !measuredDropBudget(drop)) return OrdinaryMotor.VETO;
+        var target = drop.top().getPos();
+        float pitch = (float) Math.toDegrees(Math.atan2(player.getEyeY() - target.y,
+            Math.hypot(target.x - player.getX(), target.z - player.getZ())));
+        turnFixed(yaw, Math.min(86, pitch));
+        float actualYaw = player.getYaw();
+        if (Math.abs(MathHelper.wrapDegrees(actualYaw - yaw)) > 0.7 || Math.abs(observedYawSpeed) > 25
+                || !measuredTopSeen(drop.top())) return OrdinaryMotor.ALIGN;
+        var pulse = measuredCoast(drop, 1, actualYaw);
+        if (pulse != AgentDryLanding.CaveMotion.SOURCE && pulse != AgentDryLanding.CaveMotion.LANDING)
+            return OrdinaryMotor.VETO;
+        dryRouteWalk = true;
+        measuredForwardKey = true;
+        measuredLaunchKey = pulse == AgentDryLanding.CaveMotion.LANDING;
+        walkDownTo(Vec3d.ofBottomCenter(drop.to()));
+        return OrdinaryMotor.KEY;
     }
 
     private AgentVisibleHorizon.Patch horizonSurface(BlockPos floor, double contactY) {

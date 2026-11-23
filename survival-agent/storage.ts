@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, realpathSync, statfsSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, statfsSync } from "node:fs";
 import path from "node:path";
 import { evaluationPaths } from "../src/evaluation/paths.ts";
 
@@ -12,6 +12,7 @@ const admissionRoot = path.join(local, "survival-pilot");
 export const artifactLimitBytes = 300_000_000_000;
 type Lane = "survival" | "diagnostic";
 type Reservations = { generation: number } & Record<Lane, number>;
+type CrashReservation = { bootMs: number; startedAtMs: number; priorReserveBytes: number };
 const lanes = ["survival", "diagnostic"] as const;
 // The model-guided development runner can start independently of either agent lane.
 const legacyHeadroom = 50 * 1024 ** 3;
@@ -156,7 +157,7 @@ function tryOwner(lane: Lane): Database | undefined {
     }
 }
 
-function checkOwners(state: Reservations, requested: Lane, take: boolean) {
+function checkOwners(state: Reservations, requested: Lane, take: boolean, replaceCrashReservation = false) {
     let owner: Database | undefined;
     try {
         for (const lane of lanes) {
@@ -166,12 +167,13 @@ function checkOwners(state: Reservations, requested: Lane, take: boolean) {
                 if (lane === requested) throw new Error(`The ${lane} lane already has an active run.`);
                 continue;
             }
-            if (!state[lane] && lane === requested && take) {
+            const replacing = replaceCrashReservation && lane === "survival";
+            if ((!state[lane] || replacing) && lane === requested && take) {
                 owner = probe;
                 continue;
             }
             probe.close();
-            if (state[lane]) {
+            if (state[lane] && !replacing) {
                 // A process exit releases its lock, not its detached children.
                 // Only a drained runner can release a reservation automatically.
                 throw new Error(`The previous ${lane} run left an unreleased reservation; owned writers may still be running.`);
@@ -184,16 +186,46 @@ function checkOwners(state: Reservations, requested: Lane, take: boolean) {
     }
 }
 
+function crashLedgerFiles(ledgerPath: string) {
+    const invalid = () => new Error("Cannot tie storage admission to the prior crash autosave.");
+    const root = lstatSync(admissionRoot);
+    if (!root.isDirectory() || root.uid !== process.getuid?.() || (root.mode & 0o077)) throw invalid();
+    const regular = (file: string) => {
+        const entry = lstatSync(file);
+        if (!entry.isFile() || entry.uid !== root.uid || entry.dev !== root.dev || entry.nlink !== 1 ||
+            (entry.mode & 0o022)) throw invalid();
+        return entry;
+    };
+    function absent(file: string) {
+        try { lstatSync(file); }
+        catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+            throw error;
+        }
+        throw invalid();
+    }
+    // A WAL or hot shared-ledger journal would make main-file wall times
+    // insufficient to date or attribute the currently visible reservation.
+    for (const suffix of ["-journal", "-wal", "-shm"]) absent(ledgerPath + suffix);
+    const ledger = regular(ledgerPath);
+    regular(path.join(admissionRoot, "owner.sqlite"));
+    return { dev: ledger.dev, ino: ledger.ino, lastWrite: Math.max(ledger.mtimeMs, ledger.ctimeMs) };
+}
+
 /** Reserve space before starting any writers; release only after all have drained. */
-export async function admitRun(reserveBytes: number, lane: Lane = "survival"): Promise<() => void> {
+export async function admitRun(reserveBytes: number, lane: Lane = "survival",
+    crash?: CrashReservation): Promise<() => void> {
     if (!Number.isSafeInteger(reserveBytes) || reserveBytes <= 0) throw new Error("Invalid run disk reservation");
     if (lane !== "survival" && lane !== "diagnostic") throw new Error("Invalid agent lane");
-    mkdirSync(admissionRoot, { recursive: true, mode: 0o700 });
-    const ledger = new Database(path.join(admissionRoot, "admission.sqlite"), { create: true });
+    if (crash && lane !== "survival") throw new Error("Crash autosave recovery uses only the ordinary Survival lane.");
+    const ledgerPath = path.join(admissionRoot, "admission.sqlite");
+    if (!crash) mkdirSync(admissionRoot, { recursive: true, mode: 0o700 });
+    const original = crash && crashLedgerFiles(ledgerPath);
+    const ledger = new Database(ledgerPath, crash ? { readwrite: true } : { create: true });
     let owner: Database | undefined;
     try {
-        ledger.exec(`
-            PRAGMA busy_timeout = 5000;
+        ledger.exec("PRAGMA busy_timeout = 5000");
+        if (!crash) ledger.exec(`
             CREATE TABLE IF NOT EXISTS reservations (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
@@ -204,9 +236,22 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival"): P
         `);
         const read = ledger.query<Reservations, []>("SELECT generation, survival, diagnostic FROM reservations WHERE id = 1");
         const write = ledger.query(`UPDATE reservations SET ${lane} = ?, generation = generation + 1 WHERE id = 1`);
+        const replace = (state: Reservations) => {
+            if (!crash || !original || !state.survival) return false;
+            const current = crashLedgerFiles(ledgerPath);
+            // The runner writes its reservation before it creates and declares
+            // the now-validated live run. An unknown newer owner is not ours.
+            if (state.survival !== crash.priorReserveBytes || state.diagnostic ||
+                current.dev !== original.dev || current.ino !== original.ino ||
+                current.lastWrite !== original.lastWrite || !(current.lastWrite <= crash.startedAtMs) ||
+                !(crash.startedAtMs < crash.bootMs)) {
+                throw new Error("The existing reservation is not attributable to the prior crash autosave.");
+            }
+            return true;
+        };
         const snapshot = ledger.transaction(() => {
             const state = read.get()!;
-            checkOwners(state, lane, false);
+            checkOwners(state, lane, false, replace(state));
             return state.generation;
         });
         const roots = evaluationPaths(project);
@@ -216,11 +261,12 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival"): P
         const reserve = ledger.transaction((generation: number, used: number) => {
             const state = read.get()!;
             if (state.generation !== generation) return false;
-            owner = checkOwners(state, lane, true);
+            const replacing = replace(state);
+            owner = checkOwners(state, lane, true, replacing);
             if (!owner) throw new Error(`Could not acquire the ${lane} lane.`);
             // Charge full reservations on top of the scan: active payloads can
             // grow while du walks them, so the scan gives no safe per-run credit.
-            const reserved = state.survival + state.diagnostic;
+            const reserved = (replacing ? 0 : state.survival) + state.diagnostic;
             const fs = statfsSync(existsSync(artifactRoot) ? artifactRoot : local, { bigint: true });
             if (used + reserved + reserveBytes + legacyHeadroom > artifactLimitBytes ||
                 fs.bavail * fs.bsize < BigInt(reserved) + BigInt(reserveBytes) + 1024n ** 3n) {

@@ -9,6 +9,40 @@ const commands = {
     release();
     console.log("admitted");
   `,
+  crashAdmission: `
+    const { Database } = await import("bun:sqlite");
+    const { mkdirSync, statSync } = await import("node:fs");
+    mkdirSync("local/survival-pilot", { recursive: true, mode: 0o700 });
+    const owner = new Database("local/survival-pilot/owner.sqlite");
+    const diagnostic = new Database("local/survival-pilot/diagnostic-owner.sqlite");
+    const ledgerPath = "local/survival-pilot/admission.sqlite";
+    const ledger = new Database(ledgerPath);
+    ledger.exec(\`
+      CREATE TABLE reservations (id INTEGER PRIMARY KEY, generation INTEGER, survival INTEGER, diagnostic INTEGER);
+      INSERT INTO reservations VALUES (1, 10, 7, 0);
+    \`);
+    let state = () => ledger.query("SELECT generation, survival, diagnostic FROM reservations").get();
+    const writtenAt = Math.ceil(statSync(ledgerPath).mtimeMs);
+    const startedAtMs = writtenAt + (process.env.CASE === "newer-owner" ? -1 : 20_000);
+    const proof = { startedAtMs, bootMs: writtenAt + 50_000, priorReserveBytes: 7 };
+    if (process.env.CASE === "active-owner") owner.exec("BEGIN IMMEDIATE");
+    if (process.env.CASE === "unknown-diagnostic") {
+      ledger.exec("UPDATE reservations SET diagnostic = 9");
+      diagnostic.exec("BEGIN IMMEDIATE");
+    }
+    try {
+      const release = process.env.CASE === "ordinary" ? await admitRun(11) : await admitRun(11, "survival", proof);
+      const admitted = state();
+      release();
+      console.log(JSON.stringify({ admitted, released: state() }));
+    } catch (error) {
+      console.error(error.message);
+      console.log(JSON.stringify(state()));
+      process.exitCode = 1;
+    } finally {
+      owner.close(); diagnostic.close(); ledger.close();
+    }
+  `,
   measure: `console.log(await diskBytes("./runtime"));`,
   abort: `
     const controller = new AbortController();
@@ -99,7 +133,8 @@ esac
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
     ]);
-    const roots = command === "admission" ? ["local", "runtime", "reports", "governance", "data"] : ["runtime"];
+    const roots = command === "admission" || command === "crashAdmission"
+      ? ["local", "runtime", "reports", "governance", "data"] : ["runtime"];
     const fullScan = roots.map(name => join(project, name)).join(" ");
     const attempts = readFileSync(scans, "utf8").split("\n").slice(0, -1);
     for (const attempt of attempts) expect(attempt).toBe(fullScan);
@@ -119,6 +154,29 @@ test("admission refuses repeated vanished entries after bounded full scans", asy
     code: 1, attempts: 3,
   });
 });
+
+test("opt-in recovery replaces exactly the attributed unlocked reservation and releases only its own", async () => {
+  const result = await withScanner("crash", "crashAdmission");
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 1 });
+  expect(JSON.parse(result.stdout)).toEqual({
+    admitted: { generation: 11, survival: 11, diagnostic: 0 },
+    released: { generation: 12, survival: 0, diagnostic: 0 },
+  });
+});
+
+for (const [scenario, reason, diagnostic] of [
+  ["ordinary", "left an unreleased reservation", 0],
+  ["newer-owner", "not attributable", 0],
+  ["active-owner", "already has an active run", 0],
+  ["unknown-diagnostic", "not attributable", 9],
+] as const) {
+  test(`recovery never clears a reservation for ${scenario}`, async () => {
+    const result = await withScanner(scenario, "crashAdmission");
+    expect(result).toMatchObject({ code: 1, attempts: 0 });
+    expect(result.stderr).toContain(reason);
+    expect(JSON.parse(result.stdout)).toEqual({ generation: 10, survival: 7, diagnostic });
+  });
+}
 
 for (const [scenario, category] of [
   ["mixed", "permission denied; du exit 1"], ["io", "I/O error; du exit 1"],

@@ -60,6 +60,14 @@ Vanilla inventory or dimension evidence verifies the goal separately.
 Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.
 
+If the host rebooted before the last run could close, use
+`--recover-crash-autosave RUN_BASENAME` instead of `--continue-from` on
+the first launch after the crash. The runner copies the latest eligible
+vanilla autosave into a new attempt and leaves the interrupted one
+untouched. Minecraft may have saved less than the recording shows.
+Only the inventory and position in the loaded world count. After this
+attempt closes normally, use `--continue-from` again.
+
 The player gathers supplies for the next stretch of mine, keeping
 enough light for the return. If it lands partly on a stair edge, it can
 ease inward on the dry block supporting its feet before setting up a

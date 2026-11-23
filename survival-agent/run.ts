@@ -21,6 +21,7 @@ import { createUrgentThreatProbe, urgentThreatDeclaration, urgentThreatLimits, u
   urgentCraftLimits } from "./diagnostic-urgent.ts";
 import { closedParentDeath, FAST_DEATH_LIMIT, FAST_DEATH_WINDOW_MS, LIFE_RECEIPTS, LifeLedger, lifeReceiptReader,
   RESPAWN_MARKER, RESPAWN_TIMEOUT_MS } from "./lives.ts";
+import { currentKernelBootMs, ordinaryRunBasename as RUN_BASENAME, readCrashAutosave } from "./crash-autosave.ts";
 import { admitRun, diskBytes } from "./storage.ts";
 import { finalPauseEvidence, PAUSE_DIAGNOSTICS } from "./pause-evidence.ts";
 import { preparePendingFurnace, readPendingFurnaceParent, sealPendingFurnace } from "./pending-furnace.ts";
@@ -43,7 +44,6 @@ const DIAGNOSTIC_LIVE = path.join(AGENT_LOCAL, "diagnostic-live.json");
 const HISTORIC_RUNS = path.join(ROOT, "local/survival-pilot/runs");
 const SERVER_JAR = path.join(RUNTIME, "minecraft/server-1.21.4.jar");
 const AGENT_JAR = path.join(import.meta.dir, "build/libs/survival-agent-1.0.jar");
-const RUN_BASENAME = new RegExp(`^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}\\.\\d{3}Z-(?:${GOALS.join("|")})-[A-Za-z0-9]{6}$`);
 const DEFAULT_SECONDS = 900;
 const MAX_SECONDS = Math.floor(2_147_483_647 / 1_000);
 const SCREEN = { width: 1280, height: 720 } as const;
@@ -117,7 +117,7 @@ class Stop extends Error {
 
 const usage = `Minecraft Survival Agent
 
-Usage: bun run play:agent [--strategy terra [--control local|constrained] [--macro-requests N] [--startup allow|off] [--skill-trials allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --replay-incident) RUN_BASENAME]]
+Usage: bun run play:agent [--strategy terra [--control local|constrained] [--macro-requests N] [--startup allow|off] [--skill-trials allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --recover-crash-autosave | --replay-incident) RUN_BASENAME]]
        bun run diagnose:pool [SECONDS]
        bun run play:agent --diagnostic-descent (${descentVariants.join(" | ")}) [SECONDS]
        bun run play:agent --diagnostic-terrain (${terrainVariants.join(" | ")}) [SECONDS]
@@ -133,6 +133,8 @@ GOAL: ${GOALS.join(" | ")}
 --skill-trials allow: opt into the work-order controller and separate skill trial worlds. The default is off.
 SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SECONDS}).
 --continue-from: copy a closed, recorded Survival world. Retry its goal or pursue a later one.
+--recover-crash-autosave: explicitly copy the latest recorded ordinary Survival autosave after a host reboot.
+  The observed tick may be newer than the saved world. No prior goal claim or lifecycle evidence carries over.
 --replay-incident: replay an ordinary save in the diagnostic lane; never a fresh run.
 diagnose:pool: test casting a Nether portal in a separate, pre-provisioned diagnostic world.
 --diagnostic-descent: test a dry fall, a chosen boat descent, or connected cave shelves.
@@ -161,20 +163,20 @@ function parseArgs(args: string[]) {
     if (!diagnostic || args.length > 3 || !/^\d+$/.test(rawSeconds) || !Number.isSafeInteger(seconds) ||
         seconds < 1 || seconds > MAX_SECONDS) throw new Error(usage);
     const fixtures = { ...descentFixtures, ...terrainFixtures };
-    return { goal: fixtures[diagnostic].goal, seconds, parentRun: undefined, diagnostic };
+    return { goal: fixtures[diagnostic].goal, seconds, parentRun: undefined, diagnostic, recoverCrashAutosave: false };
   }
   const [rawGoal, rawSeconds = String(DEFAULT_SECONDS), flag, parentRun] = args;
   const pool = rawGoal === "--diagnostic-pool";
   const goal = pool ? "nether_portal" : GOALS.find((item) => item === rawGoal);
   const seconds = Number(rawSeconds);
   if (!goal || (args.length > 2 && (pool || args.length !== 4 ||
-      (flag !== "--continue-from" && flag !== "--replay-incident") ||
+      (flag !== "--continue-from" && flag !== "--recover-crash-autosave" && flag !== "--replay-incident") ||
       !parentRun || !RUN_BASENAME.test(parentRun))) || !/^\d+$/.test(rawSeconds) ||
       !Number.isSafeInteger(seconds) || seconds < 1 || seconds > MAX_SECONDS) {
     throw new Error(usage);
   }
   const diagnostic: Diagnostic | undefined = pool ? "pool" : flag === "--replay-incident" ? "incident-replay" : undefined;
-  return { goal, seconds, parentRun, diagnostic };
+  return { goal, seconds, parentRun, diagnostic, recoverCrashAutosave: flag === "--recover-crash-autosave" };
 }
 
 async function isolatedDisplay() {
@@ -653,7 +655,7 @@ async function recoverAgentTrail(pose: Progress | null, read: ReadAgentArtifact)
   return { version: 1, dimension: OVERWORLD, trail };
 }
 
-async function pinSavedRun(source: SavedWorld, signal: AbortSignal) {
+async function pinSavedRun(source: Pick<SavedWorld, "root" | "rootInode" | "device">, signal: AbortSignal) {
   const parent = await open(source.root, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_DIRECTORY)
     .catch(() => null);
   if (!parent) return;
@@ -666,7 +668,7 @@ async function pinSavedRun(source: SavedWorld, signal: AbortSignal) {
     const read: ReadAgentArtifact = (name, limit, privateMode) =>
       readAgentArtifact(root, source.device, name, limit, signal, privateMode);
     keep = true;
-    return { read, world: path.join(root, "server/world"), close: () => parent.close() };
+    return { read, fd: parent.fd, world: path.join(root, "server/world"), close: () => parent.close() };
   } finally {
     if (!keep) await parent.close();
   }
@@ -799,7 +801,7 @@ function goalMilestones(goal: Goal, progress: PlayingProgress, highWater: Map<st
 }
 
 async function run(goal: Goal, seconds: number, parentRun: string | undefined, diagnostic: Diagnostic | undefined,
-    strategyOptions?: TerraOptions, macroTrial?: MacroTrialLaunch) {
+    strategyOptions?: TerraOptions, macroTrial?: MacroTrialLaunch, recoverCrashAutosave = false) {
   const display = await isolatedDisplay();
   const actorJar = macroTrial ? macroTrialActor(macroTrial.ordinaryDir) : AGENT_JAR;
   const urgentCraft = diagnostic === "urgent-craft";
@@ -852,10 +854,24 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   let release: (() => void) | undefined;
   let canRelease = true;
   try {
-    release = diagnostic ? await admitRun(reserveBytes, "diagnostic") : await admitRun(reserveBytes);
+    const bootMs = recoverCrashAutosave ? await currentKernelBootMs() : undefined;
+    const readRecovery = bootMs !== undefined && parentRun ? () => readCrashAutosave({
+      runs: RUNS, historicRuns: HISTORIC_RUNS, live: LIVE, run: parentRun, goal, bootMs, signal,
+    }) : undefined;
+    const initialRecovery = await readRecovery?.();
+    if (initialRecovery?.normalParentRun)
+      await savedWorld(initialRecovery.normalParentRun, initialRecovery.goal, signal);
+    release = diagnostic ? await admitRun(reserveBytes, "diagnostic") :
+      await admitRun(reserveBytes, "survival", initialRecovery?.reservation);
     signal.throwIfAborted();
     await mkdir(runs, { recursive: true, mode: 0o700 });
-    const source = parentRun ? await savedWorld(parentRun, goal, signal) : null;
+    // Reconfirm the source once this run owns the lane, before opening writers.
+    const recovery = await readRecovery?.();
+    if (recovery && initialRecovery && recovery.rootInode !== initialRecovery.rootInode)
+      throw new Error("Crash autosave source changed during exclusive admission.");
+    const source = recovery ? {
+      ...recovery, historic: false, progress: null, parentDeath: null, pendingSeal: undefined,
+    } : parentRun ? await savedWorld(parentRun, goal, signal) : null;
     const dir = macroTrial ? path.join(runs, macroTrial.run) :
       await mkdtemp(path.join(runs, `${new Date().toISOString().replaceAll(":", "-")}-${goal}-`));
     if (macroTrial) await mkdir(dir, { mode: 0o700 });
@@ -884,7 +900,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         fastDeathLimit: FAST_DEATH_LIMIT, fastDeathWindowMs: FAST_DEATH_WINDOW_MS,
         resetsOn: "new objective high-water milestone, not recovery supplies or generic digging",
       }),
-      ...(source ? { inheritedInitialScreen: "closed parent, matching saved player and first native DeathScreen required" } : {}),
+      ...(source && !recovery ? { inheritedInitialScreen: "closed parent, matching saved player and first native DeathScreen required" } : {}),
     };
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), display: display.display, authority: display.authority };
@@ -902,7 +918,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       fixture ? fixtureWorld(fixture) : diagnostic === "pool" ? poolDiagnosticWorld : {
       type: diagnostic === "incident-replay" ? "vanilla-incident-replay" : "vanilla",
       mode: "survival", difficulty: "normal",
-      ...(parentRun ? { fresh: false, parentRun } : { fresh: true, seed: "random" }),
+      ...(parentRun ? { fresh: false, parentRun, ...(recovery ? { crashAutosave: recovery.provenance } : {}) } :
+        { fresh: true, seed: "random" }),
     };
     let declared = false;
     let trialJarSha256: string | undefined;
@@ -1055,7 +1072,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         await checkWorldTree(source.world, source.device, copyStopBytes - bytesBefore, startup);
         const pinned = await pinSavedRun(source, startup);
         try {
-          const pendingSource = !diagnostic && parentRun && !source.historic && pinned ? {
+          const copyFd = recovery ? pinned?.fd : undefined;
+          if (recovery && copyFd === undefined) throw new Stop("failed", "Could not pin the original crash autosave run.");
+          const pendingSource = !recovery && !diagnostic && parentRun && !source.historic && pinned ? {
             run: parentRun, world: pinned.world, device: source.device, read: pinned.read,
             seal: source.pendingSeal, signal: startup,
           } : undefined;
@@ -1064,13 +1083,13 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           // Reflink when supported, otherwise copy. Never follow links or share writable inodes.
           const copier = own(spawn("cp", [
             "--recursive", "--no-dereference", "--reflink=auto", "--preserve=mode,timestamps",
-            "--", source.world, destination,
-          ], { env, signal: startup, stdio: "ignore" }));
+            "--", copyFd === undefined ? source.world : "/proc/self/fd/3/server/world", destination,
+          ], { env, signal: startup, stdio: copyFd === undefined ? "ignore" : ["ignore", "ignore", "ignore", copyFd] }));
           const exit = await copier.closed;
           startup.throwIfAborted();
           if (exit.code !== 0) throw new Stop("failed", "Could not copy the saved Survival world.");
           await checkWorldTree(destination, worldDevice, copyStopBytes - bytesBefore, startup);
-          if (pinned) await copyAgentMemory(source, dir, pinned.read, startup);
+          if (pinned && !recovery) await copyAgentMemory(source, dir, pinned.read, startup);
           if (!diagnostic) await preparePendingFurnace(dir, live.run, { world: destination, device: worldDevice, signal: startup },
             pendingSource, pendingParent);
         } finally { await pinned?.close(); }
@@ -1079,7 +1098,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         measuredBytes = await diskBytes(dir, startup);
         if (measuredBytes >= copyStopBytes)
           throw new Stop("storage_limit", "Saved world would exceed the run storage stop threshold.");
-        await record("world_copied", { parentRun });
+        await record("world_copied", { parentRun, ...(recovery ? { crashAutosave: recovery.provenance } : {}) });
         stage = "server_startup";
       } else if (!diagnostic) {
         await preparePendingFurnace(dir, live.run, { world: destination, device: worldDevice, signal: startup });
@@ -1172,6 +1191,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           else await provisionPoolDiagnostic(runningServer.child, worldDir, profileName, startup);
           await record("diagnostic_sealed");
           stage = "client_startup";
+        } : recovery ? async (profileName) => {
+          if (profileName !== recovery.profileName || beforeStats?.file !== `${offlineUuid(profileName)}.json`)
+            throw new Stop("failed", "The verified official profile does not own the copied crash autosave player.");
         } : parentDeath ? async (profileName) => {
           const baseline = savedDeathDelta(null, beforeStats);
           if (baseline && /^[A-Za-z0-9_]{1,16}$/.test(profileName)) {
@@ -1603,9 +1625,9 @@ try {
         args[1] === "--help")) console.log(usage);
   else {
     const { game, terra } = readStrategy(args);
-    const { goal, seconds, parentRun, diagnostic } = parseArgs(game);
+    const { goal, seconds, parentRun, diagnostic, recoverCrashAutosave } = parseArgs(game);
     process.umask(0o077);
-    process.exitCode = await run(goal, seconds, parentRun, diagnostic, terra);
+    process.exitCode = await run(goal, seconds, parentRun, diagnostic, terra, undefined, recoverCrashAutosave);
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : "Run failed.");

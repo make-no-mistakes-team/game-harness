@@ -1024,6 +1024,7 @@ final class AgentProgress {
     void tick(AgentEars ears, AgentMacroControl macro) {
         if (win || c.player == null || c.world == null) return;
         tick++;
+        supplyEgress.observeStandingSupport();
         ears.confirmPoultryPlayback();
         if (poultryLook.active()) body.pauseWork(); // Re-arbitrate after danger gets its turn.
         if (foodWorld != c.world) resetOrdinaryHealing();
@@ -6040,7 +6041,7 @@ final class AgentProgress {
         private ClientWorld world;
         private BlockPos openFoot, unknownFoot, to, armedCut, packedBench;
         private BlockPos floodOpening, floodWater;
-        private Vec3d floor, alternateFloor, aim, buildLow, buildHigh, reverseLeft, reverseRight, outlineCutPoint;
+        private Vec3d floor, alternateFloor, aim, riseLook, buildLow, buildHigh, reverseLeft, reverseRight, outlineCutPoint;
         private Vec3d lightNeed, lightLook;
         private BlockHitResult lightFace;
         private Direction bearing, lane, apexSide;
@@ -6057,9 +6058,14 @@ final class AgentProgress {
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
         private boolean lightRear;
         private boolean triedLower, built, mineDeparture, floodSource, checkingExit, buildLowProved;
-        private boolean outlineReaimed, outlineApexChecked;
+        private boolean outlineReaimed, outlineApexChecked, changedCrossingIntent;
 
         boolean active() { return world == c.world && order.active(); }
+
+        void observeStandingSupport() {
+            if (active() && driving == 0 && order.carriedSupport() != null)
+                order.observeSupport(body.supplyFootContact(order.foot()));
+        }
 
         void observeBreak(BlockPos position, BlockState material) {
             if (world != c.world) return;
@@ -6123,6 +6129,11 @@ final class AgentProgress {
         boolean seekFoodSurface() {
             if (!active()) return seek("foraging ground", true);
             if (mineDeparture) return false;
+            if (!foodExit) {
+                if (driving != 0 || outline.apexAccess() != null || restoredApex != null)
+                    changedCrossingIntent = true;
+                else if (order.carriedSupport() != null) resurveyTakeoff();
+            }
             foodExit = true;
             firstStoneExit = false;
             return step();
@@ -6206,6 +6217,7 @@ final class AgentProgress {
             firstRefusal = lastRefusal = null;
             to = armedCut = packedBench = null;
             driving = 0;
+            changedCrossingIntent = false;
             handoffAfter = tick;
             revealedFrame = -1;
             rises = levels = cuts = laneCuts = connectors = builds = 0;
@@ -6292,10 +6304,16 @@ final class AgentProgress {
                 status = "supply egress: recovered the obstructing portable crafting table";
                 return true;
             }
+            BlockState carried = order.carriedSupport();
+            if (carried != null && !order.retainSupport()) {
+                if (apex != null || restoredApex != null) return stop("settled support changed during outlined apex work");
+                resurveyTakeoff();
+                return true;
+            }
             if (!settled(from)) {
                 status = "supply egress: centering on the witnessed support";
                 if (tick - since >= LOOK_TICKS) return stop("no settled full-width takeoff stance");
-                centerSupplyFoot(from);
+                centerSupplyFoot(from, carried);
                 return true;
             }
             if (outline.active() && !actualOutlineFoot(from))
@@ -6315,7 +6333,7 @@ final class AgentProgress {
                 lightFace = null;
                 since = tick;
             }
-            if (!sourceProved) {
+            if (!sourceProved && carried == null) {
                 if (outline.active()) return proveOutlineSource(from);
                 if (aim == null) aim = Vec3d.ofBottomCenter(from).add(0, -0.035, 0);
                 body.aim(aim);
@@ -6551,6 +6569,7 @@ final class AgentProgress {
             BlockPos from = order.foot();
             if (!beginOutline(from)) return false;
             sourceProved = false;
+            order.forgetLanding();
             if (outline.allowsLeg(from, to)) phase(Proof.OPENING);
             else {
                 to = null;
@@ -6609,6 +6628,18 @@ final class AgentProgress {
             aim = null;
         }
 
+        private void resurveyTakeoff() {
+            body.pauseWork();
+            order.forgetSupport();
+            order.forgetLanding();
+            outline.abandonLanding();
+            to = null;
+            sourceProved = lighting = triedLight = triedCraftLight = false;
+            lightFace = null;
+            phase(Proof.OPENING);
+            survey(1);
+        }
+
         private boolean look() {
             if ((!outline.active() || outline.canHandoff()) && outdoors())
                 return ready(outline.active() ? "returned to confirmed open ground after short outline passage" : "confirmed open ground");
@@ -6632,6 +6663,7 @@ final class AgentProgress {
                 since = tick;
                 return true;
             }
+            if (tryAscentHandoff(from)) return true;
             Direction direction = option(view);
             float yaw = direction.getPositiveHorizontalDegrees();
             int age = tick - since;
@@ -6694,6 +6726,39 @@ final class AgentProgress {
             return true;
         }
 
+        private boolean tryAscentHandoff(BlockPos from) {
+            if (order.ascentBearing(tick) != bearing) return false;
+            BlockPos next = from.offset(bearing).up();
+            if (rises < MAX_RISE && !walked.contains(next) && !order.avoidFlood(next, tick)
+                    && (!outline.active() || outline.allowsLeg(from, next))
+                    && (!mineDeparture || mineResite.eligibleReturn(from, next))
+                    && !body.lavaEmergency() && !body.macroLavaNear()
+                    && !body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.5)) {
+                if (aim == null) aim = openingAim(next);
+                var sample = body.dryRouteClear(aim);
+                BlockHitResult outlined = outline.active() ? body.supplyOutlineFace() : null;
+                if (sample == AgentBody.DryRouteSample.OBSTRUCTION || (sample != AgentBody.DryRouteSample.FLUID
+                        && outlined != null && outlined.getBlockPos().equals(next) && body.renderedAim(aim, 10))) {
+                    Vec3d opening = aim;
+                    surveying = false;
+                    order.endAscentHandoff();
+                    choice = flatBearings = 0;
+                    if (!choose()) return true;
+                    aim = opening;
+                    status = crossingActivity;
+                    return revealedFrame == body.renderedFrame() || clearance();
+                }
+                if (sample == AgentBody.DryRouteSample.UNKNOWN && !body.renderedAim(aim, 8)) {
+                    body.aim(aim);
+                    status = "supply egress: looking toward the next rise from the settled tread";
+                    return true;
+                }
+            }
+            order.endAscentHandoff();
+            aim = null;
+            return false;
+        }
+
         private Direction option(int index) {
             return switch (index & 3) {
                 case 0 -> bearing;
@@ -6744,6 +6809,8 @@ final class AgentProgress {
 
         private void setCrossing() {
             BlockPos from = order.foot();
+            order.forgetLanding();
+            changedCrossingIntent = false;
             outlineApexChecked = false;
             apexSourceSupport = apexRiseSupport = null;
             restoredApex = null;
@@ -6756,8 +6823,13 @@ final class AgentProgress {
             Vec3d center = Vec3d.ofBottomCenter(to).add(0, -0.025, 0);
             floor = center.add(lane.getOffsetX() * 0.35, 0, lane.getOffsetZ() * 0.35);
             alternateFloor = center.add(lane.getOffsetX() * 0.14, 0, lane.getOffsetZ() * 0.14);
+            riseLook = to.getY() > from.getY() ? openingAim(to.offset(lane).up()) : null;
             crossingActivity = "supply egress: " + (returning ? "retracing walked footing" : "proving an inclined exit")
                 + " toward " + to.toShortString();
+        }
+
+        private Vec3d openingAim(BlockPos cell) {
+            return Vec3d.ofCenter(cell, 0.65);
         }
 
         private void phase(Proof next) {
@@ -6775,10 +6847,12 @@ final class AgentProgress {
             if (outline.active()) return proveOutlineTop();
             BlockPos from = order.foot();
             boolean risingLip = proof == Proof.LIP;
+            BlockPos support = to.down();
+            if (!risingLip && body.supplyTopUnchanged(support, order.landingSupport(to)))
+                return beginLitCrossing(from);
             // This is sampled after the visible side face has opened. A previous
             // obstruction or an opaque face is not evidence of what's behind it.
             body.aim(floor);
-            BlockPos support = to.down();
             Vec3d sample = floor;
             AgentBody.DryRouteTop top = body.dryRouteTop(floor, support);
             if (top != AgentBody.DryRouteTop.WITNESSED && top != AgentBody.DryRouteTop.FLUID) {
@@ -6791,18 +6865,13 @@ final class AgentProgress {
             }
             switch (top) {
                 case WITNESSED -> {
+                    // Read only the support just identified by the rendered top ray.
+                    order.witnessLanding(to, c.world.getBlockState(support));
                     if (risingLip) {
                         phase(Proof.CROWN);
                         return true;
                     }
-                    var veto = body.dryRouteVeto(from, to);
-                    if (veto != AgentBody.DryRouteVeto.CLEAR) {
-                        if ((veto == AgentBody.DryRouteVeto.SWEEP || veto == AgentBody.DryRouteVeto.SUPPORT)
-                                && tryFootholdAfterLower()) return true;
-                        return refuse(vetoReason(veto));
-                    }
-                    driving = tick;
-                    return drive();
+                    return beginLitCrossing(from);
                 }
                 case FLUID -> {
                     return refuseFluid(support, sample, "fluid covers the observed supporting top at " + support.toShortString());
@@ -6851,39 +6920,37 @@ final class AgentProgress {
                 || refuse("supporting top still occluded after opening the side face at " + support.toShortString());
         }
 
+        private boolean beginLitCrossing(BlockPos from) {
+            var veto = body.dryRouteVeto(from, to);
+            if (veto != AgentBody.DryRouteVeto.CLEAR) {
+                if ((veto == AgentBody.DryRouteVeto.SWEEP || veto == AgentBody.DryRouteVeto.SUPPORT)
+                        && tryFootholdAfterLower()) return true;
+                return refuse(vetoReason(veto));
+            }
+            driving = tick;
+            return drive();
+        }
+
         private boolean proveOutlineTop() {
             BlockPos from = order.foot(), support = to.down();
             boolean lip = proof == Proof.LIP;
+            BlockState known = order.landingSupport(to);
+            if (!lip && body.supplyTopUnchanged(support, known))
+                return beginOutlineCrossing(from, known);
             Vec3d sample = tick - since < OUTLINE_REAIM_TICKS ? floor : alternateFloor;
             body.aim(sample);
             status = "supply egress: looking for the close " + (lip ? "rise lip" : "landing top")
                 + " outline at " + support.toShortString();
             if (body.supplyOutlineTop(from, support)) {
-                if (lip) {
-                    phase(Proof.CROWN);
-                    return true;
-                }
-                var veto = body.dryRouteVeto(from, to);
-                if (veto != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(veto));
-                if (!body.walkedLaneDry(from, to, lane))
-                    return refuse("outline landing or its exact crossing no longer holds dry");
-                if (to.getY() > from.getY()) {
-                    var grade = body.supplyOutlineGradeVeto(from, to);
-                    if (grade == AgentBody.DryRouteVeto.SWEEP && !outlineApexChecked) {
-                        // Only the upper band failed: look at the two exact crown cells;
-                        // a physical veto alone does not give us a cut target or material.
-                        apexSourceSupport = body.dryCaveContact(from);
-                        apexRiseSupport = body.supplyOutlineState(body.supplyOutlineFace());
-                        outlineApexChecked = true;
-                        order.considered(from.up(3));
-                        phase(Proof.HIGH_CROWN);
+                BlockState shown = body.supplyOutlineState(body.supplyOutlineFace());
+                if (shown != null) {
+                    order.witnessLanding(to, shown);
+                    if (lip) {
+                        phase(Proof.CROWN);
                         return true;
                     }
-                    if (grade != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(grade));
+                    return beginOutlineCrossing(from, shown);
                 }
-                if (!outline.admitLanding(from, to)) return refuse("short outline crossing is no longer eligible");
-                driving = tick;
-                return drive();
             }
             var lit = body.dryRouteTop(sample, support);
             if (lit == AgentBody.DryRouteTop.FLUID)
@@ -6904,6 +6971,29 @@ final class AgentProgress {
             }
             return tick - since < OUTLINE_LOOK_TICKS
                 || refuse("no matching, stable " + (lip ? "rise lip" : "landing top") + " outline at " + support.toShortString());
+        }
+
+        private boolean beginOutlineCrossing(BlockPos from, BlockState support) {
+            var veto = body.dryRouteVeto(from, to);
+            if (veto != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(veto));
+            if (!body.walkedLaneDry(from, to, lane))
+                return refuse("outline landing or its exact crossing no longer holds dry");
+            if (to.getY() > from.getY()) {
+                var grade = body.supplyOutlineGradeVeto(from, to);
+                if (grade == AgentBody.DryRouteVeto.SWEEP && !outlineApexChecked) {
+                    // Only the upper band failed; the physical veto gives no cut target.
+                    apexSourceSupport = body.dryCaveContact(from);
+                    apexRiseSupport = support;
+                    outlineApexChecked = true;
+                    order.considered(from.up(3));
+                    phase(Proof.HIGH_CROWN);
+                    return true;
+                }
+                if (grade != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(grade));
+            }
+            if (!outline.admitLanding(from, to)) return refuse("short outline crossing is no longer eligible");
+            driving = tick;
+            return drive();
         }
 
         private boolean beginApexAccess(BlockHitResult hit) {
@@ -7295,7 +7385,7 @@ final class AgentProgress {
             switch (proof) {
                 case OPENING -> {
                     cell = from.offset(lane).up();
-                    if (aim == null) aim = Vec3d.ofCenter(cell, 0.56);
+                    if (aim == null) aim = openingAim(cell);
                 }
                 case CROWN -> {
                     cell = from.up(2);
@@ -7578,22 +7668,31 @@ final class AgentProgress {
 
         private boolean drive() {
             BlockPos from = order.foot();
+            BlockState expected = order.landingSupport(to);
+            BlockState carried = order.carriedSupport();
+            if (!body.supplyTopUnchanged(to.down(), expected)
+                    || (carried != null && !body.supplyTopUnchanged(from.down(), order.crossingSourceSupport())))
+                return refuse("a witnessed support changed before landing");
             var veto = body.dryRouteVeto(from, to);
             if (veto != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(veto));
             boolean outlined = outline.active();
-            if (outlined && (!body.walkedLaneDry(from, to, lane)
-                    || body.lavaEmergency() || body.macroLavaNear()))
-                return refuse("dry outline crossing changed before landing");
-            if (outlined && to.getY() > from.getY()) {
+            boolean rising = riseLook != null;
+            if ((outlined || rising) && (!body.walkedLaneDry(from, to, lane) || body.macroLavaNear()))
+                return refuse("the dry crossing changed before landing");
+            if (outlined && rising) {
                 var grade = body.supplyOutlineGradeVeto(from, to);
                 if (grade != AgentBody.DryRouteVeto.CLEAR) return refuse(vetoReason(grade));
             }
-            if (settled(to) && (!mineDeparture || mineResite.exactContact(to))) {
-                if (outlined && !outline.landed(to, actualOutlineFoot(to)))
+            boolean onDestination = dryFieldFooting() && to.equals(c.player.getBlockPos());
+            BlockState contact = onDestination ? body.supplyFootContact(to) : null;
+            if (contact == expected && settled(to)) {
+                if (outlined && !outline.landed(to, true))
                     return stop("no exact settled dry outline landing receipt");
                 BlockPos old = from;
                 from = to;
-                order.landed(from);
+                if (!order.landWitnessed(from, contact, tick, !returning && !changedCrossingIntent
+                        && packedBench == null && AgentBody.normalDryTraction(contact)))
+                    return stop("no exact settled dry landing receipt");
                 walked.add(from);
                 caves.walkedDry(old, from);
                 caves.witnessedDry(from, old);
@@ -7618,7 +7717,7 @@ final class AgentProgress {
                 restoredApex = null;
                 driving = 0;
                 firstRefusal = lastRefusal = null;
-                sourceProved = !outlined;
+                sourceProved = false;
                 triedLight = false;
                 bearing = lane;
                 handoffAfter = tick;
@@ -7630,14 +7729,22 @@ final class AgentProgress {
             if (outlined && dryFieldFooting() && from.equals(c.player.getBlockPos()) && !actualOutlineFoot(from))
                 return refuse("actual dry takeoff support changed before movement");
             if (outlined) status = "supply egress: crossing toward the outlined top at " + to.toShortString();
-            if (dryFieldFooting() && to.equals(c.player.getBlockPos())) {
-                centerSupplyFoot(to);
+            if (onDestination) {
+                if (contact == expected) {
+                    if (rising) body.lookSupplyRise(lane, riseLook);
+                    centerSupplyFoot(to, contact);
+                }
                 return true;
             }
-            boolean jump = to.getY() > from.getY() && dryFieldFooting() && from.equals(c.player.getBlockPos());
-            if (jump && body.jumpBlocked(lane.getPositiveHorizontalDegrees()))
+            boolean onSource = dryFieldFooting() && from.equals(c.player.getBlockPos());
+            if (onSource && carried != null && body.supplyFootContact(from) != carried) {
+                order.observeSupport(null);
+                return refuse("actual dry takeoff support changed before movement");
+            }
+            if (rising && onSource && body.jumpBlocked(lane.getPositiveHorizontalDegrees()))
                 return refuse("the ordinary jump was blocked by headroom");
-            body.driveDryRoute(from, to, lane);
+            if (rising) body.driveSupplyRise(from, to, lane, riseLook);
+            else body.driveDryRoute(from, to, lane);
             return true;
         }
 
@@ -7647,6 +7754,11 @@ final class AgentProgress {
             // vanilla outline and the same physical support may authorize the inward shift.
             if (actualOutlineFoot(foot) && body.supplyOutlineTop(foot, foot.down()))
                 body.centerOnGroundedSupport(foot, body.dryCaveContact(foot));
+        }
+
+        private void centerSupplyFoot(BlockPos foot, BlockState known) {
+            if (known != null && AgentBody.normalDryTraction(known)) body.centerOnGroundedSupport(foot, known);
+            else centerSupplyFoot(foot);
         }
 
         private boolean settled(BlockPos foot) {
@@ -7681,6 +7793,7 @@ final class AgentProgress {
             body.pauseWork();
             if (outline.active() && to != null && to.getY() > order.foot().getY() && proof == Proof.OPENING)
                 flatBearings |= 1 << lane.ordinal(); // No reason to repeat the same exact failed opening for a level leg.
+            order.forgetLanding();
             outline.abandonLanding();
             body.forgetSupplyOutlineCut();
             outlineCutPoint = null;

@@ -28,6 +28,7 @@ final class AgentSupplyEgress {
     static final double LIGHT_REACH = 2.6;
     private static final int MAX_WALKED_LEGS = 96, MAX_RETURN_LEGS = 8, MAX_REFUSALS = 32;
     private static final int MAX_FLOODS = 6, FLOOD_TICKS = 1200;
+    private static final int ASCENT_HANDOFF_TICKS = 18;
 
     private record Refusal(String detail, Set<BlockPos> cells, BlockPos floodPremise) {}
     private record Leg(BlockPos from, BlockPos to) {
@@ -63,8 +64,11 @@ final class AgentSupplyEgress {
     private final Set<BlockPos> checked = new HashSet<>();
     private final ArrayDeque<Leg> walked = new ArrayDeque<>();
     private final ArrayDeque<Flood> floods = new ArrayDeque<>();
-    private BlockPos foot, floodPremise;
-    private boolean airborneHold;
+    private BlockPos foot, floodPremise, witnessedLanding;
+    private BlockState landingSupport, carriedSupport;
+    private Direction ascentBearing;
+    private int ascentUntil;
+    private boolean airborneHold, carriedSupportLost;
 
     BlockPos foot() { return foot; }
     boolean active() { return foot != null; }
@@ -147,8 +151,67 @@ final class AgentSupplyEgress {
         }
         foot = standing;
         floodPremise = null;
+        forgetLanding();
+        forgetSupport();
         checked.clear();
         checked.add(standing.down());
+    }
+
+    void witnessLanding(BlockPos to, BlockState observed) {
+        if (active() && observed != null) {
+            witnessedLanding = to.toImmutable();
+            landingSupport = observed;
+        }
+    }
+
+    BlockState landingSupport(BlockPos to) {
+        return to.equals(witnessedLanding) ? landingSupport : null;
+    }
+
+    void forgetLanding() {
+        witnessedLanding = null;
+        landingSupport = null;
+    }
+
+    /** A render witness is only promoted by matching, settled vanilla contact. */
+    boolean landWitnessed(BlockPos to, BlockState contact, int tick, boolean continueAscent) {
+        if (contact == null || contact != landingSupport(to)) return false;
+        Direction travel = AgentDryLanding.bearing(foot, to);
+        if (travel == null || !AgentSurfaceTread.cardinalTread(foot, to, travel)) return false;
+        boolean rising = to.getY() > foot.getY();
+        landed(to);
+        carriedSupport = contact;
+        if (rising && continueAscent) {
+            ascentBearing = travel;
+            ascentUntil = tick + ASCENT_HANDOFF_TICKS;
+        }
+        return true;
+    }
+
+    BlockState carriedSupport() { return carriedSupport; }
+
+    void observeSupport(BlockState actualContact) {
+        if (carriedSupport != null && carriedSupport != actualContact) carriedSupportLost = true;
+    }
+
+    boolean retainSupport() {
+        if (carriedSupport == null || carriedSupportLost) {
+            forgetSupport();
+            return false;
+        }
+        return true;
+    }
+
+    BlockState crossingSourceSupport() { return carriedSupportLost ? null : carriedSupport; }
+
+    Direction ascentBearing(int tick) { return !carriedSupportLost && tick < ascentUntil ? ascentBearing : null; }
+
+    void endAscentHandoff() { ascentBearing = null; }
+
+    void forgetSupport() {
+        carriedSupport = null;
+        carriedSupportLost = false;
+        endAscentHandoff();
     }
 
     BlockPos previousLevelFoot(BlockPos standing) {
@@ -160,6 +223,8 @@ final class AgentSupplyEgress {
     void considered(BlockPos cell) { checked.add(cell); }
 
     void observeBreak(BlockPos cell) {
+        if (witnessedLanding != null && witnessedLanding.equals(cell.up())) forgetLanding();
+        if (carriedSupport != null && foot.equals(cell.up())) carriedSupportLost = true;
         if (!refusals.isEmpty()) refusals.values().removeIf(refusal -> refusal.cells().contains(cell));
         if (!walked.isEmpty()) {
             BlockPos above = cell.up();
@@ -243,6 +308,8 @@ final class AgentSupplyEgress {
     void finish() {
         foot = floodPremise = null;
         airborneHold = false;
+        forgetLanding();
+        forgetSupport();
         checked.clear();
     }
 

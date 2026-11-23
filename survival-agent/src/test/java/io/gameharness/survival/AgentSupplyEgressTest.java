@@ -39,6 +39,82 @@ final class AgentSupplyEgressTest {
     }
 
     @Test
+    void eachWitnessedRiseCanHandItsSupportAndBearingToTheNextTurn() {
+        var egress = new AgentSupplyEgress();
+        var stone = Blocks.STONE.getDefaultState();
+        assertTrue(egress.begin(REFUGE, true, 1));
+        BlockPos from = REFUGE;
+        assertNull(egress.carriedSupport(), "a new order cannot borrow a takeoff receipt");
+        for (int tick = 10; tick <= 70; tick += 10) {
+            var to = from.south().up();
+            assertFalse(egress.landWitnessed(to, stone, tick, true), "contact alone is not a landing proof");
+            egress.witnessLanding(to, stone);
+            assertFalse(egress.landWitnessed(to, null, tick, true), "an airborne feet cell is not a landing");
+            assertFalse(egress.landWitnessed(to.east(), stone, tick, true), "no receipt for the wrong contact");
+            assertTrue(egress.landWitnessed(to, stone, tick, true));
+            assertEquals(to, egress.foot());
+            assertEquals(Direction.SOUTH, egress.ascentBearing(tick + 1));
+            egress.observeSupport(stone);
+            assertTrue(egress.retainSupport());
+            assertEquals(stone, egress.carriedSupport());
+            egress.endAscentHandoff();
+            assertNull(egress.ascentBearing(tick + 2), "the receipt only starts one immediate continuation");
+            assertTrue(egress.retainSupport(), "the same support remains known while proving the next crossing");
+            from = to;
+        }
+        egress.finish();
+        assertTrue(egress.begin(from, true, 82));
+        assertNull(egress.carriedSupport(), "returning later must establish a new takeoff witness");
+    }
+
+    @Test
+    void anExpiredImmediateAscentDoesNotRevokeStillGroundedSupport() {
+        var egress = new AgentSupplyEgress();
+        var stone = Blocks.STONE.getDefaultState();
+        var rise = REFUGE.south().up();
+        assertTrue(egress.begin(REFUGE, true, 1));
+        egress.witnessLanding(rise, stone);
+        assertTrue(egress.landWitnessed(rise, stone, 10, true));
+        assertEquals(Direction.SOUTH, egress.ascentBearing(11));
+        egress.observeSupport(stone);
+        assertNull(egress.ascentBearing(50), "an interrupted turn must not resume the immediate continuation");
+        assertTrue(egress.retainSupport());
+    }
+
+    @Test
+    void walksCarryTheSupportButNotAnAscentAndMutationOrLostContactRevokesIt() {
+        var egress = new AgentSupplyEgress();
+        var stone = Blocks.STONE.getDefaultState();
+        var dirt = Blocks.DIRT.getDefaultState();
+        var walked = REFUGE.south();
+        assertTrue(egress.begin(REFUGE, true, 1));
+        egress.witnessLanding(walked, stone);
+        assertFalse(egress.landWitnessed(walked, dirt, 8, true), "a replacement cube is not the witnessed top");
+        egress.observeBreak(walked.down());
+        assertFalse(egress.landWitnessed(walked, stone, 9, true), "a broken witness cannot be used after replacement");
+        egress.witnessLanding(walked, stone);
+        assertTrue(egress.landWitnessed(walked, stone, 10, true));
+        assertEquals(stone, egress.carriedSupport());
+        assertNull(egress.ascentBearing(11));
+        var rise = walked.south().up();
+        egress.witnessLanding(rise, dirt);
+        assertTrue(egress.landWitnessed(rise, dirt, 20, false));
+        assertNull(egress.ascentBearing(21), "a return or a different intent does not inherit the ascent");
+        egress.observeSupport(null);
+        egress.observeSupport(dirt);
+        assertFalse(egress.retainSupport(), "stepping back after a slip cannot revive the old receipt");
+        assertNull(egress.carriedSupport());
+
+        var later = rise.south().up();
+        egress.witnessLanding(later, stone);
+        assertTrue(egress.landWitnessed(later, stone, 30, true));
+        egress.observeBreak(later.down());
+        egress.observeSupport(stone);
+        assertFalse(egress.retainSupport(), "even the same state does not restore a broken receipt");
+        assertNull(egress.ascentBearing(31));
+    }
+
+    @Test
     void crossingLightChoosesAVisibleFrontOrSideMountBeforeTurningBack() {
         BlockPos from = BlockPos.ORIGIN, to = from.west().up();
         Vec3d eye = new Vec3d(0.39, 1.62, 0.50), dark = new Vec3d(-0.5, 2.6, 0.5);

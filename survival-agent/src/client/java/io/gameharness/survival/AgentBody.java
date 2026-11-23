@@ -3678,6 +3678,24 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return !dryCaveDanger(state) && stableDryRouteTop(floor, state) ? state : null;
     }
 
+    /** A local veto on an already witnessed tread, not a substitute for seeing a new landing. */
+    BlockState supplyFootContact(BlockPos foot) {
+        var player = client.player;
+        if (!player.isOnGround() || !foot.equals(player.getBlockPos())
+                || !foot.down().equals(player.supportingBlockPos.orElse(null))
+                || player.isTouchingWater() || player.isInLava() || player.isOnFire() || player.hurtTime != 0
+                || player.hasVehicle() || player.isClimbing() || player.isSpectator() || player.getAbilities().flying
+                || lavaEmergency || macroLavaNear()) return null;
+        var box = player.getBoundingBox();
+        return dryGradeVolume(box) && client.world.isSpaceEmpty(player, box) ? dryCaveContact(foot) : null;
+    }
+
+    /** Only compare an exact support already witnessed by this crossing. */
+    boolean supplyTopUnchanged(BlockPos support, BlockState known) {
+        return known != null && client.world.getBlockState(support) == known
+            && !dryCaveDanger(known) && stableDryRouteTop(support, known);
+    }
+
     static boolean dryCaveDanger(BlockState state) {
         return !state.getFluidState().isEmpty() || AgentProgress.dangerous(state) || state.isOf(Blocks.COBWEB);
     }
@@ -4357,6 +4375,20 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     /** One bounded traversal under the normal lava and final key vetoes, without an automatic jump. */
     void driveDryRoute(BlockPos from, BlockPos to, Direction bearing) {
         driveDryRoute(from, to, bearing, false);
+    }
+
+    /** Supply already proved this riser. Aim at clearance height ahead, not at its floor in flight. */
+    void driveSupplyRise(BlockPos from, BlockPos to, Direction bearing, Vec3d opening) {
+        lookSupplyRise(bearing, opening);
+        driveDryRoute(from, to, bearing, false, true, true, 6);
+    }
+
+    void lookSupplyRise(Direction bearing, Vec3d opening) {
+        var player = client.player;
+        double horizontal = Math.hypot(opening.x - player.getX(), opening.z - player.getZ());
+        float pitch = (float) Math.toDegrees(Math.atan2(player.getEyeY() - opening.y, horizontal));
+        // Keep the movement yaw cardinal until the arrival has handed off to ordinary face aim.
+        turnFixed(bearing.getPositiveHorizontalDegrees(), pitch);
     }
 
     /** Keep W through a level waypoint only when the straight successor has already passed its guards. */

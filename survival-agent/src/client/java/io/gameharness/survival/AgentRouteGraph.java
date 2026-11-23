@@ -461,12 +461,12 @@ final class AgentRouteGraph {
         return bucket;
     }
 
-    private static int slot(long from, long to) {
+    static int slot(long from, long to) {
         if (from == NO_CELL || to == NO_CELL) return -1;
         int dy = y(to) - y(from);
         if (dy < -1 || dy > 1) return -1;
-        int dx = (int) (to >> 38) - (int) (from >> 38);
-        int dz = (int) ((to << 26) >> 38) - (int) ((from << 26) >> 38);
+        int dx = x(to) - x(from);
+        int dz = z(to) - z(from);
         if (dz == 0 && (dx == 1 || dx == -1)) return (dx > 0 ? 0 : 3) + dy + 1;
         if (dx == 0 && (dz == 1 || dz == -1)) return (dz > 0 ? 6 : 9) + dy + 1;
         return -1;
@@ -474,7 +474,15 @@ final class AgentRouteGraph {
 
     static boolean cardinalStep(long from, long to) { return slot(from, to) >= 0; }
 
+    static int x(long cell) { return (int) (cell >> 38); }
     static int y(long cell) { return (int) (cell << 52 >> 52); }
+    static int z(long cell) { return (int) ((cell << 26) >> 38); }
+
+    static long neighbor(long cell, int bearing, int rise) {
+        return cell(x(cell) + (bearing == 0 ? 1 : bearing == 1 ? -1 : 0), y(cell) + rise,
+            z(cell) + (bearing == 2 ? 1 : bearing == 3 ? -1 : 0));
+    }
+
     private static int opposite(int slot) { return ((slot / 3) ^ 1) * 3 + 2 - slot % 3; }
     private static int viewBit(int bearing) { return bearing >= 0 && bearing < SLOTS ? 1 << bearing : 0; }
 }

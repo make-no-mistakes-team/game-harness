@@ -14,6 +14,7 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.util.math.Box;
 
 /** Local meal policy and exact model-authorized food sources. */
 final class AgentFoodWork {
@@ -78,12 +79,50 @@ final class AgentFoodWork {
         return null;
     }
 
-    static boolean criticalForage(int hunger, float health, boolean safe) {
-        return safe && (hunger == 0 || hunger < 18 && health <= 7);
+    /** No source, denied input, and safety interruptions do not end a recovery. */
+    static final class HealingGoal {
+        private boolean active;
+
+        boolean update(int hunger, float health, float maxHealth) {
+            if (active) {
+                if (hunger >= 18 && health >= maxHealth * 0.7f) active = false;
+            } else if (hunger <= 10 || health <= maxHealth * 0.5f) {
+                active = true;
+            }
+            return active;
+        }
+
+        boolean active() { return active; }
+        boolean canRest(int hunger) { return active && hunger >= 18; }
+        void reset() { active = false; }
     }
 
-    static boolean canPauseRoute(int hunger, boolean waitingForEvidence, boolean critical) {
-        return critical || hunger <= 10 && waitingForEvidence;
+    enum SourceAction { APPROACH, CONTACT, REFUSE }
+
+    /** Call only with a currently witnessed source. Range alone never authorizes contact. */
+    static SourceAction sourceAction(boolean dry, boolean inReach, boolean directed) {
+        if (!dry) return SourceAction.REFUSE;
+        if (inReach) return SourceAction.CONTACT;
+        return directed ? SourceAction.APPROACH : SourceAction.REFUSE;
+    }
+
+    static SourceAction huntAction(double eyeDistanceSquared, double reach, boolean dry, boolean directed) {
+        return sourceAction(dry, criticalHuntContact(eyeDistanceSquared, reach, dry), directed);
+    }
+
+    static SourceAction dropAction(Box player, Box drop, boolean grounded, boolean dry, boolean directed) {
+        if (!dry) return SourceAction.REFUSE;
+        if (AgentPickup.passiveOverlap(player, drop)) return SourceAction.CONTACT;
+        if (!grounded) return SourceAction.REFUSE;
+        if (directed) return SourceAction.APPROACH;
+        double dx = (drop.minX + drop.maxX - player.minX - player.maxX) * 0.5;
+        double dz = (drop.minZ + drop.maxZ - player.minZ - player.maxZ) * 0.5;
+        return Math.abs(drop.minY - player.minY) <= 1.2 && dx * dx + dz * dz <= 1.6 * 1.6
+            ? SourceAction.CONTACT : SourceAction.REFUSE;
+    }
+
+    static boolean mealConfirmed(int beforeHunger, int hunger, int beforeCount, int count) {
+        return hunger > beforeHunger && count < beforeCount;
     }
 
     static boolean safeMeal(ItemStack stack) {

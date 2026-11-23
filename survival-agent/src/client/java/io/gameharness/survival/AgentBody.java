@@ -184,6 +184,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private Vec3d dryFooting;
     private AgentWalkedRoute walkedRoutes;
     private final BlockPos.Mutable walkedProbe = new BlockPos.Mutable();
+    private final BlockPos.Mutable ordinaryFloorProbe = new BlockPos.Mutable();
+    private boolean ordinaryRiseKey;
     private final Predicate<Box> caveLandingSpace = this::caveLandingSpaceEmpty;
     private final Predicate<Box> caveLandingDry = this::caveLandingVolumeDry;
     private int dryFootingTick;
@@ -416,6 +418,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         emergencyWalk = false;
         checkedEmergencyWalk = false;
         dryRouteWalk = false;
+        ordinaryRiseKey = false;
         wetEscapeWalk = false;
         horizonIntent = null;
         reconInputGrant = null;
@@ -802,6 +805,9 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 && !options.jumpKey.isUnbound() && client.getOverlay() == null) {
             if (headroom.veto(player, tick, player.getYaw(), !advance)) jump = false;
         }
+        // A staged ordinary rise must not become a walk into the riser when a
+        // final safety or input gate rejected its takeoff.
+        if (ordinaryRiseKey && (!advance || !jump)) advance = jump = false;
         if (jump && stepJump) lastStepJump = tick;
         ownsKeys = true;
         if (advance && (emergencyWalk || rolling && horizonIntent.ranged) && !options.forwardKey.isUnbound())
@@ -3130,10 +3136,15 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     private boolean dryLandingControls() {
+        return dryLandingControls(false);
+    }
+
+    private boolean dryLandingControls(boolean allowCrouching) {
         if (!hasView() || lavaEmergency || client.options.forwardKey.isUnbound() || client.options.getAutoJump().getValue())
             return false;
         var player = client.player;
-        return player.getPose() == EntityPose.STANDING && !player.isSprinting() && !player.isUsingItem()
+        return (player.getPose() == EntityPose.STANDING || allowCrouching && player.getPose() == EntityPose.CROUCHING)
+            && !player.isSprinting() && !player.isUsingItem()
             && !player.isTouchingWater() && !player.isClimbing() && !player.isOnFire() && !player.hasVehicle()
             && !player.getAbilities().flying && !player.hasNoDrag() && player.hurtTime == 0
             && !player.hasStatusEffect(StatusEffects.LEVITATION) && !player.hasStatusEffect(StatusEffects.SLOW_FALLING)
@@ -3623,6 +3634,135 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return !state.getFluidState().isEmpty() || AgentProgress.dangerous(state) || state.isOf(Blocks.COBWEB);
     }
 
+    boolean ordinaryRouteControls() {
+        return dryLandingControls(true) && client.isWindowFocused() && client.getOverlay() == null
+            && ordinaryGradePose(client.player) && !client.player.isGliding()
+            && !client.player.hasNoGravity() && !client.player.isSpectator()
+            && client.player.getAttributeValue(EntityAttributes.SAFE_FALL_DISTANCE) >= 1.35;
+    }
+
+    boolean ordinaryRouteContact(BlockPos foot) {
+        if (!ordinaryRouteControls()) return false;
+        var player = client.player;
+        BlockPos support = player.supportingBlockPos.orElse(null);
+        return player.isOnGround()
+            && Math.abs(player.getY() - foot.getY()) <= 0.055 && player.getBlockPos().equals(foot)
+            && support != null
+            && support.getX() == foot.getX() && support.getY() == foot.getY() - 1 && support.getZ() == foot.getZ()
+            && ordinaryRouteSupport(foot);
+    }
+
+    private boolean ordinaryRouteSupport(BlockPos foot) {
+        BlockPos floor = ordinaryFloorProbe.set(foot.getX(), foot.getY() - 1, foot.getZ());
+        BlockState state = client.world.getBlockState(floor);
+        return !dryCaveDanger(state) && normalDryTraction(state) && fullStepSupport(floor, state)
+            && overlandLoadHolds(client.world, floor, state, ordinaryFloorProbe);
+    }
+
+    /** Admit only the exact full top returned by a projected first-hit ray, not a nominated column. */
+    boolean ordinaryRouteTop(BlockPos foot, int leaveRays) {
+        if (!hasView() || raysLeft <= leaveRays) return false;
+        double dx = foot.getX() + 0.5 - eye.x, dz = foot.getZ() + 0.5 - eye.z;
+        double distance = Math.max(Math.abs(dx), Math.abs(dz));
+        if (distance > 6.4) return false;
+        // The farther half stays in frame next to the player and can clear a descending lip.
+        double offset = distance > 0.20 ? 0.38 / distance : 0;
+        if (ordinaryTopRay(foot, dx * offset, dz * offset)) return true;
+        return raysLeft > leaveRays && ordinaryTopRay(foot, 0, 0);
+    }
+
+    private boolean ordinaryTopRay(BlockPos foot, double offsetX, double offsetZ) {
+        double x = foot.getX() + 0.5 + offsetX, y = foot.getY() - 0.025, z = foot.getZ() + 0.5 + offsetZ;
+        if (!inView(x, y, z)) return false;
+        BlockHitResult hit = litHit(new Vec3d(x, y, z), Ray.TERRAIN);
+        if (hit == null || hit.isInsideBlock() || hit.getSide() != Direction.UP) return false;
+        BlockPos floor = hit.getBlockPos();
+        return floor.getX() == foot.getX() && floor.getY() == foot.getY() - 1 && floor.getZ() == foot.getZ()
+            && Math.abs(hit.getPos().y - foot.getY()) <= 0.035 && ordinaryRouteSupport(foot);
+    }
+
+    /**
+     * A veto on a lane whose two supports have already been seen or occupied, including a
+     * remembered return. The sweep cannot supply a new floor or name an occluded obstacle.
+     */
+    DryRouteVeto ordinaryRouteLane(BlockPos from, BlockPos to) {
+        int dx = to.getX() - from.getX(), dz = to.getZ() - from.getZ(), rise = to.getY() - from.getY();
+        if (Math.abs(dx) + Math.abs(dz) != 1 || Math.abs(rise) > 1) return DryRouteVeto.DRIFT;
+        if (!ordinaryRouteSupport(from) || !ordinaryRouteSupport(to)) return DryRouteVeto.SUPPORT;
+        var player = client.player;
+        double half = player.getWidth() * 0.5 + 0.045;
+        double x = from.getX() + 0.5, z = from.getZ() + 0.5, y = Math.max(from.getY(), to.getY());
+        Box high = new Box(x - half, y + 0.005, z - half, x + half,
+            y + Math.max(1.8, player.getHeight()) + (rise > 0 ? 0.27 : 0.005), z + half);
+        Box upper = high.stretch(dx, 0, dz);
+        DryRouteVeto veto = ordinaryRouteVolume(upper);
+        if (veto != DryRouteVeto.CLEAR || rise == 0) return veto;
+        return ordinaryRouteVolume((rise < 0 ? high.offset(dx, 0, dz) : high).stretch(0, -1, 0));
+    }
+
+    private DryRouteVeto ordinaryRouteVolume(Box sweep) {
+        if (!caveLandingVolumeDry(sweep)) return DryRouteVeto.HAZARD;
+        return client.world.isSpaceEmpty(client.player, sweep) ? DryRouteVeto.CLEAR : DryRouteVeto.SWEEP;
+    }
+
+    enum OrdinaryMotor { KEY, COAST, ALIGN, CENTER, VIEW, VETO }
+
+    /** Use ordinary keys and the existing final lava/headroom/input arbitration, never another look. */
+    OrdinaryMotor driveOrdinaryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry) {
+        if (!ordinaryRouteControls()) return OrdinaryMotor.VIEW;
+        var player = client.player;
+        int dx = bearing.getOffsetX(), dz = bearing.getOffsetZ(), rise = to.getY() - from.getY();
+        double fx = player.getX() - from.getX() - 0.5, fz = player.getZ() - from.getZ() - 0.5;
+        Vec3d velocity = player.getVelocity();
+        double along = fx * dx + fz * dz, across = fx * dz - fz * dx;
+        double coast = player.isOnGround() ? 2.20 : 4.0;
+        double sideDrift = (velocity.x * dz - velocity.z * dx) * coast;
+        if (along < -0.51 || along > 1.27 || player.fallDistance > (rise > 0 ? 0.35 : -rise + 0.08)
+                || player.getY() < Math.min(from.getY(), to.getY()) - 0.055
+                || player.getY() > Math.max(from.getY(), to.getY()) + (rise > 0 ? 0.28 : 0.055)
+                || rise == 0 && !player.isOnGround()
+                || hazardAhead(bearing.getPositiveHorizontalDegrees(), Math.max(0.68, 1.42 - along)))
+            return OrdinaryMotor.VETO;
+        float yaw = bearing.getPositiveHorizontalDegrees();
+        if (Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > 5) return OrdinaryMotor.ALIGN;
+        if (Math.abs(across) > 0.205 || Math.abs(across + sideDrift) > 0.205) {
+            if (!ordinaryRouteContact(from)) return OrdinaryMotor.VETO;
+            return ordinaryRouteAdjust(from, from.getX() + 0.5, from.getZ() + 0.5)
+                ? OrdinaryMotor.CENTER : OrdinaryMotor.VETO;
+        }
+        boolean takeoff = rise > 0 && player.isOnGround() && player.getY() < to.getY() - 0.055;
+        if (takeoff && client.options.jumpKey.isUnbound()) return OrdinaryMotor.VETO;
+        if (player.getPose() != EntityPose.STANDING) return OrdinaryMotor.COAST;
+        // Check the actual body's next displacement, not just the centered planning envelope.
+        // Before a rise the riser itself is expected at knee height; the exact apron and
+        // full climb envelope were independently checked by ordinaryRouteLane.
+        double speed = Math.max(0, velocity.x * dx + velocity.z * dz);
+        double advance = Math.min(Math.max(0, 1 - along), speed + 0.12);
+        Box imminent = player.getBoundingBox().offset(0, 0.005, 0).stretch(velocity.x, 0, velocity.z);
+        if (!takeoff && (rise <= 0 || player.getY() >= to.getY() - 0.055))
+            imminent = imminent.stretch(dx * advance, 0, dz * advance);
+        if (!caveLandingVolumeDry(imminent)) return OrdinaryMotor.VETO;
+        if (rise == 0 && !client.world.isSpaceEmpty(player, imminent)) return OrdinaryMotor.VETO;
+        driveDryRoute(from, to, bearing, carry, true, takeoff, 5);
+        ordinaryRiseKey = forward && takeoff;
+        return forward || backward ? OrdinaryMotor.KEY : OrdinaryMotor.COAST;
+    }
+
+    /** Move inward on the exact occupied top only, with ordinary slow directional input. */
+    boolean ordinaryRouteAdjust(BlockPos foot, double x, double z) {
+        if (!ordinaryRouteContact(foot) || client.options.sneakKey.isUnbound()
+                || client.options.backKey.isUnbound() || client.options.leftKey.isUnbound()
+                || client.options.rightKey.isUnbound()) return false;
+        var player = client.player;
+        double dx = x - player.getX(), dz = z - player.getZ();
+        double distance = Math.hypot(dx, dz);
+        if (distance > 0.81 || hazardAhead(heading(dx, dz), distance + 0.12)
+                || ordinaryRouteVolume(player.getBoundingBox().offset(0, 0.005, 0).stretch(dx, 0, dz))
+                    != DryRouteVeto.CLEAR) return false;
+        centerLanding = new Vec3d(x, player.getY(), z);
+        return true;
+    }
+
     /** A full, visible surface top. Falling material gets a separate under-load veto, not a cave proof. */
     BlockState overlandTop(BlockPos floor, Direction travel, Predicate<BlockState> dangerous) {
         if (!hasView()) return null;
@@ -3992,6 +4132,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     private void driveDryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry, boolean keepView,
                                boolean allowJump) {
+        driveDryRoute(from, to, bearing, carry, keepView, allowJump, keepView ? 0.7 : 6.0);
+    }
+
+    private void driveDryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry, boolean keepView,
+                               boolean allowJump, double alignment) {
         var player = client.player;
         Vec3d landing = Vec3d.ofBottomCenter(to);
         double dx = landing.x - player.getX(), dz = landing.z - player.getZ();
@@ -4000,7 +4145,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         float yaw = heading(bearing.getOffsetX(), bearing.getOffsetZ());
         boolean level = to.getY() == from.getY();
         if (!keepView) turnFixed(yaw, level ? LEVEL_ROUTE_PITCH : jump ? 4 : 39);
-        if (!hasView() || Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > (keepView ? 0.7 : 6.0)) return;
+        if (!hasView() || Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > alignment) return;
         double remaining = dx * bearing.getOffsetX() + dz * bearing.getOffsetZ();
         Vec3d velocity = player.getVelocity();
         double forwardSpeed = Math.max(0, velocity.x * bearing.getOffsetX() + velocity.z * bearing.getOffsetZ());

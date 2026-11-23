@@ -104,9 +104,9 @@ final class AgentPickup {
     }
 
     /** A grounded wood sighting can retain a travel bearing beyond the one-tread pickup envelope. */
-    static AgentOverlandSearch.ResourceGoal logApproach(Box player, Box grounded) {
+    static AgentResourceStance logApproach(Box player, Box grounded) {
         if (grounded == null || passiveOverlap(player, grounded)) return null;
-        return new AgentOverlandSearch.ResourceGoal(grounded.getCenter(), 1.12,
+        return new AgentResourceStance(grounded.getCenter(), 1.12,
             grounded.minY - (player.maxY - player.minY) - 0.42, grounded.maxY + 0.42);
     }
 

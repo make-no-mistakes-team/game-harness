@@ -8,6 +8,7 @@ import net.minecraft.block.CaveVines;
 import net.minecraft.block.SweetBerryBushBlock;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.util.math.Box;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -62,13 +63,46 @@ final class AgentFoodWorkTest {
     }
 
     @Test
-    void aCriticallyWoundedPlayerBelowHealingHungerCanPauseABlockedRouteOnSafeFooting() {
-        assertTrue(AgentFoodWork.canPauseRoute(17, false, AgentFoodWork.criticalForage(17, 0.833f, true)));
-        assertFalse(AgentFoodWork.canPauseRoute(17, false, AgentFoodWork.criticalForage(17, 0.833f, false)));
-        assertFalse(AgentFoodWork.canPauseRoute(17, true, AgentFoodWork.criticalForage(17, 20, true)));
-        assertFalse(AgentFoodWork.canPauseRoute(18, false, AgentFoodWork.criticalForage(18, 0.833f, true)));
-        assertTrue(AgentFoodWork.canPauseRoute(10, true, AgentFoodWork.criticalForage(10, 20, true)));
-        assertFalse(AgentFoodWork.canPauseRoute(10, false, AgentFoodWork.criticalForage(10, 20, true)));
+    void aHalfHeartPlayerKeepsTheHealingTurnAcrossDaysOfMisses() {
+        var goal = new AgentFoodWork.HealingGoal();
+        assertFalse(goal.update(16, 20, 20));
+        for (int tick = 0; tick < 72_000; tick++) {
+            assertTrue(goal.update(16, 0.833f, 20), "no-source and cooldown ticks must not yield to ore");
+            assertFalse(goal.canRest(16));
+        }
+        assertTrue(goal.update(18, 0.833f, 20), "a meal is not yet a recovery");
+        assertTrue(goal.canRest(18));
+        assertTrue(goal.update(17, 12, 20), "falling below healing hunger resumes the food search");
+        assertFalse(goal.canRest(17));
+        assertFalse(goal.update(18, 14, 20), "ordinary work returns only after a safe recovery");
+    }
+
+    @Test
+    void visibleAdultBeyondMeleeReachIsApproachedButNotAttackedWhileUnsafe() {
+        assertEquals(AgentFoodWork.SourceAction.APPROACH, AgentFoodWork.huntAction(6 * 6, 2.8, true, true));
+        assertEquals(AgentFoodWork.SourceAction.CONTACT, AgentFoodWork.huntAction(2 * 2, 2.8, true, true));
+        assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.huntAction(6 * 6, 2.8, false, true));
+        assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.huntAction(2 * 2, 2.8, false, true));
+        assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.huntAction(6 * 6, 2.8, true, false));
+    }
+
+    @Test
+    void visibleGroundedDropIsApproachedUntilActualPickupOverlap() {
+        var standing = new Box(-0.3, 64, -0.3, 0.3, 65.8, 0.3);
+        var drop = new Box(7, 64, 0, 7.25, 64.25, 0.25);
+        assertEquals(AgentFoodWork.SourceAction.APPROACH, AgentFoodWork.dropAction(standing, drop, true, true, true));
+        assertEquals(AgentFoodWork.SourceAction.CONTACT,
+            AgentFoodWork.dropAction(standing.offset(6, 0, 0), drop, true, true, true));
+        assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.dropAction(standing, drop, false, true, true));
+        assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.dropAction(standing, drop, true, false, true));
+        assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.dropAction(standing, drop, true, true, false));
+    }
+
+    @Test
+    void aMealReceiptNeedsObservedConsumptionAndHungerGain() {
+        assertTrue(AgentFoodWork.mealConfirmed(16, 19, 2, 1));
+        assertFalse(AgentFoodWork.mealConfirmed(16, 16, 2, 1));
+        assertFalse(AgentFoodWork.mealConfirmed(16, 19, 2, 2));
     }
 
     @Test

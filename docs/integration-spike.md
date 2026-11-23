@@ -64,6 +64,13 @@ The player gathers supplies for the next stretch of mine, keeping
 enough light for the return. If it lands partly on a stair edge, it can
 ease inward on the dry block supporting its feet before setting up a
 workshop. That small shift is not a new route or a resource gain.
+Ordinary travel keeps its destination while it follows a sequence of
+visible or previously walked treads. The route can go sideways or
+briefly away from a resource, jump up, or step down. If a crossing is
+blocked, the player checks another path toward the same destination;
+it does not turn to all four compass points to calculate a path. Where
+the route is still unknown it can head for a reachable vantage point.
+Reaching that vantage is not the same as reaching the resource.
 When gathering timber on uneven ground,
 it approaches a stance where it can collect the log, not just reach
 the trunk with a swing. It makes the first pick as soon as it can pay
@@ -125,10 +132,13 @@ worksite. The player keeps checking older connected stairs on its way
 out; it does not assume a previously walked tread is still clear or dry.
 If a retreat is blocked, the player can strike a hostile mob it can
 see and reach, including while being knocked back.
-After danger passes, a critically hurt player below the hunger needed
-for healing can take reachable food even if it was following a blocked
-mine route. It prefers safe food to rotten flesh. An empty view does
-not start a hunt.
+After danger passes, a badly hurt or hungry player suspends mining to
+find food. It eats suitable carried food, or follows a checked path
+toward a food drop, ripe berries or an edible animal it has seen.
+If none is visible, it searches from new reachable ground rather than
+resuming the stone job. An empty view does not authorize an attack.
+It prefers safe food to rotten flesh. Pickup, eating and health
+recovery are separate outcomes.
 It need not abandon work on a dry bank to chase an unarmed drowned
 swimming below it. A visible trident or an actual hit changes that decision.
 Without a shield, the player can keep moving along a checked retreat

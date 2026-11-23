@@ -198,20 +198,15 @@ final class CanopyPassageTest {
     }
 
     @Test
-    void anUnlandedCanopyTreadDoesNotReserveItsWholeDirectionOrCreateAFootprint() {
-        var course = new AgentOverlandSearch.Course();
-        course.start(FOOT, Direction.EAST);
+    void onlyAnActualCanopyLandingProtectsTheLowerSupport() {
+        var passage = new AgentSupplyEgress.CanopyPassage();
         BlockPos lower = FOOT.east().down();
-        assertTrue(course.walkedSupport(FOOT.down()));
-        assertTrue(course.canExtend(FOOT, lower, Direction.EAST, 0));
-        assertTrue(course.canExtend(FOOT, FOOT.east(), Direction.EAST, 0));
-        assertFalse(course.walkedSupport(lower.down()));
-        assertFalse(course.canExtend(FOOT, lower.down(), Direction.EAST, 0));
-        assertTrue(course.arrived(lower));
-        assertTrue(course.walkedSupport(lower.down()));
-        assertEquals(FOOT, course.previous(lower));
-        assertFalse(course.canExtend(FOOT, lower, Direction.EAST, 0));
-        assertTrue(course.canExtend(FOOT, FOOT.east(), Direction.EAST, 0));
+        passage.offer(FOOT, Direction.EAST, top(lower), true);
+        assertFalse(passage.walkedSupport(lower.down()));
+        passage.landed(FOOT, lower);
+        assertTrue(passage.walkedSupport(FOOT.down()));
+        assertTrue(passage.walkedSupport(lower.down()));
+        assertFalse(passage.walkedSupport(lower));
     }
 
     private static BlockHitResult face(BlockPos leaf) {

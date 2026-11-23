@@ -20,7 +20,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 
-/** Local meal policy and exact model-authorized food sources. */
+/** Local meal policy, with exact-work sources narrower than ordinary forage. */
 final class AgentFoodWork {
     static final String EFFECT = "forage:";
     static final int MAX_SWINGS = 4;
@@ -36,7 +36,8 @@ final class AgentFoodWork {
         MOOSHROOM("entity", "mooshroom", Items.BEEF, Items.COOKED_BEEF),
         PIG("entity", "pig", Items.PORKCHOP, Items.COOKED_PORKCHOP),
         SHEEP("entity", "sheep", Items.MUTTON, Items.COOKED_MUTTON),
-        RABBIT("entity", "rabbit", Items.RABBIT, Items.COOKED_RABBIT);
+        RABBIT("entity", "rabbit", Items.RABBIT, Items.COOKED_RABBIT),
+        CHICKEN("entity", "chicken", Items.CHICKEN, Items.COOKED_CHICKEN);
 
         final String subject, effect;
         final Item item, cooked;
@@ -61,7 +62,7 @@ final class AgentFoodWork {
     private static final Source[] SOURCES = Source.values();
 
     static Source effect(String effect) {
-        for (Source source : SOURCES) if (source.effect.equals(effect)) return source;
+        for (Source source : SOURCES) if (source != Source.CHICKEN && source.effect.equals(effect)) return source;
         return null;
     }
 
@@ -73,6 +74,14 @@ final class AgentFoodWork {
     }
 
     static Source adult(Entity entity) {
+        return adult(entity, false);
+    }
+
+    static Source ordinaryAdult(Entity entity) {
+        return adult(entity, true);
+    }
+
+    private static Source adult(Entity entity, boolean ordinary) {
         if (!(entity instanceof LivingEntity animal) || !animal.isAlive() || animal.isBaby() || animal.isTouchingWater()) return null;
         EntityType<?> type = entity.getType();
         if (type == EntityType.COW) return Source.COW;
@@ -80,6 +89,7 @@ final class AgentFoodWork {
         if (type == EntityType.PIG) return Source.PIG;
         if (type == EntityType.SHEEP) return Source.SHEEP;
         if (type == EntityType.RABBIT) return Source.RABBIT;
+        if (ordinary && type == EntityType.CHICKEN) return Source.CHICKEN;
         return null;
     }
 
@@ -88,9 +98,10 @@ final class AgentFoodWork {
         private boolean active;
 
         boolean update(int hunger, float health, float maxHealth) {
+            boolean recovered = health >= maxHealth * 0.7f;
             if (active) {
-                if (hunger >= 18 && health >= maxHealth * 0.7f) active = false;
-            } else if (hunger <= 10 || health <= maxHealth * 0.5f) {
+                if (hunger >= 18 && recovered) active = false;
+            } else if (hunger <= 10 || health <= maxHealth * 0.5f || !recovered && hunger < 18) {
                 active = true;
             }
             return active;
@@ -99,6 +110,48 @@ final class AgentFoodWork {
         boolean active() { return active; }
         boolean canRest(int hunger) { return active && hunger >= 18; }
         void reset() { active = false; }
+    }
+
+    /** One view request per recovery, with no target, movement, or contact authority. */
+    static final class PoultryLook {
+        static final float PITCH = 20;
+        private static final int LOOK_TICKS = 24;
+        enum View { LOOKING, FINISHED, SCOUT_HANDOFF }
+
+        private BlockPos foot;
+        private long fromFrame;
+        private int lastTick, until;
+        private float bearing;
+        private boolean spent, scoutHandoff;
+
+        boolean available() { return !spent; }
+        boolean active() { return foot != null; }
+        float bearing() { return bearing; }
+
+        boolean begin(float yaw, BlockPos stoppedFoot, int tick, long frame, boolean handoff) {
+            if (spent || stoppedFoot == null || !Float.isFinite(yaw)) return false;
+            spent = true;
+            scoutHandoff = handoff;
+            foot = stoppedFoot;
+            bearing = yaw;
+            lastTick = tick;
+            until = tick + LOOK_TICKS;
+            fromFrame = frame;
+            return true;
+        }
+
+        View awaitView(BlockPos stoppedFoot, int tick, long frame, boolean aligned) {
+            boolean continuous = foot != null && foot.equals(stoppedFoot) && tick == lastTick + 1;
+            if (!continuous || tick >= until || frame > fromFrame && aligned) {
+                finish();
+                return continuous && scoutHandoff ? View.SCOUT_HANDOFF : View.FINISHED;
+            }
+            lastTick = tick;
+            return View.LOOKING;
+        }
+
+        void finish() { foot = null; }
+        void reset() { finish(); spent = false; }
     }
 
     enum SourceAction { APPROACH, CONTACT, REFUSE }
@@ -195,7 +248,7 @@ final class AgentFoodWork {
         void reset() { foot = null; }
 
         boolean canStart(BlockPos at, int tick) {
-            return !at.equals(foot) || tick - start >= RETRY_TICKS;
+            return foot == null || foot.getSquaredDistance(at) > 16 || tick - start >= RETRY_TICKS;
         }
 
         void start(BlockPos at, int tick) {
@@ -239,6 +292,20 @@ final class AgentFoodWork {
         return stack.isOf(Items.ROTTEN_FLESH) && positiveNutrition(stack);
     }
 
+    static boolean poultryMeal(ItemStack stack) {
+        return stack.isOf(Items.CHICKEN) && positiveNutrition(stack);
+    }
+
+    // Ordered weakest first. Safe food always wins the usual nutrition ranking.
+    enum Meal { NONE, FLESH, POULTRY, SAFE }
+
+    static Meal mealPriority(ItemStack stack, boolean emergency, boolean ordinaryRecovery) {
+        if (safeMeal(stack)) return Meal.SAFE;
+        if (!emergency) return Meal.NONE;
+        if (ordinaryRecovery && poultryMeal(stack)) return Meal.POULTRY;
+        return fleshMeal(stack) ? Meal.FLESH : Meal.NONE;
+    }
+
     private static boolean positiveNutrition(ItemStack stack) {
         var food = stack.get(DataComponentTypes.FOOD);
         return !stack.isEmpty() && food != null && food.nutrition() > 0;
@@ -271,7 +338,7 @@ final class AgentFoodWork {
 
     static boolean policy(Source source, AgentWorkOrder.Target target, Map<Item, Integer> caps,
                           int effects, int breaks, int crafts, int placements) {
-        return target.item() == source.item && caps.isEmpty() && effects == 1
+        return source != Source.CHICKEN && target.item() == source.item && caps.isEmpty() && effects == 1
             && breaks == 0 && crafts == 0 && placements == 0;
     }
 

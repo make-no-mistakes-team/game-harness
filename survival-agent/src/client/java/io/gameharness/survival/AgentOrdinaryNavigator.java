@@ -8,6 +8,8 @@ import static io.gameharness.survival.AgentRouteGraph.z;
 
 import java.util.Arrays;
 import java.util.List;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
@@ -32,7 +34,7 @@ final class AgentOrdinaryNavigator {
     private static final float TRAVEL_PITCH = 31;
     private static final int[] GRADES = {0, 1, -1};
     private static final Direction[] BEARINGS = {Direction.EAST, Direction.WEST, Direction.SOUTH, Direction.NORTH};
-    private static final byte SEEN = 1, HIDDEN = 2, QUEUED = 3;
+    private static final byte SEEN = 1, HIDDEN = 2, QUEUED = 3, FORAGE_TOP = 4;
 
     enum Sight {
         STALE_FRAME("stale or shifted frame"), BAD_FACING("not facing the requested view"),
@@ -158,6 +160,7 @@ final class AgentOrdinaryNavigator {
     private final short[] checked = new short[VIEW_CELLS];
     private final long[] sightQueue = new long[SIGHT_NODES];
     private final BlockPos.Mutable sightFrom = new BlockPos.Mutable(), sightTo = new BlockPos.Mutable();
+    private final BlockPos.Mutable foodFloor = new BlockPos.Mutable();
 
     private ClientWorld world;
     private ClientPlayerEntity player;
@@ -230,6 +233,24 @@ final class AgentOrdinaryNavigator {
 
     boolean foodScoutHandoff() { return foodScoutHandoff; }
     boolean foodFrontierExhausted() { return exhaustedFoodView; }
+
+    void resetFoodSearch() { route.resetFoodSearch(); }
+
+    /** A settled canopy descent or completed surface egress already witnessed this footing. */
+    void rememberForagingFoot(BlockPos foot, int tick) {
+        if (world != client.world || player != client.player) reset();
+        if (body.dryCaveContact(foot) != null) route.rememberForagingFoot(foot.asLong(), tick);
+    }
+
+    boolean atForagingGround(BlockPos foot, BlockState support) {
+        return forageHabitat(support)
+            || world == client.world && player == client.player && route.atForagingFoot(foot.asLong());
+    }
+
+    private static boolean forageHabitat(BlockState support) {
+        return support != null && (support.isOf(Blocks.GRASS_BLOCK) || support.isOf(Blocks.PODZOL)
+            || support.isOf(Blocks.MYCELIUM) || AgentSupplyEgress.naturalDryLeaf(support));
+    }
 
     Arrival takeArrival() {
         Arrival value = arrival;
@@ -346,7 +367,9 @@ final class AgentOrdinaryNavigator {
             if (recallAt != here) recallAt = recalled = NO_CELL;
             if (lookAt != here) lookAt = lookCue = NO_CELL;
             if (edgeStance == null) stanceSupport = null;
-            route.contact(here, tick);
+            if (requested == Job.FOOD && forageHabitat(world.getBlockState(foodFloor.set(
+                    foot.getX(), foot.getY() - 1, foot.getZ())))) route.rememberForagingFoot(here, tick);
+            else route.contact(here, tick);
             if (from == null && !changed && arrived(destination, arrivalRadius, minFootY, maxFootY)) {
                 body.pauseWork();
                 stage = "grounded arrival";
@@ -385,7 +408,7 @@ final class AgentOrdinaryNavigator {
                 long frame = body.renderedFrame();
                 if (grounded && foot.equals(from) && lastScan == tick && frame == rendered) {
                     byte seen = sight[gridIndex(foot.asLong(), to.asLong())];
-                    if (seen == SEEN || seen == QUEUED) gradeAt = tick;
+                    if (seen == SEEN || seen == QUEUED || seen == FORAGE_TOP) gradeAt = tick;
                 }
                 if (tick - gradeAt > GRADE_AGE && frame != gradeFrame
                         && body.generalRaysRemaining() >= RAY_RESERVE + 10) {
@@ -465,7 +488,8 @@ final class AgentOrdinaryNavigator {
         if (destination != null) route.destination(destination.x, destination.z, r, low, high);
         else {
             double yaw = Math.toRadians(player == null ? 0 : player.getYaw());
-            route.explore(-Math.sin(yaw), Math.cos(yaw));
+            if (job == Job.FOOD) route.exploreFood(-Math.sin(yaw), Math.cos(yaw));
+            else route.explore(-Math.sin(yaw), Math.cos(yaw));
         }
     }
 
@@ -679,18 +703,24 @@ final class AgentOrdinaryNavigator {
                     int slot = direction * 3 + rise + 1;
                     if (n < 0 || (checked[at] & (1 << slot)) != 0) continue;
                     set(sightTo, next);
-                    if (sight[n] == 0) sight[n] = body.ordinaryRouteTop(sightTo, leaveRays) ? SEEN : HIDDEN;
+                    if (sight[n] == 0) {
+                        if (!body.ordinaryRouteTop(sightTo, leaveRays)) sight[n] = HIDDEN;
+                        else if (job == Job.FOOD && forageHabitat(world.getBlockState(foodFloor.set(
+                                x(next), y(next) - 1, z(next))))) sight[n] = FORAGE_TOP;
+                        else sight[n] = SEEN;
+                    }
                     if (sight[n] == HIDDEN) continue;
                     checked[at] |= (short) (1 << slot);
                     checked[n] |= (short) (1 << ((direction ^ 1) * 3 - rise + 1));
                     boolean forward = body.ordinaryRouteLane(sightFrom, sightTo) == AgentBody.DryRouteVeto.CLEAR;
                     if (forward) {
                         route.observe(source, next, tick);
+                        if (sight[n] == FORAGE_TOP) route.witnessForagingTop(next, tick);
                         if (source == here) neighbor = true;
                     }
                     if (rise == 0 ? forward : body.ordinaryRouteLane(sightTo, sightFrom) == AgentBody.DryRouteVeto.CLEAR)
                         route.observe(next, source, tick);
-                    if (forward && sight[n] == SEEN && tail < SIGHT_NODES) {
+                    if (forward && sight[n] != QUEUED && tail < SIGHT_NODES) {
                         sight[n] = QUEUED;
                         sightQueue[tail++] = next;
                     }
@@ -725,7 +755,8 @@ final class AgentOrdinaryNavigator {
     private static double horizontalSquared(double x, double z) { return x * x + z * z; }
 
     String status() {
-        return "ordinary " + job + " goal=" + (goalCell == NO_CELL ? "frontier" : display(goalCell))
+        return "ordinary " + job + " goal=" + (route.returningForFood() ? "foraging-ground"
+            : goalCell == NO_CELL ? "frontier" : display(goalCell))
             + (route.exact() ? " destination=" : " proxy=") + display(route.endpoint())
             + " next=" + display(route.hop(0)) + " suffix=" + route.remaining() + " plan=" + route.plans()
             + " " + stage + (lastVeto.isEmpty() ? "" : " replan=" + lastVeto);

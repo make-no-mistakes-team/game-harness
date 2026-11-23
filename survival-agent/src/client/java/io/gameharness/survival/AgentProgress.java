@@ -128,6 +128,7 @@ final class AgentProgress {
         || stack.isOf(Items.COBBLESTONE) || stack.isOf(Items.COBBLED_DEEPSLATE) || PLANK.test(stack);
     private static final Predicate<ItemStack> FOOD = AgentFoodWork::safeMeal;
     private static final Predicate<ItemStack> FLESH_MEAL = AgentFoodWork::fleshMeal;
+    private static final Predicate<ItemStack> POULTRY_MEAL = AgentFoodWork::poultryMeal;
     private static final Predicate<BlockState> RIPE_BERRIES = state -> AgentFoodWork.ripe(state) != null;
     private static final int FOOD_RESERVE = 12; // nutrition points, not stack size
     private static final double FOOD_SIGHT = 12;
@@ -537,6 +538,7 @@ final class AgentProgress {
     private long emergencyMealJob;
     private float mealHealth = Float.NaN;
     private final AgentFoodWork.HealingGoal healing = new AgentFoodWork.HealingGoal();
+    private final AgentFoodWork.PoultryLook poultryLook = new AgentFoodWork.PoultryLook();
     private ClientWorld foodWorld;
     private boolean healingOwnsWork;
     private int foodTravelTick = -2;
@@ -1009,6 +1011,8 @@ final class AgentProgress {
     }
 
     void interruptSituationalRecovery() {
+        if (poultryLook.active()) body.pauseWork();
+        poultryLook.finish();
         cancelEarlyAxe();
         stallGuard.interruptSituational("a primed creeper took priority");
     }
@@ -1020,6 +1024,8 @@ final class AgentProgress {
     void tick(AgentEars ears, AgentMacroControl macro) {
         if (win || c.player == null || c.world == null) return;
         tick++;
+        ears.confirmPoultryPlayback();
+        if (poultryLook.active()) body.pauseWork(); // Re-arbitrate after danger gets its turn.
         if (foodWorld != c.world) resetOrdinaryHealing();
         // Observe cargo before a recipe can spend it.
         if (stoneCutFoot != null && (!stoneCutFoot.equals(c.player.getBlockPos()) || has(STONE, stoneCutStock + 1)))
@@ -1040,6 +1046,12 @@ final class AgentProgress {
         } else {
             healingOwnsWork = false;
             foodTravelTick = -2;
+            poultryLook.finish();
+            if (mealItem == Items.CHICKEN) {
+                confirmMeal(c.player.getHungerManager().getFoodLevel());
+                mealItem = null;
+                mealUntil = 0;
+            }
             foodCanopy.finish();
             if (forage != null) finishForage(12);
         }
@@ -1273,7 +1285,7 @@ final class AgentProgress {
             } else {
                 if (ordinaryRouteTick == tick - 1 && ordinaryRouteJob == Job.FOOD)
                     navigator.prepareObservation(Job.FOOD, tick);
-                eatOrHunt(hunger, true);
+                eatOrHunt(hunger, true, ears);
             }
             caves.interruptLight();
             stallGuard.priorityAim();
@@ -1281,7 +1293,9 @@ final class AgentProgress {
         }
         if (healingOwnsWork) {
             healingOwnsWork = false;
+            poultryLook.reset();
             foodCanopy.reset();
+            supplyEgress.releaseFood();
             finishForage(12);
             holdHealing("recovered on safe footing");
             return;
@@ -1298,7 +1312,7 @@ final class AgentProgress {
         // Safety has its turn first. Pay the active route's pending terrain view
         // before broad target scans, without changing who can act on this turn.
         if (ordinaryRouteTick == tick - 1) navigator.prepareObservation(ordinaryRouteJob, tick);
-        if (eatOrHunt(hunger, false)) {
+        if (eatOrHunt(hunger, false, ears)) {
             caves.interruptLight();
             stallGuard.priorityAim();
             return;
@@ -6022,7 +6036,7 @@ final class AgentProgress {
         private AgentSupplyEgress.ApexAccess restoredApex;
         private final BiPredicate<BlockPos, Direction> woodlandLane = this::woodlandLaneClear;
         private final Predicate<BlockPos> witnessedDryFlood = this::witnessedDryFloodCell;
-        private boolean firstStoneExit;
+        private boolean firstStoneExit, foodExit;
         private ClientWorld world;
         private BlockPos openFoot, unknownFoot, to, armedCut, packedBench;
         private BlockPos floodOpening, floodWater;
@@ -6085,10 +6099,36 @@ final class AgentProgress {
                 order.reset();
                 unknownFoot = null;
             }
-            if (!order.blocksFloodWork(foot, tick)) openFoot = foot;
+            if (!order.blocksFloodWork(foot, tick)) {
+                openFoot = foot;
+                navigator.rememberForagingFoot(foot, tick);
+            }
         }
 
         boolean seek(String need) {
+            return seek(need, false);
+        }
+
+        boolean foodActive() { return foodExit && active(); }
+
+        boolean foodCrossing() {
+            return foodActive() && driving != 0
+                && (!c.player.isOnGround() || !c.player.getBlockPos().equals(order.foot()));
+        }
+
+        void releaseFood() {
+            if (foodActive()) yieldToWorkshop();
+        }
+
+        boolean seekFoodSurface() {
+            if (!active()) return seek("foraging ground", true);
+            if (mineDeparture) return false;
+            foodExit = true;
+            firstStoneExit = false;
+            return step();
+        }
+
+        private boolean seek(String need, boolean forFood) {
             if (c.player.hasVehicle()) return false;
             boolean grounded = dryFieldFooting();
             if (world != c.world) {
@@ -6109,6 +6149,7 @@ final class AgentProgress {
             if (grounded) order.recheckFloods(standing, tick, witnessedDryFlood);
             if (!order.begin(standing, grounded, tick)) return false;
             start(c.player.getHorizontalFacing(), tick + JOB_TICKS, false);
+            foodExit = forFood;
             surveyActivity = "supply egress: surveying the rendered roof and opening for " + need;
             return step();
         }
@@ -6155,7 +6196,7 @@ final class AgentProgress {
 
         private void start(Direction direction, int end, boolean resite) {
             mineDeparture = resite;
-            firstStoneExit = false;
+            firstStoneExit = foodExit = false;
             deadline = end;
             bearing = direction;
             walked.clear();
@@ -6323,7 +6364,7 @@ final class AgentProgress {
                     return surfaceReady(from, yaw, "confirmed walkable woodland after short outline passage");
                 return false;
             }
-            if (tick < handoffAfter) return handoffTimber(false);
+            if (tick < handoffAfter) return !foodExit && handoffTimber(false);
             handoffAfter = tick + 5;
             if (firstStoneExit) {
                 if (has(STONE, 3)) {
@@ -6341,6 +6382,7 @@ final class AgentProgress {
             if (body.dryCaveContact(from) != null && order.handoffWoodland(body.dryCaveProbeView(),
                     Direction.fromHorizontalDegrees(yaw), woodlandLane))
                 return surfaceReady(from, yaw, "confirmed walkable woodland");
+            if (foodExit) return false;
             if (collectLocalDrop(LOG) || collectLocalDrop(PLANK))
                 return ready("ordinary pickup from connected footing");
             if (handoffTimber(true)) return true;
@@ -6646,7 +6688,8 @@ final class AgentProgress {
                 // An inconclusive roofless view isn't a cave, including in treeless terrain.
                 if (mineDeparture) return ready("no enclosure witnessed for a supported ascent");
                 unknownFoot = from;
-                return ready("no enclosure observed; continuing ordinary timber traversal");
+                return ready(foodExit ? "no enclosure witnessed for a food-search ascent"
+                    : "no enclosure observed; continuing ordinary timber traversal");
             }
             return true;
         }
@@ -7555,6 +7598,7 @@ final class AgentProgress {
                 caves.walkedDry(old, from);
                 caves.witnessedDry(from, old);
                 body.recordWalkedLeg(old, from);
+                if (!mineDeparture) navigator.rememberWalked(old, from);
                 if (from.getY() > old.getY()) {
                     rises++;
                     if (!mineDeparture) stallGuard.navigationArrival(old, from);
@@ -7652,7 +7696,7 @@ final class AgentProgress {
 
         private boolean surfaceReady(BlockPos from, float yaw, String why) {
             body.pauseWork();
-            openFoot = from;
+            observeOpenFoot(from);
             heading = yaw;
             headingUntil = tick + 125;
             approachGoal = null;
@@ -12344,14 +12388,14 @@ final class AgentProgress {
         if (!c.player.isOnGround() || c.player.isTouchingWater()
                 || tick < mealQuietUntil || tick < mealRetry || hunger == 20
                 || (mealUntil == 0 && !needsEmergencyFood(hunger))) return false;
-        if (mealUntil == 0 && bestMeal(hunger, macro.safetySpend()) < 0) return false;
+        if (mealUntil == 0 && bestMeal(hunger, macro.safetySpend(), false) < 0) return false;
         if (macro.hasAction() || hands.busy() || c.currentScreen instanceof HandledScreen<?>) {
             macro.urgent("releasing the current action for emergency food");
             interruptHands();
             status = "making room to eat emergency food";
             return true;
         }
-        if (c.currentScreen != null || !eatMeal(hunger, macro.safetySpend())) return false;
+        if (c.currentScreen != null || !eatMeal(hunger, macro.safetySpend(), false)) return false;
         if (hands.busy()) emergencyMealJob = hands.jobGeneration();
         macro.urgent("eating emergency food");
         return true;
@@ -12364,11 +12408,13 @@ final class AgentProgress {
         foodTravelTick = -2;
         foodTravelTarget = null;
         foodTravelBand = null;
+        poultryLook.reset();
         finishForage(0);
         refusedFoodEntity = null;
         refusedFoodBlock = null;
         appleStand.reset();
         foodCanopy.reset();
+        supplyEgress.releaseFood();
         mealUntil = mealRetry = mealQuietUntil = 0;
         emergencyMealJob = 0;
         mealItem = null;
@@ -12379,6 +12425,7 @@ final class AgentProgress {
 
     private void beginOrdinaryHealing() {
         healingOwnsWork = true;
+        navigator.resetFoodSearch();
         if (ordinaryApproach != null) body.stopHorizonTravel(ordinaryApproach);
         ordinaryApproach = null;
         body.pauseWork();
@@ -12404,7 +12451,7 @@ final class AgentProgress {
         healingStatus(detail);
     }
 
-    private boolean eatOrHunt(int hunger, boolean recovering) {
+    private boolean eatOrHunt(int hunger, boolean recovering, AgentEars ears) {
         var player = c.player;
         float health = player.getHealth();
         // The danger handler runs first. A retreat or newly lost health means the
@@ -12414,6 +12461,7 @@ final class AgentProgress {
         mealHealth = health;
         if (!macroFoodSafe() || !safePickupStance()) {
             if (forage != null) finishForage(12);
+            poultryLook.finish();
             foodCanopy.finish();
             mealUntil = 0;
             mealItem = null;
@@ -12428,6 +12476,7 @@ final class AgentProgress {
             return true;
         }
         if (recovering && foodCanopy.inFlight()) return foodCanopy.step();
+        if (recovering && supplyEgress.foodCrossing()) return stepFoodEgress();
         if (!player.isOnGround()) {
             if (recovering) holdHealing("waiting for dry ground contact");
             return recovering;
@@ -12439,19 +12488,24 @@ final class AgentProgress {
         }
         boolean mealWanted = hunger < 20 && (mealUntil != 0 || hunger <= 14 || canRefuelHealing(hunger) || recovering);
         if (mealWanted) {
-            if (tick >= mealRetry && eatMeal(hunger)) {
+            if (tick >= mealRetry && eatMeal(hunger, null, recovering)) {
+                poultryLook.finish();
                 foodCanopy.finish();
+                supplyEgress.releaseFood();
                 if (forage == Forage.APPLE_LEAVES || forage == Forage.GROUND) finishForage(0);
                 if (recovering) healingStatus(status);
                 return true;
             }
-            if (recovering && tick < mealRetry && bestMeal(hunger) >= 0) {
+            if (recovering && tick < mealRetry && bestMeal(hunger, null, true) >= 0) {
+                poultryLook.finish();
                 holdHealing("waiting to retry an owned meal");
                 return true;
             }
         }
         if (healing.canRest(hunger)) {
+            poultryLook.finish();
             foodCanopy.finish();
+            supplyEgress.releaseFood();
             if (forage != null) finishForage(0);
             holdHealing("resting with enough hunger to regenerate");
             return true;
@@ -12466,11 +12520,45 @@ final class AgentProgress {
                 && (!surface || !needsTimberKit() || firing != Firing.NONE || foodNutrition() >= FOOD_RESERVE))
             return false;
         boolean scoutHandoff = foodTravelTick == tick - 1 && ordinaryArrival != null && navigator.foodScoutHandoff();
+        boolean poultryEmergency = ordinaryPoultryEmergency(hunger, recovering);
+        boolean poultryView = poultryLook.active();
+        if (poultryView) {
+            float bearing = poultryLook.bearing();
+            BlockPos foot = poultryEmergency ? stoppedFoodFooting() : null;
+            var look = poultryLook.awaitView(foot, tick, body.renderedFrame(),
+                body.renderedDirection(bearing, AgentFoodWork.PoultryLook.PITCH, 17));
+            if (look == AgentFoodWork.PoultryLook.View.LOOKING) {
+                lookForPoultry(bearing);
+                return true;
+            }
+            scoutHandoff |= look == AgentFoodWork.PoultryLook.View.SCOUT_HANDOFF;
+        }
         boolean scanned = (forage == null || forage == Forage.APPLE_LEAVES || forage == Forage.GROUND)
-            && (tick >= forageScan || scoutHandoff || forage == Forage.APPLE_LEAVES || foodCanopy.active());
+            && (tick >= forageScan || scoutHandoff || poultryView || forage == Forage.APPLE_LEAVES || foodCanopy.active());
         if (scanned) {
             forageScan = tick + (recovering ? 4 : 12);
-            if (findFood(recovering)) foodCanopy.finish();
+            if (findFood(recovering, poultryEmergency)) {
+                foodCanopy.finish();
+                supplyEgress.releaseFood();
+            }
+        }
+        if (poultryEmergency && forage == null && scanned && !foodCanopy.active() && !supplyEgress.foodActive()
+                && (scoutHandoff || !traveling) && poultryLook.available()
+                && !c.options.attackKey.isUnbound() && huntingWeapon(true) >= 0) {
+            BlockPos foot = stoppedFoodFooting();
+            if (foot != null) {
+                float bearing = ears.takeFreshPoultryBearing();
+                if (poultryLook.begin(bearing, foot, tick, body.renderedFrame(), scoutHandoff)) {
+                    lookForPoultry(bearing);
+                    return true;
+                }
+            }
+        }
+        // A scout on reachable oak can try a few leaves now. The last stable spot
+        // in an exhausted terrain graph may be bare rock, not the tree we passed.
+        if (recovering && scoutHandoff && forage == null && !foodCanopy.active()
+                && hands.stableCraftFooting() && findAppleStand(player.getBlockPos())) {
+            healingStatus("checking reachable apple-bearing leaves before scouting onward");
         }
         if (forage != null) {
             if (continueForage(recovering)) return true;
@@ -12479,21 +12567,52 @@ final class AgentProgress {
             return recovering;
         }
         if (recovering && foodCanopy.active()) return foodCanopy.step();
+        if (recovering && supplyEgress.foodActive() && stepFoodEgress()) return true;
         if (recovering && navigateFood(null, 0) == Result.BLOCKED && scanned && navigator.foodFrontierExhausted()
                 && hands.stableCraftFooting()) {
             BlockPos foot = player.getBlockPos();
             if (findFoodGround(foot)) healingStatus("found a checked route to visible lower foraging ground");
             else if (foodCanopy.begin(foot)) healingStatus("checking a visible opening below the canopy");
             else if (findAppleStand(foot)) healingStatus("found collectible apple-bearing leaves");
+            else {
+                // Even without any surviving terrain memory after reload, an exhausted
+                // non-forage tread can request the existing bounded enclosure survey.
+                // The survey, not altitude or an unseen sky column, must prove an exit.
+                BlockState support = body.dryCaveContact(foot);
+                if (support != null && !navigator.atForagingGround(foot, support)
+                        && supplyEgress.seekFoodSurface()) healingStatus(status);
+            }
         }
         return recovering;
     }
 
-    private boolean findFood(boolean recovering) {
+    private boolean stepFoodEgress() {
+        if (!supplyEgress.step()) return false;
+        healingStatus(status);
+        return true;
+    }
+
+    private boolean ordinaryPoultryEmergency(int hunger, boolean recovering) {
+        return recovering && healing.active() && needsEmergencyFood(hunger)
+            && !FOOD.test(c.player.getOffHandStack());
+    }
+
+    private BlockPos stoppedFoodFooting() {
+        if (navigator.driving() || !hands.stableCraftFooting() || c.player.isUsingItem()
+                || c.interactionManager.isBreakingBlock()) return null;
+        BlockPos foot = c.player.getBlockPos();
+        return body.ordinaryRouteContact(foot) ? foot : null;
+    }
+
+    private void lookForPoultry(float bearing) {
+        body.pauseWork();
+        body.turnScan(bearing, AgentFoodWork.PoultryLook.PITCH);
+        healingStatus("checking the direction of a nearby chicken cluck");
+    }
+
+    private boolean findFood(boolean recovering, boolean poultryEmergency) {
         double sight = recovering ? FOOD_SIGHT : REACH - 0.25;
         ItemEntity drop = visibleMealDrop(FOOD, sight, recovering, null);
-        if (drop == null && recovering && needsEmergencyFood(c.player.getHungerManager().getFoodLevel()))
-            drop = visibleMealDrop(FLESH_MEAL, sight, true, null);
         if (drop != null) {
             startForage(Forage.DROP, drop, null, drop.getPos(), null, 140);
             return true;
@@ -12504,7 +12623,8 @@ final class AgentProgress {
             startForage(Forage.BERRIES, null, berries.getBlockPos(), berries.getPos(), AgentFoodWork.ripe(state(berries)), 180);
             return true;
         }
-        if (!c.options.attackKey.isUnbound() && huntingWeapon(recovering) >= 0) {
+        boolean canHunt = !c.options.attackKey.isUnbound() && huntingWeapon(recovering) >= 0;
+        if (canHunt) {
             Entity animal = body.visibleEntity(candidate -> foodEntityEligible(candidate)
                 && AgentFoodWork.adult(candidate) != null && dryPrey(candidate)
                 && (recovering || criticalHuntContact(candidate)), sight).orElse(null);
@@ -12512,6 +12632,23 @@ final class AgentProgress {
                 startForage(Forage.ANIMAL, animal, null, animal.getPos(), AgentFoodWork.adult(animal), 230);
                 return true;
             }
+        }
+        if (poultryEmergency) {
+            drop = visibleMealDrop(POULTRY_MEAL, sight, true, null);
+            if (drop == null && canHunt) {
+                Entity chicken = body.visibleEntity(candidate -> foodEntityEligible(candidate) && dryPrey(candidate)
+                    && AgentFoodWork.ordinaryAdult(candidate) == AgentFoodWork.Source.CHICKEN, sight).orElse(null);
+                if (chicken != null) {
+                    startForage(Forage.ANIMAL, chicken, null, chicken.getPos(), AgentFoodWork.Source.CHICKEN, 230);
+                    return true;
+                }
+            }
+        }
+        if (drop == null && recovering && needsEmergencyFood(c.player.getHungerManager().getFoodLevel()))
+            drop = visibleMealDrop(FLESH_MEAL, sight, true, null);
+        if (drop != null) {
+            startForage(Forage.DROP, drop, null, drop.getPos(), null, 140);
+            return true;
         }
         return false;
     }
@@ -12741,6 +12878,7 @@ final class AgentProgress {
                 case LANDED -> {
                     stallGuard.navigationArrival(tread.from, tread.to);
                     lastFoodVantage = tread.to;
+                    navigator.rememberForagingFoot(tread.to, tick);
                     if (seenGround || AgentFoodWork.forageGround(tread.edge.lowerSupport())) uncuedLandings = 0;
                     else uncuedLandings++;
                     // One-way receipt only; the ordinary FOOD planner resumes from this actual support.
@@ -12775,11 +12913,7 @@ final class AgentProgress {
         mealUntil = 0;
     }
 
-    private boolean eatMeal(int hunger) {
-        return eatMeal(hunger, null);
-    }
-
-    private boolean eatMeal(int hunger, Predicate<ItemStack> allowed) {
+    private boolean eatMeal(int hunger, Predicate<ItemStack> allowed, boolean recovering) {
         if (mealUntil != 0 && tick >= mealUntil) {
             mealRetry = tick + 45;
             mealUntil = 0;
@@ -12787,9 +12921,9 @@ final class AgentProgress {
             return false;
         }
         ItemStack held = c.player.getMainHandStack();
-        int slot = mealItem == null || mealItem == Items.ROTTEN_FLESH || !held.isOf(mealItem)
+        int slot = mealItem == null || mealItem == Items.ROTTEN_FLESH || mealItem == Items.CHICKEN || !held.isOf(mealItem)
                 || allowed != null && !allowed.test(held)
-            ? bestMeal(hunger, allowed) : mealSlot;
+            ? bestMeal(hunger, allowed, recovering) : mealSlot;
         if (slot < 0) {
             mealUntil = 0;
             mealItem = null;
@@ -12813,38 +12947,49 @@ final class AgentProgress {
             mealCount = hand.getCount();
             mealStartHunger = hunger;
         }
-        status = mealItem == Items.ROTTEN_FLESH ? "eating rotten flesh in an emergency"
+        status = mealItem == Items.CHICKEN ? "eating raw chicken in an emergency"
+            : mealItem == Items.ROTTEN_FLESH ? "eating rotten flesh in an emergency"
             : canRefuelHealing(hunger) ? "eating to recover health" : "eating";
-        body.turn(c.player.getYaw(), -50);
+        // A meal usually needs no camera motion. Avoid clicking an entity or
+        // planting edible block items; stop redirecting as soon as use is safe.
+        HitResult crosshair = c.crosshairTarget;
+        if (!c.player.isUsingItem() && crosshair != null && (crosshair.getType() == HitResult.Type.ENTITY
+                || crosshair.getType() == HitResult.Type.BLOCK && mealItem instanceof net.minecraft.item.BlockItem))
+            body.turn(c.player.getYaw(), -50);
         body.holdUse();
         return true;
     }
 
     private int bestMeal(int hunger) {
-        return bestMeal(hunger, null);
+        return bestMeal(hunger, null, false);
     }
 
-    private int bestMeal(int hunger, Predicate<ItemStack> allowed) {
+    private int bestMeal(int hunger, Predicate<ItemStack> allowed, boolean recovering) {
         var inv = c.player.getInventory();
         int best = -1;
-        int emergency = -1;
-        float score = -1;
-        boolean allowFlesh = needsEmergencyFood(hunger);
+        var category = AgentFoodWork.Meal.NONE;
+        float score = 0;
+        boolean emergency = needsEmergencyFood(hunger);
+        boolean allowPoultry = allowed == null && recovering && healing.active()
+            && !FOOD.test(c.player.getOffHandStack());
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
             ItemStack stack = inv.getStack(slot);
             if (allowed != null && (stack.isEmpty() || !allowed.test(stack))) continue;
-            if (allowFlesh && FLESH_MEAL.test(stack)
-                && (emergency < 0 || slot == inv.selectedSlot)) emergency = slot;
-            if (!FOOD.test(stack)) continue;
-            var food = stack.get(DataComponentTypes.FOOD);
-            int useful = Math.min(20 - hunger, food.nutrition());
-            float rank = 2 * useful + food.saturation() - 0.25f * (food.nutrition() - useful);
-            if (rank > score || rank == score && slot == inv.selectedSlot) {
+            var meal = AgentFoodWork.mealPriority(stack, emergency, allowPoultry);
+            if (meal == AgentFoodWork.Meal.NONE || meal.compareTo(category) < 0) continue;
+            float rank = 0;
+            if (meal == AgentFoodWork.Meal.SAFE) {
+                var food = stack.get(DataComponentTypes.FOOD);
+                int useful = Math.min(20 - hunger, food.nutrition());
+                rank = 2 * useful + food.saturation() - 0.25f * (food.nutrition() - useful);
+            }
+            if (meal != category || rank > score || rank == score && slot == inv.selectedSlot) {
                 best = slot;
+                category = meal;
                 score = rank;
             }
         }
-        return best >= 0 ? best : emergency;
+        return best;
     }
 
     private int foodNutrition() {
@@ -12899,7 +13044,8 @@ final class AgentProgress {
 
     private boolean matchesForageStock(ItemStack stack) {
         if (forageDropStock != null) return ItemStack.areItemsAndComponentsEqual(stack, forageDropStock);
-        return forageSource == null ? stack.isOf(Items.APPLE) : forageSource.matchesDrop(stack) && FOOD.test(stack);
+        return forageSource == null ? stack.isOf(Items.APPLE) : forageSource.matchesDrop(stack)
+            && (FOOD.test(stack) || forageSource == AgentFoodWork.Source.CHICKEN && POULTRY_MEAL.test(stack));
     }
 
     private void observeForagePickup() {
@@ -13056,8 +13202,10 @@ final class AgentProgress {
 
     private boolean huntMeal(boolean recovering) {
         if (forageAction != 0 && lookForMealDrop()) return collectMealDrop(recovering);
+        if (forageSource == AgentFoodWork.Source.CHICKEN
+                && !ordinaryPoultryEmergency(c.player.getHungerManager().getFoodLevel(), recovering)) return false;
         Entity animal = body.visibleEntity(candidate -> candidate == forageEntity
-            && AgentFoodWork.adult(candidate) == forageSource, FOOD_SIGHT).orElse(null);
+            && AgentFoodWork.ordinaryAdult(candidate) == forageSource, FOOD_SIGHT).orElse(null);
         if (animal == null) {
             return reacquireFood(forageAction == 0 ? "adult " + forageSource.subject : "meat drops", recovering,
                 forageAction == 0 ? 0.65 : 0.1);
@@ -13218,6 +13366,7 @@ final class AgentProgress {
         var result = navigateFood(forageStance.point(), forageStance.arrival(), forageStance);
         if (result == Result.ARRIVED) {
             lastFoodVantage = c.player.getBlockPos();
+            navigator.rememberForagingFoot(lastFoodVantage, tick);
             finishForage(0);
             healingStatus("reached the visible lower foraging ground");
         }

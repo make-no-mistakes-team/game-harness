@@ -43,6 +43,17 @@ final class AgentFoodWorkTest {
     }
 
     @Test
+    void ordinaryPoultryDoesNotAuthorizeAnExactForageEffect() {
+        var raw = JsonParser.parseString("""
+            {"v":1,"id":"poultry","run":"run","life":1,"epoch":1,"basisTick":10,"expiresTick":120,
+             "safetyRevision":1,"origin":"model","target":{"kind":"stock","item":"minecraft:chicken","count":1},
+             "allowedEffects":["forage:entity:minecraft:chicken"],
+             "maxBreaks":0,"maxCrafts":0,"maxPlacements":0,"costCaps":[],"reserves":[]}
+            """).getAsJsonObject();
+        assertNull(AgentWorkOrder.parse(raw, "run", "constrained").policy());
+    }
+
+    @Test
     void contactRequiresRipeFoodAndAnAxeThatCannotBreakOnTheNextHit() {
         var bush = Blocks.SWEET_BERRY_BUSH.getDefaultState();
         assertNull(AgentFoodWork.ripe(bush.with(SweetBerryBushBlock.AGE, 1)));
@@ -79,6 +90,8 @@ final class AgentFoodWorkTest {
         assertTrue(goal.canRest(18));
         assertTrue(goal.update(17, 12, 20), "falling below healing hunger resumes the food search");
         assertFalse(goal.canRest(17));
+        goal.reset();
+        assertTrue(goal.update(17, 12.2f, 20), "reopening the same injured player cannot erase the need to eat");
         assertFalse(goal.update(18, 14, 20), "ordinary work returns only after a safe recovery");
     }
 
@@ -195,6 +208,8 @@ final class AgentFoodWorkTest {
         assertFalse(stand.canTry(foot.west(), 108));
         assertFalse(stand.active(foot.east(), 108));
         assertFalse(stand.canStart(foot, 108));
+        assertFalse(stand.canStart(foot.east(), 108), "stepping beside the same crown doesn't start a fresh stand");
+        assertTrue(stand.canStart(foot.east(5), 108), "a genuinely different cluster can still be tried");
         assertTrue(stand.canStart(foot, 100 + AgentFoodWork.AppleStand.RETRY_TICKS));
     }
 
@@ -218,6 +233,60 @@ final class AgentFoodWorkTest {
             assertFalse(AgentFoodWork.fleshMeal(stack));
         }
         assertFalse(AgentFoodWork.fleshMeal(ItemStack.EMPTY));
+    }
+
+    @Test
+    void onlyOrdinaryEmergencyMealsPreferRawChickenToRottenFlesh() {
+        var raw = new ItemStack(Items.CHICKEN);
+        var cooked = new ItemStack(Items.COOKED_CHICKEN);
+        var flesh = new ItemStack(Items.ROTTEN_FLESH);
+        assertEquals(AgentFoodWork.Meal.NONE, AgentFoodWork.mealPriority(raw, false, true));
+        assertEquals(AgentFoodWork.Meal.NONE, AgentFoodWork.mealPriority(raw, true, false));
+        assertEquals(AgentFoodWork.Meal.FLESH, AgentFoodWork.mealPriority(flesh, true, false));
+        assertEquals(AgentFoodWork.Meal.POULTRY, AgentFoodWork.mealPriority(raw, true, true));
+        assertEquals(AgentFoodWork.Meal.SAFE, AgentFoodWork.mealPriority(cooked, false, false));
+        assertTrue(AgentFoodWork.mealPriority(cooked, true, true).compareTo(
+            AgentFoodWork.mealPriority(raw, true, true)) > 0);
+        assertTrue(AgentFoodWork.mealPriority(raw, true, true).compareTo(
+            AgentFoodWork.mealPriority(flesh, true, true)) > 0);
+        assertEquals(AgentFoodWork.Meal.NONE, AgentFoodWork.mealPriority(new ItemStack(Items.SPIDER_EYE), true, true));
+    }
+
+    @Test
+    void poultryHearingGrantsOneCoarseLookOnlyFromAStoppedHandoff() {
+        var look = new AgentFoodWork.PoultryLook();
+        var looking = AgentFoodWork.PoultryLook.View.LOOKING;
+        var handoff = AgentFoodWork.PoultryLook.View.SCOUT_HANDOFF;
+        var foot = new BlockPos(9, 65, -4);
+        assertFalse(look.begin(90, null, 30, 20, true), "no safe stopped foothold");
+        assertFalse(look.begin(Float.NaN, foot, 30, 20, true), "no audible bearing");
+        assertTrue(look.begin(90, foot, 30, 20, true));
+        assertEquals(90f, look.bearing());
+        assertEquals(looking, look.awaitView(foot, 31, 20, true), "a preexisting view is not the response to the cue");
+        assertEquals(handoff, look.awaitView(foot, 32, 21, true), "resume the actual deferred handoff");
+        assertFalse(look.begin(-90, foot, 33, 21, true), "fresh calls cannot trigger repeated spins in the recovery");
+        look.reset();
+        assertTrue(look.begin(-90, foot, 90, 22, true));
+        assertEquals(AgentFoodWork.PoultryLook.View.FINISHED, look.awaitView(foot.east(), 91, 23, false),
+            "leaving the stopped foothold ends the look without a completed handoff");
+    }
+
+    @Test
+    void poultryLookCannotOwnTheViewIndefinitely() {
+        var look = new AgentFoodWork.PoultryLook();
+        var foot = new BlockPos(9, 65, -4);
+        assertTrue(look.begin(90, foot, 30, 20, false));
+        for (int tick = 31; tick < 70 && look.active(); tick++) look.awaitView(foot, tick, 20, false);
+        assertFalse(look.active(), "no render must not hold input indefinitely");
+        assertFalse(look.available(), "a missed view cannot request a second turn");
+    }
+
+    @Test
+    void poultryBearingRejectsOutOfRangeAndUnlocalizableSounds() {
+        assertEquals(-45f, AgentEars.poultryBearing(4, 2, 5, 16));
+        assertTrue(Float.isNaN(AgentEars.poultryBearing(4, 2, 5, 6)));
+        assertTrue(Float.isNaN(AgentEars.poultryBearing(13, 0, 0, 16)));
+        assertTrue(Float.isNaN(AgentEars.poultryBearing(0, 2, 0, 16)));
     }
 
     @Test

@@ -3,9 +3,11 @@ package io.gameharness.survival;
 import java.util.function.Supplier;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.gui.screen.Screen;
+import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.sound.SoundInstance;
 import net.minecraft.client.sound.SoundInstanceListener;
 import net.minecraft.client.sound.WeightedSoundSet;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.sound.SoundCategory;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
@@ -15,9 +17,11 @@ final class AgentEars implements SoundInstanceListener {
     private static final long FRESH_ZOMBIE_NANOS = 900_000_000L;
     private static final long FRESH_SHOT_NANOS = 700_000_000L;
     private static final long FRESH_MELEE_NANOS = 550_000_000L;
+    private static final long FRESH_POULTRY_NANOS = 1_200_000_000L;
 
     record RangedCue(float yaw, float pitch, long heardAt) {}
     record MeleeCue(float yaw, long heardAt) {}
+    private record PoultryCue(ClientWorld world, ClientPlayerEntity player, float bearing, long heardAt) {}
 
     enum ZombieCue {
         GROAN("checking a nearby zombie groan"),
@@ -44,6 +48,8 @@ final class AgentEars implements SoundInstanceListener {
     private float towardZombie;
     private RangedCue rangedCue;
     private MeleeCue meleeCue;
+    private SoundInstance pendingPoultrySound;
+    private PoultryCue pendingPoultryCue, poultryCue;
 
     AgentEars(MinecraftClient client, Supplier<Screen> renderedScreen) {
         this.client = client;
@@ -53,6 +59,10 @@ final class AgentEars implements SoundInstanceListener {
     @Override public void onSoundPlayed(SoundInstance sound, WeightedSoundSet sounds, float range) {
         if (client.player == null || sound.isRelative() || !sound.getId().getNamespace().equals("minecraft")) return;
         String id = sound.getId().getPath();
+        if (id.equals("entity.chicken.ambient")) {
+            if (escapeTicks == 0) onPoultrySound(sound, range);
+            return;
+        }
         boolean fuse = id.equals("entity.creeper.primed");
         boolean explosion = id.equals("entity.generic.explode") && lastFuseNs != 0
             && System.nanoTime() - lastFuseNs < 4_000_000_000L;
@@ -85,6 +95,8 @@ final class AgentEars implements SoundInstanceListener {
             zombieCue = null;
             rangedCue = null;
             meleeCue = null;
+            pendingPoultrySound = null;
+            pendingPoultryCue = poultryCue = null;
         } else if (explosion) {
             if (explosionCue == null) explosionCue = soundCue(sound);
         } else if (shot) {
@@ -102,6 +114,39 @@ final class AgentEars implements SoundInstanceListener {
                 zombieCue = cue;
             }
         }
+    }
+
+    private void onPoultrySound(SoundInstance sound, float range) {
+        if (client.world == null || !client.player.isAlive() || client.currentScreen != null
+                || sound.getCategory() != SoundCategory.NEUTRAL || sound.getVolume() <= 0
+                || client.options.getSoundVolume(SoundCategory.MASTER) <= 0
+                || client.options.getSoundVolume(SoundCategory.NEUTRAL) <= 0) return;
+        var ear = client.getSoundManager().getListenerTransform().position();
+        float bearing = poultryBearing(sound.getX() - ear.x, sound.getY() - ear.y, sound.getZ() - ear.z, range);
+        if (!Float.isFinite(bearing)) return;
+        pendingPoultryCue = new PoultryCue(client.world, client.player, bearing, System.nanoTime());
+        pendingPoultrySound = sound;
+    }
+
+    static float poultryBearing(double dx, double dy, double dz, float range) {
+        double inRange = Math.min(12, range), lateral = dx * dx + dz * dz;
+        return inRange > 0 && lateral >= 0.09 && lateral + dy * dy < inRange * inRange
+            ? coarseBearing(dx, dz) : Float.NaN;
+    }
+
+    void confirmPoultryPlayback() {
+        if (pendingPoultrySound == null) return;
+        // The vanilla callback precedes channel allocation and can fire for a sound that never plays.
+        if (client.getSoundManager().isPlaying(pendingPoultrySound)) poultryCue = pendingPoultryCue;
+        pendingPoultrySound = null;
+        pendingPoultryCue = null;
+    }
+
+    float takeFreshPoultryBearing() {
+        PoultryCue cue = poultryCue;
+        poultryCue = null;
+        return cue != null && cue.world() == client.world && cue.player() == client.player
+            && System.nanoTime() - cue.heardAt() <= FRESH_POULTRY_NANOS ? cue.bearing() : Float.NaN;
     }
 
     private SoundCue soundCue(SoundInstance sound) {

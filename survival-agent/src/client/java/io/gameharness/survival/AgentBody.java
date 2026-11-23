@@ -701,7 +701,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 use = player.isUsingItem() || actual != null && actual.getType() == HitResult.Type.MISS
                     || actual instanceof BlockHitResult && player.isSneaking()
                         && !(player.getMainHandStack().getItem() instanceof BlockItem);
-                crouch |= actual != null && actual.getType() == HitResult.Type.BLOCK;
+                crouch |= !player.isUsingItem() && actual != null && actual.getType() == HitResult.Type.BLOCK;
             } else if (striking != null) {
                 if (strikeContact(striking, actual)
                         && striking.isAlive() && !player.isUsingItem()

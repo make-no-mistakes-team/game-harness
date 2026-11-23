@@ -11,6 +11,7 @@ import java.util.Arrays;
 /** Directed, rolling dry-foot memory. Only its adapter can see, settle on, or drive an edge. */
 final class AgentOrdinaryRoute {
     private static final int NODES = 192, SLOTS = 12, SIGHT_TICKS = 100;
+    private static final int UNCUED_FOOD_DROP = 2;
     private final long[] feet = new long[NODES + 1];
     private final short[] index = new short[512];
     private final short[] edges = new short[(NODES + 1) * SLOTS];
@@ -20,6 +21,8 @@ final class AgentOrdinaryRoute {
     private final boolean[] grounded = new boolean[NODES + 1];
     private final int[] visited = new int[NODES + 1];
     private final int[] looked = new int[NODES + 1];
+    private final int[] forageSeen = new int[NODES + 1];
+    private final boolean[] foodVisited = new boolean[NODES + 1], foodLooked = new boolean[NODES + 1];
     private final short[] queue = new short[NODES], parent = new short[NODES + 1], depth = new short[NODES + 1];
     private final long[] suffix = new long[NODES];
     private final boolean[] connected = new boolean[NODES + 1];
@@ -29,7 +32,9 @@ final class AgentOrdinaryRoute {
     private int nodes, intent = 1, plans, revision, examinedRevision, examinedTick, examinedRetry;
     private int cursor, length;
     private long origin = NO_CELL, endpoint = NO_CELL;
-    private boolean directed, exact;
+    private long forageFoot = NO_CELL;
+    private int firstFoodY = Integer.MIN_VALUE;
+    private boolean directed, exact, foodSearch, returningForFood;
     private double goalX, goalZ, radiusSquared, minY, maxY, axisX, axisZ;
 
     void clear() {
@@ -40,15 +45,20 @@ final class AgentOrdinaryRoute {
         Arrays.fill(grounded, false);
         Arrays.fill(visited, 0);
         Arrays.fill(looked, 0);
+        Arrays.fill(forageSeen, 0);
         nodes = plans = revision = 0;
         connectedFrom = NO_CELL;
         intent = 1;
+        forageFoot = NO_CELL;
+        foodSearch = false;
+        resetFoodSearch();
         renew();
     }
 
     void destination(double x, double z, double arrival, double minFootY, double maxFootY) {
         renew();
         directed = true;
+        foodSearch = false;
         goalX = x;
         goalZ = z;
         radiusSquared = arrival * arrival;
@@ -59,8 +69,53 @@ final class AgentOrdinaryRoute {
     void explore(double dx, double dz) {
         renew();
         directed = false;
+        foodSearch = false;
         axisX = dx;
         axisZ = dz;
+    }
+
+    void exploreFood(double dx, double dz) {
+        explore(dx, dz);
+        foodSearch = true;
+    }
+
+    void resetFoodSearch() {
+        Arrays.fill(foodVisited, false);
+        Arrays.fill(foodLooked, false);
+        firstFoodY = Integer.MIN_VALUE;
+        returningForFood = false;
+        if (foodSearch) clearSuffix();
+    }
+
+    /** Record an occupied resource habitat, not merely a sighting of one across a gap. */
+    void rememberForagingFoot(long foot, int tick) {
+        contact(foot, tick);
+        if (forageFoot == foot) return;
+        if (returningForFood) clearSuffix();
+        if (forageFoot == NO_CELL || y(forageFoot) != y(foot)) revision++;
+        forageFoot = foot;
+        returningForFood = false;
+    }
+
+    boolean atForagingFoot(long foot) { return foot == forageFoot; }
+
+    boolean returningForFood() { return foodSearch && returningForFood; }
+
+    private int foodFloor() { return (forageFoot == NO_CELL ? firstFoodY : y(forageFoot)) - UNCUED_FOOD_DROP; }
+
+    void witnessForagingTop(long foot, int tick) {
+        int n = find(foot);
+        if (n == 0) return;
+        if (!freshForagingTop(n, tick)) revision++;
+        forageSeen[n] = tick;
+    }
+
+    private boolean freshForagingTop(int n, int tick) {
+        return forageSeen[n] != 0 && tick - forageSeen[n] <= SIGHT_TICKS;
+    }
+
+    private boolean outsideScoutBand(int n, int tick, int floor) {
+        return floor != Integer.MIN_VALUE && y(feet[n]) < floor && !freshForagingTop(n, tick);
     }
 
     private void renew() {
@@ -116,7 +171,7 @@ final class AgentOrdinaryRoute {
                 axisZ = z(to) - z(from);
             }
             origin = to;
-            visited[find(to)] = intent;
+            markVisited(find(to));
             cursor++;
             examinedRevision = -1;
         }
@@ -162,15 +217,23 @@ final class AgentOrdinaryRoute {
 
     boolean canLook(long foot) {
         int node = find(foot);
-        return node != 0 && looked[node] != intent;
+        return node != 0 && !looked(node);
     }
 
     void consumeLook(long foot) {
         int node = find(foot);
-        if (node != 0 && looked[node] != intent) {
-            looked[node] = intent;
+        if (node != 0 && !looked(node)) {
+            if (foodSearch) foodLooked[node] = true;
+            else looked[node] = intent;
             revision++;
         }
+    }
+
+    private boolean looked(int node) { return foodSearch ? foodLooked[node] : looked[node] == intent; }
+
+    private void markVisited(int node) {
+        if (foodSearch) foodVisited[node] = true;
+        else visited[node] = intent;
     }
 
     long endpoint() { return endpoint; }
@@ -190,12 +253,25 @@ final class AgentOrdinaryRoute {
     void plan(long current, int tick) {
         int start = find(current);
         if (start == 0) return;
+        if (foodSearch) {
+            if (firstFoodY == Integer.MIN_VALUE) firstFoodY = y(current);
+            // A targeted pickup, a fall, or a restored stance can be below the
+            // scouting band. Return along an actual connected route, not a proxy.
+            boolean recover = forageFoot != NO_CELL && current != forageFoot
+                && (returningForFood || y(current) < foodFloor());
+            if (recover != returningForFood) {
+                returningForFood = recover;
+                clearSuffix();
+            }
+        }
         if (origin != current) {
             clearSuffix();
             origin = current;
         }
-        visited[start] = intent;
-        boolean keep = remaining() > 0 && suffixUsable(current, tick);
+        markVisited(start);
+        boolean returning = returningForFood();
+        int scoutFloor = foodSearch && !returning ? foodFloor() : Integer.MIN_VALUE;
+        boolean keep = remaining() > 0 && suffixUsable(current, tick, scoutFloor);
         if (keep && (exact || !directed || examinedRevision == revision)) return;
         if (exact && endpoint == current) return;
         if (!keep && remaining() > 0) examinedRevision = -1;
@@ -216,21 +292,23 @@ final class AgentOrdinaryRoute {
         for (int head = 0; head < tail; head++) {
             int at = queue[head];
             long foot = feet[at];
-            if (fits(foot)) {
+            if (returning ? foot == forageFoot : fits(foot)) {
                 goal = at;
                 break;
             }
-            if (visited[at] != intent) {
+            if (!returning && !(foodSearch ? foodVisited[at] : visited[at] == intent)) {
                 double dx = x(foot) - x(current), dz = z(foot) - z(current);
                 double score = directed
                     ? Math.hypot(x(foot) + 0.5 - goalX, z(foot) + 0.5 - goalZ)
                         + 1.3 * Math.max(0, Math.max(minY - y(foot), y(foot) - maxY)) + depth[at] * 0.20
                     : -dx * axisX - dz * axisZ - 0.55 * Math.hypot(dx, dz) + depth[at] * 0.28;
+                if (foodSearch && !freshForagingTop(at, tick)) score += 1.75 * Math.max(0, y(current) - y(foot));
                 if (foot == endpoint || (frontier == 0 || feet[frontier] != endpoint) && score < best) {
                     frontier = at;
                     best = score;
                 }
-            } else if (!directed && looked[start] == intent && grounded[at] && looked[at] != intent) {
+            } else if (!directed && !returning && looked(start) && grounded[at] && !looked(at)
+                    && (!foodSearch || y(foot) >= y(current) || freshForagingTop(at, tick))) {
                 // All nearby treads may already be walked. A dry junction we
                 // crossed without looking can expose new ground from a different
                 // angle. Do not turn around for another view one block away.
@@ -244,7 +322,7 @@ final class AgentOrdinaryRoute {
             int first = at * SLOTS;
             for (int edge = first; edge < first + SLOTS; edge++) {
                 short next = edges[edge];
-                if (next == 0 || depth[next] >= 0) continue;
+                if (next == 0 || depth[next] >= 0 || outsideScoutBand(next, tick, scoutFloor)) continue;
                 if (!usable(edge, tick)) {
                     if (seen[edge] == Integer.MAX_VALUE) examinedRetry = Math.min(examinedRetry, retryAfter[edge]);
                     continue;
@@ -272,12 +350,13 @@ final class AgentOrdinaryRoute {
         plans++;
     }
 
-    private boolean suffixUsable(long from, int tick) {
+    private boolean suffixUsable(long from, int tick, int scoutFloor) {
         for (int i = cursor; i < length; i++) {
             long to = suffix[i];
             int n = find(from), slot = AgentRouteGraph.slot(from, to);
             int edge = n * SLOTS + slot;
-            if (n == 0 || slot < 0 || edges[edge] == 0 || feet[edges[edge]] != to || !usable(edge, tick))
+            if (n == 0 || slot < 0 || edges[edge] == 0 || feet[edges[edge]] != to || !usable(edge, tick)
+                    || outsideScoutBand(edges[edge], tick, scoutFloor))
                 return false;
             from = to;
         }
@@ -347,7 +426,8 @@ final class AgentOrdinaryRoute {
             clearEdge(victim * SLOTS + slot);
         }
         grounded[victim] = false;
-        visited[victim] = looked[victim] = 0;
+        visited[victim] = looked[victim] = forageSeen[victim] = 0;
+        foodVisited[victim] = foodLooked[victim] = false;
         revision++;
         return victim;
     }

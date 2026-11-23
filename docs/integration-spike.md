@@ -158,8 +158,11 @@ resuming the stone job. From a safe stand beside an oak or dark oak it
 can try several leaves for an apple; breaking a leaf does not mean food
 dropped. A visible meal takes priority over trying another leaf.
 An empty view does not authorize an attack.
-It prefers safe food to rotten flesh. Pickup, eating and health
-recovery are separate outcomes.
+It prefers safe food to rotten flesh. It can eat without turning away
+from the scene unless the use key would interact with an entity or
+place the food as a block. Pickup, eating and health recovery are
+separate outcomes. Reopening a world with low health and too little
+food to regenerate does not turn the recovery back into a mining job.
 It need not abandon work on a dry bank to chase an unarmed drowned
 swimming below it. A visible trident or an actual hit changes that decision.
 Without a shield, the player can keep moving along a checked retreat

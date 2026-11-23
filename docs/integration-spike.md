@@ -68,6 +68,15 @@ untouched. Minecraft may have saved less than the recording shows.
 Only the inventory and position in the loaded world count. After this
 attempt closes normally, use `--continue-from` again.
 
+If a primary runner died without a reboot, `--continue-from` still
+requires a clean close. For a run started in an isolated user systemd
+scope, set `SURVIVAL_AGENT_ORPHAN_SCOPE` to that original scope and
+use `--recover-orphan-autosave RUN_BASENAME` instead. Start the recovery
+on a different private display. The runner must prove that the old
+scope stopped and hold the vanilla world lock while making its copy.
+An unrelated ordinary world in the second slot can keep playing.
+Recovery neither supplies a missing result nor preserves unfinished work.
+
 The player gathers supplies for the next stretch of mine, keeping
 enough light for the return. If it lands partly on a stair edge, it can
 ease inward on the dry block supporting its feet before setting up a

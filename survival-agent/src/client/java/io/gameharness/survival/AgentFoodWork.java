@@ -5,6 +5,7 @@ import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.CaveVines;
 import net.minecraft.block.SweetBerryBushBlock;
+import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LivingEntity;
@@ -14,7 +15,7 @@ import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.ItemTags;
 
-/** One model-authorized local food source, independent of general break and attack grants. */
+/** Local meal policy and exact model-authorized food sources. */
 final class AgentFoodWork {
     static final String EFFECT = "forage:";
     static final int MAX_SWINGS = 4;
@@ -26,24 +27,30 @@ final class AgentFoodWork {
         SWEET_BERRIES("block", "sweet_berry_bush", Items.SWEET_BERRIES),
         GLOW_VINES("block", "cave_vines", Items.GLOW_BERRIES),
         GLOW_PLANT("block", "cave_vines_plant", Items.GLOW_BERRIES),
-        COW("entity", "cow", Items.BEEF),
-        MOOSHROOM("entity", "mooshroom", Items.BEEF),
-        PIG("entity", "pig", Items.PORKCHOP),
-        SHEEP("entity", "sheep", Items.MUTTON),
-        RABBIT("entity", "rabbit", Items.RABBIT);
+        COW("entity", "cow", Items.BEEF, Items.COOKED_BEEF),
+        MOOSHROOM("entity", "mooshroom", Items.BEEF, Items.COOKED_BEEF),
+        PIG("entity", "pig", Items.PORKCHOP, Items.COOKED_PORKCHOP),
+        SHEEP("entity", "sheep", Items.MUTTON, Items.COOKED_MUTTON),
+        RABBIT("entity", "rabbit", Items.RABBIT, Items.COOKED_RABBIT);
 
         final String subject, effect;
-        final Item item;
+        final Item item, cooked;
         final ItemStack stock;
 
         Source(String kind, String name, Item item) {
+            this(kind, name, item, null);
+        }
+
+        Source(String kind, String name, Item item, Item cooked) {
             subject = kind + ":minecraft:" + name;
             effect = EFFECT + subject;
             this.item = item;
+            this.cooked = cooked;
             stock = new ItemStack(item);
         }
 
         boolean animal() { return ordinal() >= COW.ordinal(); }
+        boolean matchesDrop(ItemStack stack) { return stack.isOf(item) || cooked != null && stack.isOf(cooked); }
     }
 
     private static final Source[] SOURCES = Source.values();
@@ -71,6 +78,38 @@ final class AgentFoodWork {
         return null;
     }
 
+    static boolean criticalForage(int hunger, float health, boolean safe) {
+        return safe && (hunger == 0 || hunger < 18 && health <= 7);
+    }
+
+    static boolean canPauseRoute(int hunger, boolean waitingForEvidence, boolean critical) {
+        return critical || hunger <= 10 && waitingForEvidence;
+    }
+
+    static boolean safeMeal(ItemStack stack) {
+        return positiveNutrition(stack) && !stack.isOf(Items.ROTTEN_FLESH) && !stack.isOf(Items.SPIDER_EYE)
+            && !stack.isOf(Items.POISONOUS_POTATO) && !stack.isOf(Items.PUFFERFISH)
+            && !stack.isOf(Items.CHICKEN) && !stack.isOf(Items.SUSPICIOUS_STEW) && !stack.isOf(Items.CHORUS_FRUIT);
+    }
+
+    static boolean fleshMeal(ItemStack stack) {
+        return stack.isOf(Items.ROTTEN_FLESH) && positiveNutrition(stack);
+    }
+
+    private static boolean positiveNutrition(ItemStack stack) {
+        var food = stack.get(DataComponentTypes.FOOD);
+        return !stack.isEmpty() && food != null && food.nutrition() > 0;
+    }
+
+    static boolean improvisedWeapon(ItemStack stack) {
+        return stack.isIn(ItemTags.PICKAXES) && Registries.ITEM.getId(stack.getItem()).getNamespace().equals("minecraft")
+            && stack.getMaxDamage() - stack.getDamage() > 2;
+    }
+
+    static boolean criticalHuntContact(double squaredDistance, double reach, boolean dryTarget) {
+        return dryTarget && reach > 0 && squaredDistance <= reach * reach;
+    }
+
     static boolean safeWeapon(ItemStack stack) {
         // Unlike a charged sword swing, an axe cannot sweep other entities.
         // Reserve more than the maximum two wear of a vanilla axe hit.
@@ -81,6 +120,10 @@ final class AgentFoodWork {
 
     static int pickupGain(int before, int carried, boolean removed, boolean matchingStock) {
         return removed || matchingStock ? Math.max(0, carried - before) : 0;
+    }
+
+    static int ordinaryPickupGain(int before, int carried, int witnessed, int remaining) {
+        return Math.max(0, Math.min(carried - before, witnessed - remaining));
     }
 
     static boolean policy(Source source, AgentWorkOrder.Target target, Map<Item, Integer> caps,

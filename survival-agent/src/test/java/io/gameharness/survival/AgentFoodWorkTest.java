@@ -60,4 +60,50 @@ final class AgentFoodWorkTest {
         assertEquals(2, AgentFoodWork.pickupGain(0, 2, false, true));
         assertEquals(0, AgentFoodWork.pickupGain(2, 1, true, true), "a later meal is not additional loot");
     }
+
+    @Test
+    void aCriticallyWoundedPlayerBelowHealingHungerCanPauseABlockedRouteOnSafeFooting() {
+        assertTrue(AgentFoodWork.canPauseRoute(17, false, AgentFoodWork.criticalForage(17, 0.833f, true)));
+        assertFalse(AgentFoodWork.canPauseRoute(17, false, AgentFoodWork.criticalForage(17, 0.833f, false)));
+        assertFalse(AgentFoodWork.canPauseRoute(17, true, AgentFoodWork.criticalForage(17, 20, true)));
+        assertFalse(AgentFoodWork.canPauseRoute(18, false, AgentFoodWork.criticalForage(18, 0.833f, true)));
+        assertTrue(AgentFoodWork.canPauseRoute(10, true, AgentFoodWork.criticalForage(10, 20, true)));
+        assertFalse(AgentFoodWork.canPauseRoute(10, false, AgentFoodWork.criticalForage(10, 20, true)));
+    }
+
+    @Test
+    void aRiskyMealIsLimitedToActualRottenFlesh() {
+        var flesh = new ItemStack(Items.ROTTEN_FLESH, 2);
+        assertFalse(AgentFoodWork.safeMeal(flesh));
+        assertTrue(AgentFoodWork.fleshMeal(flesh));
+        assertTrue(AgentFoodWork.safeMeal(new ItemStack(Items.SWEET_BERRIES)));
+        for (var item : new net.minecraft.item.Item[] {Items.SPIDER_EYE, Items.POISONOUS_POTATO,
+                Items.PUFFERFISH, Items.CHICKEN, Items.SUSPICIOUS_STEW, Items.CHORUS_FRUIT, Items.DIRT}) {
+            var stack = new ItemStack(item);
+            assertFalse(AgentFoodWork.safeMeal(stack));
+            assertFalse(AgentFoodWork.fleshMeal(stack));
+        }
+        assertFalse(AgentFoodWork.fleshMeal(ItemStack.EMPTY));
+    }
+
+    @Test
+    void anExactDropReceiptRequiresBothMatchingStockGainAndWitnessedDepletion() {
+        assertEquals(1, AgentFoodWork.ordinaryPickupGain(0, 1, 3, 2));
+        assertEquals(2, AgentFoodWork.ordinaryPickupGain(0, 3, 2, 0), "never count more than the sighting held");
+        assertEquals(0, AgentFoodWork.ordinaryPickupGain(0, 2, 3, 3), "unrelated gain is not the sighted drop");
+        assertEquals(0, AgentFoodWork.ordinaryPickupGain(1, 1, 2, 0), "a vanishing drop is not a pickup");
+    }
+
+    @Test
+    void anImprovisedHuntCanUseAWoodenPickButCannotBreakItOrChase() {
+        var pick = new ItemStack(Items.WOODEN_PICKAXE);
+        assertTrue(AgentFoodWork.improvisedWeapon(pick));
+        pick.setDamage(pick.getMaxDamage() - 2);
+        assertFalse(AgentFoodWork.improvisedWeapon(pick));
+        assertFalse(AgentFoodWork.improvisedWeapon(ItemStack.EMPTY));
+        assertFalse(AgentFoodWork.improvisedWeapon(new ItemStack(Items.STICK)));
+        assertTrue(AgentFoodWork.criticalHuntContact(6, 2.8, true));
+        assertFalse(AgentFoodWork.criticalHuntContact(9, 2.8, true));
+        assertFalse(AgentFoodWork.criticalHuntContact(6, 2.8, false));
+    }
 }

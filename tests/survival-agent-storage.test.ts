@@ -43,6 +43,65 @@ const commands = {
       owner.close(); diagnostic.close(); ledger.close();
     }
   `,
+  orphanAdmission: `
+    const { Database } = await import("bun:sqlite");
+    const second = await admitRun(17, "diagnostic");
+    const root = "local/survival-pilot/";
+    const primary = new Database(root + "owner.sqlite");
+    const ledger = new Database(root + "admission.sqlite");
+    ledger.exec("UPDATE reservations SET survival = 7, generation = generation + 1");
+    const state = () => ledger.query("SELECT generation, survival, diagnostic FROM reservations").get();
+    const scenario = process.env.CASE;
+    let proofComplete = false;
+    const proof = {
+      kind: "same-boot-orphan-autosave",
+      sourceRun: "2026-11-23T14-05-01.000Z-diamond-Ab1Cd2",
+      priorReserveBytes: scenario === "orphan-wrong-charge" ? 8 : 7,
+      signal: new AbortController().signal,
+      assertSource() {
+        if (scenario === "orphan-wrong-source" || scenario === "orphan-source-raced" && proofComplete)
+          throw new Error("The primary source marker changed.");
+      },
+      async assertQuiescent() {
+        if (scenario === "orphan-unknown-writer") throw new Error("Cannot prove source writers are gone.");
+        proofComplete = true;
+        try {
+          primary.exec("BEGIN IMMEDIATE");
+        } catch (error) {
+          if (error.code === "SQLITE_BUSY") return;
+          throw error;
+        }
+        primary.exec("ROLLBACK");
+        throw new Error("The final evidence check did not hold the primary lock.");
+      },
+    };
+    if (scenario === "orphan-active-owner") primary.exec("BEGIN IMMEDIATE");
+    if (scenario === "orphan-unlocked-secondary") {
+      second();
+      ledger.exec("UPDATE reservations SET diagnostic = 17, generation = generation + 1");
+    }
+    try {
+      // Equal charges must still consume the older source exactly once.
+      const release = await admitRun(7, "survival", proof);
+      const admitted = state();
+      let secondLocked = false;
+      try { (await admitRun(19, "diagnostic"))(); }
+      catch (error) { secondLocked = error.message.includes("already has an active run"); }
+      release();
+      const released = state();
+      if (scenario === "orphan-replay") {
+        // Simulate a new equal-byte stranded charge without a matching new live marker.
+        ledger.exec("UPDATE reservations SET survival = 7, generation = generation + 1");
+        (await admitRun(7, "survival", proof))();
+      }
+      second();
+      console.log(JSON.stringify({ admitted, secondLocked, released, drained: state() }));
+    } catch (error) {
+      console.error(error.message);
+      console.log(JSON.stringify(state()));
+      process.exitCode = 1;
+    } finally { primary.close(); ledger.close(); second(); }
+  `,
   concurrentAdmission: `
     const { Database } = await import("bun:sqlite");
     const primary = await admitRun(11);
@@ -223,6 +282,34 @@ test("opt-in recovery replaces exactly the attributed unlocked reservation and r
     released: { generation: 12, survival: 0, diagnostic: 0 },
   });
 });
+
+test("same-boot recovery reattributes only primary storage while the second owner remains charged and locked", async () => {
+  const result = await withScanner("orphan", "orphanAdmission");
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 2 });
+  expect(JSON.parse(result.stdout)).toEqual({
+    admitted: { generation: 3, survival: 7, diagnostic: 17 },
+    secondLocked: true,
+    released: { generation: 4, survival: 0, diagnostic: 17 },
+    drained: { generation: 5, survival: 0, diagnostic: 0 },
+  });
+});
+
+for (const [scenario, reason, attempts, generation] of [
+  ["orphan-wrong-charge", "not attributable", 1, 2],
+  ["orphan-active-owner", "already has an active run", 1, 2],
+  ["orphan-wrong-source", "source marker changed", 1, 2],
+  ["orphan-source-raced", "source marker changed", 2, 2],
+  ["orphan-unknown-writer", "Cannot prove source writers are gone", 2, 2],
+  ["orphan-unlocked-secondary", "diagnostic run left an unreleased reservation", 1, 4],
+  ["orphan-replay", "already reattributed", 2, 5],
+] as const) {
+  test(`same-boot recovery refuses ${scenario} without altering either charge`, async () => {
+    const result = await withScanner(scenario, "orphanAdmission");
+    expect(result).toMatchObject({ code: 1, attempts });
+    expect(result.stderr).toContain(reason);
+    expect(JSON.parse(result.stdout)).toEqual({ generation, survival: 7, diagnostic: 17 });
+  });
+}
 
 test("the primary and second physical owner share one ledger without releasing each other's reservations", async () => {
   const result = await withScanner("concurrent", "concurrentAdmission");

@@ -4,22 +4,28 @@ import path from "node:path";
 import { z } from "zod";
 import { SURVIVAL_AGENT_GOALS as GOALS, type SurvivalAgentGoal as Goal } from "../src/shared/survival-agent-ui.ts";
 import { offlineUuid } from "./diagnostic-pool.ts";
+import { openOrphanSource, orphanScopeName, type SystemdEvidenceSource } from "./orphan-source.ts";
 
 export const ordinaryRunBasename = new RegExp(
   `^\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}\\.\\d{3}Z-(?:${GOALS.join("|")})-[A-Za-z0-9]{6}$`,
 );
 
 const isoTime = z.iso.datetime();
-const crashProvenance = z.object({
-  kind: z.literal("previous-boot-crash-autosave"),
+const recoveryFields = {
   sourceRun: z.string().regex(ordinaryRunBasename),
   sourceLastObservedTick: z.int().positive(),
   sourceLastActivityAt: isoTime,
   sourceSaveLastWriteAt: isoTime,
-  recoveryKernelBootAt: isoTime,
   possibleProgressLoss: z.literal(true),
   carriedClaim: z.literal(null),
+};
+const crashProvenance = z.object({
+  kind: z.literal("previous-boot-crash-autosave"), ...recoveryFields, recoveryKernelBootAt: isoTime,
 });
+export const orphanAutosaveProvenance = z.object({
+  kind: z.literal("same-boot-orphan-autosave"), ...recoveryFields, sourceScope: z.string().regex(orphanScopeName),
+});
+const autosaveProvenance = z.union([crashProvenance, orphanAutosaveProvenance]);
 const declarationSchema = z.object({
   schemaVersion: z.literal(1),
   startedAt: isoTime,
@@ -47,6 +53,10 @@ const historySchema = z.object({
   at: isoTime, elapsedMs: z.int().nonnegative(), event: z.string(), tick: z.int().nonnegative().optional(),
   parentRun: z.string().optional(), crashAutosave: crashProvenance.optional(),
 });
+const orphanDeclaration = declarationSchema.extend({
+  world: declarationSchema.shape.world.extend({ crashAutosave: autosaveProvenance.optional() }),
+});
+const orphanHistory = historySchema.extend({ crashAutosave: autosaveProvenance.optional() });
 const requiredHistory = ["declared", "server_started", "server_ready", "recorder_started", "client_started", "agent_ready"];
 const closingEvents = new Set(["closed", "server_drained", "operator_stop_accepted", "work_program_goal"]);
 const regionFile = /^r\.-?\d+\.-?\d+\.mca$/;
@@ -64,21 +74,61 @@ export async function currentKernelBootMs() {
   return bootMs;
 }
 
-/**
- * Admission evidence only. Never decode world, chunk or player NBT or pass any
- * prior live state to the new actor. The kernel time is supplied by the runner.
- */
-export async function readCrashAutosave({
-  runs, historicRuns, live, run, goal, bootMs, signal,
-}: {
-  runs: string; historicRuns: string; live: string; run: string; goal: Goal; bootMs: number; signal: AbortSignal;
-}) {
+type RecoveryInput = { runs: string; historicRuns: string; live: string; run: string; goal: Goal; signal: AbortSignal };
+
+/** Admission evidence only. Never deserialize world, chunk or player state. */
+export async function readCrashAutosave(input: RecoveryInput & { bootMs: number }) {
+  const { source, evidence, startedAtMs, priorReserveBytes } = await readAutosaveEvidence(input, input.bootMs);
+  return {
+    ...source, reservation: { bootMs: input.bootMs, startedAtMs, priorReserveBytes },
+    provenance: {
+      kind: "previous-boot-crash-autosave", ...evidence, recoveryKernelBootAt: new Date(input.bootMs).toISOString(),
+    } satisfies z.infer<typeof crashProvenance>,
+  };
+}
+
+export async function openOrphanAutosave(input: RecoveryInput & { scope?: string }, systemd?: SystemdEvidenceSource) {
+  const { run, signal } = input;
+  let fence: Awaited<ReturnType<typeof openOrphanSource>> | undefined;
+  try {
+    if (!ordinaryRunBasename.test(run)) throw new Error("invalid ordinary run name");
+    const bootMs = await currentKernelBootMs();
+    fence = await openOrphanSource({
+      ...input, bootMs, sourceGoal: run.slice(25, -7), ordinaryRunBasename,
+      scope: input.scope ?? process.env.SURVIVAL_AGENT_ORPHAN_SCOPE,
+    }, systemd);
+    const { source, evidence, startedAtMs, priorReserveBytes } = await readAutosaveEvidence(input, bootMs, fence);
+    await fence.assertQuiescent();
+    fence.assertSource();
+    fence.assertLatestPrimary();
+    return {
+      ...source, ...fence,
+      reservation: { kind: "same-boot-orphan-autosave" as const, startedAtMs, priorReserveBytes },
+      provenance: {
+        kind: "same-boot-orphan-autosave", ...evidence, sourceScope: fence.scope,
+      } satisfies z.infer<typeof orphanAutosaveProvenance>,
+    };
+  } catch (error) {
+    await fence?.close();
+    signal.throwIfAborted();
+    throw new Error(`Cannot recover orphan autosave ${run}: ${recoveryReason(error)}.`);
+  }
+}
+
+function recoveryReason(error: unknown) {
+  return error instanceof Error && !(error instanceof z.ZodError) &&
+    !(error instanceof SyntaxError) && !("code" in error) ? error.message : "source records are missing or malformed";
+}
+
+async function readAutosaveEvidence({
+  runs, historicRuns, live, run, goal, signal,
+}: RecoveryInput, bootMs: number, orphan?: Awaited<ReturnType<typeof openOrphanSource>>) {
   const reject = (reason: string): never => { throw new Error(reason); };
   try {
     const uid = process.getuid?.();
-    const beforeBoot = (entry: { mtimeMs: number; ctimeMs: number }) => {
+    const activityTime = (entry: { mtimeMs: number; ctimeMs: number }) => {
       const time = Math.max(entry.mtimeMs, entry.ctimeMs);
-      if (!(time < bootMs)) reject("a source artifact changed during this boot");
+      if (!orphan && !(time < bootMs)) reject("a source artifact changed during this boot");
       return time;
     };
     if (!ordinaryRunBasename.test(run)) reject("invalid ordinary run name");
@@ -102,16 +152,18 @@ export async function readCrashAutosave({
       if (!entry.isDirectory() || (directory === root && (entry.mode & 0o077)))
         reject("the expected private ordinary run tree was not found");
     }
-    const names = (await readdir(runs)).filter(name => ordinaryRunBasename.test(name));
-    if (names.some(name => name !== run && name.slice(0, 24) >= run.slice(0, 24)) ||
-        await lstat(path.join(historicRuns, run)).then(() => true, error => {
-          if (error.code !== "ENOENT") throw error;
-          return false;
-        })) reject("the source is not the unique latest ordinary run");
+    if (!orphan) {
+      const names = (await readdir(runs)).filter(name => ordinaryRunBasename.test(name));
+      if (names.some(name => name !== run && name.slice(0, 24) >= run.slice(0, 24)) ||
+          await lstat(path.join(historicRuns, run)).then(() => true, error => {
+            if (error.code !== "ENOENT") throw error;
+            return false;
+          })) reject("the source is not the unique latest ordinary run");
+    }
 
     const file = async <T>(name: string, inspect: (handle: Awaited<ReturnType<typeof open>>, size: number) => Promise<T>) => {
       const entry = await check(name);
-      beforeBoot(entry);
+      activityTime(entry);
       if (!entry.isFile() || !entry.size) reject("a required source artifact is not a nonempty regular file");
       const handle = await open(name, readFlags);
       try {
@@ -135,7 +187,7 @@ export async function readCrashAutosave({
     const marker = z.object({ run: z.literal(run), active: z.literal(true) }).safeParse(await parse(live));
     if (!marker.success || (markerEntry.mode & 0o077)) reject("the previous live marker does not identify this source");
     if ((await readdir(root)).includes("outcome.json")) reject("the source already has an outcome");
-    const declaration = declarationSchema.safeParse(await parse(path.join(root, "declaration.json")));
+    const declaration = (orphan ? orphanDeclaration : declarationSchema).safeParse(await parse(path.join(root, "declaration.json")));
     if (!declaration.success) throw new Error("the original ordinary declaration is missing or invalid");
     const declared = declaration.data;
     const prior = declared.world.parentRun;
@@ -145,7 +197,8 @@ export async function readCrashAutosave({
     if (declared.benchmark.goal !== declared.goal || declared.benchmark.claimScope !== declared.claimScope ||
         declared.goal !== run.slice(25, -7) || !Number.isFinite(runStartedAtMs) ||
         new Date(runStartedAtMs).toISOString().replaceAll(":", "-") !== run.slice(0, 24) ||
-        startedAtMs < runStartedAtMs || startedAtMs >= bootMs || beforeBoot(markerEntry) < startedAtMs ||
+        startedAtMs < runStartedAtMs || (orphan ? startedAtMs <= bootMs : startedAtMs >= bootMs) ||
+        activityTime(markerEntry) < startedAtMs ||
         GOALS.indexOf(declared.goal) > GOALS.indexOf(goal) ||
         (declared.world.fresh
           ? declared.claimScope !== "fresh-attempt" || declared.world.seed !== "random" || prior || declared.world.crashAutosave
@@ -159,9 +212,9 @@ export async function readCrashAutosave({
     if (!history.endsWith("\n")) reject("the native startup history has an incomplete record");
     let ordinal = 0, readyTick = 0, lastEvent = startedAtMs, lastElapsed = 0, copied = false;
     for (const line of history.slice(0, -1).split("\n")) {
-      const row = historySchema.parse(JSON.parse(line));
+      const row = (orphan ? orphanHistory : historySchema).parse(JSON.parse(line));
       const at = Date.parse(row.at);
-      if (at < lastEvent || at >= bootMs || row.elapsedMs < lastElapsed || closingEvents.has(row.event))
+      if (at < lastEvent || (!orphan && at >= bootMs) || row.elapsedMs < lastElapsed || closingEvents.has(row.event))
         reject("source history contains a closing claim or invalid activity time");
       lastEvent = at;
       lastElapsed = row.elapsedMs;
@@ -201,7 +254,8 @@ export async function readCrashAutosave({
     const log = await text(path.join(server, "logs/latest.log"), 4_000_000);
     if (uuid !== offlineUuid(name) || !log.includes("Starting minecraft server version 1.21.4") ||
         !log.includes("Default game type: SURVIVAL") || !log.includes(`] [Server thread/INFO]: ${name} joined the game`) ||
-        /Stopping server|Saving players|Saving worlds|All dimensions are saved/.test(log))
+        (orphan ? /All dimensions are saved/.test(log) :
+          /Stopping server|Saving players|Saving worlds|All dimensions are saved/.test(log)))
       reject("the prior server log lacks an ordinary joined profile or records shutdown");
     for (const [dir, ext] of [["playerdata", "dat"], ["stats", "json"]] as const) {
       const entries = (await readdir(path.join(world, dir))).filter(file => file.endsWith(`.${ext}`));
@@ -240,7 +294,7 @@ export async function readCrashAutosave({
     let lastActivity = lastEvent, lastSaveWrite = 0;
     async function ownedTree(dir: string) {
       const entry = await check(dir);
-      lastActivity = Math.max(lastActivity, beforeBoot(entry));
+      lastActivity = Math.max(lastActivity, activityTime(entry));
       if (entry.isDirectory()) {
         for (const child of await readdir(dir)) await ownedTree(path.join(dir, child));
       } else if (dir.startsWith(`${world}${path.sep}`)) lastSaveWrite = Math.max(lastSaveWrite, entry.mtimeMs);
@@ -248,20 +302,21 @@ export async function readCrashAutosave({
     await ownedTree(root);
     const rootEntry = await check(root);
     return {
-      root, rootInode: rootEntry.ino, device, world, profileName: name, goal: declared.goal,
-      normalParentRun: declared.world.crashAutosave ? undefined : prior,
-      reservation: { bootMs, startedAtMs, priorReserveBytes: declared.limits.reserveBytes },
-      provenance: {
-        kind: "previous-boot-crash-autosave", sourceRun: run, sourceLastObservedTick: progress.data.tick,
+      source: {
+        root, rootInode: rootEntry.ino, device, world, profileName: name, goal: declared.goal,
+        normalParentRun: declared.world.crashAutosave ? undefined : prior,
+      },
+      startedAtMs, priorReserveBytes: declared.limits.reserveBytes,
+      evidence: {
+        sourceRun: run, sourceLastObservedTick: progress.data.tick,
         sourceLastActivityAt: new Date(lastActivity).toISOString(),
         sourceSaveLastWriteAt: new Date(lastSaveWrite).toISOString(),
-        recoveryKernelBootAt: new Date(bootMs).toISOString(), possibleProgressLoss: true, carriedClaim: null,
-      } satisfies z.infer<typeof crashProvenance>,
+        possibleProgressLoss: true as const, carriedClaim: null,
+      },
     };
   } catch (error) {
     signal.throwIfAborted();
-    const reason = error instanceof Error && !(error instanceof z.ZodError) &&
-      !(error instanceof SyntaxError) && !("code" in error) ? error.message : "source records are missing or malformed";
-    throw new Error(`Cannot recover crash autosave ${run}: ${reason}.`);
+    if (orphan) throw error;
+    throw new Error(`Cannot recover crash autosave ${run}: ${recoveryReason(error)}.`);
   }
 }

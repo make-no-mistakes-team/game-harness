@@ -1,14 +1,22 @@
 package io.gameharness.survival;
 
+import java.util.Arrays;
+import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
+import net.minecraft.block.FallingBlock;
 import net.minecraft.block.ShapeContext;
+import net.minecraft.registry.tag.BlockTags;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.BlockView;
 import net.minecraft.world.RaycastContext;
 
-/** Geometry of one outlined supply-exit contact, without classifying hidden cells. */
+/** Evidence for an outlined supply-exit contact, without classifying hidden cells. */
 final class AgentSupplyOutline {
     static final long MAX_FRAME_NANOS = 200_000_000L;
     private static final double MIN_PREFIX = 0.05, BEFORE_BACKSTOP = 0.06, LINE_ERROR = 0.065;
@@ -35,6 +43,98 @@ final class AgentSupplyOutline {
     private static boolean withinReach(Vec3d eye, BlockHitResult hit, double reach) {
         double distance = eye.squaredDistanceTo(hit.getPos());
         return Double.isFinite(reach) && reach > 0 && distance > MIN_PREFIX * MIN_PREFIX && distance <= reach * reach;
+    }
+
+    static boolean naturalCut(BlockState state) {
+        return state.isIn(BlockTags.BASE_STONE_OVERWORLD) || state.isIn(BlockTags.DIRT) || state.isOf(Blocks.GRASS_BLOCK)
+            || state.isOf(Blocks.TUFF) || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.CLAY)
+            || state.isOf(Blocks.DRIPSTONE_BLOCK);
+    }
+
+    /** One pending cut and its drawn cap or attachments. There is no world lookup here. */
+    static final class CutCover {
+        private static final int MAX_TICKS = 8, CAP = 0;
+        private static final long MAX_NANOS = 500_000_000L;
+        private static final double COLUMN_MARGIN = 0.02;
+        private enum Cover { UNKNOWN, CLEAR, HAZARD }
+
+        private final Cover[] seen = new Cover[5];
+        private final int[] seenTick = new int[seen.length];
+        private final long[] seenNanos = new long[seen.length];
+        private BlockPos target;
+        private Vec3d capCenter;
+        private int watchedTick;
+
+        void watch(BlockPos cell, int tick) {
+            if (!cell.equals(target) || tick - watchedTick > 1) {
+                Arrays.fill(seen, Cover.UNKNOWN);
+                target = cell.toImmutable();
+                capCenter = Vec3d.ofCenter(cell, 1.30);
+            }
+            watchedTick = tick;
+        }
+
+        void forget() { target = null; }
+
+        boolean watching(int tick) {
+            return target != null && tick >= watchedTick && tick - watchedTick <= 1;
+        }
+
+        void observe(BlockHitResult hit, BlockState drawn, Vec3d eye, double reach, int tick, long nanos) {
+            if (!watching(tick) || !blockHit(hit) || !withinReach(eye, hit, reach)) return;
+            BlockPos cell = hit.getBlockPos();
+            int dx = cell.getX() - target.getX(), dy = cell.getY() - target.getY(), dz = cell.getZ() - target.getZ();
+            if (dx == 0 && dy == 1 && dz == 0) {
+                boolean unsafe = AgentBody.dryCaveDanger(drawn) || drawn.getBlock() instanceof FallingBlock
+                    || drawn.isOf(Blocks.TORCH) || drawn.isOf(Blocks.SOUL_TORCH) || drawn.isOf(Blocks.REDSTONE_TORCH)
+                    || drawn.isOf(Blocks.CRAFTING_TABLE) || drawn.isOf(Blocks.FURNACE);
+                receipt(CAP, unsafe ? Cover.HAZARD
+                    : hit.getSide() != Direction.DOWN && naturalCut(drawn) ? Cover.CLEAR : Cover.UNKNOWN, tick, nanos);
+            } else if (dy == 0 && Math.abs(dx) + Math.abs(dz) == 1) {
+                boolean unsafe = !drawn.getFluidState().isEmpty();
+                if (drawn.isOf(Blocks.WALL_TORCH) || drawn.isOf(Blocks.SOUL_WALL_TORCH)
+                        || drawn.isOf(Blocks.REDSTONE_WALL_TORCH)) {
+                    Direction facing = drawn.get(Properties.HORIZONTAL_FACING);
+                    unsafe = facing.getOffsetX() == dx && facing.getOffsetZ() == dz;
+                }
+                int side = dx < 0 ? 1 : dx > 0 ? 2 : dz < 0 ? 3 : 4;
+                receipt(side, unsafe ? Cover.HAZARD : Cover.UNKNOWN, tick, nanos);
+            }
+        }
+
+        /** Only the center of the load zone may be supported by a dry, actually selected backstop. */
+        Vec3d capSample(BlockHitResult backstop, Vec3d eye, double reach, int tick, long nanos) {
+            if (!watching(tick) || current(CAP, tick, nanos) != Cover.UNKNOWN) return null;
+            return provesPrefix(eye, capCenter, backstop, reach) ? capCenter : null;
+        }
+
+        void observeDryCapPrefix(int tick, long nanos) { receipt(CAP, Cover.CLEAR, tick, nanos); }
+
+        private void receipt(int slot, Cover cover, int tick, long nanos) {
+            seen[slot] = cover;
+            seenTick[slot] = tick;
+            seenNanos[slot] = nanos;
+        }
+
+        private Cover current(int slot, int tick, long nanos) {
+            int age = tick - seenTick[slot];
+            long elapsed = nanos - seenNanos[slot];
+            return age >= 0 && age <= MAX_TICKS && elapsed >= 0 && elapsed <= MAX_NANOS ? seen[slot] : Cover.UNKNOWN;
+        }
+
+        boolean allows(BlockPos cell, Box hull, int tick, long nanos) {
+            if (!watching(tick) || !cell.equals(target)) return false;
+            int x = cell.getX(), z = cell.getZ();
+            boolean underColumn = x + 1.0 + COLUMN_MARGIN > hull.minX && x - COLUMN_MARGIN < hull.maxX
+                && z + 1.0 + COLUMN_MARGIN > hull.minZ && z - COLUMN_MARGIN < hull.maxZ;
+            Cover cap = current(CAP, tick, nanos);
+            if (cap == Cover.HAZARD || underColumn && (cell.getY() < hull.maxY || cap != Cover.CLEAR)) return false;
+            for (int side = 1; side < seen.length; side++) {
+                if (current(side, tick, nanos) == Cover.HAZARD) return false;
+            }
+            // Unknown cover permits a lateral cut only, never one above or below the stance.
+            return true;
+        }
     }
 
     static boolean provesPrefix(Vec3d eye, Vec3d sample, BlockHitResult backstop, double reach) {

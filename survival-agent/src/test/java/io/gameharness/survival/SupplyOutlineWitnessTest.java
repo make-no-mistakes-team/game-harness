@@ -6,8 +6,11 @@ import net.minecraft.block.Blocks;
 import net.minecraft.block.ShapeContext;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.fluid.FluidState;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.BlockView;
@@ -15,7 +18,9 @@ import net.minecraft.world.RaycastContext;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class SupplyOutlineWitnessTest {
@@ -25,6 +30,12 @@ final class SupplyOutlineWitnessTest {
     private static final BlockPos WALL = new BlockPos(3, 64, 0);
     private static final BlockPos FOREGROUND = new BlockPos(1, 64, 0);
     private static final double REACH = 4.0;
+    private static final Vec3d CAP_EYE = EYE.add(0, 0.8, 0);
+    private static final BlockPos CAP = FOREGROUND.up();
+    private static final BlockPos CAP_BACKSTOP = WALL.up();
+    private static final Box BELOW_CUT = new Box(1.20, 62, 0.20, 1.80, 63.80, 0.80);
+    private static final Box ABOVE_CUT = BELOW_CUT.offset(0, 3, 0);
+    private static final Box BESIDE_CUT = BELOW_CUT.offset(-1, 0, 0);
 
     @BeforeAll static void bootstrap() { VanillaTestResources.initialize(); }
 
@@ -93,11 +104,89 @@ final class SupplyOutlineWitnessTest {
         assertFalse(AgentSupplyOutline.entersAttachment(EYE, hit, WALL.up()));
     }
 
+    @Test void unknownCoverAllowsOnlyAnOffColumnCut() {
+        var cover = new AgentSupplyOutline.CutCover();
+        cover.watch(FOREGROUND, 10);
+        assertTrue(cover.allows(FOREGROUND, BESIDE_CUT, 10, 10));
+        assertFalse(cover.allows(FOREGROUND, BELOW_CUT, 10, 10));
+        assertFalse(cover.allows(FOREGROUND, ABOVE_CUT, 10, 10));
+        assertFalse(cover.allows(FOREGROUND, BESIDE_CUT.offset(0.21, 0, 0), 10, 10));
+    }
+
+    @Test void onlyTheDrawnCapCanAuthorizeOverheadOrVetoSideways() {
+        var cover = new AgentSupplyOutline.CutCover();
+        cover.watch(FOREGROUND, 10);
+        BlockState stone = Blocks.STONE.getDefaultState();
+        var stable = new Corridor(Map.of(CAP, stone));
+        BlockHitResult cap = stable.vanillaHit(CAP_EYE, FAR.add(0, 0.8, 0));
+        assertEquals(CAP, cap.getBlockPos());
+        assertEquals(Direction.WEST, cap.getSide());
+        cover.observe(cap, stone, CAP_EYE, 0.4, 10, 10);
+        assertFalse(cover.allows(FOREGROUND, BELOW_CUT, 10, 10)); // A remote outline is not admitted.
+        cover.observe(cap, stone, CAP_EYE, REACH, 10, 10);
+        assertTrue(cover.allows(FOREGROUND, BELOW_CUT, 10, 10));
+        assertFalse(cover.allows(FOREGROUND, ABOVE_CUT, 10, 10)); // Never the bearing column underfoot.
+
+        BlockState gravel = Blocks.GRAVEL.getDefaultState();
+        var falling = new Corridor(Map.of(CAP, gravel));
+        cover.observe(falling.vanillaHit(CAP_EYE, FAR.add(0, 0.8, 0)), gravel, CAP_EYE, REACH, 10, 11);
+        assertFalse(cover.allows(FOREGROUND, BESIDE_CUT, 10, 11));
+        cover.watch(FOREGROUND, 11);
+        assertTrue(cover.allows(FOREGROUND, BESIDE_CUT, 11, 501_000_000L));
+        assertFalse(cover.allows(FOREGROUND, BELOW_CUT, 11, 501_000_000L));
+
+        cover.observe(cap, stone, CAP_EYE, REACH, 11, 501_000_001L);
+        cover.forget(); // Exposure, new view/world, or release.
+        cover.watch(FOREGROUND, 11);
+        assertFalse(cover.allows(FOREGROUND, BELOW_CUT, 11, 501_000_001L));
+    }
+
+    @Test void aDrawnWallTorchVetoesOnlyIfAttachedToTheCut() {
+        var cover = new AgentSupplyOutline.CutCover();
+        cover.watch(FOREGROUND, 10);
+        BlockPos neighbor = FOREGROUND.west();
+        Vec3d outside = EYE.add(-1, -0.2, 0);
+        BlockState wallTorch = Blocks.WALL_TORCH.getDefaultState().with(Properties.HORIZONTAL_FACING, Direction.WEST);
+        var corridor = new Corridor(Map.of(neighbor, wallTorch));
+        BlockHitResult torch = corridor.vanillaHit(outside, EYE.add(1, 0.3, 0));
+        assertEquals(HitResult.Type.BLOCK, torch.getType());
+        assertEquals(neighbor, torch.getBlockPos());
+        cover.observe(torch, wallTorch, outside, REACH, 10, 10);
+        assertFalse(cover.allows(FOREGROUND, BESIDE_CUT, 10, 10));
+        BlockState unrelatedTorch = wallTorch.with(Properties.HORIZONTAL_FACING, Direction.EAST);
+        var unrelated = new Corridor(Map.of(neighbor, unrelatedTorch));
+        cover.observe(unrelated.vanillaHit(outside, EYE.add(1, 0.3, 0)), unrelatedTorch, outside, REACH, 10, 11);
+        assertTrue(cover.allows(FOREGROUND, BESIDE_CUT, 10, 11));
+    }
+
+    @Test void onlyAPositiveDryLoadZonePrefixCanSupplyCoverEvidence() {
+        var cover = new AgentSupplyOutline.CutCover();
+        cover.watch(FOREGROUND, 10);
+        Vec3d end = FAR.add(0, 0.8, 0);
+        BlockState stone = Blocks.STONE.getDefaultState();
+        assertNull(cover.capSample(new Corridor(Map.of()).vanillaHit(CAP_EYE, end), CAP_EYE, REACH, 10, 10));
+
+        var wet = new Corridor(Map.of(CAP, Blocks.WATER.getDefaultState(), CAP_BACKSTOP, stone));
+        BlockHitResult backstop = wet.vanillaHit(CAP_EYE, end);
+        assertEquals(CAP_BACKSTOP, backstop.getBlockPos());
+        Vec3d sample = cover.capSample(backstop, CAP_EYE, REACH, 10, 10);
+        assertEquals(Vec3d.ofCenter(FOREGROUND, 1.30), sample);
+        assertFalse(AgentSupplyOutline.dryPrefix(wet, ShapeContext.absent(), CAP_EYE, backstop, sample, REACH));
+        assertFalse(cover.allows(FOREGROUND, BELOW_CUT, 10, 10));
+
+        var dry = new Corridor(Map.of(CAP_BACKSTOP, stone));
+        assertTrue(AgentSupplyOutline.dryPrefix(dry, ShapeContext.absent(), CAP_EYE, backstop, sample, REACH));
+        cover.observeDryCapPrefix(10, 10);
+        assertTrue(cover.allows(FOREGROUND, BELOW_CUT, 10, 10));
+    }
+
     private static Corridor wall() { return new Corridor(Map.of(WALL, Blocks.STONE.getDefaultState())); }
 
     private record Corridor(Map<BlockPos, BlockState> blocks) implements BlockView {
-        BlockHitResult vanillaHit() {
-            return raycast(new RaycastContext(EYE, FAR, RaycastContext.ShapeType.OUTLINE,
+        BlockHitResult vanillaHit() { return vanillaHit(EYE, FAR); }
+
+        BlockHitResult vanillaHit(Vec3d eye, Vec3d end) {
+            return raycast(new RaycastContext(eye, end, RaycastContext.ShapeType.OUTLINE,
                 RaycastContext.FluidHandling.NONE, ShapeContext.absent()));
         }
 

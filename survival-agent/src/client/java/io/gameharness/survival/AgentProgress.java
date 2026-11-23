@@ -5884,6 +5884,7 @@ final class AgentProgress {
             if (world != c.world) return;
             order.observeBreak(position);
             if (!position.equals(armedCut)) return;
+            body.forgetSupplyOutlineCut();
             armedCut = null;
             outlineCutPoint = null;
             outlineReaimed = false;
@@ -5957,7 +5958,7 @@ final class AgentProgress {
             if (!mineDeparture) return;
             mineDeparture = false;
             order.finish();
-            outline.reset();
+            resetOutline();
             to = armedCut = null;
             driving = 0;
         }
@@ -5975,7 +5976,7 @@ final class AgentProgress {
 
         void yieldToWorkshop() {
             order.finish();
-            outline.reset();
+            resetOutline();
             to = armedCut = packedBench = null;
         }
 
@@ -5994,8 +5995,7 @@ final class AgentProgress {
             handoffAfter = tick;
             revealedFrame = -1;
             rises = levels = cuts = laneCuts = connectors = builds = 0;
-            outline.reset();
-            outlineCutPoint = null;
+            resetOutline();
             sourceProved = walkedReturn = lighting = triedLight = triedCraftLight = false;
             returning = !mineDeparture && findReturn();
             enclosed = returning && trail.get(backEnd).getY() >= order.foot().getY() + 2;
@@ -6019,7 +6019,7 @@ final class AgentProgress {
             if (!wet && floodWater == null) return false;
             BlockPos lip = order.foot();
             var retreat = order.flood(to, floodOpening, floodWater, floodSource, tick);
-            outline.reset();
+            resetOutline();
             if (openFoot != null && order.blocksFloodWork(openFoot, tick)) openFoot = null;
             if (unknownFoot != null && order.blocksFloodWork(unknownFoot, tick)) unknownFoot = null;
             to = armedCut = packedBench = floodOpening = floodWater = null;
@@ -6078,7 +6078,7 @@ final class AgentProgress {
             if (!settled(from)) {
                 status = "supply egress: centering on the witnessed support";
                 if (tick - since >= LOOK_TICKS) return stop("no settled full-width takeoff stance");
-                body.centerOnSupport(from.down());
+                centerSupplyFoot(from);
                 return true;
             }
             if (outline.active() && !actualOutlineFoot(from))
@@ -6434,6 +6434,7 @@ final class AgentProgress {
             since = tick;
             proof = next;
             armedCut = null;
+            body.forgetSupplyOutlineCut();
             outlineCutPoint = null;
             outlineReaimed = false;
             aim = null;
@@ -6836,6 +6837,7 @@ final class AgentProgress {
         }
 
         private boolean outlineClearance(BlockPos cell, int rise) {
+            body.watchSupplyOutlineCut(cell);
             if (outlineCutPoint == null && !outlineReaimed && tick - since >= OUTLINE_REAIM_TICKS) {
                 outlineReaimed = true;
                 aim = switch (proof) {
@@ -6872,8 +6874,7 @@ final class AgentProgress {
 
         private boolean cutOutline(BlockPos cell, BlockHitResult hit) {
             if (order.avoidFlood(cell, tick)) return refuse("will not cut into the recent flood neighborhood");
-            if (built || cell.equals(to.down()) || underMineFootprint(cell) || protectRecoveryBlock(cell)
-                    || AgentReturnableMine.protectedCutAttachment(c.world, cell))
+            if (built || cell.equals(to.down()) || underMineFootprint(cell) || protectRecoveryBlock(cell))
                 return refuse("outlined " + area() + " would disturb supporting or protected footing");
             if (!body.supplyOutlineCutSafe(hit))
                 return refuse("unsafe outlined cut face or overhead cap at " + cell.toShortString());
@@ -7034,7 +7035,7 @@ final class AgentProgress {
                 return refuse("actual dry takeoff support changed before movement");
             if (outlined) status = "supply egress: crossing toward the outlined top at " + to.toShortString();
             if (dryFieldFooting() && to.equals(c.player.getBlockPos())) {
-                body.centerOnSupport(to.down());
+                centerSupplyFoot(to);
                 return true;
             }
             boolean jump = to.getY() > from.getY() && dryFieldFooting() && from.equals(c.player.getBlockPos());
@@ -7042,6 +7043,14 @@ final class AgentProgress {
                 return refuse("the ordinary jump was blocked by headroom");
             body.driveDryRoute(from, to, lane);
             return true;
+        }
+
+        private void centerSupplyFoot(BlockPos foot) {
+            if (body.centerOnSupport(foot.down()) || !ordinaryCaveDrops || !body.ordinaryOutlineExitEnabled()) return;
+            // The lit helper has looked at the top from this new pose. Only the actual
+            // vanilla outline and the same physical support may authorize the inward shift.
+            if (actualOutlineFoot(foot) && body.supplyOutlineTop(foot, foot.down()))
+                body.centerOnGroundedSupport(foot, body.dryCaveContact(foot));
         }
 
         private boolean settled(BlockPos foot) {
@@ -7077,6 +7086,7 @@ final class AgentProgress {
             if (outline.active() && to != null && to.getY() > order.foot().getY() && proof == Proof.OPENING)
                 flatBearings |= 1 << lane.ordinal(); // No reason to repeat the same exact failed opening for a level leg.
             outline.abandonLanding();
+            body.forgetSupplyOutlineCut();
             outlineCutPoint = null;
             to = null;
             armedCut = null;
@@ -7099,6 +7109,12 @@ final class AgentProgress {
             return ready(order.foot(), why);
         }
 
+        private void resetOutline() {
+            outline.reset();
+            body.forgetSupplyOutlineCut();
+            outlineCutPoint = null;
+        }
+
         private boolean ready(BlockPos from, String why) {
             int index = trail.lastIndexOf(from);
             if (walkedReturn && index >= 0 && index + 1 < trail.size()) {
@@ -7108,7 +7124,7 @@ final class AgentProgress {
             }
             status = (mineDeparture ? "mine departure: " : "supply egress: ") + why + " at " + from.toShortString();
             if (order.active()) order.finish();
-            outline.reset();
+            resetOutline();
             to = armedCut = null;
             driving = 0;
             return true;
@@ -7117,7 +7133,7 @@ final class AgentProgress {
         private boolean stop(String why) {
             body.pauseWork();
             if (outline.active()) why = "short outline passage refused: " + why;
-            outline.reset();
+            resetOutline();
             to = armedCut = null;
             driving = 0;
             if (mineDeparture) {

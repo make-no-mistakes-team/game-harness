@@ -206,6 +206,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private HitResult renderedCrosshair;
     private HitResult tickCrosshair;
     private boolean ordinaryOutlineExitEnabled;
+    private final AgentSupplyOutline.CutCover supplyCutCover = new AgentSupplyOutline.CutCover();
     private BlockState renderedSupplyOutline;
     private BlockHitResult checkedSupplyOutline;
     private Vec3d checkedSupplyEye;
@@ -523,6 +524,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         } else {
             observedYawSpeed = observedPitchSpeed = 0;
             if (!sameView) {
+                supplyCutCover.forget();
                 levelWallSight.forget();
                 clearContact();
             }
@@ -550,6 +552,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         eye = null;
         renderedCrosshair = null;
         renderedSupplyOutline = null;
+        supplyCutCover.forget();
         checkedSupplyOutline = null;
         checkedSupplyEye = null;
         observedAtNanos = 0;
@@ -1011,9 +1014,16 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             && now.getBlockPos().equals(hit.getBlockPos()) && now.getSide() == hit.getSide() ? now : null;
     }
 
-    void bindOrdinaryOutlineExit(boolean enabled) { ordinaryOutlineExitEnabled = enabled; }
+    void bindOrdinaryOutlineExit(boolean enabled) {
+        ordinaryOutlineExitEnabled = enabled;
+        if (!enabled) supplyCutCover.forget();
+    }
 
     boolean ordinaryOutlineExitEnabled() { return ordinaryOutlineExitEnabled; }
+
+    void watchSupplyOutlineCut(BlockPos cell) { supplyCutCover.watch(cell, tick); }
+
+    void forgetSupplyOutlineCut() { supplyCutCover.forget(); }
 
     /** Receipt from the vanilla draw itself, not from merely aiming at an outline-shaped block. */
     void observeSupplyOutline(Entity camera, BlockPos pos, BlockState state) {
@@ -1021,6 +1031,10 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 && client.crosshairTarget == renderedCrosshair && renderedCrosshair instanceof BlockHitResult hit
                 && hit.getType() == HitResult.Type.BLOCK && pos.equals(hit.getBlockPos())) {
             renderedSupplyOutline = state;
+            if (supplyCutCover.watching(observedAtTick) && !client.options.hudHidden && inView(hit.getPos())) {
+                double reach = Math.min(SUPPLY_OUTLINE_REACH, client.player.getBlockInteractionRange());
+                supplyCutCover.observe(hit, state, eye, reach, observedAtTick, observedAtNanos);
+            }
             if (contact != null && contactMode.supplyOutline() && tick - contactTick <= 1) noteRenderedEntry();
         }
     }
@@ -1029,7 +1043,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     BlockHitResult supplyOutlineFace() {
         if (!ordinaryOutlineExitEnabled || renderedSupplyOutline == null || !hasView() || client.options.hudHidden)
             return null;
-        long age = System.nanoTime() - observedAtNanos;
+        long nanos = System.nanoTime();
+        long age = nanos - observedAtNanos;
         if (age > AgentSupplyOutline.MAX_FRAME_NANOS) return null;
         if (supplyOutlineTick == tick && supplyOutlineFrame == frameSequence) return checkedSupplyOutline;
         supplyOutlineTick = tick;
@@ -1051,6 +1066,12 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 || !supplyOutlineRay(eye, shown, null, reach)
                 || !(eye.equals(liveEye) && shown.getPos().equals(now.getPos()))
                     && !supplyOutlineRay(liveEye, now, null, reach)) return null;
+        Vec3d cap = supplyCutCover.capSample(shown, eye, reach, tick, nanos);
+        if (cap != null && inView(cap) && supplyOutlineRay(eye, shown, cap, reach)
+                && (eye.equals(liveEye) && shown.getPos().equals(now.getPos())
+                    || supplyOutlineRay(liveEye, now, cap, reach))) {
+            supplyCutCover.observeDryCapPrefix(observedAtTick, observedAtNanos);
+        }
         checkedSupplyEye = liveEye;
         return checkedSupplyOutline = now;
     }
@@ -1107,20 +1128,13 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         var player = client.player;
         BlockPos cell = now.getBlockPos();
         BlockPos from = player.getBlockPos();
+        Box hull = player.getBoundingBox();
         if (!supplyOutlineCell(from, cell.getX(), cell.getY(), cell.getZ(), 0, 3)
-                || !supplyOutlineGrounded(from) || player.getBoundingBox().intersects(new Box(cell))) return false;
+                || !supplyOutlineGrounded(from) || player.getVelocity().horizontalLengthSquared() > 0.0025
+                || hull.intersects(new Box(cell)) || !supplyCutCover.allows(cell, hull, tick, System.nanoTime())) return false;
         BlockState state = client.world.getBlockState(cell);
-        if (state != renderedSupplyOutline || state.hasBlockEntity() || state.getBlock() instanceof FallingBlock
-                || !fullStepSupport(cell, state) || !naturalSupplyCut(state)) return false;
-        // No cap identity or geometry is reported. A falling or wet load may only veto this cut.
-        BlockState cap = client.world.getBlockState(overlandProbe.set(cell).move(Direction.UP));
-        return !dryCaveDanger(cap) && !(cap.getBlock() instanceof FallingBlock);
-    }
-
-    private static boolean naturalSupplyCut(BlockState state) {
-        return state.isIn(BlockTags.BASE_STONE_OVERWORLD) || state.isIn(BlockTags.DIRT) || state.isOf(Blocks.GRASS_BLOCK)
-            || state.isOf(Blocks.TUFF) || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.CLAY)
-            || state.isOf(Blocks.DRIPSTONE_BLOCK);
+        return state == renderedSupplyOutline && !state.hasBlockEntity() && !(state.getBlock() instanceof FallingBlock)
+            && fullStepSupport(cell, state) && AgentSupplyOutline.naturalCut(state);
     }
 
     /** Negative physical placement checks, only across the attached and currently outlined face. */

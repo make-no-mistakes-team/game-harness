@@ -7,6 +7,7 @@ import static io.gameharness.survival.AgentHands.WorkCraftStep.OUTSIDE_GRANT;
 import static io.gameharness.survival.AgentHands.WorkCraftStep.STORAGE;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.HashMap;
@@ -36,6 +37,58 @@ final class AgentStockRecipeTest {
 
     @BeforeAll
     static void initializeVanilla() { VanillaTestResources.initialize(); }
+
+    @Test
+    void carriedBenchAndBirchStockCanFundAnAxeWithoutSpendingTheNextPick() {
+        var inventory = new PlayerInventory(null);
+        inventory.setStack(0, new ItemStack(Items.WOODEN_PICKAXE));
+        inventory.setStack(1, new ItemStack(Items.BIRCH_LOG));
+        inventory.setStack(2, new ItemStack(Items.BIRCH_PLANKS, 2));
+        inventory.setStack(3, new ItemStack(Items.CRAFTING_TABLE));
+        inventory.setStack(20, new ItemStack(Items.STICK, 4));
+
+        assertEquals(AgentProgress.EarlyAxe.WOODEN, AgentProgress.EarlyAxe.choose(inventory, false, false, false));
+        inventory.setStack(20, new ItemStack(Items.STICK, 2));
+        assertNull(AgentProgress.EarlyAxe.choose(inventory, false, false, false),
+            "the axe cannot take the only iron pick handles");
+        inventory.setStack(20, new ItemStack(Items.STICK, 4));
+        inventory.setStack(3, ItemStack.EMPTY);
+        assertNull(AgentProgress.EarlyAxe.choose(inventory, false, false, false),
+            "no bench is owned or witnessed");
+        assertNull(AgentProgress.EarlyAxe.choose(inventory, false, true, false),
+            "a borrowed bench cannot spend the only wood for a portable one");
+        assertEquals(AgentProgress.EarlyAxe.WOODEN, AgentProgress.EarlyAxe.choose(inventory, false, true, true));
+    }
+
+    @Test
+    void stoneAxeRequiresSurplusBeyondTheFirstStonePickAndFurnace() {
+        var inventory = new PlayerInventory(null);
+        inventory.setStack(2, new ItemStack(Items.OAK_PLANKS, 6));
+        inventory.setStack(3, new ItemStack(Items.CRAFTING_TABLE));
+        inventory.setStack(20, new ItemStack(Items.STICK, 4));
+        inventory.setStack(21, new ItemStack(Items.COBBLESTONE, 13));
+
+        assertEquals(AgentProgress.EarlyAxe.WOODEN, AgentProgress.EarlyAxe.choose(inventory, false, false, false));
+        inventory.setStack(21, new ItemStack(Items.COBBLESTONE, 14));
+        assertEquals(AgentProgress.EarlyAxe.STONE, AgentProgress.EarlyAxe.choose(inventory, false, false, false));
+        inventory.setStack(21, new ItemStack(Items.COBBLESTONE, 11));
+        assertEquals(AgentProgress.EarlyAxe.STONE, AgentProgress.EarlyAxe.choose(inventory, true, false, false));
+        inventory.setStack(21, new ItemStack(Items.COBBLESTONE, 10));
+        assertEquals(AgentProgress.EarlyAxe.WOODEN, AgentProgress.EarlyAxe.choose(inventory, true, false, false));
+        inventory.setStack(2, ItemStack.EMPTY);
+        inventory.setStack(4, new ItemStack(Items.FURNACE));
+        inventory.setStack(21, new ItemStack(Items.COBBLESTONE, 3));
+        assertNull(AgentProgress.EarlyAxe.choose(inventory, true, false, false), "keep the only replacement head");
+        inventory.setStack(21, new ItemStack(Items.COBBLESTONE, 6));
+        assertEquals(AgentProgress.EarlyAxe.STONE, AgentProgress.EarlyAxe.choose(inventory, true, false, false));
+    }
+
+    @Test
+    void aTableAloneDoesNotCreateAnAxeOrder() {
+        var inventory = new PlayerInventory(null);
+        inventory.setStack(3, new ItemStack(Items.CRAFTING_TABLE));
+        assertNull(AgentProgress.EarlyAxe.choose(inventory, false, false, false));
+    }
 
     @Test
     void suppliedStonePickUsesBenchPreparationWithoutBreakPermission() {

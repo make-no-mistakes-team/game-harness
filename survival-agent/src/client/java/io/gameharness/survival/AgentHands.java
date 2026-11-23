@@ -2426,6 +2426,7 @@ final class AgentHands {
         boolean preferHotbar = stack.isOf(Items.CRAFTING_TABLE) || stack.isOf(Items.FURNACE)
                 || stack.isOf(Items.BUCKET) || stack.isOf(Items.FLINT_AND_STEEL)
                 || stack.isIn(ItemTags.PICKAXES) || stack.isIn(ItemTags.SHOVELS) || stack.isIn(ItemTags.SWORDS)
+                || craftBudget == null && stack.isIn(ItemTags.AXES)
                 || stack.isIn(ItemTags.BOATS);
         Slot best = null;
         int bestScore = 0;

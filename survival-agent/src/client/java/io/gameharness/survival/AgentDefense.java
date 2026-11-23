@@ -1522,6 +1522,10 @@ final class AgentDefense {
         return tick >= calmAfter && !client.player.isUsingItem() && body.hasRecentView();
     }
 
+    boolean recentlyThreatened(int tick) {
+        return calmAfter != 0 && tick - calmAfter < 160;
+    }
+
     boolean prepare(AgentProgress progress, int tick, int reserve, int sparePlanks, int sticks, boolean beforePortal) {
         status = null;
         var player = client.player;

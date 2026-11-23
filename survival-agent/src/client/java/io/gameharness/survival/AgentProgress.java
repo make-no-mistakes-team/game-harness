@@ -271,6 +271,7 @@ final class AgentProgress {
     private final Predicate<ItemStack> goalItem;
     private final Station table = new Station(Blocks.CRAFTING_TABLE, Items.CRAFTING_TABLE, "crafting_table");
     private final Station furnace = new Station(Blocks.FURNACE, Items.FURNACE, "furnace");
+    private final Predicate<BlockHitResult> currentTableFace = hit -> hit.getBlockPos().equals(table.position);
     private final Predicate<BlockHitResult> unreservedFurnaceFace = hit -> !reservedFurnace(hit.getBlockPos());
     private final Predicate<BlockHitResult> currentFurnaceFace = hit -> hit.getBlockPos().equals(furnace.position);
     private final FieldBench fieldBench = new FieldBench();
@@ -289,6 +290,9 @@ final class AgentProgress {
     private String tableAxe;
     private int tablePlanks;
     private int tableSticks;
+    private EarlyAxe earlyAxe;
+    private BlockPos earlyAxeFoot;
+    private int earlyAxeStarted;
     private BlockPos tableReturn;
     private BlockPos failedTableReturn;
     private Firing firing = Firing.NONE;
@@ -977,6 +981,7 @@ final class AgentProgress {
     }
 
     void interruptSituationalRecovery() {
+        cancelEarlyAxe();
         stallGuard.interruptSituational("a primed creeper took priority");
     }
 
@@ -1365,7 +1370,7 @@ final class AgentProgress {
             if (longGoal && surfaceDeparture() && !nightSite.guarding() && (stonePick || woodPick || ironPick)
                 && (woodPickupPending() || timberDropUntil != 0 || timberExitFrom != null || shortTimber)) {
                 if (woodPickupPending() || timberDropUntil != 0 || timberExitFrom != null) seekTimber();
-                else if (!has(AXE, 1) && affordsWood(localTableWood(), 2)) {
+                else if (!ordinaryCaveDrops && !has(AXE, 1) && affordsWood(localTableWood(), 2)) {
                     if (has(STONE, stonePick ? 3 : 6)) requestTable("stone_axe", null, 0, 2);
                     else if (affordsWood(localTableWood() + 3, 2)) requestTable("wooden_axe", null, 3, 2);
                     else seekTimber();
@@ -2481,15 +2486,18 @@ final class AgentProgress {
             String recipe = tableRecipe;
             String extra = tableExtra;
             String axe = tableAxe;
+            boolean fieldAxe = earlyAxe != null && earlyAxe.recipe.equals(recipe);
+            boolean affordableAxe = !fieldAxe || huntingWeapon(false) < 0 && earlyAxeStock(used) == earlyAxe;
+            if (fieldAxe) cancelEarlyAxe();
             tableRecipe = null;
             tableExtra = null;
             tableAxe = null;
             status = "crafting " + recipe;
-            if (!affordsWood(tablePlanks, tableSticks)) {
+            if (!affordableAxe || !affordsWood(tablePlanks, tableSticks)) {
                 c.currentScreen.close();
                 return true;
             }
-            boolean addBoat = canAddBoat(recipe);
+            boolean addBoat = !fieldAxe && canAddBoat(recipe);
             List<String> recipes = woodBatch(tablePlanks + (addBoat ? 5 : 0), tableSticks);
             recipes.add(recipe);
             if (extra != null) recipes.add(extra);
@@ -3227,7 +3235,7 @@ final class AgentProgress {
             int wood = hands.count(PLANK) + 4 * hands.count(LOG) - plankCost - localTableWood();
             var extras = PickExtras.choose(wooden, wooden ? wood : hands.count(STONE) - quantity, wood, hands.count(STICK),
                 !goal.equals("wooden_pickaxe") && (wooden || !goal.equals("stone_pickaxe")) && !has(SHOVEL, 1),
-                needsTimberKit() && !timberReady && !has(AXE, 1));
+                !ordinaryCaveDrops && needsTimberKit() && !timberReady && !has(AXE, 1));
             if (extras.shovel) { extra = wooden ? "wooden_shovel" : "stone_shovel"; if (wooden) plankCost++; sticks += 2; }
             if (extras.axe) { axe = wooden ? "wooden_axe" : "stone_axe"; if (wooden) plankCost += 3; sticks += 2; }
         }
@@ -3696,6 +3704,7 @@ final class AgentProgress {
 
     private void requestTable(String recipe, String extra, String axe, int planks, int sticks) {
         if (!hands.stableCraftFooting()) return;
+        cancelEarlyAxe();
         boolean shore = portalSupplies != null && portalSupplies.stoneBank != null;
         if (fieldBench.packUntil != 0) fieldBench.leave();
         BlockHitResult localBench = null;
@@ -4239,7 +4248,7 @@ final class AgentProgress {
                 if (!observeStationPlacement(station, center)) return;
             }
             if (seen == null && station == table)
-                seen = body.find(TABLE_BLOCK, REACH, hit -> hit.getBlockPos().equals(station.position)).orElse(null);
+                seen = body.find(TABLE_BLOCK, REACH, currentTableFace).orElse(null);
             if (seen == null && station == furnace) {
                 seen = body.find(FURNACE_BLOCK, REACH, currentFurnaceFace).orElse(null);
                 if (seen == null && !station.position.equals(station.provedPlacement)
@@ -12147,8 +12156,11 @@ final class AgentProgress {
     }
 
     private boolean prepareDefense() {
-        if (!(goal.equals("diamond") || portal != null) || nextFoot != null || firing != Firing.NONE
-                || !c.player.isOnGround() || c.player.isTouchingWater() || !defense.canPrepare(tick)) return false;
+        if (nextFoot != null || firing != Firing.NONE || !c.player.isOnGround()
+                || c.player.isTouchingWater() || !defense.canPrepare(tick)) return cancelEarlyAxe();
+        boolean deepPick = has(DEEP_PICK, 1);
+        if (!deepPick && ordinaryCaveDrops && needsTimberKit() && prepareEarlyAxe()) return true;
+        if (!(goal.equals("diamond") || portal != null)) return false;
         if (ordinaryCaveDrops && tick >= nextLoadoutCheck && target == null && timberChop == null
                 && !returnableMine.active() && !c.interactionManager.isBreakingBlock()) {
             nextLoadoutCheck = tick + 160;
@@ -12157,7 +12169,8 @@ final class AgentProgress {
                 return true;
             }
         }
-        if (!has(DEEP_PICK, 1)) return false;
+        if (!deepPick) return false;
+        cancelEarlyAxe();
         int reserve = (has(PORTAL_BUCKET, 1) ? 0 : 3) + (has(IGNITER, 1) ? 0 : 1);
         int sparePlanks = hands.count(PLANK) + 4 * hands.count(LOG) - localTableWood();
         boolean beforePortal = !portalStarted && (portal == null || !has(DIAMOND, 3) && !has(DIAMOND_PICK, 1));
@@ -12166,7 +12179,140 @@ final class AgentProgress {
         return true;
     }
 
+    enum EarlyAxe {
+        STONE("stone_axe", 0), WOODEN("wooden_axe", 3);
+
+        final String recipe;
+        final int planks;
+
+        EarlyAxe(String recipe, int planks) {
+            this.recipe = recipe;
+            this.planks = planks;
+        }
+
+        static EarlyAxe choose(PlayerInventory inventory, boolean stonePick, boolean localBench, boolean recoverableBench) {
+            int wood = 0, stone = 0, sticks = 0;
+            boolean carriedBench = false, carriedFurnace = false;
+            for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+                ItemStack stack = inventory.getStack(slot);
+                if (stack.isEmpty()) continue;
+                if (PLANK.test(stack)) wood += stack.getCount();
+                else if (LOG.test(stack)) wood += 4 * stack.getCount();
+                else if (AgentProgress.STONE.test(stack)) stone += stack.getCount();
+                else if (stack.isOf(Items.STICK)) sticks += stack.getCount();
+                else if (stack.isOf(Items.CRAFTING_TABLE)) carriedBench = true;
+                else if (stack.isOf(Items.FURNACE)) carriedFurnace = true;
+            }
+            if (!carriedBench && !localBench) return null;
+            // A borrowed table should not consume the wood for a portable bench.
+            int benchWood = carriedBench || recoverableBench ? 0 : 4;
+            int handleWood = 2 * Math.ceilDiv(Math.max(0, 2 * PICK_HANDLES - sticks), 4);
+            int spareWood = wood - benchWood - handleWood;
+            if (spareWood < 0) return null;
+            // Keep a head for the first stone pick, or for a replacement if there isn't spare wood.
+            int stoneReserve = (stonePick && spareWood >= 3 ? 0 : 3) + (carriedFurnace ? 0 : 8);
+            if (stone >= 3 + stoneReserve) return STONE;
+            return spareWood >= WOODEN.planks + 3 ? WOODEN : null;
+        }
+    }
+
+    private EarlyAxe earlyAxeStock(BlockPos usableBench) {
+        int missingIron = 3 - hands.count(INGOT);
+        // Once smelting has feedstock, don't spend its wood fuel or take a funded workshop's turn.
+        if (missingIron <= 0 || has(RAW_IRON, 1) && (!has(FUEL, 1) || fundedFirstIron(missingIron) != null))
+            return null;
+        boolean recoverableBench = usableBench != null && fieldBench.world == c.world
+            && fieldBench.packable && usableBench.equals(fieldBench.position);
+        return EarlyAxe.choose(c.player.getInventory(), pickUses(STONE_PICK) >= MIN_PICK_USES,
+            usableBench != null, recoverableBench);
+    }
+
+    private boolean prepareEarlyAxe() {
+        var player = c.player;
+        if (!hands.stableCraftFooting() || !safePickupStance() || c.options.useKey.isUnbound()
+                || timberChop != null || returnableMine.active() || c.interactionManager.isBreakingBlock())
+            return cancelEarlyAxe();
+        BlockPos foot = player.getBlockPos();
+        if (earlyAxe == null) {
+            if (tableRecipe != null || table.placed != 0 || foot.equals(earlyAxeFoot)
+                    || earlyAxeStarted != 0 && tick - earlyAxeStarted < 150
+                    || pickUses(WOOD_PICK) + pickUses(STONE_PICK) < MIN_PICK_USES || huntingWeapon(false) >= 0)
+                return false;
+            if (!defense.recentlyThreatened(tick) && player.getHealth() >= player.getMaxHealth()
+                    && body.find(state -> state.isIn(BlockTags.LOGS), Math.min(REACH, player.getBlockInteractionRange()),
+                        this::timberCandidate).isEmpty()
+                    && (foodNutrition() >= FOOD_RESERVE || body.visibleEntity(entity -> AgentFoodWork.adult(entity) != null
+                        && localForagePoint(entity.getPos()), 6).isEmpty())) return false;
+            var bench = body.find(TABLE_BLOCK, REACH).orElse(null);
+            if (bench == null && (c.options.sneakKey.isUnbound() || !has(table.item, 1))) return false;
+            earlyAxe = earlyAxeStock(bench == null ? null : bench.getBlockPos());
+            if (earlyAxe == null) return false;
+            earlyAxeFoot = foot;
+            earlyAxeStarted = tick;
+            if (bench == null) releaseTablePosition();
+            else {
+                table.position = confirmStation(table, bench);
+                table.lastUse = null;
+                table.opened = table.openAttempts = 0;
+            }
+        } else if (!foot.equals(earlyAxeFoot) || tick - earlyAxeStarted >= 48) return cancelEarlyAxe();
+
+        if (table.position == null) {
+            if (!has(table.item, 1) || !table.rejected.isEmpty()) return cancelEarlyAxe();
+            if (table.face == null) {
+                BlockHitResult support = body.benchFace(REACH, this::earlyAxeBenchSite, null);
+                if (!selectWorkshopFace(table, support, null)) {
+                    if (tick - earlyAxeStarted >= 14) return cancelEarlyAxe();
+                    body.turn(player.getYaw(), 52);
+                    status = "looking for nearby support for the carried table";
+                    return true;
+                }
+            } else if (!earlyAxeBenchSite(table.face, AgentBody.placementCell(table.face))) {
+                return cancelEarlyAxe();
+            }
+            useWorkshopFace(table);
+            return true;
+        }
+
+        Vec3d center = Vec3d.ofCenter(table.position);
+        if (table.placed != 0 && !observeStationPlacement(table, center)) {
+            if (table.position == null) return cancelEarlyAxe();
+            return true;
+        }
+        if (table.openAttempts >= 2 && tick - table.opened > 7) return cancelEarlyAxe();
+        var bench = body.find(TABLE_BLOCK, REACH, currentTableFace).orElse(null);
+        status = "opening the local table for a field axe";
+        if (bench == null) body.aim(center);
+        else {
+            confirmStation(table, bench);
+            tableRecipe = earlyAxe.recipe;
+            tableExtra = tableAxe = null;
+            tablePlanks = earlyAxe.planks;
+            tableSticks = 2 * PICK_HANDLES;
+            openStation(table, bench, AgentBody.Contact.INTERACT);
+        }
+        return true;
+    }
+
+    private boolean earlyAxeBenchSite(BlockHitResult support, BlockPos dest) {
+        int height = dest.getY() - c.player.getBlockY();
+        return support.getSide() == Direction.UP && height >= 0 && height <= 1
+            && Math.abs(support.getPos().y - dest.getY()) <= 0.06
+            && c.world.getWorldBorder().contains(dest) && table.availableSite(dest)
+            && AgentMacroControl.benchSpace(c.world, support, dest, c.player.getBoundingBox());
+    }
+
+    private boolean cancelEarlyAxe() {
+        if (earlyAxe != null) {
+            if (earlyAxe.recipe.equals(tableRecipe)) tableRecipe = null;
+            if (table.position == null) table.resetSite();
+            earlyAxe = null;
+        }
+        return false;
+    }
+
     private void interruptHands() {
+        cancelEarlyAxe();
         defense.cancelSelection();
         if (hands.busy()) hands.cancel();
         if (c.currentScreen instanceof HandledScreen<?>) c.currentScreen.close();

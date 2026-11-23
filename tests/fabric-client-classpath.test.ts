@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { access, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { prepareFabricClientClasspath } from "../src/server/minecraft-client.ts";
+import { prepareAgentAssets, prepareFabricClientClasspath } from "../src/server/minecraft-client.ts";
 
 test("Fabric classpath never requests profile metadata or accepts unverified JARs", async () => {
   const root = await mkdtemp(join(tmpdir(), "fabric-client-classpath-"));
@@ -42,6 +42,45 @@ test("Fabric classpath never requests profile metadata or accepts unverified JAR
     await expect(access(localJar)).rejects.toMatchObject({ code: "ENOENT" });
   } finally {
     globalThis.fetch = originalFetch;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent agent asset roots share installed objects but not launcher assets or skin caches", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-client-assets-"));
+  try {
+    const source = join(root, "installed");
+    const official = join(source, "assets");
+    const index = "indexes/19.json";
+    const skin = "skins/cached.png";
+    const object = "objects/ab/asset";
+    const primaryGame = join(root, "primary");
+    const parallelGame = join(root, "parallel");
+    for (const name of [index, skin, object]) {
+      await mkdir(dirname(join(official, name)), { recursive: true });
+      await writeFile(join(official, name), name);
+    }
+    await Promise.all([mkdir(primaryGame), mkdir(parallelGame)]);
+
+    const [primary, parallel] = await Promise.all([
+      prepareAgentAssets(source, primaryGame, "19"), prepareAgentAssets(source, parallelGame, "19"),
+    ]);
+    expect(primary).toBe(join(primaryGame, "assets"));
+    expect(parallel).toBe(join(parallelGame, "assets"));
+    for (const [assetDir, label] of [[primary, "primary"], [parallel, "parallel"]] as const) {
+      expect(await readFile(join(assetDir, object), "utf8")).toBe(object);
+      expect(await realpath(join(assetDir, object))).toBe(await realpath(join(official, object)));
+      expect(await readFile(join(assetDir, index), "utf8")).toBe(index);
+      await mkdir(dirname(join(assetDir, skin)), { recursive: true });
+      await writeFile(join(assetDir, skin), label);
+    }
+    await writeFile(join(primary, index), "primary index");
+    expect(await readFile(join(parallel, index), "utf8")).toBe(index);
+    expect(await readFile(join(official, index), "utf8")).toBe(index);
+    expect(await readFile(join(primary, skin), "utf8")).toBe("primary");
+    expect(await readFile(join(parallel, skin), "utf8")).toBe("parallel");
+    expect(await readFile(join(official, skin), "utf8")).toBe(skin);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

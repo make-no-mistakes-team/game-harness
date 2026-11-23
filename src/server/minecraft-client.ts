@@ -9,6 +9,8 @@ import {
   copyFile,
   access,
   rename,
+  stat,
+  symlink,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -304,6 +306,22 @@ export async function prepareFabricClientClasspath(
   };
 }
 
+/** Give Minecraft its own mutable skin cache without duplicating installed content-addressed assets. */
+export async function prepareAgentAssets(source: string, directory: string, assetIndex: string) {
+  if (!/^[A-Za-z0-9_-]+$/.test(assetIndex)) throw new Error("Invalid installed Minecraft asset index.");
+  const installed = path.resolve(source, "assets");
+  const objects = path.join(installed, "objects");
+  if (!(await stat(objects)).isDirectory()) throw new Error("Installed Minecraft asset objects are unavailable.");
+  const assets = path.join(directory, "assets");
+  const indexes = path.join(assets, "indexes");
+  await mkdir(assets, { mode: 0o700 });
+  await mkdir(indexes, { mode: 0o700 });
+  await copyFile(path.join(installed, "indexes", `${assetIndex}.json`), path.join(indexes, `${assetIndex}.json`));
+  // Vanilla's ResourceIndex only reads these objects. PlayerSkinProvider writes under assets/skins instead.
+  await symlink(objects, path.join(assets, "objects"), "dir");
+  return assets;
+}
+
 /** Trusted local launcher. Credentials exist only in memory and a private child stdin pipe. */
 export class MinecraftClient {
   readonly dataDir: string;
@@ -411,6 +429,7 @@ export class MinecraftClient {
     accessToken: string,
     assetIndex: string,
     address: string,
+    assetsDir = path.join(this.source, "assets"),
   ) {
     return [
       "--username", profile.name,
@@ -420,7 +439,7 @@ export class MinecraftClient {
       "--version", "1.21.4",
       "--versionType", "release",
       "--gameDir", this.directory,
-      "--assetsDir", path.join(this.source, "assets"),
+      "--assetsDir", assetsDir,
       "--assetIndex", assetIndex,
       "--width", "1280",
       "--height", "720",
@@ -457,6 +476,7 @@ export class MinecraftClient {
       evidenceDir: string;
       display: string;
       authority: string;
+      stillOwned: () => boolean;
       onSetup?: (phase: "client_session_check" | "client_dependencies" | "client_startup") => void;
       beforeConnect?: (profileName: string) => Promise<void>;
     },
@@ -472,6 +492,7 @@ export class MinecraftClient {
     const { libraries, assetIndex } = await prepareFabricClientClasspath(
       this.source, this.dataDir, signal, path.join(config.runtimeCache, "native-libraries"),
     );
+    const assetsDir = await prepareAgentAssets(this.source, this.directory, assetIndex);
     await writeFile(
       path.join(this.directory, "options.txt"),
       CLIENT_OPTIONS,
@@ -483,6 +504,7 @@ export class MinecraftClient {
       await config.beforeConnect(profile.name);
     }
     signal.throwIfAborted();
+    if (!config.stillOwned()) throw new Error("The run no longer owns its private Minecraft display.");
     const child = spawn(this.java, [
       ...javaProxyArguments(process.env),
       "-Xms512M",
@@ -526,7 +548,7 @@ export class MinecraftClient {
     };
     child.stdout.on("data", diagnose);
     child.stderr.on("data", diagnose);
-    const args = this.gameArguments(profile, accessToken, assetIndex, `127.0.0.1:${config.port}`);
+    const args = this.gameArguments(profile, accessToken, assetIndex, `127.0.0.1:${config.port}`, assetsDir);
     child.stdin.end(JSON.stringify({ args }));
     return { child, closed, diagnostics };
   }

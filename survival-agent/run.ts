@@ -41,6 +41,7 @@ const RUNTIME = path.join(ROOT, "local/runtime");
 const AGENT_LOCAL = path.join(ROOT, "local/survival-agent");
 const RUNS = path.join(AGENT_LOCAL, "runs");
 const LIVE = path.join(AGENT_LOCAL, "live.json");
+const PARALLEL_LIVE = path.join(AGENT_LOCAL, "parallel-live.json");
 const DIAGNOSTIC_RUNS = path.join(AGENT_LOCAL, "diagnostic-runs");
 const DIAGNOSTIC_LIVE = path.join(AGENT_LOCAL, "diagnostic-live.json");
 const HISTORIC_RUNS = path.join(ROOT, "local/survival-pilot/runs");
@@ -116,7 +117,7 @@ class Stop extends Error {
 
 const usage = `Minecraft Survival Agent
 
-Usage: bun run play:agent [--strategy terra [--control local|constrained] [--macro-requests N] [--startup allow|off] [--skill-trials allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --recover-crash-autosave | --replay-incident) RUN_BASENAME]]
+Usage: bun run play:agent [--parallel-world] [--strategy terra [--control local|constrained] [--macro-requests N] [--startup allow|off] [--skill-trials allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --recover-crash-autosave | --replay-incident) RUN_BASENAME]]
        bun run diagnose:pool [SECONDS]
        bun run play:agent --diagnostic-descent (${descentVariants.join(" | ")}) [SECONDS]
        bun run play:agent --diagnostic-terrain (${terrainVariants.join(" | ")}) [SECONDS]
@@ -130,6 +131,8 @@ GOAL: ${GOALS.join(" | ")}
 --control constrained: use the work-order controller instead of the local pilot. Requires --task TEXT.
 --startup: local Terra waits for live observations. Only constrained runs and explicit skill studies can spend a request during loading.
 --skill-trials allow: opt into the work-order controller and separate skill trial worlds. The default is off.
+--parallel-world: use the second execution slot for a fresh or cleanly continued ordinary run.
+  It shares capacity with diagnostics and cannot be combined with recovery, replay, or skill trials.
 SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SECONDS}).
 --continue-from: copy a closed, recorded Survival world. Retry its goal or pursue a later one.
 --recover-crash-autosave: explicitly copy the latest recorded ordinary Survival autosave after a host reboot.
@@ -152,6 +155,26 @@ To stop a specific active ordinary run: bun survival-agent/operator-stop.ts RUN_
 Only a verified result exits 0. Artifacts and outcome JSON go in the printed run directory.`;
 
 type Diagnostic = "pool" | "incident-replay" | "macro-trial" | "urgent-creeper" | "urgent-craft" | DescentVariant | TerrainVariant;
+
+const parallelWorldUsage = "--parallel-world is only available for ordinary fresh or clean continuation runs without skill trials.";
+
+function readParallelWorld(rawArgs: string[]) {
+  let parallelWorld = false;
+  const args: string[] = [];
+  for (let i = 0; i < rawArgs.length; i++) {
+    const arg = rawArgs[i]!;
+    if (arg === "--parallel-world") {
+      if (parallelWorld) throw new Error("Repeated --parallel-world.");
+      parallelWorld = true;
+    } else {
+      args.push(arg);
+      // A free-form strategy task may literally be "--parallel-world".
+      if (arg === "--task" && i + 1 < rawArgs.length) args.push(rawArgs[++i]!);
+    }
+  }
+  if (parallelWorld && args[0]?.startsWith("--diagnostic-")) throw new Error(parallelWorldUsage);
+  return { args, parallelWorld };
+}
 
 function parseArgs(args: string[]) {
   if (args[0] === "--diagnostic-descent" || args[0] === "--diagnostic-terrain") {
@@ -763,7 +786,7 @@ function goalMilestones(goal: Goal, progress: PlayingProgress, highWater: Map<st
 }
 
 async function run(goal: Goal, seconds: number, parentRun: string | undefined, diagnostic: Diagnostic | undefined,
-    strategyOptions?: TerraOptions, macroTrial?: MacroTrialLaunch, recoverCrashAutosave = false) {
+    strategyOptions?: TerraOptions, macroTrial?: MacroTrialLaunch, { recoverCrashAutosave = false, parallelWorld = false } = {}) {
   const display = await isolatedDisplay();
   const actorJar = macroTrial ? macroTrialActor(macroTrial.ordinaryDir) : AGENT_JAR;
   const urgentCraft = diagnostic === "urgent-craft";
@@ -784,8 +807,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       : !diagnostic && strategyOptions && !localOptions ? declareTerraStrategy(strategyOptions, wallMs) : undefined;
   const requiresTerraActor = localOptions !== undefined || terraDeclaration !== undefined;
   const { java, ffmpeg } = await verifyInputs(actorJar, requiresTerraActor);
+  const executionSlot = diagnostic ? undefined : parallelWorld ? "parallel" : "primary";
   const runs = diagnostic ? DIAGNOSTIC_RUNS : RUNS;
-  const liveFile = diagnostic ? DIAGNOSTIC_LIVE : LIVE;
+  const liveFile = diagnostic ? DIAGNOSTIC_LIVE : parallelWorld ? PARALLEL_LIVE : LIVE;
   const terrain = terrainVariants.find(variant => variant === diagnostic);
   const descent = descentVariants.find(variant => variant === diagnostic);
   const fixture = terrain ?? descent;
@@ -823,8 +847,10 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     const initialRecovery = await readRecovery?.();
     if (initialRecovery?.normalParentRun)
       await savedWorld(initialRecovery.normalParentRun, initialRecovery.goal, signal);
-    release = diagnostic ? await admitRun(reserveBytes, "diagnostic") :
-      await admitRun(reserveBytes, "survival", initialRecovery?.reservation);
+    // "diagnostic" is the existing second physical lock and reservation column;
+    // its holder's run class, claim, and live descriptor remain independent.
+    release = await admitRun(reserveBytes, diagnostic || parallelWorld ? "diagnostic" : "survival",
+      initialRecovery?.reservation);
     signal.throwIfAborted();
     await mkdir(runs, { recursive: true, mode: 0o700 });
     // Reconfirm the source once this run owns the lane, before opening writers.
@@ -945,6 +971,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       await privateJson(path.join(dir, "declaration.json"), {
         schemaVersion: 1, startedAt, goal, minecraftVersion: "1.21.4", agentJarSha256,
         world, claimScope, deathPolicy,
+        ...(executionSlot ? { executionSlot } : {}),
         ...(!macroTrial ? { pauseDiagnostics: PAUSE_DIAGNOSTICS } : {}),
         ...(benchmark ? { benchmark, strategy: expeditionAdvisor?.declaration ?? terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         ...(macroTrial ? { macroTrial: { ordinaryRun: path.basename(macroTrial.ordinaryDir), maximumIntents: 1 } } : {}),
@@ -963,7 +990,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         recording: { file: "screen.mp4", size: SIZE, fps: 30, codec: "h264", cursor: true, audio: false },
       });
       declared = true;
-      if (!diagnostic) stopChannel = await openOperatorStop(dir);
+      if (executionSlot) stopChannel = await openOperatorStop(dir, {
+        slot: executionSlot, display: live.display, authority: live.authority,
+      });
       await privateJson(liveFile, { ...live, active: true, ...(stopChannel ? { operatorStop: stopChannel.scope } : {}) });
       if (stopChannel) {
         const channel = stopChannel;
@@ -980,7 +1009,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       }
       console.log(diagnostic
         ? "Diagnostic live view: http://127.0.0.1:4382/ (start with `bun run watch:agent --diagnostic` if needed)"
-        : "Live view: http://127.0.0.1:4379/ (start with `bun run watch:agent` if needed)");
+        : parallelWorld
+          ? "Parallel live view: http://127.0.0.1:4383/ (start with `bun run watch:agent --parallel-world` if needed)"
+          : "Live view: http://127.0.0.1:4379/ (start with `bun run watch:agent` if needed)");
       await record("declared");
       if (!provisioned) await writeFile(path.join(dir, RESPAWN_MARKER), "", { mode: 0o600, flag: "wx" });
       meter = (async () => {
@@ -1109,6 +1140,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       const ffmpegErr = await open(path.join(dir, "ffmpeg.log"), "wx", 0o600);
       try {
         startup.throwIfAborted();
+        if (!display.stillOwned()) throw new Stop("failed", "The run no longer owns its private recording display.");
         recordingStartedNs = osMonotonicNs();
         recorder = own(spawn(ffmpeg, [
           "-hide_banner", "-loglevel", "warning", "-nostats",
@@ -1518,6 +1550,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         result = new Stop("failed", "The vanilla goal was verified, but no Terra-issued effect was confirmed.");
       const outcome = {
         schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt, world, claimScope, deathPolicy,
+        ...(executionSlot ? { executionSlot } : {}),
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start),
         finalStage: stage, reservedBytes: reserveBytes, measuredBytes, progress: lastProgress,
         ...(pendingFurnace ? { pendingFurnace } : {}),
@@ -1571,7 +1604,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
 }
 
 try {
-  const args = process.argv.slice(2);
+  const { args, parallelWorld } = readParallelWorld(process.argv.slice(2));
   if (args[0] === "--diagnostic-macro-trial") {
     const trial = parseMacroTrialLaunch(args.slice(1), RUNS);
     process.umask(0o077);
@@ -1582,15 +1615,17 @@ try {
   } else if (args.length === 1 && args[0] === "--diagnostic-urgent-craft") {
     process.umask(0o077);
     process.exitCode = await run("stone_pickaxe", urgentCraftLimits.wallSeconds, undefined, "urgent-craft");
-  } else if ((args.length === 1 && args[0] === "--help") ||
+  } else if (!parallelWorld && ((args.length === 1 && args[0] === "--help") ||
       (args.length === 2 && (args[0] === "--diagnostic-pool" || args[0] === "--diagnostic-descent" ||
         args[0] === "--diagnostic-terrain") &&
-        args[1] === "--help")) console.log(usage);
+        args[1] === "--help"))) console.log(usage);
   else {
     const { game, terra } = readStrategy(args);
     const { goal, seconds, parentRun, diagnostic, recoverCrashAutosave } = parseArgs(game);
+    if (parallelWorld && (diagnostic || recoverCrashAutosave || terra?.skillTrials === "allow"))
+      throw new Error(parallelWorldUsage);
     process.umask(0o077);
-    process.exitCode = await run(goal, seconds, parentRun, diagnostic, terra, undefined, recoverCrashAutosave);
+    process.exitCode = await run(goal, seconds, parentRun, diagnostic, terra, undefined, { recoverCrashAutosave, parallelWorld });
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : "Run failed.");

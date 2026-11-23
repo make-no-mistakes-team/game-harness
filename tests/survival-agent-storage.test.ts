@@ -43,6 +43,58 @@ const commands = {
       owner.close(); diagnostic.close(); ledger.close();
     }
   `,
+  concurrentAdmission: `
+    const { Database } = await import("bun:sqlite");
+    const primary = await admitRun(11);
+    const second = await admitRun(17, "diagnostic");
+    const db = new Database("local/survival-pilot/admission.sqlite", { readonly: true });
+    const state = () => db.query("SELECT survival, diagnostic FROM reservations").get();
+    const refused = async (lane) => {
+      try {
+        (await admitRun(19, lane))();
+        return "admitted";
+      } catch (error) { return error.message; }
+    };
+    const held = state();
+    const deniedPrimary = await refused("survival");
+    const deniedSecond = await refused("diagnostic");
+    second();
+    const remaining = state();
+    primary();
+    console.log(JSON.stringify({ held, deniedPrimary, deniedSecond, remaining, drained: state() }));
+    db.close();
+  `,
+  aggregateAdmission: `
+    const primary = await admitRun(900_000);
+    let refused;
+    try { (await admitRun(900_000, "diagnostic"))(); }
+    catch (error) { refused = error.message; }
+    const second = await admitRun(90_000, "diagnostic");
+    second();
+    primary();
+    console.log(refused);
+  `,
+  unaccountedSecondLane: `
+    const { Database } = await import("bun:sqlite");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync("local/survival-pilot", { recursive: true, mode: 0o700 });
+    const legacy = new Database("local/survival-pilot/diagnostic-owner.sqlite");
+    const refused = async () => {
+      try {
+        (await admitRun(19, "diagnostic"))();
+        return "admitted";
+      } catch (error) { return error.message; }
+    };
+    legacy.exec("BEGIN IMMEDIATE");
+    const unaccounted = await refused();
+    legacy.close();
+    const db = new Database("local/survival-pilot/admission.sqlite");
+    db.exec("UPDATE reservations SET diagnostic = 7 WHERE id = 1");
+    const stranded = await refused();
+    const reservation = db.query("SELECT diagnostic FROM reservations").get();
+    console.log(JSON.stringify({ unaccounted, stranded, reservation }));
+    db.close();
+  `,
   measure: `console.log(await diskBytes("./runtime"));`,
   abort: `
     const controller = new AbortController();
@@ -104,8 +156,16 @@ case "$CASE" in
     printf '%s\\n' "$$" > "$SCAN_PID"
     exec sleep 4 ;;
 esac
-for root; do printf '4096\\t%s\\000' "$root"; done
 total=$(($# * 4096))
+first=4096
+if [ "$CASE" = nearly-full ]; then
+  total=246311908800
+  first=$((total - ($# - 1) * 4096))
+fi
+for root; do
+  printf '%s\\t%s\\000' "$first" "$root"
+  first=4096
+done
 case "$CASE" in
   malformed) printf '\\ttotal\\000' ;;
   truncated) printf '%s\\ttotal' "$total" ;;
@@ -133,8 +193,8 @@ esac
     const [stdout, stderr, code] = await Promise.all([
       new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
     ]);
-    const roots = command === "admission" || command === "crashAdmission"
-      ? ["local", "runtime", "reports", "governance", "data"] : ["runtime"];
+    const roots = command === "measure" || command === "abort"
+      ? ["runtime"] : ["local", "runtime", "reports", "governance", "data"];
     const fullScan = roots.map(name => join(project, name)).join(" ");
     const attempts = readFileSync(scans, "utf8").split("\n").slice(0, -1);
     for (const attempt of attempts) expect(attempt).toBe(fullScan);
@@ -161,6 +221,34 @@ test("opt-in recovery replaces exactly the attributed unlocked reservation and r
   expect(JSON.parse(result.stdout)).toEqual({
     admitted: { generation: 11, survival: 11, diagnostic: 0 },
     released: { generation: 12, survival: 0, diagnostic: 0 },
+  });
+});
+
+test("the primary and second physical owner share one ledger without releasing each other's reservations", async () => {
+  const result = await withScanner("concurrent", "concurrentAdmission");
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 2 });
+  expect(JSON.parse(result.stdout)).toEqual({
+    held: { survival: 11, diagnostic: 17 },
+    deniedPrimary: "The survival lane already has an active run.",
+    deniedSecond: "The diagnostic lane already has an active run.",
+    remaining: { survival: 11, diagnostic: 0 },
+    drained: { survival: 0, diagnostic: 0 },
+  });
+});
+
+test("the second physical owner charges the existing primary reservation against the aggregate cap", async () => {
+  const result = await withScanner("nearly-full", "aggregateAdmission");
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 3 });
+  expect(result.stdout).toContain("246311908800 bytes counted, 900000 reserved for agent runs, 900000 requested");
+});
+
+test("the second physical owner refuses both a legacy lock without a reservation and a stranded reservation", async () => {
+  const result = await withScanner("unaccounted", "unaccountedSecondLane");
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 0 });
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    unaccounted: expect.stringContaining("locked without a shared reservation"),
+    stranded: expect.stringContaining("left an unreleased reservation"),
+    reservation: { diagnostic: 7 },
   });
 });
 

@@ -442,6 +442,25 @@ final class AgentSupplyEgressTest {
         assertFalse(passage.attemptHandClearance(WATER));
     }
 
+    @Test
+    void confirmedHandWorkLeavesTheRemainingTimeToProveAndWalkTheExit() {
+        var passage = new AgentSupplyEgress.OutlinePassage();
+        passage.begin(REFUGE, 10);
+        assertTrue(passage.attemptHandClearance(OPENING));
+        assertFalse(passage.withinTime(910), "an attack by itself buys no more search time");
+        passage.confirmedHandClearance(LOWER, 831, 981);
+        assertFalse(passage.withinTime(981), "a different break is not an escape receipt");
+        passage.confirmedHandClearance(OPENING, 831, 981);
+        assertTrue(passage.withinTime(1059));
+        assertFalse(passage.withinTime(1060));
+        passage.confirmedHandClearance(OPENING, 831, 981);
+        assertFalse(passage.withinTime(1060), "the same break cannot be credited twice");
+        assertTrue(passage.attemptHandClearance(LOWER));
+        passage.abandonHandClearance();
+        passage.confirmedHandClearance(LOWER, 1000, 1040);
+        assertFalse(passage.withinTime(1060), "a break after releasing the contact is not this order's receipt");
+    }
+
     private static BlockHitResult apexFace(BlockPos foot, Direction side) {
         BlockPos apex = foot.up(3);
         return new BlockHitResult(Vec3d.ofCenter(apex), side, apex, false);

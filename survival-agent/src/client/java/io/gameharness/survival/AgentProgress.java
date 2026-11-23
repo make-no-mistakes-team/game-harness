@@ -6025,7 +6025,6 @@ final class AgentProgress {
         private static final int MAX_RISE = 48, MAX_LEVEL = 2, MAX_CUTS = 96, MAX_LANE_CUTS = 3;
         private static final int MAX_CONNECTORS = 2, MAX_FOOTHOLDS = 2, FOOTHOLD_RESERVE = 8, ANCHOR_TICKS = 24;
         private static final int OUTLINE_LOOK_TICKS = 46, OUTLINE_REAIM_TICKS = 23;
-        private static final int OUTLINE_HAND_TICKS = 190;
         private static final int LIGHT_SIDE_TICKS = 18, LIGHT_REAR_TICKS = 26, LIGHT_CONTACT_TICKS = 20;
         private static final int LIGHT_RECEIPT_TICKS = 14, LIGHT_RESERVE = 1;
         private static final Predicate<ItemStack> ANDESITE_FOOTHOLD = item(Items.ANDESITE), DIRT_FOOTHOLD = item(Items.DIRT);
@@ -6071,11 +6070,13 @@ final class AgentProgress {
             if (world != c.world) return;
             order.observeBreak(position);
             if (!position.equals(armedCut)) return;
+            if (handClearSince >= 0 && !body.supplyHandClearanceBroke(position, material)) return;
             var apex = outline.apexAccess();
             if (apex != null) {
                 if (!apex.broken(position, material)) return;
                 aim = null;
             }
+            if (handClearSince >= 0) outline.confirmedHandClearance(position, handClearSince, tick);
             body.forgetSupplyOutlineCut();
             armedCut = null;
             handClearSince = -1;
@@ -6286,7 +6287,9 @@ final class AgentProgress {
                 if (!dryFieldFooting()) return stop("lost ground contact outside a witnessed crossing");
                 if (!from.equals(c.player.getBlockPos()))
                     return stop("left the connected footing before the next crossing");
-                if (outline.active() && !outline.withinTime(tick)) return stop("short outline exit time limit reached");
+                if (outline.active() && !outline.withinTime(tick)
+                        && (handClearSince < 0 || !body.supplyHandClearanceFinishing(armedCut)))
+                    return stop("short outline exit time limit reached");
             }
             if (!body.hasRecentView()) {
                 body.pauseWork();
@@ -6837,6 +6840,7 @@ final class AgentProgress {
             proof = next;
             armedCut = null;
             handClearSince = -1;
+            outline.abandonHandClearance();
             body.forgetSupplyOutlineCut();
             outlineCutPoint = null;
             outlineReaimed = false;
@@ -7003,8 +7007,7 @@ final class AgentProgress {
                     || apexRiseSupport == null || c.world.getBlockState(to.down()) != apexRiseSupport
                     || body.dryRouteVeto(from, to) != AgentBody.DryRouteVeto.CLEAR
                     || body.supplyOutlineGradeVeto(from, to) != AgentBody.DryRouteVeto.SWEEP
-                    || !body.walkedLaneDry(from, to, lane)
-                    || !body.supplyOutlineCutObstructedByUnknownOverhead(hit))
+                    || !body.walkedLaneDry(from, to, lane))
                 return false;
             var apex = outline.beginApexAccess(from, to, hit, body.supplyOutlineState(hit),
                 apexSourceSupport, apexRiseSupport);
@@ -7499,12 +7502,21 @@ final class AgentProgress {
             if (laneCuts >= (outlineApexChecked ? 5 : MAX_LANE_CUTS)
                     || cuts >= MAX_CUTS || armedCut == null && !outline.allowsCut(cell))
                 return rejectOutlineCut("short outline cut limit or repeated cut target at " + cell.toShortString());
-            if (!body.supplyOutlineCutSafe(hit)) {
-                if (outline.apexAccess() == null && beginApexAccess(hit)) return true;
-                return rejectOutlineCut("unsafe outlined cut face or overhead cap at " + cell.toShortString());
+            BlockState material = body.supplyOutlineState(hit);
+            if (material == null) return true;
+            switch (body.supplyOutlineCutAdmission(hit)) {
+                case ALLOWED -> {}
+                case UNKNOWN_OVERHEAD -> {
+                    if (outline.apexAccess() == null && beginApexAccess(hit)) return true;
+                    return refuseOutlinedFace(cell, material, "no witnessed dry overhead cover or safe side approach");
+                }
+                case MATERIAL -> { return refuseOutlinedFace(cell, material, "not stable natural cut material"); }
+                case FOOTING -> { return refuseOutlinedFace(cell, material, "outside the settled cut envelope"); }
+                case BLOCKED -> { return refuseOutlinedFace(cell, material, "unsafe cutting column, cover or attachment"); }
+                case NO_CONTACT -> { return true; }
             }
             if (handClearSince >= 0) {
-                if (tick - handClearSince >= OUTLINE_HAND_TICKS)
+                if (tick - handClearSince >= AgentSupplyOutline.EscapeWork.MAX_TICKS)
                     return rejectOutlineCut("no confirmed hand clearance at " + cell.toShortString());
                 return handleHandClearance(cell, body.clearSupplyOutline(hit));
             }
@@ -7512,9 +7524,6 @@ final class AgentProgress {
                 return rejectOutlineCut("no confirmed outlined break at " + cell.toShortString());
             if (outlineCutPoint == null) outlineCutPoint = hit.getPos();
             status = "supply egress: targeting an outlined " + area() + " cut at " + cell.toShortString();
-            // Consult only the currently authenticated natural face, never an unseen stock or cover cell.
-            BlockState material = body.supplyOutlineState(hit);
-            if (material == null) return true;
             var inventory = c.player.getInventory();
             if (material.isToolRequired() && !inventory.getMainHandStack().isSuitableFor(material)) {
                 for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
@@ -7543,8 +7552,13 @@ final class AgentProgress {
             if (apex != null) apex.requestedCut();
         }
 
+        private boolean refuseOutlinedFace(BlockPos cell, BlockState state, String why) {
+            return rejectOutlineCut("outlined " + area() + " at " + cell.toShortString()
+                + " (" + Registries.BLOCK.getId(state.getBlock()) + "): " + why);
+        }
+
         private boolean continueHandClearance(BlockPos cell) {
-            if (tick - handClearSince >= OUTLINE_HAND_TICKS)
+            if (tick - handClearSince >= AgentSupplyOutline.EscapeWork.MAX_TICKS)
                 return rejectOutlineCut("no confirmed hand clearance at " + cell.toShortString());
             return handleHandClearance(cell, body.continueSupplyOutlineClearance(cell));
         }
@@ -7563,7 +7577,7 @@ final class AgentProgress {
                 case WAIT -> true;
                 case UNSAFE -> rejectOutlineCut("outlined hand clearance lost its safe contact");
                 case TOO_SLOW -> rejectOutlineCut("the outlined hand cut cannot finish inside its bound");
-                case STALLED -> rejectOutlineCut("no observed crack progress from the outlined hand cut");
+                case STALLED -> rejectOutlineCut("the native outlined hand cut stopped advancing");
                 case EXPIRED -> rejectOutlineCut("the outlined hand clearance expired without a break");
             };
         }
@@ -7798,6 +7812,7 @@ final class AgentProgress {
             body.forgetSupplyOutlineCut();
             outlineCutPoint = null;
             handClearSince = -1;
+            outline.abandonHandClearance();
             restoredApex = null;
             to = null;
             armedCut = null;

@@ -346,7 +346,7 @@ final class AgentSupplyEgress {
         private static final int APEX_ACCESSES = 2, HAND_CLEARANCES = 2;
         private final Set<BlockPos> visited = new HashSet<>(), attemptedCuts = new HashSet<>();
         private final Set<BlockPos> shiftedApexes = new HashSet<>(), handClearances = new HashSet<>();
-        private BlockPos foot, pending;
+        private BlockPos foot, pending, handReceiptCell;
         private ApexAccess apex;
         private int until;
 
@@ -381,7 +381,21 @@ final class AgentSupplyEgress {
         }
 
         boolean attemptHandClearance(BlockPos cell) {
-            return allowsHandClearance(cell) && handClearances.add(cell.toImmutable());
+            if (!allowsHandClearance(cell)) return false;
+            handReceiptCell = cell.toImmutable();
+            handClearances.add(handReceiptCell);
+            return true;
+        }
+
+        void abandonHandClearance() { handReceiptCell = null; }
+
+        void confirmedHandClearance(BlockPos cell, int from, int tick) {
+            if (!cell.equals(handReceiptCell)) return;
+            abandonHandClearance();
+            int spent = tick - from;
+            // Reserve search/landing time, not another swing. Only a real break refunds its work.
+            if (active() && from < until && spent > 0 && spent <= AgentSupplyOutline.EscapeWork.MAX_TICKS)
+                until += spent;
         }
 
         ApexAccess apexAccess() { return apex; }
@@ -427,6 +441,7 @@ final class AgentSupplyEgress {
             attemptedCuts.clear();
             shiftedApexes.clear();
             handClearances.clear();
+            abandonHandClearance();
             until = 0;
         }
     }

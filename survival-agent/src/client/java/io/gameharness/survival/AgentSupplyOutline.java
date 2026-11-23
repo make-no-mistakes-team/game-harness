@@ -68,7 +68,8 @@ final class AgentSupplyOutline {
 
     /** Bounds one attack on one drawn surface, not a source of break or drop receipts. */
     static final class EscapeWork {
-        private static final int MAX_TICKS = 180, STALLED_TICKS = 12, MAX_GAP_TICKS = 3;
+        static final int MAX_TICKS = 166;
+        private static final int STALLED_TICKS = 12, MAX_GAP_TICKS = 3;
         private BlockHitResult face;
         private BlockState state;
         private ItemStack hand = ItemStack.EMPTY;
@@ -107,10 +108,20 @@ final class AgentSupplyOutline {
                 && matchesFace(face, seen) && matchesFace(face, live);
         }
 
+        boolean finishing(int tick, float crack) {
+            return active() && tick - startedAt < MAX_TICKS && crack > 0
+                && (crack > peak || crack == peak && tick - advancedAt < STALLED_TICKS);
+        }
+
+        boolean broke(BlockPos cell, BlockState material) {
+            return active() && cell.equals(face.getBlockPos()) && material == state;
+        }
+
         OutlineClearance check(int tick, float delta, float crack) {
             int elapsed = active() ? tick - startedAt : 0;
             if (elapsed >= MAX_TICKS) return OutlineClearance.EXPIRED;
             if (active()) {
+                if (crack < peak) return OutlineClearance.STALLED; // Vanilla canceled this attack, not another try.
                 if (crack > peak) {
                     peak = crack;
                     advancedAt = tick;
@@ -125,7 +136,7 @@ final class AgentSupplyOutline {
         }
     }
 
-    enum CutAdmission { ALLOWED, UNKNOWN_OVERHEAD, BLOCKED }
+    enum CutAdmission { ALLOWED, UNKNOWN_OVERHEAD, BLOCKED, MATERIAL, FOOTING, NO_CONTACT }
 
     /** One pending cut and its drawn cap or attachments. There is no world lookup here. */
     static final class CutCover {

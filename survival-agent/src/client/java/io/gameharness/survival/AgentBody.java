@@ -1158,15 +1158,6 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 || supplyOutlineRay(checkedSupplyEye, now, sample, reach));
     }
 
-    /** A negative-only guard for an exact cut chosen by the active supply owner. */
-    boolean supplyOutlineCutSafe(BlockHitResult witness) {
-        return supplyOutlineCutAdmission(witness) == CutAdmission.ALLOWED;
-    }
-
-    boolean supplyOutlineCutObstructedByUnknownOverhead(BlockHitResult witness) {
-        return supplyOutlineCutAdmission(witness) == CutAdmission.UNKNOWN_OVERHEAD;
-    }
-
     /** Only the exact selected face already authenticated against the vanilla draw. */
     BlockState supplyOutlineState(BlockHitResult witness) {
         BlockHitResult now = supplyOutlineFace();
@@ -1183,14 +1174,16 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             && !hull.intersects(x, y, z, x + 1.0, y + 1.0, z + 1.0);
     }
 
-    private CutAdmission supplyOutlineCutAdmission(BlockHitResult witness) {
+    /** A negative-only guard for an exact cut chosen by the active supply owner. */
+    CutAdmission supplyOutlineCutAdmission(BlockHitResult witness) {
         BlockState state = supplyOutlineState(witness);
-        if (state == null) return CutAdmission.BLOCKED;
+        if (state == null) return CutAdmission.NO_CONTACT;
         BlockPos cell = witness.getBlockPos();
         var player = client.player;
         Box hull = player.getBoundingBox();
-        if (!supplyOutlineCutSpace(cell, hull) || state.hasBlockEntity() || state.getBlock() instanceof FallingBlock
-                || !fullStepSupport(cell, state) || !AgentSupplyOutline.naturalCut(state)) return CutAdmission.BLOCKED;
+        if (!supplyOutlineCutSpace(cell, hull)) return CutAdmission.FOOTING;
+        if (state.hasBlockEntity() || state.getBlock() instanceof FallingBlock
+                || !fullStepSupport(cell, state) || !AgentSupplyOutline.naturalCut(state)) return CutAdmission.MATERIAL;
         return supplyCutCover.admission(cell, hull, tick, System.nanoTime());
     }
 
@@ -2406,7 +2399,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     boolean mineSupplyOutline(BlockHitResult witness) {
-        if (!supplyOutlineCutSafe(witness)) return false;
+        if (supplyOutlineCutAdmission(witness) != CutAdmission.ALLOWED) return false;
         var held = client.player.getMainHandStack();
         if (renderedSupplyOutline.isToolRequired() && !held.isSuitableFor(renderedSupplyOutline)) return false;
         return requestMine(witness, Contact.SUPPLY_MINE);
@@ -2476,6 +2469,15 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         Box hull = client.player.getBoundingBox();
         return !AgentSupplyOutline.CutCover.underColumn(cell, hull) && supplyOutlineCutSpace(cell, hull)
             && supplyCutCover.allows(cell, hull, tick, nanos) && !hazards.lavaNear(hull, 0.12, tick);
+    }
+
+    boolean supplyHandClearanceFinishing(BlockPos cell) {
+        return supplyEscapeInputSafe() && supplyEscapeWork.finishing(tick, supplyEscapeCrack(cell));
+    }
+
+    boolean supplyHandClearanceBroke(BlockPos cell, BlockState material) {
+        return contactMode == Contact.SUPPLY_CLEAR && cell.equals(lastHeldMine)
+            && tick - lastHeldMineTick <= 1 && supplyEscapeWork.broke(cell, material);
     }
 
     private float supplyEscapeCrack(BlockPos cell) {

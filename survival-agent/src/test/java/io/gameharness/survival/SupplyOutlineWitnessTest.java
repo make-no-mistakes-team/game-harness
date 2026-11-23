@@ -78,9 +78,10 @@ final class SupplyOutlineWitnessTest {
     }
 
     @Test void onlyOrdinaryEarthAndRockAreEligibleForEscapeWork() {
+        assertTrue(AgentSupplyOutline.escapeMaterial(Blocks.STONE.getDefaultState()));
         assertTrue(AgentSupplyOutline.escapeMaterial(Blocks.DIRT.getDefaultState()));
         assertTrue(AgentSupplyOutline.escapeMaterial(Blocks.ANDESITE.getDefaultState()));
-        for (Block denied : new Block[]{Blocks.IRON_ORE, Blocks.DEEPSLATE_DIAMOND_ORE, Blocks.BEDROCK, Blocks.GRAVEL,
+        for (Block denied : new Block[]{Blocks.COPPER_ORE, Blocks.IRON_ORE, Blocks.DEEPSLATE_DIAMOND_ORE, Blocks.BEDROCK, Blocks.GRAVEL,
                 Blocks.MAGMA_BLOCK, Blocks.WATER, Blocks.CRAFTING_TABLE, Blocks.FURNACE, Blocks.TORCH}) {
             assertFalse(AgentSupplyOutline.escapeMaterial(denied.getDefaultState()), denied.toString());
         }
@@ -125,7 +126,25 @@ final class SupplyOutlineWitnessTest {
         assertEquals(OutlineClearance.REQUESTED, work.check(105, handStone, handStone));
         assertEquals(OutlineClearance.REQUESTED, work.check(116, handStone, handStone));
         assertEquals(OutlineClearance.STALLED, work.check(117, handStone, handStone));
-        assertEquals(OutlineClearance.EXPIRED, work.check(280, handStone, 0.99f));
+        assertEquals(OutlineClearance.EXPIRED, work.check(266, handStone, 0.99f));
+    }
+
+    @Test void onlyAStillAdvancingNativeCrackCanFinishPastThePassageDeadline() {
+        var work = new AgentSupplyOutline.EscapeWork();
+        var hit = wall().vanillaHit();
+        float handStone = 1 / 150f;
+        assertFalse(work.finishing(100, 0.5f), "never start a cut after the passage deadline");
+        work.start(hit, Blocks.STONE.getDefaultState(), ItemStack.EMPTY, 100);
+        assertFalse(work.finishing(101, 0), "a held attack without a native crack does not count");
+        work.check(179, handStone, 0.50f);
+        assertTrue(work.finishing(180, 0.51f), "the ordinary stone cut is still advancing");
+        assertFalse(work.finishing(191, 0.50f), "a stuck crack cannot buy more time");
+        assertFalse(work.finishing(192, 0.25f), "resetting to a smaller crack is not progress");
+        assertEquals(OutlineClearance.STALLED, work.check(181, handStone, 0), "release cannot start a new swing");
+        assertFalse(work.finishing(266, 0.99f), "even real progress cannot exceed the single-cut bound");
+        assertFalse(work.broke(WALL.east(), Blocks.STONE.getDefaultState()));
+        assertFalse(work.broke(WALL, Blocks.DIRT.getDefaultState()), "a block update does not complete the attack");
+        assertTrue(work.broke(WALL, Blocks.STONE.getDefaultState()));
     }
 
     @Test void foregroundWaterVetoesEvenThoughTheVanillaTargetIsTheSameWall() {

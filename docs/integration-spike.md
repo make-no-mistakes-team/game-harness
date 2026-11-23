@@ -645,6 +645,23 @@ includes its cursor; the local recording continues if you close the tab.
 To open an exported review clip from its existing playback link, run
 `bun run review:agent` on the same computer first.
 
+To run a second ordinary world alongside the first, use separate terminals:
+
+```sh
+bun run play:agent --parallel-world --strategy terra --skill-trials off --task 'Enter the Nether' nether_portal 7200
+bun run watch:agent --parallel-world
+```
+
+Watch the second player at `http://127.0.0.1:4383/`. The two players have
+separate displays, servers, inventories, recordings and run IDs. Neither
+sees the other's world. The second world occupies the slot otherwise used
+for diagnostics, and both slots share the 300 GB artifact ceiling. Use
+the same per-run stop command below for either player.
+
+Count a goal only when the verifier confirms it in that world. A diamond
+in one world and a Nether entry in another are two successes, not one
+uninterrupted playthrough. Report the other attempts alongside any win.
+
 To stop an ordinary run from a second terminal or a progress watch, pass the
 basename of that attempt's printed directory:
 

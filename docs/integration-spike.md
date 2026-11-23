@@ -72,6 +72,9 @@ The player gathers supplies for the next stretch of mine, keeping
 enough light for the return. If it lands partly on a stair edge, it can
 ease inward on the dry block supporting its feet before setting up a
 workshop. That small shift is not a new route or a resource gain.
+If a recipe is already affordable at its own nearby crafting table,
+the player can walk back to it rather than gather wood for a duplicate.
+It must see the table again before it can use it.
 Ordinary travel keeps its destination while it follows a sequence of
 visible or previously walked treads. The route can go sideways or
 briefly away from a resource, jump up, or step down. If a crossing is
@@ -81,6 +84,8 @@ the route is still unknown it can head for a reachable vantage point.
 Reaching that vantage is not the same as reaching the resource. A
 missing frame releases the movement keys; it does not cancel a checked
 one-block descent if the same player is still making that crossing.
+On a short, flat retrace the player can back up or sidestep on the two
+recently crossed treads rather than turn its camera all the way around.
 When gathering timber on uneven ground,
 it approaches a stance where it can collect the log, not just reach
 the trunk with a swing. It makes the first pick as soon as it can pay

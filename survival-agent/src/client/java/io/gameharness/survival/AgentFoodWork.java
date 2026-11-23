@@ -13,9 +13,12 @@ import net.minecraft.item.Item;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
+import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 
 /** Local meal policy and exact model-authorized food sources. */
 final class AgentFoodWork {
@@ -132,6 +135,42 @@ final class AgentFoodWork {
 
     static boolean appleLeaf(BlockState state) {
         return (state.isOf(Blocks.OAK_LEAVES) || state.isOf(Blocks.DARK_OAK_LEAVES)) && state.getFluidState().isEmpty();
+    }
+
+    static boolean forageGround(BlockState state) {
+        return (state.isIn(BlockTags.DIRT) || state.isOf(Blocks.MOSS_BLOCK)) && !AgentBody.dryCaveDanger(state);
+    }
+
+    /** A lower top seen in the frustum supplies a bearing, not permission to descend to it. */
+    static Direction lowerForageBearing(BlockPos from, BlockPos floor) {
+        if (floor.getY() >= from.getY() - 1) return null;
+        int dx = floor.getX() - from.getX(), dz = floor.getZ() - from.getZ();
+        if (dx == 0 && dz == 0) return null;
+        return Math.abs(dx) >= Math.abs(dz) ? (dx > 0 ? Direction.EAST : Direction.WEST)
+            : (dz > 0 ? Direction.SOUTH : Direction.NORTH);
+    }
+
+    static AgentSurfaceTread.Edge canopyEdge(BlockPos from, BlockState source, Direction bearing,
+                                             BlockPos to, BlockState witnessedTop) {
+        if (source == null || !AgentSupplyEgress.naturalDryLeaf(source) || witnessedTop == null
+                || !AgentDryLanding.shape(from, to, bearing)
+                || !(forageGround(witnessedTop) || AgentSupplyEgress.naturalDryLeaf(witnessedTop))) return null;
+        return new AgentSurfaceTread.Edge(from, source, to, witnessedTop, bearing);
+    }
+
+    static boolean canopyDropAllowed(int drop, double safeFallDistance, double fallDistance) {
+        return drop >= 1 && drop <= AgentDryLanding.MAX_DROP
+            && safeFallDistance >= drop + 0.35 && fallDistance <= 0.05;
+    }
+
+    static boolean canopyMask(BlockPos foot, Box player, Direction bearing, BlockHitResult hit,
+                              BlockState leaves, boolean protectedSupport) {
+        if (hit == null || protectedSupport) return false;
+        BlockPos at = hit.getBlockPos();
+        int x = at.getX(), y = at.getY(), z = at.getZ();
+        return !player.intersects(x - 0.1, y - 0.1, z - 0.1, x + 1.1, y + 1.1, z + 1.1)
+            && (AgentSupplyEgress.canopyTopLeaf(foot, bearing, hit, leaves, false)
+                || AgentSupplyEgress.canopyLeaf(foot, bearing, hit, leaves, false));
     }
 
     static boolean leafClearOfStance(BlockPos foot, Box player, BlockPos leaf) {

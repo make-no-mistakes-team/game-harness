@@ -9,8 +9,10 @@ import net.minecraft.block.LeavesBlock;
 import net.minecraft.block.SweetBerryBushBlock;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -131,6 +133,51 @@ final class AgentFoodWorkTest {
         assertTrue(AgentFoodWork.appleCatch(player, next.getX(), 64, next.getZ()));
         assertFalse(AgentFoodWork.appleCatch(player, next.getX(), 63, next.getZ()));
         assertFalse(AgentFoodWork.appleCatch(player, next.getX() + 1, 64, next.getZ()));
+    }
+
+    @Test
+    void lowerForageCueNamesABearingNotAnUnseenLanding() {
+        var foot = new BlockPos(0, 72, 0);
+        assertEquals(Direction.EAST, AgentFoodWork.lowerForageBearing(foot, foot.east(4).down(5)));
+        assertEquals(Direction.NORTH, AgentFoodWork.lowerForageBearing(foot, foot.north(3).west().down(2)));
+        assertNull(AgentFoodWork.lowerForageBearing(foot, foot.down(4)));
+        assertNull(AgentFoodWork.lowerForageBearing(foot, foot.east(4).down()));
+
+        var leaves = Blocks.OAK_LEAVES.getDefaultState();
+        var grass = Blocks.GRASS_BLOCK.getDefaultState();
+        var shelf = foot.east().down();
+        assertNotNull(AgentFoodWork.canopyEdge(foot, leaves, Direction.EAST, shelf, grass));
+        assertNull(AgentFoodWork.canopyEdge(foot, leaves, Direction.EAST, foot.east(4).down(5), grass));
+        assertNull(AgentFoodWork.canopyEdge(foot, leaves, Direction.EAST, shelf, Blocks.SAND.getDefaultState()));
+        assertNull(AgentFoodWork.canopyEdge(foot, leaves, Direction.EAST, shelf,
+            leaves.with(LeavesBlock.WATERLOGGED, true)));
+    }
+
+    @Test
+    void canopyOpeningCannotCutCurrentOrProtectedSupport() {
+        var foot = new BlockPos(0, 72, 0);
+        var player = new Box(0.2, 72, 0.2, 0.8, 73.8, 0.8);
+        var leaves = Blocks.BIRCH_LEAVES.getDefaultState();
+        var adjacentTop = foot.east().down();
+        var mask = new BlockHitResult(new Vec3d(1.5, 72, 0.5), Direction.UP, adjacentTop, false);
+        assertTrue(AgentFoodWork.canopyMask(foot, player, Direction.EAST, mask, leaves, false));
+        assertFalse(AgentFoodWork.canopyMask(foot, player.offset(0.17, 0, 0), Direction.EAST, mask, leaves, false),
+            "the stationary box plus safety margin overlaps the proposed mask");
+        assertFalse(AgentFoodWork.canopyMask(foot, player, Direction.EAST, mask, leaves, true));
+        assertFalse(AgentFoodWork.canopyMask(foot, player, Direction.WEST, mask, leaves, false));
+        assertFalse(AgentFoodWork.canopyMask(foot, player, Direction.EAST, mask,
+            leaves.with(LeavesBlock.WATERLOGGED, true), false));
+        var ownSupport = new BlockHitResult(new Vec3d(0.5, 72, 0.5), Direction.UP, foot.down(), false);
+        assertFalse(AgentFoodWork.canopyMask(foot, player, Direction.EAST, ownSupport, leaves, false));
+    }
+
+    @Test
+    void foodScoutOnlyAdmitsAShortDropWithNoExpectedDamage() {
+        assertTrue(AgentFoodWork.canopyDropAllowed(1, 1.4, 0));
+        assertTrue(AgentFoodWork.canopyDropAllowed(2, 3, 0));
+        assertFalse(AgentFoodWork.canopyDropAllowed(2, 2.2, 0));
+        assertFalse(AgentFoodWork.canopyDropAllowed(2, 3, 0.2));
+        assertFalse(AgentFoodWork.canopyDropAllowed(3, 10, 0));
     }
 
     @Test

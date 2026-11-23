@@ -206,9 +206,12 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private int dryFootingTick;
     private Vec3d previousDryFooting;
     private int previousDryFootingTick;
+    private BlockPos dryTread, previousDryTread;
+    private int dryTreadTick, previousDryTreadTick;
     private boolean lavaEmergency;
     private boolean checkedEmergencyWalk;
     private int emergencyDriveTick = -1;
+    private FlatKey emergencyDriveKey = FlatKey.NONE;
     private Predicate<ItemStack> safetySpend;
     private int stableDryTicks;
     private Vec3d escapeLanding;
@@ -379,6 +382,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             stepSupport = null;
             emergencyDriveTick = -1;
             dryFooting = previousDryFooting = null;
+            dryTread = previousDryTread = null;
             lavaEmergency = false;
             horizonApplied = null;
             horizonPulseContact = null;
@@ -415,6 +419,15 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             } else stableDryTicks = 0;
         }
         if (!lavaEmergency && dry) {
+            BlockPos support = player.supportingBlockPos.orElse(null);
+            if (player.hurtTime == 0 && flatSupport(player.getBlockPos(), support)) {
+                if (!support.equals(dryTread)) {
+                    previousDryTread = dryTread;
+                    previousDryTreadTick = dryTreadTick;
+                    dryTread = support;
+                }
+                dryTreadTick = tick;
+            }
             Vec3d feet = player.getPos();
             if (dryFooting == null || feet.squaredDistanceTo(dryFooting) >= 0.49) {
                 previousDryFooting = dryFooting;
@@ -855,8 +868,13 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         if (measuredLaunchKey && advance && !jump && !crouch) recordMeasuredLaunch();
         if (jump && stepJump) lastStepJump = tick;
         ownsKeys = true;
-        if (advance && (emergencyWalk || rolling && horizonIntent.ranged) && !options.forwardKey.isUnbound())
+        if (emergencyWalk && retraceWalk && (retreat || retraceSide != 0)) {
             emergencyDriveTick = tick;
+            emergencyDriveKey = ordinaryFlatKey;
+        } else if (advance && (emergencyWalk || rolling && horizonIntent.ranged) && !options.forwardKey.isUnbound()) {
+            emergencyDriveTick = tick;
+            emergencyDriveKey = FlatKey.FORWARD;
+        }
         options.forwardKey.setPressed(advance);
         options.backKey.setPressed(retreat);
         if (pickupWalk) visibleHorizon.reportPickup(pickupTarget,
@@ -1292,6 +1310,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         hazardWorld = null;
         hazardPlayer = null;
         dryFooting = previousDryFooting = escapeLanding = null;
+        dryTread = previousDryTread = null;
         lavaEmergency = false;
         horizonApplied = null;
         interruptHorizonWade(Refusal.WORLD_OR_CAMERA_UNAVAILABLE);
@@ -4846,7 +4865,19 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     boolean appliedEmergencyForward() {
-        return emergencyDriveTick == tick - 1 && client.options.forwardKey.isPressed();
+        return emergencyDriveKey == FlatKey.FORWARD && appliedEmergencyDrive();
+    }
+
+    boolean appliedEmergencyDrive() {
+        if (emergencyDriveTick != tick - 1) return false;
+        var options = client.options;
+        return switch (emergencyDriveKey) {
+            case FORWARD -> options.forwardKey.isPressed();
+            case BACK -> options.backKey.isPressed();
+            case LEFT -> options.leftKey.isPressed();
+            case RIGHT -> options.rightKey.isPressed();
+            case NONE -> false;
+        };
     }
 
     float defensiveViewYaw() { return hasView() ? observedYaw : Float.NaN; }
@@ -4863,6 +4894,14 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     @Override public Vec3d dryLanding(float bearing) {
+        return dryDefensiveLanding(bearing, null);
+    }
+
+    Vec3d dryMeleeLanding(float bearing) {
+        return dryDefensiveLanding(bearing, recentlyWalkedTread());
+    }
+
+    private Vec3d dryDefensiveLanding(float bearing, BlockPos walked) {
         var player = client.player;
         if (!hasView() || lavaEmergency || !player.isOnGround() || player.hasVehicle()
                 || player.isTouchingWater() || client.options.forwardKey.isUnbound()) return null;
@@ -4897,7 +4936,9 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 for (int z = MathHelper.floor(sweep.minZ + 1e-5); z <= MathHelper.floor(sweep.maxZ - 1e-5); ++z) {
                     long bit = 1L << ((x - startX) * columnsZ + z - startZ);
                     if ((witnessed & bit) != 0) continue;
-                    if (!defensiveColumn(x, y, z, travel, x == sourceX && z == sourceZ)) break lanes;
+                    boolean contact = x == sourceX && z == sourceZ || walked != null
+                        && walked.getX() == x && walked.getY() == y - 1 && walked.getZ() == z;
+                    if (!defensiveColumn(x, y, z, travel, contact)) break lanes;
                     witnessed |= bit;
                 }
             }
@@ -4907,9 +4948,9 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return safeReach >= minimum ? player.getPos().add(dx * safeReach, 0, dz * safeReach) : null;
     }
 
-    private boolean defensiveColumn(int x, int y, int z, Direction travel, boolean standing) {
+    private boolean defensiveColumn(int x, int y, int z, Direction travel, boolean ownContact) {
         BlockPos floor = walkedProbe.set(x, y - 1, z);
-        if (!standing && emergencyFloor(new Vec3d(x + 0.5, y - 0.032, z + 0.5), travel, DEFENSIVE_DANGER)
+        if (!ownContact && emergencyFloor(new Vec3d(x + 0.5, y - 0.032, z + 0.5), travel, DEFENSIVE_DANGER)
                 != DryRouteTop.WITNESSED) return false;
         // Recheck just the witnessed support (or own contact) and its swept body column.
         BlockState state = client.world.getBlockState(floor);
@@ -4917,6 +4958,47 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             && overlandLoadHolds(client.world, floor, state, overlandProbe)
             && !dryCaveDanger(client.world.getBlockState(walkedProbe.move(Direction.UP)))
             && !dryCaveDanger(client.world.getBlockState(walkedProbe.move(Direction.UP)));
+    }
+
+    private BlockPos recentlyWalkedTread() {
+        // Knockback can move us into the next cell before it qualifies as a
+        // dry contact. The latest settled support is then the one behind us.
+        if (dryTread != null && tick - dryTreadTick <= 35 && !flatSupport(client.player.getBlockPos(), dryTread))
+            return dryTread;
+        return tick - previousDryTreadTick <= 35 ? previousDryTread : null;
+    }
+
+    /** A same-level backward/lateral pulse is allowed only over the actual last dry contact. */
+    float stepRecentEmergencyTread(float away) {
+        BlockPos support = recentlyWalkedTread();
+        if (support == null || !hasView() || lavaEmergency) return Float.NaN;
+        var player = client.player;
+        BlockPos from = player.getBlockPos();
+        Direction travel = emergencyTreadBearing(from, support, away);
+        if (travel == null) return Float.NaN;
+        BlockPos to = support.up();
+        float yaw = travel.getPositiveHorizontalDegrees();
+        if (!defensiveColumn(from.getX(), from.getY(), from.getZ(), travel, true)
+                || !defensiveColumn(to.getX(), to.getY(), to.getZ(), travel, true)
+                || driveOrdinaryFlatRetrace(from, to, travel, false) != OrdinaryMotor.KEY) return Float.NaN;
+        float actual = player.getYaw() + ordinaryFlatKey.yawOffset;
+        if (Math.abs(MathHelper.wrapDegrees(actual - yaw)) > 5
+                || Math.abs(MathHelper.wrapDegrees(actual - away)) > 90) {
+            ordinaryFlatKey = FlatKey.NONE;
+            return Float.NaN;
+        }
+        emergencyWalk = true;
+        return actual;
+    }
+
+    static Direction emergencyTreadBearing(BlockPos from, BlockPos support, float away) {
+        int dx = support.getX() - from.getX(), dz = support.getZ() - from.getZ();
+        if (!Float.isFinite(away) || support.getY() + 1 != from.getY() || Math.abs(dx) + Math.abs(dz) != 1)
+            return null;
+        Direction travel = dx == 0 ? (dz > 0 ? Direction.SOUTH : Direction.NORTH)
+            : (dx > 0 ? Direction.EAST : Direction.WEST);
+        // A sidestep may be perpendicular to the attacker; never walk back into it.
+        return Math.abs(MathHelper.wrapDegrees(travel.getPositiveHorizontalDegrees() - away)) <= 90 ? travel : null;
     }
 
     float recentEmergencyBearing() {

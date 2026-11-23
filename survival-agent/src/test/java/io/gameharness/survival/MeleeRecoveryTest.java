@@ -1,10 +1,13 @@
 package io.gameharness.survival;
 
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
 import org.junit.jupiter.api.Test;
 
 import static io.gameharness.survival.AgentDefense.MeleeRecovery.DryAction.*;
 import static io.gameharness.survival.AgentDefense.MeleeRecovery.Evidence.*;
 import static io.gameharness.survival.AgentDefense.MeleeRecovery.Footing.*;
+import static io.gameharness.survival.AgentDefense.MeleeRecovery.dryAction;
 import static org.junit.jupiter.api.Assertions.*;
 
 final class MeleeRecoveryTest {
@@ -128,18 +131,71 @@ final class MeleeRecoveryTest {
 
     @Test
     void knockbackStopsRetreatButNotAVisibleCounter() {
-        assertEquals(COUNTER, AgentDefense.MeleeRecovery.dryAction(true, true, true, true));
-        assertEquals(COUNTER, AgentDefense.MeleeRecovery.dryAction(false, false, true, true));
-        assertEquals(COUNTER, AgentDefense.MeleeRecovery.dryAction(true, false, false, true));
-        assertEquals(RETREAT, AgentDefense.MeleeRecovery.dryAction(true, false, true, true));
+        assertEquals(COUNTER, dryAction(true, true, true, true, false, false));
+        assertEquals(COUNTER, dryAction(false, false, true, true, false, false));
+        assertEquals(COUNTER, dryAction(true, false, false, true, false, false));
+        assertEquals(RETREAT, dryAction(true, false, true, true, false, false));
     }
 
     @Test
     void noReachableVisualContactMeansSurveyOrWaitWithoutAttacking() {
-        assertEquals(WAIT, AgentDefense.MeleeRecovery.dryAction(false, false, false, false));
-        assertEquals(WAIT, AgentDefense.MeleeRecovery.dryAction(true, true, true, false));
-        assertEquals(SURVEY, AgentDefense.MeleeRecovery.dryAction(true, false, false, false));
-        assertEquals(RETREAT, AgentDefense.MeleeRecovery.dryAction(true, false, true, false));
+        assertEquals(WAIT, dryAction(false, false, false, false, false, false));
+        assertEquals(WAIT, dryAction(true, true, true, false, false, false));
+        assertEquals(SURVEY, dryAction(true, false, false, false, false, false));
+        assertEquals(RETREAT, dryAction(true, false, true, false, false, false));
+    }
+
+    @Test
+    void unarmedHuskDamageCadenceKeepsTheEscapeViewAndContinuesCheckedDrive() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        // Observed desert encounter: 8.09 -> 5.09 -> 2.09 HP, with the last two hits 11 ticks apart.
+        assertTrue(recovery.observe(275, CONTACT, false, false, DRY));
+        assertTrue(recovery.escapeFirst(275, 8.09f, false, false));
+        assertEquals(SURVEY, dryAction(true, false, false, true, recovery.escapeFirst(275, 8.09f, false, false), false),
+            "a visible body in attack reach is not a reason to abandon an unverified retreat view");
+        assertEquals(RETREAT, dryAction(true, false, true, true, true, false));
+        assertTrue(AgentDefense.MeleeRecovery.canSprint(2.55, 0.12, 17, false));
+
+        assertTrue(recovery.observeImpact(287, 3, false, false, UNSETTLED));
+        assertEquals(SURVEY, dryAction(true, false, false, true, recovery.escapeFirst(287, 5.09f, false, false), false));
+        assertTrue(recovery.observeImpact(298, 3, true, false, UNSETTLED));
+        assertTrue(recovery.escapeFirst(298, 2.09f, false, false));
+        assertEquals(EMERGENCY, dryAction(false, true, false, true, true, false),
+            "airborne footing still allows immediate defense, not speculative movement");
+        assertEquals(RETREAT, dryAction(true, false, true, false, true, false),
+            "losing sight while turning away doesn't stop an already checked escape");
+    }
+
+    @Test
+    void equippedDefenseAndActuallyBlockedEscapeHaveDifferentFallbacks() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        recovery.observeImpact(287, 3, false, false, UNSETTLED);
+        assertFalse(recovery.escapeFirst(287, 5.09f, true, false));
+        recovery.observeImpact(298, 3, true, false, DRY);
+        assertFalse(recovery.escapeFirst(298, 8.09f, true, false));
+        assertFalse(recovery.escapeFirst(298, 2.09f, true, true));
+        assertTrue(recovery.escapeFirst(298, 5.09f, true, false),
+            "actual repeated damage can outrun a weapon without a usable shield");
+        assertEquals(COUNTER, dryAction(true, false, false, true, false, true));
+        assertEquals(EMERGENCY, dryAction(true, false, false, true, true, true));
+        assertTrue(recovery.tryEmergencyStrike());
+        assertFalse(recovery.tryEmergencyStrike());
+        recovery.observeImpact(309, 1, true, false, UNSETTLED);
+        assertFalse(recovery.tryEmergencyStrike(), "another hit is not another punch allowance");
+        assertEquals(WAIT, dryAction(false, true, false, false, true, true),
+            "no sight-checked hostile means no strike even when trapped");
+    }
+
+    @Test
+    void walkedFallbackOnlyAdmitsAFlatAdjacentTreadOutsideTheAttackersHalfPlane() {
+        BlockPos feet = new BlockPos(3, 68, 5);
+        BlockPos floor = feet.down();
+        assertEquals(Direction.SOUTH, AgentBody.emergencyTreadBearing(feet, floor.south(), 0));
+        assertEquals(Direction.EAST, AgentBody.emergencyTreadBearing(feet, floor.east(), 0));
+        assertNull(AgentBody.emergencyTreadBearing(feet, floor.north(), 0));
+        assertNull(AgentBody.emergencyTreadBearing(feet, floor.south().down(), 0));
+        assertNull(AgentBody.emergencyTreadBearing(feet, floor.south().east(), 0));
+        assertNull(AgentBody.emergencyTreadBearing(feet, floor.south(), Float.NaN));
     }
 
     @Test

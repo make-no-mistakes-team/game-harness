@@ -56,6 +56,9 @@ For a stall, Terra can propose a short subgoal in its own words and up
 to three successive steps. The player checks each step from its current
 position. A picture does not authorize a click or
 prove there is safe ground beyond a ledge. Combat never waits for advice.
+An outmatched player looks for dry ground to retreat over instead of
+waiting for another strike. It sprints only with room to brake and can
+step back or sideways over a recently walked tread after rechecking it.
 Vanilla inventory or dimension evidence verifies the goal separately.
 Use `--continue-from RUN_BASENAME` after the time limit to continue a
 saved campaign. Ordinary advisory play does not create skill-trial worlds.

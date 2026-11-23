@@ -5767,6 +5767,7 @@ final class AgentProgress {
             surfaceApproach.timberFrontier.finish();
             return;
         }
+        if (surfaceApproach.timberFrontier.active() && surfaceApproach.workTimberFrontier(false)) return;
         BlockPos foot = player.getBlockPos();
         boolean canopy = bootstrapCanopy(foot);
         if (timberWitness != null) {
@@ -13024,14 +13025,16 @@ final class AgentProgress {
         private final Job owner;
         private final Set<BlockPos> tried = new HashSet<>();
         private final Set<BlockPos> attemptedLeaves = new HashSet<>();
+        private final Set<BlockPos> refusedCrown = new HashSet<>();
         private final Predicate<BlockHitResult> freshCrownLeaf = this::newCrownMask;
         private final Predicate<BlockHitResult> lowerCrownLog = this::reachableLowerCrownLog;
-        private BlockPos from;
+        private BlockPos from, refusalStand, crownRiseSupport;
         private BlockState source;
         private Direction bearing, crownFacing;
         private Vec3d aim, crownCutPoint;
         private BlockHitResult mask;
         private AgentSurfaceTread tread;
+        private AgentSurfaceTread.CrownCrossing crownCrossing;
         private AgentSurfaceTread.MeasuredDescent measured;
         private AgentDryLanding.Measured measuredCandidate;
         private Vec3d measuredPoint;
@@ -13039,16 +13042,20 @@ final class AgentProgress {
         private float restoreHealth;
         private boolean checkingMeasured;
         private long openedFrame;
-        private int since, continued, uncuedLandings, crownView, columnCuts, centerUntil;
-        private boolean seenGround, attackRequested;
+        private int since, continued, uncuedLandings, crownView, columnCuts, centerUntil, crownSettleUntil;
+        private boolean seenGround, attackRequested, crownRiseSpent;
 
         CanopyExit(Job owner) { this.owner = owner; }
 
         boolean active() { return from != null; }
-        boolean inFlight() { return measured != null ? measured.inFlight() : tread != null && tread.inFlight(); }
+        boolean inFlight() {
+            return measured != null ? measured.inFlight() : tread != null && tread.inFlight()
+                || crownCrossing != null && crownCrossing.inFlight();
+        }
 
         boolean controlsShortFall() {
-            return measured != null ? measured.controlsFall(c, body, tick) : inFlight() && tread.controlsShortFall(c, body, tick);
+            return measured != null ? measured.controlsFall(c, body, tick)
+                : tread != null && tread.controlsShortFall(c, body, tick);
         }
 
         void finish() {
@@ -13058,6 +13065,9 @@ final class AgentProgress {
             aim = crownCutPoint = null;
             mask = null;
             tread = null;
+            crownCrossing = null;
+            crownRiseSupport = null;
+            crownSettleUntil = 0;
             measured = null;
             measuredCandidate = null;
             measuredPoint = null;
@@ -13068,6 +13078,8 @@ final class AgentProgress {
             finish();
             tried.clear();
             attemptedLeaves.clear();
+            refusedCrown.clear();
+            refusalStand = null;
             uncuedLandings = 0;
             quietAfter = 0;
             restoreHealth = 0;
@@ -13084,14 +13096,8 @@ final class AgentProgress {
             BlockState upper = body.caveLipFooting(foot);
             if (upper == null || !AgentSupplyEgress.naturalDryLeaf(upper) || !canDrop(1)) return false;
             if (owner == Job.TIMBER) {
-                tried.add(foot);
-                from = foot;
-                source = upper;
-                crownFacing = Direction.fromHorizontalDegrees(c.player.getYaw());
-                crownView = columnCuts = 0;
-                centerUntil = tick + 14;
-                continued = tick;
-                crownLook();
+                crownRiseSpent = false;
+                enterCrown(foot, upper);
                 return true;
             }
             var ground = body.findSampled(AgentFoodWork::forageGround, FOOD_SIGHT, hit ->
@@ -13122,6 +13128,21 @@ final class AgentProgress {
             aim = AgentDryLanding.caveTopAim(foot, bearing, canDrop(2) ? 2 : 1);
             if (edge != null) tread = AgentSurfaceTread.recall(edge, false, tick, AgentSurfaceTread.RecallPolicy.ORDINARY);
             return true;
+        }
+
+        private void enterCrown(BlockPos foot, BlockState support) {
+            if (!foot.equals(refusalStand)) {
+                refusedCrown.clear();
+                refusalStand = foot;
+            }
+            tried.add(foot);
+            from = foot;
+            source = support;
+            crownFacing = Direction.fromHorizontalDegrees(c.player.getYaw());
+            crownView = columnCuts = 0;
+            centerUntil = tick + 14;
+            continued = tick;
+            crownLook();
         }
 
         private void crownLook() {
@@ -13222,6 +13243,7 @@ final class AgentProgress {
         }
 
         private boolean stepTimberCrown() {
+            if (crownSettleUntil != 0) return resumeCrownContact();
             if (body.caveLipFooting(from) != source) return blocked("the dry crown support changed");
             if (tread != null) {
                 if (body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65)
@@ -13236,6 +13258,14 @@ final class AgentProgress {
             if (mask != null) return openCrownColumn();
             if (!body.hasRecentView()) return true;
             if (openedFrame >= 0 && body.renderedFrame() <= openedFrame) return true;
+            var log = findTimber(true, crownTrunk);
+            if (log != null) {
+                witnessTimber(log);
+                beginTimberChop(log, false);
+                finish();
+                status = "preparing to cut the exposed log from the occupied crown";
+                return true;
+            }
             if (tick < centerUntil && horizontalDistance(c.player.getPos(), Vec3d.ofBottomCenter(from)) > 0.17
                     && body.centerOnGroundedSupport(from, source)) {
                 status = "centering on the occupied dry crown support";
@@ -13247,7 +13277,13 @@ final class AgentProgress {
             if (!body.renderedAim(aim, 10)) return true;
 
             if (harvestLowerCrownLog()) return true;
-            if (selectCrownTread()) return true;
+            if (selectCrownDescent()) return true;
+            BlockPos side = from.offset(bearing);
+            BlockState level = crownTreadTop(side);
+            if (level != null) return beginCrownCrossing(side, level);
+            BlockPos rise = side.up();
+            BlockState riseTop = crownTreadTop(rise);
+            crownRiseSupport = riseTop == null ? null : side;
             noticeMeasuredTread();
             if (columnCuts < COLUMN_CUTS && attemptedLeaves.size() < CROWN_CUTS) {
                 double reach = c.player.getBlockInteractionRange() - 0.10;
@@ -13263,6 +13299,9 @@ final class AgentProgress {
                     return openCrownColumn();
                 }
             }
+            // One unsolicited rise may reveal a new viewpoint; don't keep
+            // climbing the crown when that view still shows no reachable wood.
+            if (riseTop != null && !crownRiseSpent) return beginCrownCrossing(rise, riseTop);
             return nextCrownView();
         }
 
@@ -13300,7 +13339,7 @@ final class AgentProgress {
                 && !surfaceApproach.protectedCanopyLeaf(block) && !foodCanopy.protects(block);
         }
 
-        private boolean selectCrownTread() {
+        private boolean selectCrownDescent() {
             BlockPos side = from.offset(bearing);
             for (int grade = -1; grade >= -AgentDryLanding.MAX_DROP; grade--) {
                 if (!canDrop(-grade)) continue;
@@ -13315,17 +13354,71 @@ final class AgentProgress {
                     false, tick, AgentSurfaceTread.RecallPolicy.ORDINARY);
                 if (tread != null) return true;
             }
-            for (int grade = 0; grade <= 1; grade++) {
-                BlockPos to = side.up(grade);
-                if (tried.contains(to) || stallGuard.refusedCrossing(from, to)) continue;
-                BlockState floor = body.overlandTop(to.down(), bearing, AgentBody::dryCaveDanger);
-                if (floor == null || body.ordinaryRouteLane(from, to) != AgentBody.DryRouteVeto.CLEAR) continue;
-                var edge = grade == 0 ? new AgentSurfaceTread.Edge(from, source, to, floor, bearing)
-                    : new AgentSurfaceTread.Edge(to, floor, from, source, bearing.getOpposite());
-                tread = AgentSurfaceTread.recall(edge, grade != 0, tick, AgentSurfaceTread.RecallPolicy.ORDINARY);
-                if (tread != null) return true;
-            }
             return false;
+        }
+
+        private BlockState crownTreadTop(BlockPos to) {
+            if (tried.size() >= MAX_STANDS || tried.contains(to) || refusedCrown.contains(to)
+                    || stallGuard.refusedCrossing(from, to)) return null;
+            BlockState floor = body.overlandTop(to.down(), bearing, AgentBody::dryCaveDanger);
+            return floor != null && body.ordinaryRouteLane(from, to) == AgentBody.DryRouteVeto.CLEAR ? floor : null;
+        }
+
+        private boolean beginCrownCrossing(BlockPos to, BlockState floor) {
+            crownCrossing = new AgentSurfaceTread.CrownCrossing(from, to, bearing, source, floor, body.actionTick(), tick);
+            return stepCrownCrossing();
+        }
+
+        private boolean stepCrownCrossing() {
+            var crossing = crownCrossing;
+            body.pauseWork();
+            switch (crossing.step(c, body, tick)) {
+                case CHECKING -> status = "lining up on the occupied tread to cross the crown";
+                case MOVING -> {
+                    rememberMotion();
+                    status = crossing.to.getY() > from.getY() ? "jumping to the witnessed crown tread"
+                        : "walking across to the witnessed crown tread";
+                }
+                case LANDED -> {
+                    body.recordWalkedLeg(crossing.from, crossing.to);
+                    navigator.rememberWalked(crossing.from, crossing.to);
+                    stallGuard.navigationArrival(crossing.from, crossing.to);
+                    surfaceApproach.bootstrapLanded(crossing.from, crossing.to);
+                    crownRiseSpent |= crossing.to.getY() > crossing.from.getY();
+                    finish();
+                    enterCrown(crossing.to, crossing.landing);
+                }
+                case REFUSED -> { return refuseCrownCrossing(crossing.refusal()); }
+            }
+            return true;
+        }
+
+        private boolean refuseCrownCrossing(String reason) {
+            refusedCrown.add(crownCrossing.to);
+            crownCrossing = null;
+            crownSettleUntil = tick + 20;
+            resumeCrownContact();
+            status = "crown tread refused (" + reason + "); checking from actual footing";
+            return true;
+        }
+
+        private boolean resumeCrownContact() {
+            BlockPos foot = c.player.getBlockPos();
+            BlockState support = body.caveLipFooting(foot);
+            if (support == null) {
+                if (tick >= crownSettleUntil) return blocked("the crown crossing did not settle on dry footing");
+                body.pauseWork();
+                status = "waiting for actual dry crown contact";
+                return true;
+            }
+            crownSettleUntil = 0;
+            if (foot.equals(from) && support == source) crownLook();
+            else {
+                crownRiseSpent |= foot.getY() > from.getY();
+                finish();
+                enterCrown(foot, support);
+            }
+            return true;
         }
 
         private boolean crownMask(BlockHitResult hit) {
@@ -13333,7 +13426,8 @@ final class AgentProgress {
             BlockPos leaf = hit.getBlockPos();
             BlockPos side = from.offset(bearing);
             int rise = leaf.getY() - side.getY();
-            if (leaf.getX() != side.getX() || leaf.getZ() != side.getZ() || rise < -2 || rise > 1
+            if (leaf.getX() != side.getX() || leaf.getZ() != side.getZ() || rise < 0 || rise > 1
+                    || leaf.equals(crownRiseSupport)
                     || protects(leaf) || foodCanopy.protects(leaf) || surfaceApproach.protectedCanopyLeaf(leaf)
                     || !AgentSupplyEgress.naturalDryLeaf(state(hit))) return false;
             return !c.player.getBoundingBox().expand(0.10).intersects(new Box(leaf));
@@ -13418,11 +13512,19 @@ final class AgentProgress {
         }
 
         boolean step() {
-            if (continued != tick - 1) return blocked("canopy inspection was interrupted");
+            if (continued != tick - 1) {
+                if (crownCrossing != null) {
+                    continued = tick;
+                    body.pauseWork();
+                    return refuseCrownCrossing("the ordinary movement turn was interrupted");
+                }
+                if (crownSettleUntil == 0) return blocked("canopy inspection was interrupted");
+            }
             continued = tick;
             if (measured != null) return stepMeasured();
             if (checkingMeasured) return recheckMeasured();
-            if (inFlight()) return stepTread();
+            if (crownCrossing != null) return stepCrownCrossing();
+            if (tread != null && tread.inFlight()) return stepTread();
             if (owner == Job.TIMBER) return stepTimberCrown();
             var player = c.player;
             if (body.caveLipFooting(from) != source || body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65))

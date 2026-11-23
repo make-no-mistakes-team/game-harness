@@ -23,6 +23,73 @@ final class CanopyPassageTest {
     static void initializeVanilla() { VanillaTestResources.initialize(); }
 
     @Test
+    void crownRiseStartsOnlyOnTheOrdinaryMotorAndSettlesOnActualUpperContact() {
+        var leaves = Blocks.OAK_LEAVES.getDefaultState();
+        BlockPos to = FOOT.north().up();
+        var tread = new AgentSurfaceTread.CrownCrossing(FOOT, to, Direction.NORTH, leaves, leaves, 1, 1);
+        Vec3d feet = Vec3d.ofBottomCenter(FOOT);
+
+        assertEquals(AgentSurfaceTread.Result.CHECKING,
+            tread.accept(AgentBody.OrdinaryMotor.CENTER, feet));
+        assertFalse(tread.inFlight(), "inward centering cannot own a rise");
+        assertEquals(AgentSurfaceTread.Result.CHECKING,
+            tread.accept(AgentBody.OrdinaryMotor.ALIGN, feet));
+        assertEquals(AgentSurfaceTread.Result.MOVING, tread.accept(AgentBody.OrdinaryMotor.KEY, feet));
+        assertTrue(tread.inFlight());
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(2, 2, feet.add(0, 0.42, -0.09), false, false, false, 0.01));
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(3, 3, feet.add(0, 0.75, -0.21), false, false, false, 0.01));
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(4, 4, feet.add(0, 0.99, -0.34), false, false, false, 0.01));
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(5, 5, feet.add(0, 1.16, -0.48), false, false, false, 0.01));
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(6, 6, feet.add(0, 1.25, -0.62), false, false, false, 0.01));
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(7, 7, feet.add(0, 1.25, -0.76), false, false, false, 0.006));
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(8, 8, feet.add(0, 1.17, -0.84), false, false, false, 0.003));
+        assertEquals(AgentSurfaceTread.Result.LANDED,
+            tread.observe(9, 9, feet.add(0, 1, -0.91), true, false, true, 0.002));
+    }
+
+    @Test
+    void aCrownHopBackOntoItsTakeoffRetiresInsteadOfJumpingInPlaceAgain() {
+        var leaves = Blocks.OAK_LEAVES.getDefaultState();
+        var tread = new AgentSurfaceTread.CrownCrossing(FOOT, FOOT.east().up(), Direction.EAST, leaves, leaves, 1, 1);
+        Vec3d feet = Vec3d.ofBottomCenter(FOOT);
+
+        tread.accept(AgentBody.OrdinaryMotor.KEY, feet);
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(2, 2, feet.add(0.04, 0.42, 0), false, false, false, 0));
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(3, 3, feet.add(0.04, 0.14, 0), false, false, false, 0));
+        assertEquals(AgentSurfaceTread.Result.REFUSED,
+            tread.observe(4, 4, feet.add(0.04, 0, 0), true, true, false, 0),
+            "the next tick cannot issue another takeoff on the same failed tread");
+    }
+
+    @Test
+    void aLevelCrownTreadNeedsTheExactSettledLandingRatherThanJustEnteringItsCell() {
+        var leaves = Blocks.OAK_LEAVES.getDefaultState();
+        var tread = new AgentSurfaceTread.CrownCrossing(FOOT, FOOT.south(), Direction.SOUTH, leaves, leaves, 1, 1);
+        Vec3d feet = Vec3d.ofBottomCenter(FOOT);
+        tread.accept(AgentBody.OrdinaryMotor.KEY, feet);
+        for (int tick = 2; tick <= 5; tick++) {
+            assertEquals(AgentSurfaceTread.Result.MOVING,
+                tread.observe(tick, tick, feet.add(0, 0, (tick - 1) * 0.18), true, tick <= 3, false, 0.01));
+        }
+        Vec3d nearCenter = feet.add(0, 0, 0.90);
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(6, 6, nearCenter, true, false, false, 0.002), "not on the expected vanilla support");
+        assertEquals(AgentSurfaceTread.Result.MOVING,
+            tread.observe(7, 7, nearCenter, true, false, true, 0.008), "still has walking momentum");
+        assertEquals(AgentSurfaceTread.Result.LANDED,
+            tread.observe(8, 8, nearCenter, true, false, true, 0.002));
+    }
+
+    @Test
     void aSpentBareHandedTimberFrontierDefersToWoodAndStillNeedsACheckedOpening() {
         var leaves = Blocks.OAK_LEAVES.getDefaultState();
         BlockPos lower = FOOT.east().down(2);

@@ -25,6 +25,87 @@ final class AgentSurfaceTread {
     enum ReturnClearance { CLEAR, DAMP, OVERHEAD, OBSTRUCTION }
     enum RecallPolicy { ISOLATED, ORDINARY }
 
+    /** A freshly witnessed level/rising crown edge, not a reversal of a retained tread. */
+    static final class CrownCrossing {
+        final BlockPos from, to;
+        private final Direction bearing;
+        private final BlockPos takeoffBlock, landingBlock;
+        final BlockState landing;
+        private final BlockState takeoff;
+        private final boolean rising;
+        private final AgentOrdinaryNavigator.EdgeTravel travel = new AgentOrdinaryNavigator.EdgeTravel();
+        private boolean advancing, airborne;
+        private String refusal;
+
+        CrownCrossing(BlockPos from, BlockPos to, Direction bearing, BlockState takeoff, BlockState landing,
+                      int action, int tick) {
+            this.from = from;
+            this.to = to;
+            this.bearing = bearing;
+            this.takeoff = takeoff;
+            this.landing = landing;
+            takeoffBlock = from.down();
+            landingBlock = to.down();
+            rising = to.getY() > from.getY();
+            travel.begin(action, tick);
+        }
+
+        boolean inFlight() { return advancing; }
+        String refusal() { return refusal; }
+
+        Result step(MinecraftClient client, AgentBody body, int tick) {
+            var player = client.player;
+            if (!body.ordinaryRouteInputs() || !body.supplyTopUnchanged(takeoffBlock, takeoff)
+                    || !body.supplyTopUnchanged(landingBlock, landing))
+                return refuse("the ordinary controls or an exact crown support changed");
+            boolean atTakeoff = body.ordinaryRoutePhysicalContact(from);
+            boolean atLanding = body.ordinaryRoutePhysicalContact(to);
+            var state = observe(body.actionTick(), tick, player.getPos(), player.isOnGround(), atTakeoff, atLanding,
+                player.getVelocity().horizontalLengthSquared());
+            if (state == Result.LANDED || state == Result.REFUSED || !body.hasRecentView()) return state;
+            if (body.ordinaryRouteLane(from, to) != AgentBody.DryRouteVeto.CLEAR)
+                return refuse("the ordinary crown lane is obstructed");
+            // The ordinary motor checks the actual launch volume and couples the
+            // forward and jump keys at final arbitration. Keep one travel view.
+            var motor = body.driveOrdinaryRoute(from, to, bearing, false, advancing);
+            if (motor != AgentBody.OrdinaryMotor.VETO)
+                body.turn(bearing.getPositiveHorizontalDegrees(), rising ? 19 : 31);
+            return accept(motor, player.getPos());
+        }
+
+        Result observe(int action, int tick, Vec3d feet, boolean grounded, boolean atTakeoff, boolean atLanding,
+                       double speedSquared) {
+            if (!travel.keepTurn(action) || advancing && !travel.observe(feet))
+                return refuse("the body lost the continuous crown crossing");
+            if (!advancing && !atTakeoff) return refuse("the body lost the exact crown takeoff contact");
+            double along = (feet.x - from.getX() - 0.5) * bearing.getOffsetX()
+                + (feet.z - from.getZ() - 0.5) * bearing.getOffsetZ();
+            if (advancing && atLanding && AgentBody.dryStrideContact(1 - along)
+                    && speedSquared <= 0.0036 && travel.traversed()) return Result.LANDED;
+            if (rising && advancing) {
+                if (airborne && grounded && feet.y < to.getY() - 0.055)
+                    return refuse("the jump did not reach its witnessed crown top");
+                airborne |= !grounded;
+            }
+            if (travel.expired(tick, along)) return refuse("the body did not advance along the checked crown tread");
+            return advancing ? Result.MOVING : Result.CHECKING;
+        }
+
+        Result accept(AgentBody.OrdinaryMotor motor, Vec3d feet) {
+            if (motor == AgentBody.OrdinaryMotor.VETO) return refuse("the ordinary body sweep vetoed the crown tread");
+            if (!advancing && motor == AgentBody.OrdinaryMotor.KEY) {
+                travel.startMotion(feet);
+                advancing = true;
+            }
+            return advancing ? Result.MOVING : Result.CHECKING;
+        }
+
+        private Result refuse(String why) {
+            refusal = why;
+            return Result.REFUSED;
+        }
+    }
+
     /** The canopy-only, budgeted branch; it cannot construct an ordinary or reversible edge. */
     static final class MeasuredDescent {
         private static final int PROOF_TICKS = 38, MOTION_TICKS = 45, RECEIPT_TICKS = 8;

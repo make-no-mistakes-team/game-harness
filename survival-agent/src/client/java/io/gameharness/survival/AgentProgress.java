@@ -1650,6 +1650,9 @@ final class AgentProgress {
         ordinaryRouteTarget = target;
         ordinaryRouteArrival = arrival;
         ordinaryRouteBand = null;
+        if (job == Job.STONE && target == null && (navigator.driving(Job.STONE) ? navigator.scoutingQuarry()
+                : surfaceApproach.stoneCanopySupport(c.player.getBlockPos()) != null))
+            return navigationResult(job, navigator.scoutQuarry(tick));
         return navigationResult(job, job == Job.FOOD && target == null && ordinaryCaveDrops
             ? navigator.scoutFood(memory, tick) : navigator.step(job, target, arrival, tick));
     }
@@ -8572,18 +8575,19 @@ final class AgentProgress {
         private final AgentResourceStance.Refusals refusedFaces = new AgentResourceStance.Refusals();
         private final Predicate<BlockHitResult> distantFace = this::canApproach;
         private ClientWorld world;
-        private BlockPos probeFrom, probeTo, sightBlock;
+        private BlockPos probeFrom, probeTo, sightBlock, crownCheck;
         private Direction forward, bearing;
         private Vec3d sightPoint;
         private AgentResourceStance goal;
         private AgentSurfaceTread tread;
         private int probeUntil, probeCheckAt, probeHeight, starterSteps, sideProbes, travelTick;
         private BlockPos cutting;
-        private int lastProbeContact;
-        private boolean started, exhausted, triedSupplyExit, directedProbe;
+        private int lastProbeContact, crownCheckUntil;
+        private boolean started, exhausted, triedSupplyExit, directedProbe, onProvenQuarry;
 
         boolean working() {
-            return probeTo != null || tread != null || sightBlock != null || target != null && quarryingStoneStock;
+            return probeTo != null || tread != null || sightBlock != null || crownCheck != null
+                || target != null && quarryingStoneStock;
         }
 
         boolean witnessedProbeWork() {
@@ -8596,7 +8600,7 @@ final class AgentProgress {
         }
 
         void interrupt() {
-            probeFrom = probeTo = cutting = null;
+            probeFrom = probeTo = cutting = crownCheck = null;
             tread = null;
             stopWalk();
         }
@@ -8607,6 +8611,7 @@ final class AgentProgress {
             triedProbes.clear();
             refusedFaces.clear();
             started = false;
+            onProvenQuarry = false;
         }
 
         void broken(BlockPos block, BlockState state) {
@@ -8639,6 +8644,7 @@ final class AgentProgress {
                 triedProbes.clear();
                 refusedFaces.clear();
                 started = false;
+                onProvenQuarry = false;
             }
         }
 
@@ -8670,14 +8676,20 @@ final class AgentProgress {
                 if (sightBlock != null) stopWalk();
                 return;
             }
-            if (body.dryCaveContact(standing) == null) {
+            BlockState support = body.dryCaveContact(standing);
+            if (support == null) {
                 walk(standing);
                 return;
             }
             if (c.player.getVelocity().horizontalLengthSquared() > 0.0025) return;
             int uses = pickUses(WOOD_PICK);
             Direction guarded = nightSite.mineBearing(standing);
-            if (!started) beginPatch(standing, guarded == null ? c.player.getHorizontalFacing() : guarded, stock, uses, true);
+            Direction outward = guarded == null ? c.player.getHorizontalFacing() : guarded;
+            boolean canopy = surfaceApproach.stoneCanopySupport(standing) != null;
+            boolean quarry = !canopy && stoneCanopyGround(support) && body.ordinaryRoutePhysicalContact(standing);
+            if (!started) beginPatch(standing, outward, stock, uses, true);
+            else if (quarry && !onProvenQuarry) beginQuarryPatch(standing, outward, stock, uses);
+            onProvenQuarry = quarry;
             boolean fresh = !exhausted && budget.canDeepen(uses, retiredAt(standing)) && starterSteps < STARTER_STEPS;
             // A different distant face is not a pickup. Finish the already
             // chosen opening and verify its tread before resurveying the seam.
@@ -8692,6 +8704,9 @@ final class AgentProgress {
                 walk(standing);
                 return;
             }
+            // At an actual quarry, a visible side face is work now even when
+            // a previous patch used up its deeper prospect budget.
+            if (quarry && sideProbes < SIDE_PROBES && beginProbe(standing, false)) return;
             if (tick >= seekAfter) {
                 var shown = body.find(Resource.STONE.block, STONE_VIEW, distantFace).orElse(null);
                 if (shown != null) {
@@ -8703,9 +8718,10 @@ final class AgentProgress {
                     return;
                 }
             }
-            if (surfaceApproach.stoneCanopySupport(standing) != null) {
-                // The crown is a viewpoint, not a quarry. Take the ordinary
-                // connected route first; a spent route may then inspect the canopy.
+            boolean localCheck = crownCheck != null && crownCheck.equals(standing) && tick <= crownCheckUntil;
+            crownCheck = null;
+            if (canopy) {
+                if (localCheck && surfaceApproach.beginStoneFrontier(standing, false, true)) return;
                 walk(standing);
                 return;
             }
@@ -8720,7 +8736,7 @@ final class AgentProgress {
                 triedSupplyExit = true;
                 if (supplyEgress.leaveDepletedQuarry()) return;
             }
-            if (sideProbes < SIDE_PROBES && beginProbe(standing, false)) return;
+            if (!quarry && sideProbes < SIDE_PROBES && beginProbe(standing, false)) return;
             if (uses < 3 - stock) {
                 makePick("wooden_pickaxe", PLANK, 3);
                 return;
@@ -8733,7 +8749,7 @@ final class AgentProgress {
             BlockPos block = face.getBlockPos();
             return !refusedFaces.contains(c.player.getBlockPos(), block)
                 && reachableResourceFace(block) && !protectRecoveryBlock(block)
-                && !underMineFootprint(block) && !stoneStockFace(block)
+                && !underMineFootprint(block) && !navigator.walkedSupport(block) && !stoneStockFace(block)
                 && c.player.getBlockY() - block.getY() <= 2 && block.getY() - c.player.getBlockY() <= 4
                 && tools.canHarvest(state(face));
         }
@@ -8772,17 +8788,29 @@ final class AgentProgress {
                 return;
             }
             Result result = goal == null ? navigate(Job.STONE, null, 0) : navigate(Job.STONE, goal);
-            status = (sightBlock == null ? "seeking different stone-bearing ground; " : "approaching exposed stone; ") + status;
+            boolean crownRoute = goal == null && navigator.scoutingQuarry();
+            status = (sightBlock != null ? "approaching exposed stone; "
+                : crownRoute ? "seeking quarry ground below the crown; " : "seeking different stone-bearing ground; ") + status;
             var arrival = ordinaryArrival;
-            if (goal == null && arrival != null && exhausted && !retiredAt(arrival.to())) {
+            if (crownRoute && result == Result.ARRIVED && arrival != null
+                    && surfaceApproach.stoneCanopySupport(arrival.to()) == null) {
+                beginQuarryPatch(arrival.to(), AgentDryLanding.bearing(arrival.from(), arrival.to()),
+                    hands.count(STONE), pickUses(WOOD_PICK));
+                status = "reached witnessed dry ground to expose and collect stone";
+            } else if (goal == null && !crownRoute && arrival != null && exhausted && !retiredAt(arrival.to())) {
                 Direction outward = AgentDryLanding.bearing(arrival.from(), arrival.to());
                 beginPatch(arrival.to(), outward, hands.count(STONE), pickUses(WOOD_PICK), false);
                 status = "reached different witnessed ground to prospect for stone";
             }
+            if (navigator.quarryInspection()) {
+                // The next work turn rechecks resources and lets any motion from
+                // the receipted edge settle before the existing crown owner takes over.
+                crownCheck = c.player.getBlockPos();
+                crownCheckUntil = tick + VIEW_TICKS;
+                return;
+            }
             if (result == Result.BLOCKED) {
-                // workOre and the ordinary probe/visible-face approach have already
-                // had their turn. A spent exact frontier, not merely "blocked", can hand off.
-                if (surfaceApproach.beginStoneFrontier(standing, sightBlock != null)) return;
+                if (surfaceApproach.beginStoneFrontier(standing, sightBlock != null, false)) return;
                 if (sightBlock != null) refuseWalk(standing);
             }
         }
@@ -8825,11 +8853,18 @@ final class AgentProgress {
             interrupt();
             if (oneWay) recordCaveFooting(to);
             else if (stoneCanopyGround(floor)) recordDryCaveFooting(from, to);
-            if (stoneCanopyGround(floor)) {
-                // A new real surface under the old crown can be horizontally close.
-                // Don't let the exhausted leaf patch stand in for this unworked soil.
-                retired.removeIf(site -> !differentStoneGround(site, to) && site.getY() != to.getY());
-                if (!retiredAt(to)) beginPatch(to, bearing, hands.count(STONE), pickUses(WOOD_PICK), false);
+            onProvenQuarry = false;
+            if (stoneCanopyGround(floor)) beginQuarryPatch(to, bearing, hands.count(STONE), pickUses(WOOD_PICK));
+        }
+
+        private void beginQuarryPatch(BlockPos foot, Direction outward, int stock, int uses) {
+            onProvenQuarry = true;
+            if (!retiredAt(foot)) beginPatch(foot, outward, stock, uses, false);
+            else {
+                // A spent deeper search must not suppress a distinct side face.
+                // The exact tried cells and the wooden-pick reserve still apply.
+                forward = outward;
+                sideProbes = 0;
             }
         }
 
@@ -8862,7 +8897,7 @@ final class AgentProgress {
                 BlockPos cell = to.up(height);
                 var hit = perceive(Vec3d.ofCenter(cell, height == 0 ? 0.91 : 0.55), REACH - 0.35);
                 if (hit == null || !cell.equals(hit.getBlockPos())) continue;
-                return returnableCutAllowed(hit) && !supportsTrail(cell) && !body.lavaBreachesDig(cell);
+                return returnableCutAllowed(hit) && !navigator.walkedSupport(cell) && !body.lavaBreachesDig(cell);
             }
             return false;
         }
@@ -8923,7 +8958,7 @@ final class AgentProgress {
             }
             Vec3d cap = Vec3d.ofCenter(cell.up(), 0.23);
             var cover = perceive(cap, REACH - 0.35);
-            if (!returnableCutAllowed(hit) || supportsTrail(cell) || body.lavaBreachesDig(cell)
+            if (!returnableCutAllowed(hit) || navigator.walkedSupport(cell) || body.lavaBreachesDig(cell)
                     || cover != null && cover.getBlockPos().equals(cell.up()) && AgentHeadroom.unsafeCutCover(state(cover))) {
                 forgetProbe();
                 return;
@@ -8990,7 +9025,9 @@ final class AgentProgress {
         }
 
         private boolean retiredAt(BlockPos foot) {
-            for (BlockPos site : retired) if (!differentStoneGround(site, foot)) return true;
+            // A nearby spent perch or lens at another height is not this patch.
+            for (BlockPos site : retired)
+                if (site.getY() == foot.getY() && !differentStoneGround(site, foot)) return true;
             return false;
         }
 
@@ -9036,7 +9073,8 @@ final class AgentProgress {
 
     private boolean stoneStockFace(BlockPos position) {
         return stoneWithinPickupStance(c.player.getBoundingBox(), position)
-            && reachableResourceFace(position) && !supportsTrail(position);
+            && reachableResourceFace(position) && (bootstrapStone
+                ? !protectRecoveryBlock(position) && !navigator.walkedSupport(position) : !supportsTrail(position));
     }
 
     static boolean stoneWithinPickupStance(Box hull, BlockPos block) {
@@ -9725,7 +9763,8 @@ final class AgentProgress {
                     && !firstStone.witnessedProbeWork() && !finishingOreCut(Resource.STONE);
         }
 
-        private boolean beginStoneFrontier(BlockPos foot, boolean exposedStone) {
+        private boolean beginStoneFrontier(BlockPos foot, boolean exposedStone, boolean localCheck) {
+            if (localCheck) return !exposedStone && stoneFrontierAllowed() && beginStoneFrontier();
             return firstStoneCanopyHandoff(navigator.spentFrontier(foot), stoneFrontierAllowed(), exposedStone,
                 beginStoneFrontier);
         }

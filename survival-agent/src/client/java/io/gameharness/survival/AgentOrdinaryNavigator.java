@@ -34,10 +34,12 @@ final class AgentOrdinaryNavigator {
     private static final int DIRECTED_RAYS = RAY_RESERVE + 24 + 8;
     private static final int LOOK_TICKS = 34, RETRY_TICKS = 24, EDGE_TICKS = 54, STANCE_TICKS = 52, GRADE_AGE = 12;
     private static final int FLAT_RETRACE_AGE = 12;
+    private static final int CROWN_FLAT_LIMIT = 3;
+    private static final double QUARRY_VIEW = 8;
     private static final float TRAVEL_PITCH = 31;
     private static final int[] GRADES = {0, 1, -1};
     private static final Direction[] BEARINGS = {Direction.EAST, Direction.WEST, Direction.SOUTH, Direction.NORTH};
-    private static final byte SEEN = 1, HIDDEN = 2, QUEUED = 3, FORAGE_TOP = 4;
+    private static final byte SEEN = 1, HIDDEN = 2, QUEUED = 3, FORAGE_TOP = 4, QUARRY_TOP = 5;
 
     enum Sight {
         STALE_FRAME("stale or shifted frame"), BAD_FACING("not facing the requested view"),
@@ -163,8 +165,9 @@ final class AgentOrdinaryNavigator {
     private final short[] checked = new short[VIEW_CELLS];
     private final long[] sightQueue = new long[SIGHT_NODES];
     private final BlockPos.Mutable sightFrom = new BlockPos.Mutable(), sightTo = new BlockPos.Mutable();
-    private final BlockPos.Mutable foodFloor = new BlockPos.Mutable();
+    private final BlockPos.Mutable sightFloor = new BlockPos.Mutable();
     private final Predicate<BlockHitResult> timberHabitatAhead = this::timberHabitatAhead;
+    private final Predicate<BlockHitResult> lowerQuarryTop = this::lowerQuarryTop;
 
     private ClientWorld world;
     private ClientPlayerEntity player;
@@ -185,6 +188,9 @@ final class AgentOrdinaryNavigator {
     private float retraceYaw = Float.NaN;
     private boolean justWalkedReturn;
     private boolean foodScoutHandoff;
+    private boolean quarryInspection;
+    private int levelCrownTreads, lowestCrownY;
+    private long checkedCrown = NO_CELL, quarryCue = NO_CELL;
     private long exhaustedAt = NO_CELL;
     private AgentBody.EdgeStance edgeStance;
     private BlockPos stanceSupport;
@@ -213,6 +219,7 @@ final class AgentOrdinaryNavigator {
         lastScan = -100;
         unavailableSince = -1;
         foodScoutHandoff = false;
+        resetQuarryInspection();
         exhaustedAt = NO_CELL;
         timberSkyFoot = NO_CELL;
         stage = "idle";
@@ -251,6 +258,16 @@ final class AgentOrdinaryNavigator {
     }
 
     boolean foodScoutHandoff() { return foodScoutHandoff; }
+    boolean scoutingQuarry() { return route.searchingQuarry(); }
+    boolean quarryInspection() { return quarryInspection; }
+
+    private void resetQuarryInspection() {
+        quarryInspection = false;
+        levelCrownTreads = 0;
+        lowestCrownY = Integer.MAX_VALUE;
+        checkedCrown = quarryCue = NO_CELL;
+    }
+
     Job spentFrontier(BlockPos foot) {
         return world == client.world && player == client.player && exhaustedAt == foot.asLong() ? job : null;
     }
@@ -380,17 +397,22 @@ final class AgentOrdinaryNavigator {
     }
 
     Result scoutFood(AgentMemory memory, int tick) {
-        return step(Job.FOOD, null, 0, 0, 0, tick, memory);
+        return step(Job.FOOD, null, 0, 0, 0, tick, memory, false);
+    }
+
+    Result scoutQuarry(int tick) {
+        return step(Job.STONE, null, 0, 0, 0, tick, null, true);
     }
 
     Result step(Job requested, Vec3d destination, double arrivalRadius, double minFootY, double maxFootY, int tick) {
-        return step(requested, destination, arrivalRadius, minFootY, maxFootY, tick, null);
+        return step(requested, destination, arrivalRadius, minFootY, maxFootY, tick, null, false);
     }
 
     private Result step(Job requested, Vec3d destination, double arrivalRadius, double minFootY, double maxFootY,
-                        int tick, AgentMemory memory) {
+                        int tick, AgentMemory memory, boolean quarry) {
         if (world != client.world || player != client.player) reset();
         foodScoutHandoff = false;
+        quarryInspection = false;
         exhaustedAt = NO_CELL;
         int action = body.actionTick();
         boolean inputs = body.ordinaryRouteInputs();
@@ -398,11 +420,12 @@ final class AgentOrdinaryNavigator {
         // A genuinely different owner, unsupported controls, or a skipped turn cannot
         // certify the same body path. A neutral turn due only to render loss can.
         if (from != null && (!inputs || job != requested || !travel.keepTurn(action))) releaseEdge();
-        boolean changed = changed(requested, destination, arrivalRadius, minFootY, maxFootY);
+        boolean changed = quarry != route.searchingQuarry() || changed(requested, destination, arrivalRadius, minFootY, maxFootY);
         // The same job cannot change destinations midair or while still crossing a
         // descent: vanilla's grounded flag can stay set past the source cell line.
         if (changed && !(travel.crossing && (!player.isOnGround() || to.getY() < from.getY()))) {
-            setIntent(requested, destination, arrivalRadius, minFootY, maxFootY);
+            if (quarry != route.searchingQuarry()) resetQuarryInspection();
+            setIntent(requested, destination, arrivalRadius, minFootY, maxFootY, quarry);
             changed = false;
         }
         if (travel.crossing && !travel.observe(player.getPos())) reject("discontinuous motion", Integer.MAX_VALUE);
@@ -432,6 +455,13 @@ final class AgentOrdinaryNavigator {
             boolean recalledLanding = foragingRecall != null;
             boolean scoutHandoff = destination == null && (requested == Job.FOOD || requested == Job.TIMBER)
                 && !straightSuccessor();
+            BlockState quarryLanding = route.searchingQuarry() ? body.dryCaveContact(foot) : null;
+            if (quarryLanding != null && AgentSupplyEgress.naturalDryLeaf(quarryLanding)) {
+                int low = Math.min(lowestCrownY, from.getY());
+                lowestCrownY = Math.min(low, to.getY());
+                if (to.getY() < low) levelCrownTreads = 0;
+                else if (to.getY() == from.getY() && !travel.recentFlatReturn(from, to, action)) levelCrownTreads++;
+            }
             remember(from, to, tick);
             body.recordWalkedLeg(from, to);
             this.arrival = new Arrival(from, to);
@@ -440,6 +470,11 @@ final class AgentOrdinaryNavigator {
             if (changed) {
                 stage = "settled on queued edge";
                 return Result.MOVING;
+            }
+            if (AgentProgress.stoneCanopyGround(quarryLanding)) {
+                body.pauseWork();
+                stage = "settled on soil or rock for a stone prospect";
+                return Result.ARRIVED;
             }
             if (scoutHandoff) {
                 // Keep a continuous level lane, but let the supply owner check
@@ -462,7 +497,7 @@ final class AgentOrdinaryNavigator {
             if (recallAt != here) recallAt = recalled = NO_CELL;
             if (lookAt != here) lookAt = lookCue = NO_CELL;
             if (edgeStance == null) stanceSupport = null;
-            if (requested == Job.FOOD && forageHabitat(world.getBlockState(foodFloor.set(
+            if (requested == Job.FOOD && forageHabitat(world.getBlockState(sightFloor.set(
                     foot.getX(), foot.getY() - 1, foot.getZ())))) route.rememberForagingFoot(here, tick);
             else route.contact(here, tick);
             if (from == null && requested == Job.TIMBER && destination == null) observeTimberHorizon(here, tick);
@@ -489,6 +524,8 @@ final class AgentOrdinaryNavigator {
                 BlockPos recalledStep = memory == null ? null : memory.nextForagingStep(world, foot);
                 if (recalledStep == null) {
                     route.plan(here, tick);
+                    if (route.searchingQuarry() && !route.quarryRoute(tick) && inspectQuarry(here, tick))
+                        return Result.OBSERVING;
                     long next = route.hop(0);
                     if (next == NO_CELL) {
                         if (route.exact() && route.endpoint() == here) return fineArrival(foot, destination, tick);
@@ -581,7 +618,7 @@ final class AgentOrdinaryNavigator {
             || Math.abs(minY - low) > 0.35 || Math.abs(maxY - high) > 0.35;
     }
 
-    private void setIntent(Job requested, Vec3d destination, double r, double low, double high) {
+    private void setIntent(Job requested, Vec3d destination, double r, double low, double high, boolean quarry) {
         releaseEdge();
         job = requested;
         target = destination;
@@ -597,8 +634,45 @@ final class AgentOrdinaryNavigator {
             double yaw = Math.toRadians(player == null ? 0 : player.getYaw());
             if (job == Job.FOOD) route.exploreFood(-Math.sin(yaw), Math.cos(yaw));
             else if (job == Job.TIMBER) route.exploreTimber(-Math.sin(yaw), Math.cos(yaw));
+            else if (quarry) route.exploreQuarry(-Math.sin(yaw), Math.cos(yaw));
             else route.explore(-Math.sin(yaw), Math.cos(yaw));
         }
+    }
+
+    private boolean inspectQuarry(long here, int tick) {
+        if (checkedCrown == here || !body.ordinaryRouteViewCurrent()) return false;
+        boolean inspect = levelCrownTreads >= CROWN_FLAT_LIMIT;
+        boolean newViewpoint = checkedCrown == NO_CELL || Math.abs(x(here) - x(checkedCrown))
+            + Math.abs(y(here) - y(checkedCrown)) + Math.abs(z(here) - z(checkedCrown)) >= CROWN_FLAT_LIMIT;
+        if (!inspect && newViewpoint && rendered == body.renderedFrame() && quarryCue != NO_CELL) inspect = true;
+        if (newViewpoint && body.generalRaysRemaining() > 0) {
+            var hit = body.findSampled(AgentProgress::stoneCanopyGround, QUARRY_VIEW, lowerQuarryTop).orElse(null);
+            if (hit != null) {
+                var dry = body.terrain(hit.getPos(), QUARRY_VIEW).orElse(null);
+                BlockPos floor = hit.getBlockPos();
+                if (AgentBody.matchesDryRouteTop(dry, floor)) {
+                    // The shallow lane scan may have missed a sightline already
+                    // connected by earlier renders. Check the same graph first.
+                    route.witnessQuarryTop(AgentRouteGraph.cell(floor.getX(), floor.getY() + 1, floor.getZ()), true, tick);
+                    route.plan(here, tick);
+                    if (route.quarryRoute(tick)) return false;
+                    inspect = true;
+                }
+            }
+        }
+        if (!inspect) return false;
+        checkedCrown = here;
+        levelCrownTreads = 0;
+        quarryInspection = true;
+        body.pauseWork();
+        stage = "settled for a local crown descent check";
+        return true;
+    }
+
+    private boolean lowerQuarryTop(BlockHitResult hit) {
+        BlockPos floor = hit.getBlockPos();
+        int below = player.getBlockY() - floor.getY() - 1;
+        return below >= 1 && below <= 5 && AgentBody.matchesDryRouteTop(hit, floor);
     }
 
     private boolean arrived(Vec3d destination, double radius, double low, double high) {
@@ -799,11 +873,13 @@ final class AgentOrdinaryNavigator {
         if (available < (directed ? DIRECTED_RAYS : RAY_RESERVE + 2)) return Sight.RAY_BUDGET;
         rendered = frame;
         lastScan = tick;
+        quarryCue = NO_CELL;
+        boolean quarry = route.searchingQuarry();
         int leaveRays = Math.max(RAY_RESERVE, available - SIGHT_RAYS);
         Arrays.fill(sight, (byte) 0);
         Arrays.fill(checked, (short) 0);
         long outlined = available >= leaveRays + 10 ? body.ordinaryRouteOutlinedFoot(player.getBlockPos()) : NO_CELL;
-        if (outlined != NO_CELL) sight[gridIndex(here, outlined)] = SEEN;
+        if (outlined != NO_CELL) sight[gridIndex(here, outlined)] = quarry ? sightKind(outlined, true) : SEEN;
         sightQueue[0] = here;
         sight[gridIndex(here, here)] = QUEUED;
         int tail = 1;
@@ -821,9 +897,7 @@ final class AgentOrdinaryNavigator {
                     set(sightTo, next);
                     if (sight[n] == 0) {
                         if (!body.ordinaryRouteTop(sightTo, leaveRays)) sight[n] = HIDDEN;
-                        else if (job == Job.FOOD && forageHabitat(world.getBlockState(foodFloor.set(
-                                x(next), y(next) - 1, z(next))))) sight[n] = FORAGE_TOP;
-                        else sight[n] = SEEN;
+                        else sight[n] = sightKind(next, quarry);
                     }
                     if (sight[n] == HIDDEN) continue;
                     checked[at] |= (short) (1 << slot);
@@ -836,6 +910,10 @@ final class AgentOrdinaryNavigator {
                     }
                     if (rise == 0 ? forward : body.ordinaryRouteLane(sightTo, sightFrom) == AgentBody.DryRouteVeto.CLEAR)
                         route.observe(next, source, tick);
+                    if (quarry && sight[n] != QUEUED) {
+                        route.witnessQuarryTop(next, sight[n] == QUARRY_TOP, tick);
+                        if (sight[n] == QUARRY_TOP && y(next) < y(here)) quarryCue = next;
+                    }
                     if (forward && sight[n] != QUEUED && tail < SIGHT_NODES) {
                         sight[n] = QUEUED;
                         sightQueue[tail++] = next;
@@ -845,6 +923,13 @@ final class AgentOrdinaryNavigator {
         }
         if (neighbor) return Sight.NEIGHBOR;
         return outlined != NO_CELL || body.generalRaysRemaining() < available ? Sight.NO_NEIGHBOR : Sight.NO_PROJECTED_SUPPORT;
+    }
+
+    private byte sightKind(long top, boolean quarry) {
+        if (job != Job.FOOD && !quarry) return SEEN;
+        BlockState support = world.getBlockState(sightFloor.set(x(top), y(top) - 1, z(top)));
+        if (quarry) return AgentProgress.stoneCanopyGround(support) ? QUARRY_TOP : SEEN;
+        return forageHabitat(support) ? FORAGE_TOP : SEEN;
     }
 
     private static int gridIndex(long origin, long foot) {
@@ -872,7 +957,7 @@ final class AgentOrdinaryNavigator {
 
     String status() {
         return "ordinary " + job + " goal=" + (route.returningForFood() ? "foraging-ground"
-            : goalCell == NO_CELL ? "frontier" : display(goalCell))
+            : route.searchingQuarry() ? "quarry-ground" : goalCell == NO_CELL ? "frontier" : display(goalCell))
             + (route.exact() ? " destination=" : " proxy=") + display(route.endpoint())
             + " next=" + display(foragingRecall == null ? route.hop(0) : to.asLong())
             + " suffix=" + route.remaining() + " plan=" + route.plans()

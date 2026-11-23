@@ -23,7 +23,7 @@ final class AgentOrdinaryRoute {
     private final boolean[] grounded = new boolean[NODES + 1];
     private final int[] visited = new int[NODES + 1];
     private final int[] looked = new int[NODES + 1];
-    private final int[] forageSeen = new int[NODES + 1];
+    private final int[] forageSeen = new int[NODES + 1], quarrySeen = new int[NODES + 1];
     private final boolean[] foodVisited = new boolean[NODES + 1], foodLooked = new boolean[NODES + 1];
     private final boolean[] foodOutletTried = new boolean[NODES + 1];
     private final boolean[] timberVisited = new boolean[NODES + 1], timberLooked = new boolean[NODES + 1];
@@ -45,7 +45,8 @@ final class AgentOrdinaryRoute {
     private long timberCue = NO_CELL;
     private int timberCueTick;
     private int firstFoodY = Integer.MIN_VALUE, egressHighY = Integer.MIN_VALUE;
-    private boolean directed, exact, foodSearch, returningForFood, viaFoodConnector, timberSearch, timberCourse;
+    private boolean directed, exact, foodSearch, returningForFood, viaFoodConnector, timberSearch, timberCourse,
+        quarrySearch;
     private double goalX, goalZ, radiusSquared, minY, maxY, axisX, axisZ;
     private double timberX, timberZ;
 
@@ -58,11 +59,12 @@ final class AgentOrdinaryRoute {
         Arrays.fill(visited, 0);
         Arrays.fill(looked, 0);
         Arrays.fill(forageSeen, 0);
+        Arrays.fill(quarrySeen, 0);
         nodes = plans = revision = 0;
         connectedFrom = NO_CELL;
         intent = 1;
         forageFoot = NO_CELL;
-        foodSearch = false;
+        foodSearch = quarrySearch = false;
         timberSearch = timberCourse = false;
         timberCue = NO_CELL;
         Arrays.fill(timberVisited, false);
@@ -75,7 +77,7 @@ final class AgentOrdinaryRoute {
     void destination(double x, double z, double arrival, double minFootY, double maxFootY) {
         renew();
         directed = true;
-        foodSearch = timberSearch = false;
+        foodSearch = timberSearch = quarrySearch = false;
         goalX = x;
         goalZ = z;
         radiusSquared = arrival * arrival;
@@ -86,7 +88,7 @@ final class AgentOrdinaryRoute {
     void explore(double dx, double dz) {
         renew();
         directed = false;
-        foodSearch = timberSearch = false;
+        foodSearch = timberSearch = quarrySearch = false;
         axisX = dx;
         axisZ = dz;
     }
@@ -94,6 +96,27 @@ final class AgentOrdinaryRoute {
     void exploreFood(double dx, double dz) {
         explore(dx, dz);
         foodSearch = true;
+    }
+
+    void exploreQuarry(double dx, double dz) {
+        explore(dx, dz);
+        quarrySearch = true;
+    }
+
+    boolean searchingQuarry() { return quarrySearch; }
+
+    boolean quarryRoute(int tick) { return quarrySearch && freshQuarryTop(find(endpoint), tick); }
+
+    /** An exact top sighting classifies a node; it never adds a lane to it. */
+    void witnessQuarryTop(long foot, boolean soilOrRock, int tick) {
+        int node = find(foot);
+        if (node == 0) return;
+        if (freshQuarryTop(node, tick) != soilOrRock) revision++;
+        quarrySeen[node] = soilOrRock ? tick : 0;
+    }
+
+    private boolean freshQuarryTop(int node, int tick) {
+        return quarrySeen[node] != 0 && tick - quarrySeen[node] <= SIGHT_TICKS;
     }
 
     void exploreTimber(double dx, double dz) {
@@ -420,7 +443,7 @@ final class AgentOrdinaryRoute {
         boolean keepingEgress = foodSearch && !returning && egressHighY != Integer.MIN_VALUE;
         if (keepingEgress) scoutFloor = Math.max(scoutFloor, Math.min(egressHighY - EGRESS_SCOUT_DROP, y(current)));
         boolean keep = remaining() > 0 && suffixUsable(current, tick, scoutFloor);
-        if (keep && (exact || !directed || examinedRevision == revision)) return;
+        if (keep && (exact || quarryRoute(tick) || !directed && !quarrySearch || examinedRevision == revision)) return;
         if (exact && endpoint == current) return;
         if (!keep && remaining() > 0) examinedRevision = -1;
         if (examinedRevision == revision && endpoint == NO_CELL
@@ -433,7 +456,8 @@ final class AgentOrdinaryRoute {
         boolean connector = end == 0 && keepingEgress && looked(start);
         if (connector) end = findEndpoint(current, start, tick, scoutFloor, false, true, true);
         boolean reachedGoal = end != 0 && (returning ? feet[end] == forageFoot : fits(feet[end]));
-        if (keep && !reachedGoal) return; // A new view must not churn an outstanding proxy.
+        // Do not churn a usable proxy, except when the real quarry becomes reachable.
+        if (keep && !reachedGoal && !(quarrySearch && end != 0 && freshQuarryTop(end, tick))) return;
         if (end == 0) {
             clearSuffix();
             examinedRevision = revision;
@@ -474,6 +498,7 @@ final class AgentOrdinaryRoute {
             int at = queue[head];
             long foot = feet[at];
             if (returning ? foot == forageFoot : fits(foot)) return at;
+            if (quarrySearch && at != start && freshQuarryTop(at, tick)) return at;
             if (!returning && !visited(at)
                     && (!connector || y(foot) >= egressHighY || freshForagingTop(at, tick))) {
                 double dx = x(foot) - x(current), dz = z(foot) - z(current);
@@ -616,7 +641,7 @@ final class AgentOrdinaryRoute {
             clearEdge(victim * SLOTS + slot);
         }
         grounded[victim] = false;
-        visited[victim] = looked[victim] = forageSeen[victim] = 0;
+        visited[victim] = looked[victim] = forageSeen[victim] = quarrySeen[victim] = 0;
         foodVisited[victim] = foodLooked[victim] = false;
         foodOutletTried[victim] = false;
         timberVisited[victim] = timberLooked[victim] = false;

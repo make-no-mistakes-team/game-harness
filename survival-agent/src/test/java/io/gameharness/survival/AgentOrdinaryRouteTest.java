@@ -83,6 +83,30 @@ final class AgentOrdinaryRouteTest {
     }
 
     @Test
+    void firstStoneTurnsFromAnOpenCrownFrontierToFreshConnectedQuarryGround() {
+        long crown = cell(0, 76, 0), higher = cell(1, 77, 0), farther = cell(2, 77, 0);
+        long shoulder = cell(0, 75, -1), soil = cell(0, 74, -2);
+        long isolatedSoil = cell(0, 74, 1);
+        chain(crown, higher, farther);
+        chain(crown, shoulder, soil);
+        route.contact(isolatedSoil, 1);
+        route.exploreQuarry(1, 0);
+        route.witnessQuarryTop(isolatedSoil, true, 2);
+
+        route.plan(crown, 2);
+        assertEquals(farther, route.endpoint(), "an unconnected sighting cannot replace the real route");
+
+        route.witnessQuarryTop(soil, true, 3);
+        route.plan(crown, 3);
+        assertEquals(soil, route.endpoint(), "a usable floor beats a previously queued higher frontier");
+        assertEquals(shoulder, route.hop(0), "take the checked descent, not a direct jump to the soil");
+
+        route.retire(shoulder, soil, 30);
+        route.plan(crown, 4);
+        assertEquals(farther, route.endpoint(), "a clearance veto still defeats the quarry goal");
+    }
+
+    @Test
     void foodScoutChoosesWoodlandOverAnAlreadyConnectedRockStair() {
         long surface = cell(0, 66, 0), grass = cell(0, 66, 1);
         long mouth = cell(1, 65, 0), lip = cell(2, 64, 0), shaft = cell(3, 63, 0);

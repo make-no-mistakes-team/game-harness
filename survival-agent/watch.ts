@@ -1,22 +1,22 @@
 #!/usr/bin/env bun
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { lstat, readFile, realpath, stat } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
 import type { Readable } from "node:stream";
 import path from "node:path";
+import { readLiveProcess, readOrdinaryLiveRun, readPrivateAuthority, readPrivateLiveDescriptor } from "./operator-stop.ts";
 
 // A browser's native multipart JPEG viewer. A new reader must start on a MIME
 // boundary, not halfway through the encoder's current JPEG.
 const args = process.argv.slice(2);
 const diagnostic = args.length === 1 && args[0] === "--diagnostic";
-if (args.length && !diagnostic) {
-    console.error("Usage: bun run watch:agent [--diagnostic]");
+const parallel = args.length === 1 && args[0] === "--parallel-world";
+if (args.length && !diagnostic && !parallel) {
+    console.error("Usage: bun run watch:agent [--diagnostic | --parallel-world]");
     process.exit(1);
 }
-const port = diagnostic ? 4382 : 4379;
+const port = diagnostic ? 4382 : parallel ? 4383 : 4379;
 const root = path.resolve(import.meta.dir, "../local/survival-agent");
-const descriptor = path.join(root, diagnostic ? "diagnostic-live.json" : "live.json");
-const runs = path.join(root, diagnostic ? "diagnostic-runs" : "runs");
 const label = diagnostic ? "Minecraft Survival Agent diagnostic" : "Minecraft Survival Agent";
 const boundary = "agentframe";
 const waitingText = diagnostic ? "Waiting for the next diagnostic run" : "Waiting for the next survival run";
@@ -51,35 +51,48 @@ function idle() {
 
 async function captureSource() {
     if (!xvfb) return;
-    const data = JSON.parse(await readFile(descriptor, "utf8"));
-    if (data?.active !== true || typeof data.run !== "string" || !/^[\w.-]+$/.test(data.run) ||
-        data.run === "." || data.run === ".." || typeof data.display !== "string" ||
-        typeof data.authority !== "string" || !path.isAbsolute(data.authority)) return;
-    const display: string = data.display;
+    const ordinary = diagnostic ? null : await readOrdinaryLiveRun(root, parallel ? "parallel" : "primary");
+    const data = diagnostic ? await readPrivateLiveDescriptor(path.join(root, "diagnostic-live.json")) : ordinary;
+    if (!data || typeof data.display !== "string" || typeof data.authority !== "string" ||
+        !path.isAbsolute(data.authority)) return;
+    if (diagnostic) {
+        if (!/^[\w.-]+$/.test(data.run) || data.run === "." || data.run === "..") return;
+        const run = path.join(root, "diagnostic-runs", data.run);
+        if (!(await lstat(run)).isDirectory()) return;
+        const closed = await lstat(path.join(run, "outcome.json")).then(() => true, (error) => {
+            if (error.code === "ENOENT") return false;
+            throw error;
+        });
+        if (closed) return;
+    }
+    const display = data.display;
     const number = display.match(/^:([1-9]\d*)$/)?.[1];
     if (!number || !Number.isSafeInteger(Number(number)) || Number(number) < 90) return;
-    const run = path.join(runs, data.run);
-    if (!(await lstat(run)).isDirectory()) return;
-    const closed = await lstat(path.join(run, "outcome.json")).then(() => true, (error) => {
-        if (error.code === "ENOENT") return false;
-        throw error;
-    });
-    if (closed) return;
-    const pid = (await readFile(`/tmp/.X${number}-lock`, "utf8")).trim();
+    const lock = `/tmp/.X${number}-lock`;
+    const pid = (await readFile(lock, "utf8")).trim();
     if (!/^[1-9]\d*$/.test(pid)) return;
     const proc = `/proc/${pid}`;
-    const [running, expected, cmdline, authority] = await Promise.all([
+    const [running, expected, cmdline, authority, identity] = await Promise.all([
         realpath(`${proc}/exe`), realpath(xvfb), readFile(`${proc}/cmdline`, "utf8"), realpath(data.authority),
+        readLiveProcess(Number(pid)),
     ]);
     const argv = cmdline.split("\0");
-    const auth = argv.indexOf("-auth");
     const offline = argv.some((arg, index) => arg === "-nolisten" && argv[index + 1] === "tcp");
     const online = argv.some((arg, index) => arg === "-listen" && argv[index + 1] === "tcp");
-    if (running !== expected || argv[1] !== display || !offline || online || auth < 0 ||
-        await realpath(argv[auth + 1]!) !== authority) return;
-    const authStat = await stat(authority);
-    if (!authStat.isFile() || authStat.uid !== process.getuid?.() || (authStat.mode & 0o077)) return;
-    return { display, authority, identity: JSON.stringify([data.run, display, pid, authority]) };
+    if (running !== expected || argv[1] !== display || !offline || online || argv.includes("-ac") ||
+        authority !== data.authority || !identity || ordinary && identity.parent !== ordinary.wrapper) return;
+    let bound = false;
+    for (let i = 0; i < argv.length; i++) {
+        if (argv[i] !== "-auth") continue;
+        const file = argv[i + 1];
+        if (!file || await realpath(file) !== authority) return;
+        bound = true;
+    }
+    if (!bound) return;
+    const authorityId = await readPrivateAuthority(authority);
+    if (!authorityId || ordinary && authorityId !== ordinary.authorityId ||
+        (await readFile(lock, "utf8")).trim() !== pid) return;
+    return { display, authority, identity: JSON.stringify([data.run, display, pid, identity.started, authority, authorityId]) };
 }
 
 async function tick() {

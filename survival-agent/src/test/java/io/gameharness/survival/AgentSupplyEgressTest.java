@@ -1,7 +1,12 @@
 package io.gameharness.survival;
 
 import java.util.List;
+import net.minecraft.block.Blocks;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -18,6 +23,11 @@ final class AgentSupplyEgressTest {
     private static final BlockPos APPROACH = LIP.south().up();
     private static final BlockPos OPENING = APPROACH.up();
     private static final BlockPos WATER = OPENING.up();
+
+    @BeforeAll
+    static void initializeVanilla() {
+        VanillaTestResources.initialize();
+    }
 
     @Test
     void aNewOrderAtAWalkedTreadKeepsTheOlderTurnedExit() {
@@ -188,5 +198,93 @@ final class AgentSupplyEgressTest {
         passage.begin(current, 800);
         assertTrue(passage.withinTime(909));
         assertFalse(passage.withinTime(910));
+    }
+
+    @Test
+    void aPreferredSideFootNeedsARealSameGradeArrivalAndDoesNotSurviveABrokenSupport() {
+        var order = new AgentSupplyEgress();
+        assertTrue(order.begin(REFUGE, true, 100));
+        order.landed(LOWER);
+        assertNull(order.previousLevelFoot(LOWER));
+        BlockPos side = LOWER.west();
+        order.landed(side);
+        order.landed(LOWER);
+        assertEquals(side, order.previousLevelFoot(LOWER));
+        order.observeBreak(side.down());
+        assertNull(order.previousLevelFoot(LOWER));
+    }
+
+    @Test
+    void offColumnClearanceRequiresAnActualRoundTripAndDoesNotEarnAnotherLanding() {
+        var passage = new AgentSupplyEgress.OutlinePassage();
+        var stone = Blocks.STONE.getDefaultState();
+        var dirt = Blocks.DIRT.getDefaultState();
+        var apex = apexFace(LOWER, Direction.DOWN);
+        BlockPos side = LOWER.west(), rise = LOWER.south().up();
+        passage.begin(REFUGE, 10);
+        assertTrue(passage.admitLanding(REFUGE, LOWER));
+        assertTrue(passage.landed(LOWER, true));
+
+        var access = passage.beginApexAccess(LOWER, rise, apex, stone, dirt, stone);
+        assertNotNull(access);
+        assertFalse(passage.canHandoff());
+        assertFalse(passage.admitLanding(LOWER, rise));
+        assertFalse(access.matchesCut(apex, stone), "cannot cut from underneath");
+        assertFalse(access.admitOut(side.down(), stone), "no drop to get clear of the column");
+        assertFalse(access.admitOut(rise.down(), stone), "the solid rise lip is not a side tread");
+        assertTrue(access.admitOut(side, stone), "a newly verified side tread needs no prior trip");
+        assertFalse(access.landed(side, false));
+        assertFalse(access.landed(LOWER.east(), true));
+        assertTrue(access.landed(side, true));
+        assertFalse(access.matchesCut(apex, dirt), "replacement material is not the same contact");
+        assertFalse(access.matchesCut(apexFace(LOWER, Direction.NORTH), stone), "exact exposed face changed");
+        assertTrue(access.matchesCut(apex, stone));
+        assertFalse(access.broken(apex.getBlockPos(), stone), "a break without an accepted cut is not a receipt");
+        access.requestedCut();
+        assertFalse(access.broken(apex.getBlockPos(), dirt));
+        assertTrue(access.broken(apex.getBlockPos(), stone));
+        assertFalse(access.broken(apex.getBlockPos(), stone), "the exact cut is spent once");
+        assertFalse(passage.finishApexAccess(side));
+        assertTrue(access.admitBack());
+        assertFalse(access.landed(LOWER, false));
+        assertTrue(access.landed(LOWER, true));
+        assertTrue(passage.finishApexAccess(LOWER));
+        assertEquals(1, passage.steps(), "neither repositioning leg earns fresh coverage");
+        assertTrue(passage.admitLanding(LOWER, rise), "the original rise can be reverified and actually crossed");
+    }
+
+    @Test
+    void failedOrFinishedApexAccessCannotBeRenewedOnAnotherBearing() {
+        var passage = new AgentSupplyEgress.OutlinePassage();
+        var stone = Blocks.STONE.getDefaultState();
+        passage.begin(REFUGE, 10);
+        assertNull(passage.beginApexAccess(REFUGE, REFUGE.south(), apexFace(REFUGE, Direction.DOWN),
+            stone, stone, stone), "an eligible uphill tread is required");
+        assertNotNull(passage.beginApexAccess(REFUGE, LOWER, apexFace(REFUGE, Direction.DOWN), stone, stone, stone));
+        assertTrue(passage.finishApexAccess(REFUGE));
+        assertNull(passage.beginApexAccess(REFUGE, REFUGE.east().up(), apexFace(REFUGE, Direction.DOWN),
+            stone, stone, stone));
+        assertTrue(passage.admitLanding(REFUGE, LOWER));
+        assertTrue(passage.landed(LOWER, true));
+        assertNotNull(passage.beginApexAccess(LOWER, FIRST_DRY, apexFace(LOWER, Direction.DOWN), stone, stone, stone));
+        assertTrue(passage.finishApexAccess(LOWER));
+        assertTrue(passage.admitLanding(LOWER, FIRST_DRY));
+        assertTrue(passage.landed(FIRST_DRY, true));
+        assertNull(passage.beginApexAccess(FIRST_DRY, LIP, apexFace(FIRST_DRY, Direction.DOWN), stone, stone, stone));
+    }
+
+    @Test
+    void handClearanceIsFiniteAndCannotBeSpentTwiceOnTheSameCell() {
+        var passage = new AgentSupplyEgress.OutlinePassage();
+        passage.begin(REFUGE, 10);
+        assertTrue(passage.attemptHandClearance(LOWER));
+        assertFalse(passage.attemptHandClearance(LOWER));
+        assertTrue(passage.attemptHandClearance(OPENING));
+        assertFalse(passage.attemptHandClearance(WATER));
+    }
+
+    private static BlockHitResult apexFace(BlockPos foot, Direction side) {
+        BlockPos apex = foot.up(3);
+        return new BlockHitResult(Vec3d.ofCenter(apex), side, apex, false);
     }
 }

@@ -107,6 +107,12 @@ final class AgentSupplyEgress {
         checked.add(standing.down());
     }
 
+    BlockPos previousLevelFoot(BlockPos standing) {
+        for (Leg leg : walked.reversed())
+            if (leg.to().equals(standing) && leg.from().getY() == standing.getY()) return leg.from();
+        return null;
+    }
+
     void considered(BlockPos cell) { checked.add(cell); }
 
     void observeBreak(BlockPos cell) {
@@ -226,15 +232,18 @@ final class AgentSupplyEgress {
     /** Budget and physical receipts for a short climb, not a replacement for visual or motor admission. */
     static final class OutlinePassage {
         private static final int TICKS = 900, STEPS = 6, CUTS = 15;
+        private static final int APEX_ACCESSES = 2, HAND_CLEARANCES = 2;
         private final Set<BlockPos> visited = new HashSet<>(), attemptedCuts = new HashSet<>();
+        private final Set<BlockPos> shiftedApexes = new HashSet<>(), handClearances = new HashSet<>();
         private BlockPos foot, pending;
+        private ApexAccess apex;
         private int until;
 
         boolean active() { return foot != null; }
         boolean withinTime(int tick) { return tick < until; }
         int steps() { return active() ? visited.size() - 1 : 0; }
 
-        boolean canHandoff() { return steps() > 0 && pending == null; }
+        boolean canHandoff() { return steps() > 0 && pending == null && apex == null; }
 
         void begin(BlockPos from, int tick) {
             if (active()) return;
@@ -244,7 +253,7 @@ final class AgentSupplyEgress {
         }
 
         boolean allowsLeg(BlockPos from, BlockPos to) {
-            if (!from.equals(foot) || steps() >= STEPS || visited.contains(to)) return false;
+            if (apex != null || !from.equals(foot) || steps() >= STEPS || visited.contains(to)) return false;
             int dy = to.getY() - from.getY();
             return dy >= 0 && dy <= 1
                 && Math.abs(to.getX() - from.getX()) + Math.abs(to.getZ() - from.getZ()) == 1;
@@ -255,6 +264,34 @@ final class AgentSupplyEgress {
         }
 
         void attemptedCut(BlockPos cell) { attemptedCuts.add(cell.toImmutable()); }
+
+        boolean allowsHandClearance(BlockPos cell) {
+            return handClearances.size() < HAND_CLEARANCES && !handClearances.contains(cell);
+        }
+
+        boolean attemptHandClearance(BlockPos cell) {
+            return allowsHandClearance(cell) && handClearances.add(cell.toImmutable());
+        }
+
+        ApexAccess apexAccess() { return apex; }
+
+        ApexAccess beginApexAccess(BlockPos from, BlockPos rise, BlockHitResult face, BlockState material,
+                                   BlockState source, BlockState landing) {
+            if (pending != null || rise.getY() != from.getY() + 1 || !allowsLeg(from, rise)
+                    || material == null || source == null || landing == null
+                    || !AgentSupplyOutline.matchesFace(face, face) || !face.getBlockPos().equals(from.up(3))
+                    || shiftedApexes.size() >= APEX_ACCESSES || !shiftedApexes.add(face.getBlockPos().toImmutable()))
+                return null;
+            return apex = new ApexAccess(foot, rise.toImmutable(), face, material, source, landing);
+        }
+
+        boolean finishApexAccess(BlockPos actualSource) {
+            if (apex == null || !foot.equals(actualSource)
+                    || apex.stage == ApexAccess.Stage.CUT || apex.stage == ApexAccess.Stage.LOOK_BACK
+                    || apex.stage == ApexAccess.Stage.WALK_BACK) return false;
+            apex = null;
+            return true;
+        }
 
         boolean admitLanding(BlockPos from, BlockPos to) {
             if (pending != null || !allowsLeg(from, to)) return false;
@@ -274,9 +311,86 @@ final class AgentSupplyEgress {
 
         void reset() {
             foot = pending = null;
+            apex = null;
             visited.clear();
             attemptedCuts.clear();
+            shiftedApexes.clear();
+            handClearances.clear();
             until = 0;
+        }
+    }
+
+    /** One exact opening and one independently witnessed walking leg there and back. */
+    static final class ApexAccess {
+        enum Stage { LOOK_SIDE, WALK_OUT, CUT, LOOK_BACK, WALK_BACK, RETURNED }
+
+        final BlockPos source, rise, cell;
+        final BlockHitResult face;
+        final BlockState sourceSupport, riseSupport;
+        private final BlockState material;
+        private BlockPos side;
+        private BlockState sideSupport;
+        private Stage stage = Stage.LOOK_SIDE;
+        private boolean requested, opened;
+
+        private ApexAccess(BlockPos source, BlockPos rise, BlockHitResult face, BlockState material,
+                           BlockState sourceSupport, BlockState riseSupport) {
+            this.source = source;
+            this.rise = rise;
+            this.face = face;
+            cell = face.getBlockPos().toImmutable();
+            this.material = material;
+            this.sourceSupport = sourceSupport;
+            this.riseSupport = riseSupport;
+        }
+
+        Stage stage() { return stage; }
+        BlockPos side() { return side; }
+        BlockState sideSupport() { return sideSupport; }
+        boolean opened() { return opened; }
+
+        boolean admitOut(BlockPos target, BlockState support) {
+            if (stage != Stage.LOOK_SIDE || support == null || target.getY() != source.getY()
+                    || target.equals(rise.down())
+                    || Math.abs(target.getX() - source.getX()) + Math.abs(target.getZ() - source.getZ()) != 1)
+                return false;
+            side = target.toImmutable();
+            sideSupport = support;
+            stage = Stage.WALK_OUT;
+            return true;
+        }
+
+        boolean matchesCut(BlockHitResult seen, BlockState state) {
+            return stage == Stage.CUT && state == material && AgentSupplyOutline.matchesFace(face, seen);
+        }
+
+        void requestedCut() {
+            if (stage == Stage.CUT) requested = true;
+        }
+
+        boolean broken(BlockPos actual, BlockState state) {
+            if (stage != Stage.CUT || !requested || !cell.equals(actual) || material != state) return false;
+            opened = true;
+            stage = Stage.LOOK_BACK;
+            return true;
+        }
+
+        void abandonCut() {
+            if (stage == Stage.CUT) stage = Stage.LOOK_BACK;
+        }
+
+        boolean admitBack() {
+            if (stage != Stage.LOOK_BACK) return false;
+            stage = Stage.WALK_BACK;
+            return true;
+        }
+
+        boolean landed(BlockPos standing, boolean settledDryContact) {
+            if (!settledDryContact) return false;
+            if (stage == Stage.WALK_OUT && side.equals(standing)) stage = Stage.CUT;
+            else if (stage == Stage.WALK_BACK && source.equals(standing)) stage = Stage.RETURNED;
+            else return false;
+            return true;
         }
     }
 

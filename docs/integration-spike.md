@@ -94,6 +94,9 @@ actually outlines under the crosshair to check a short way out. It
 must stand on real dry support and check the next tread before moving.
 An empty ray, darkness or a sound is not proof of a safe step. This
 does not reveal ore behind a wall or brighten the game for the model.
+If a low ceiling blocks a rise, the player can step aside onto a
+rechecked dry tread and clear the obstruction from outside its column.
+Without a pick, clearing a rock face for room does not earn cobblestone.
 If a short shaft is clear overhead, the player can build upward with
 spare rock. It checks for a side exit after each landing rather than
 building a tower with no way off.

@@ -1,6 +1,8 @@
 package io.gameharness.survival;
 
+import io.gameharness.survival.AgentSupplyOutline.CutAdmission;
 import io.gameharness.survival.AgentVisibleHorizon.Refusal;
+import io.gameharness.survival.mixin.AgentMiningAccess;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.function.BiFunction;
@@ -100,6 +102,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         BUCKET("pour", true, 0.022),
         RIM("rim_place", true, 0.022),
         SUPPLY_MINE("supply_outline_mine", false, 0.012),
+        SUPPLY_CLEAR("supply_outline_clear", false, 0.012),
         SUPPLY_PLACE("supply_outline_place", true, 0.022),
         OUTLINE("outline_use", true, 0.022);
 
@@ -113,9 +116,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             this.predictionSeconds = predictionSeconds;
         }
 
-        boolean supplyOutline() { return this == SUPPLY_MINE || this == SUPPLY_PLACE; }
+        boolean supplyOutline() { return this == SUPPLY_MINE || this == SUPPLY_CLEAR || this == SUPPLY_PLACE; }
         boolean allowsOutline() { return this == RIM || this == BUCKET || this == OUTLINE; }
     }
+
+    enum OutlineClearance { REQUESTED, WAIT, UNSAFE, TOO_SLOW, STALLED, EXPIRED }
 
     enum Preparation {
         READY(null), EQUIPMENT("awaiting_equipment"), RECEIPT("awaiting_receipt"), STANCE("awaiting_stance");
@@ -207,6 +212,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private HitResult tickCrosshair;
     private boolean ordinaryOutlineExitEnabled;
     private final AgentSupplyOutline.CutCover supplyCutCover = new AgentSupplyOutline.CutCover();
+    private final AgentSupplyOutline.EscapeWork supplyEscapeWork = new AgentSupplyOutline.EscapeWork();
     private BlockState renderedSupplyOutline;
     private BlockHitResult checkedSupplyOutline;
     private Vec3d checkedSupplyEye;
@@ -524,7 +530,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         } else {
             observedYawSpeed = observedPitchSpeed = 0;
             if (!sameView) {
-                supplyCutCover.forget();
+                forgetSupplyOutlineCut();
                 levelWallSight.forget();
                 clearContact();
             }
@@ -552,7 +558,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         eye = null;
         renderedCrosshair = null;
         renderedSupplyOutline = null;
-        supplyCutCover.forget();
+        forgetSupplyOutlineCut();
         checkedSupplyOutline = null;
         checkedSupplyEye = null;
         observedAtNanos = 0;
@@ -1016,14 +1022,17 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     void bindOrdinaryOutlineExit(boolean enabled) {
         ordinaryOutlineExitEnabled = enabled;
-        if (!enabled) supplyCutCover.forget();
+        if (!enabled) forgetSupplyOutlineCut();
     }
 
     boolean ordinaryOutlineExitEnabled() { return ordinaryOutlineExitEnabled; }
 
     void watchSupplyOutlineCut(BlockPos cell) { supplyCutCover.watch(cell, tick); }
 
-    void forgetSupplyOutlineCut() { supplyCutCover.forget(); }
+    void forgetSupplyOutlineCut() {
+        supplyCutCover.forget();
+        supplyEscapeWork.forget();
+    }
 
     /** Receipt from the vanilla draw itself, not from merely aiming at an outline-shaped block. */
     void observeSupplyOutline(Entity camera, BlockPos pos, BlockState state) {
@@ -1123,18 +1132,38 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     /** A negative-only guard for an exact cut chosen by the active supply owner. */
     boolean supplyOutlineCutSafe(BlockHitResult witness) {
+        return supplyOutlineCutAdmission(witness) == CutAdmission.ALLOWED;
+    }
+
+    boolean supplyOutlineCutObstructedByUnknownOverhead(BlockHitResult witness) {
+        return supplyOutlineCutAdmission(witness) == CutAdmission.UNKNOWN_OVERHEAD;
+    }
+
+    /** Only the exact selected face already authenticated against the vanilla draw. */
+    BlockState supplyOutlineState(BlockHitResult witness) {
         BlockHitResult now = supplyOutlineFace();
-        if (!AgentSupplyOutline.matchesFace(witness, now)) return false;
+        return AgentSupplyOutline.matchesFace(witness, now)
+            && client.world.getBlockState(now.getBlockPos()) == renderedSupplyOutline ? renderedSupplyOutline : null;
+    }
+
+    private boolean supplyOutlineCutSpace(BlockPos cell, Box hull) {
         var player = client.player;
-        BlockPos cell = now.getBlockPos();
         BlockPos from = player.getBlockPos();
+        int x = cell.getX(), y = cell.getY(), z = cell.getZ();
+        return supplyOutlineCell(from, x, y, z, 0, 3) && supplyOutlineGrounded(from)
+            && player.getVelocity().horizontalLengthSquared() <= 0.0025
+            && !hull.intersects(x, y, z, x + 1.0, y + 1.0, z + 1.0);
+    }
+
+    private CutAdmission supplyOutlineCutAdmission(BlockHitResult witness) {
+        BlockState state = supplyOutlineState(witness);
+        if (state == null) return CutAdmission.BLOCKED;
+        BlockPos cell = witness.getBlockPos();
+        var player = client.player;
         Box hull = player.getBoundingBox();
-        if (!supplyOutlineCell(from, cell.getX(), cell.getY(), cell.getZ(), 0, 3)
-                || !supplyOutlineGrounded(from) || player.getVelocity().horizontalLengthSquared() > 0.0025
-                || hull.intersects(new Box(cell)) || !supplyCutCover.allows(cell, hull, tick, System.nanoTime())) return false;
-        BlockState state = client.world.getBlockState(cell);
-        return state == renderedSupplyOutline && !state.hasBlockEntity() && !(state.getBlock() instanceof FallingBlock)
-            && fullStepSupport(cell, state) && AgentSupplyOutline.naturalCut(state);
+        if (!supplyOutlineCutSpace(cell, hull) || state.hasBlockEntity() || state.getBlock() instanceof FallingBlock
+                || !fullStepSupport(cell, state) || !AgentSupplyOutline.naturalCut(state)) return CutAdmission.BLOCKED;
+        return supplyCutCover.admission(cell, hull, tick, System.nanoTime());
     }
 
     /** Negative physical placement checks, only across the attached and currently outlined face. */
@@ -2287,7 +2316,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     void holdUse() { eating = true; }
 
     boolean miningFootingRefused(BlockPos target) {
-        return contactTick == tick && (contactMode == Contact.MINE || contactMode == Contact.SUPPLY_MINE) && contact != null
+        return contactTick == tick && (contactMode == Contact.MINE || contactMode == Contact.SUPPLY_MINE
+                || contactMode == Contact.SUPPLY_CLEAR) && contact != null
             && target.equals(contact.pos) && SUPPORTING_FOOTPRINT.equals(contactStatus);
     }
 
@@ -2330,6 +2360,79 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         var held = client.player.getMainHandStack();
         if (renderedSupplyOutline.isToolRequired() && !held.isSuitableFor(renderedSupplyOutline)) return false;
         return requestMine(witness, Contact.SUPPLY_MINE);
+    }
+
+    /** Explicit ordinary egress clearance; only vanilla may break the block or yield a drop. */
+    OutlineClearance clearSupplyOutline(BlockHitResult witness) {
+        if (!supplyEscapeInputSafe()) return OutlineClearance.UNSAFE;
+        BlockState state = supplyOutlineState(witness);
+        if (state == null) return OutlineClearance.UNSAFE;
+        BlockPos cell = witness.getBlockPos();
+        var player = client.player;
+        var held = player.getMainHandStack();
+        long nanos = System.nanoTime();
+        if (!supplyEscapeFaceSafe(cell, state, held, nanos)
+                || supplyEscapeWork.active() && !supplyEscapeWork.matches(witness, state, held))
+            return OutlineClearance.UNSAFE;
+        float crack = supplyEscapeWork.active() ? supplyEscapeCrack(cell) : 0;
+        OutlineClearance work = supplyEscapeWork.check(tick, state.calcBlockBreakingDelta(player, client.world, cell), crack);
+        if (work != OutlineClearance.REQUESTED) return work;
+        if (!requestMine(witness, Contact.SUPPLY_CLEAR))
+            return miningFootingRefused(cell) ? OutlineClearance.UNSAFE : OutlineClearance.WAIT;
+        if (!supplyEscapeWork.active()) supplyEscapeWork.start(witness, state, held, tick);
+        supplyEscapeWork.drawn(observedAtTick, observedAtNanos);
+        return OutlineClearance.REQUESTED;
+    }
+
+    /** A gap may preserve existing vanilla work; it cannot start or retarget an attack. */
+    OutlineClearance continueSupplyOutlineClearance(BlockPos cell) {
+        if (!supplyEscapeInputSafe()) return OutlineClearance.UNSAFE;
+        if (!supplyEscapeWork.active() || observedWorld != client.world || observedPlayer != client.player
+                || !(renderedCrosshair instanceof BlockHitResult seen)
+                || !(currentCrosshair() instanceof BlockHitResult now)) return OutlineClearance.WAIT;
+        long nanos = System.nanoTime();
+        float crack = supplyEscapeCrack(cell);
+        if (!supplyEscapeWork.bridges(seen, now, tick, nanos, crack) || !contact.admits(now))
+            return OutlineClearance.WAIT;
+        var player = client.player;
+        var held = player.getMainHandStack();
+        BlockState state = client.world.getBlockState(now.getBlockPos());
+        if (renderedSupplyOutline != null && renderedSupplyOutline != state
+                || !supplyEscapeWork.matches(now, state, held)
+                || !supplyEscapeFaceSafe(cell, state, held, nanos)
+                || !supplyOutlineRay(player.getEyePos(), now, null,
+                    Math.min(SUPPLY_OUTLINE_REACH, player.getBlockInteractionRange()))) return OutlineClearance.UNSAFE;
+        OutlineClearance work = supplyEscapeWork.check(tick, state.calcBlockBreakingDelta(player, client.world, cell), crack);
+        if (work != OutlineClearance.REQUESTED) return work;
+        contactTick = tick;
+        if (refuseSupportingMine()) return OutlineClearance.UNSAFE;
+        aimRegion(contact, now.getPos(), false);
+        mining = cell;
+        return OutlineClearance.REQUESTED;
+    }
+
+    private boolean supplyEscapeInputSafe() {
+        if (!ordinaryOutlineExitEnabled || !ready() || client.options.hudHidden || client.interactionManager == null
+                || !client.isWindowFocused() || client.getOverlay() != null || client.options.attackKey.isUnbound())
+            return false;
+        var player = client.player;
+        return !player.getAbilities().creativeMode && !player.isUsingItem() && !player.isTouchingWater()
+            && !player.isSubmergedInWater() && !player.isInLava() && !player.hasVehicle();
+    }
+
+    private boolean supplyEscapeFaceSafe(BlockPos cell, BlockState state, ItemStack held, long nanos) {
+        if (!(held.isEmpty() || held.isOf(Items.WOODEN_PICKAXE)) || !AgentSupplyOutline.escapeMaterial(state)
+                || dryCaveDanger(state) || !fullStepSupport(cell, state)) return false;
+        Box hull = client.player.getBoundingBox();
+        return !AgentSupplyOutline.CutCover.underColumn(cell, hull) && supplyOutlineCutSpace(cell, hull)
+            && supplyCutCover.allows(cell, hull, tick, nanos) && !hazards.lavaNear(hull, 0.12, tick);
+    }
+
+    private float supplyEscapeCrack(BlockPos cell) {
+        if (contact == null || contactMode != Contact.SUPPLY_CLEAR || !cell.equals(lastHeldMine)
+                || lastHeldMineTick != tick - 1 || !client.interactionManager.isBreakingBlock()
+                || !(client.interactionManager instanceof AgentMiningAccess nativeMining)) return 0;
+        return AgentSupplyOutline.observedCrack(cell, nativeMining.agent$breakingPos(), nativeMining.agent$breakingProgress());
     }
 
     private boolean requestMine(BlockHitResult witness, Contact mode) {

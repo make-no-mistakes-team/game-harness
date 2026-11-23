@@ -1,11 +1,16 @@
 package io.gameharness.survival;
 
+import io.gameharness.survival.AgentBody.OutlineClearance;
+import io.gameharness.survival.AgentSupplyOutline.CutAdmission;
 import java.util.Map;
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.ShapeContext;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.fluid.FluidState;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
@@ -72,6 +77,57 @@ final class SupplyOutlineWitnessTest {
         assertFalse(AgentBody.matchesDryRouteTop(side, WALL)); // The declared UP was not at the full top.
     }
 
+    @Test void onlyOrdinaryEarthAndRockAreEligibleForEscapeWork() {
+        assertTrue(AgentSupplyOutline.escapeMaterial(Blocks.DIRT.getDefaultState()));
+        assertTrue(AgentSupplyOutline.escapeMaterial(Blocks.ANDESITE.getDefaultState()));
+        for (Block denied : new Block[]{Blocks.IRON_ORE, Blocks.DEEPSLATE_DIAMOND_ORE, Blocks.BEDROCK, Blocks.GRAVEL,
+                Blocks.MAGMA_BLOCK, Blocks.WATER, Blocks.CRAFTING_TABLE, Blocks.FURNACE, Blocks.TORCH}) {
+            assertFalse(AgentSupplyOutline.escapeMaterial(denied.getDefaultState()), denied.toString());
+        }
+    }
+
+    @Test void onlyAnExistingNativeCrackOnTheUnchangedDrawnFaceMayBridgeABriefGap() {
+        BlockHitResult hit = wall().vanillaHit();
+        var otherSide = new BlockHitResult(hit.getPos(), Direction.UP, WALL, false);
+        var otherBlock = new BlockHitResult(hit.getPos(), Direction.WEST, WALL.east(), false);
+        var work = new AgentSupplyOutline.EscapeWork();
+        BlockState stone = Blocks.STONE.getDefaultState();
+        work.start(hit, stone, ItemStack.EMPTY, 20);
+        work.drawn(20, 1_000_000_000L);
+        assertTrue(work.matches(hit, stone, ItemStack.EMPTY));
+        assertFalse(work.matches(hit, Blocks.DIRT.getDefaultState(), ItemStack.EMPTY));
+        assertFalse(work.matches(hit, stone, new ItemStack(Items.WOODEN_PICKAXE)));
+        float crack = AgentSupplyOutline.observedCrack(WALL, WALL, 0.25f);
+        assertTrue(work.bridges(hit, hit, 23, 1_150_000_000L, crack));
+        assertFalse(work.bridges(hit, hit, 24, 1_150_000_000L, crack));
+        assertFalse(work.bridges(hit, hit, 23, 1_201_000_000L, crack));
+        assertFalse(work.bridges(otherSide, hit, 23, 1_150_000_000L, crack));
+        assertFalse(work.bridges(hit, otherBlock, 23, 1_150_000_000L, crack));
+        assertFalse(work.bridges(hit, hit, 23, 1_150_000_000L,
+            AgentSupplyOutline.observedCrack(WALL, WALL.east(), 0.25f)));
+        assertFalse(work.bridges(hit, hit, 23, 1_150_000_000L,
+            AgentSupplyOutline.observedCrack(WALL, WALL, Float.NaN)));
+        work.forget();
+        assertFalse(work.bridges(hit, hit, 21, 1_050_000_000L, crack));
+    }
+
+    @Test void vanillaHandWorkMustFitAndActuallyAdvanceWithinTheDeadline() {
+        var work = new AgentSupplyOutline.EscapeWork();
+        var hit = wall().vanillaHit();
+        // A dry grounded empty hand takes about 150 ticks on stone, and 300 on deepslate.
+        float handStone = 1 / 150f;
+        assertEquals(OutlineClearance.REQUESTED, work.check(100, handStone, 0));
+        assertEquals(OutlineClearance.REQUESTED, work.check(100, 1 / 45f, 0));
+        assertEquals(OutlineClearance.TOO_SLOW, work.check(100, 1 / 300f, 0));
+        assertEquals(OutlineClearance.TOO_SLOW, work.check(100, 0, 0));
+        assertEquals(OutlineClearance.TOO_SLOW, work.check(100, Float.POSITIVE_INFINITY, 0));
+        work.start(hit, Blocks.STONE.getDefaultState(), ItemStack.EMPTY, 100);
+        assertEquals(OutlineClearance.REQUESTED, work.check(105, handStone, handStone));
+        assertEquals(OutlineClearance.REQUESTED, work.check(116, handStone, handStone));
+        assertEquals(OutlineClearance.STALLED, work.check(117, handStone, handStone));
+        assertEquals(OutlineClearance.EXPIRED, work.check(280, handStone, 0.99f));
+    }
+
     @Test void foregroundWaterVetoesEvenThoughTheVanillaTargetIsTheSameWall() {
         var flooded = new Corridor(Map.of(WALL, Blocks.STONE.getDefaultState(),
             FOREGROUND, Blocks.WATER.getDefaultState()));
@@ -108,6 +164,10 @@ final class SupplyOutlineWitnessTest {
         var cover = new AgentSupplyOutline.CutCover();
         cover.watch(FOREGROUND, 10);
         assertTrue(cover.allows(FOREGROUND, BESIDE_CUT, 10, 10));
+        assertFalse(AgentSupplyOutline.CutCover.underColumn(FOREGROUND, BESIDE_CUT));
+        assertTrue(AgentSupplyOutline.CutCover.underColumn(FOREGROUND, BELOW_CUT));
+        assertEquals(CutAdmission.UNKNOWN_OVERHEAD, cover.admission(FOREGROUND, BELOW_CUT, 10, 10));
+        assertEquals(CutAdmission.BLOCKED, cover.admission(FOREGROUND, ABOVE_CUT, 10, 10));
         assertFalse(cover.allows(FOREGROUND, BELOW_CUT, 10, 10));
         assertFalse(cover.allows(FOREGROUND, ABOVE_CUT, 10, 10));
         assertFalse(cover.allows(FOREGROUND, BESIDE_CUT.offset(0.21, 0, 0), 10, 10));
@@ -130,6 +190,7 @@ final class SupplyOutlineWitnessTest {
         BlockState gravel = Blocks.GRAVEL.getDefaultState();
         var falling = new Corridor(Map.of(CAP, gravel));
         cover.observe(falling.vanillaHit(CAP_EYE, FAR.add(0, 0.8, 0)), gravel, CAP_EYE, REACH, 10, 11);
+        assertEquals(CutAdmission.BLOCKED, cover.admission(FOREGROUND, BELOW_CUT, 10, 11));
         assertFalse(cover.allows(FOREGROUND, BESIDE_CUT, 10, 11));
         cover.watch(FOREGROUND, 11);
         assertTrue(cover.allows(FOREGROUND, BESIDE_CUT, 11, 501_000_000L));

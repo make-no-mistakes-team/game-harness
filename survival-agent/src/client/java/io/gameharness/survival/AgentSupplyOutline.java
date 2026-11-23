@@ -1,10 +1,12 @@
 package io.gameharness.survival;
 
+import io.gameharness.survival.AgentBody.OutlineClearance;
 import java.util.Arrays;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.FallingBlock;
 import net.minecraft.block.ShapeContext;
+import net.minecraft.item.ItemStack;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
@@ -50,6 +52,80 @@ final class AgentSupplyOutline {
             || state.isOf(Blocks.TUFF) || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.CLAY)
             || state.isOf(Blocks.DRIPSTONE_BLOCK);
     }
+
+    /** Only ordinary vanilla earth or rock, not a tag that can include ore or a protected block. */
+    static boolean escapeMaterial(BlockState state) {
+        return state.isOf(Blocks.DIRT) || state.isOf(Blocks.COARSE_DIRT) || state.isOf(Blocks.ROOTED_DIRT)
+            || state.isOf(Blocks.GRASS_BLOCK) || state.isOf(Blocks.PODZOL) || state.isOf(Blocks.MYCELIUM)
+            || state.isOf(Blocks.CLAY) || state.isOf(Blocks.STONE) || state.isOf(Blocks.GRANITE)
+            || state.isOf(Blocks.DIORITE) || state.isOf(Blocks.ANDESITE) || state.isOf(Blocks.DEEPSLATE)
+            || state.isOf(Blocks.TUFF) || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.DRIPSTONE_BLOCK);
+    }
+
+    static float observedCrack(BlockPos target, BlockPos nativeTarget, float crack) {
+        return target.equals(nativeTarget) && crack > 0 && crack < 1 ? crack : 0;
+    }
+
+    /** Bounds one attack on one drawn surface, not a source of break or drop receipts. */
+    static final class EscapeWork {
+        private static final int MAX_TICKS = 180, STALLED_TICKS = 12, MAX_GAP_TICKS = 3;
+        private BlockHitResult face;
+        private BlockState state;
+        private ItemStack hand = ItemStack.EMPTY;
+        private int startedAt, advancedAt, drawnAt;
+        private long drawnNanos;
+        private float peak;
+
+        boolean active() { return face != null; }
+
+        void start(BlockHitResult selected, BlockState material, ItemStack held, int tick) {
+            face = selected;
+            state = material;
+            hand = held.isEmpty() ? ItemStack.EMPTY : held.copy();
+            startedAt = advancedAt = tick;
+            peak = 0;
+        }
+
+        void forget() {
+            face = null;
+            state = null;
+            hand = ItemStack.EMPTY;
+        }
+
+        void drawn(int tick, long nanos) {
+            drawnAt = tick;
+            drawnNanos = nanos;
+        }
+
+        boolean matches(BlockHitResult hit, BlockState material, ItemStack held) {
+            return matchesFace(face, hit) && state == material && ItemStack.areItemsAndComponentsEqual(hand, held);
+        }
+
+        boolean bridges(BlockHitResult seen, BlockHitResult live, int tick, long nanos, float crack) {
+            return crack > 0 && tick - drawnAt >= 0 && tick - drawnAt <= MAX_GAP_TICKS
+                && nanos - drawnNanos >= 0 && nanos - drawnNanos <= MAX_FRAME_NANOS
+                && matchesFace(face, seen) && matchesFace(face, live);
+        }
+
+        OutlineClearance check(int tick, float delta, float crack) {
+            int elapsed = active() ? tick - startedAt : 0;
+            if (elapsed >= MAX_TICKS) return OutlineClearance.EXPIRED;
+            if (active()) {
+                if (crack > peak) {
+                    peak = crack;
+                    advancedAt = tick;
+                }
+                if (tick - advancedAt >= STALLED_TICKS) return OutlineClearance.STALLED;
+            }
+            // The first vanilla tick starts the crack. Also reserve the cooldown
+            // that may remain from the preceding block.
+            int ticksLeft = MAX_TICKS - elapsed - (active() ? 0 : 6);
+            return Float.isFinite(delta) && delta > 0 && (1.0 - crack) <= (double) delta * ticksLeft
+                ? OutlineClearance.REQUESTED : OutlineClearance.TOO_SLOW;
+        }
+    }
+
+    enum CutAdmission { ALLOWED, UNKNOWN_OVERHEAD, BLOCKED }
 
     /** One pending cut and its drawn cap or attachments. There is no world lookup here. */
     static final class CutCover {
@@ -122,18 +198,26 @@ final class AgentSupplyOutline {
             return age >= 0 && age <= MAX_TICKS && elapsed >= 0 && elapsed <= MAX_NANOS ? seen[slot] : Cover.UNKNOWN;
         }
 
-        boolean allows(BlockPos cell, Box hull, int tick, long nanos) {
-            if (!watching(tick) || !cell.equals(target)) return false;
+        static boolean underColumn(BlockPos cell, Box hull) {
             int x = cell.getX(), z = cell.getZ();
-            boolean underColumn = x + 1.0 + COLUMN_MARGIN > hull.minX && x - COLUMN_MARGIN < hull.maxX
+            return x + 1.0 + COLUMN_MARGIN > hull.minX && x - COLUMN_MARGIN < hull.maxX
                 && z + 1.0 + COLUMN_MARGIN > hull.minZ && z - COLUMN_MARGIN < hull.maxZ;
+        }
+
+        CutAdmission admission(BlockPos cell, Box hull, int tick, long nanos) {
+            if (!watching(tick) || !cell.equals(target)) return CutAdmission.BLOCKED;
+            boolean underColumn = underColumn(cell, hull);
             Cover cap = current(CAP, tick, nanos);
-            if (cap == Cover.HAZARD || underColumn && (cell.getY() < hull.maxY || cap != Cover.CLEAR)) return false;
+            if (cap == Cover.HAZARD || underColumn && cell.getY() < hull.maxY) return CutAdmission.BLOCKED;
             for (int side = 1; side < seen.length; side++) {
-                if (current(side, tick, nanos) == Cover.HAZARD) return false;
+                if (current(side, tick, nanos) == Cover.HAZARD) return CutAdmission.BLOCKED;
             }
             // Unknown cover permits a lateral cut only, never one above or below the stance.
-            return true;
+            return underColumn && cap != Cover.CLEAR ? CutAdmission.UNKNOWN_OVERHEAD : CutAdmission.ALLOWED;
+        }
+
+        boolean allows(BlockPos cell, Box hull, int tick, long nanos) {
+            return admission(cell, hull, tick, nanos) == CutAdmission.ALLOWED;
         }
     }
 

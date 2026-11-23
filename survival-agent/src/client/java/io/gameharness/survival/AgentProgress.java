@@ -5853,11 +5853,14 @@ final class AgentProgress {
         private static final int MAX_RISE = 48, MAX_LEVEL = 2, MAX_CUTS = 96, MAX_LANE_CUTS = 3;
         private static final int MAX_CONNECTORS = 2, MAX_FOOTHOLDS = 2, FOOTHOLD_RESERVE = 8, ANCHOR_TICKS = 24;
         private static final int OUTLINE_LOOK_TICKS = 46, OUTLINE_REAIM_TICKS = 23;
+        private static final int OUTLINE_HAND_TICKS = 190;
         private static final Predicate<ItemStack> ANDESITE_FOOTHOLD = item(Items.ANDESITE), DIRT_FOOTHOLD = item(Items.DIRT);
+        private static final Predicate<ItemStack> EMPTY_HAND = ItemStack::isEmpty;
         private static final float SURVEY_PITCH = -42;
         private final List<BlockPos> walked = new ArrayList<>();
         private final AgentSupplyEgress order = new AgentSupplyEgress();
         private final AgentSupplyEgress.OutlinePassage outline = new AgentSupplyEgress.OutlinePassage();
+        private AgentSupplyEgress.ApexAccess restoredApex;
         private final BiPredicate<BlockPos, Direction> woodlandLane = this::woodlandLaneClear;
         private final Predicate<BlockPos> witnessedDryFlood = this::witnessedDryFloodCell;
         private boolean firstStoneExit;
@@ -5865,14 +5868,15 @@ final class AgentProgress {
         private BlockPos openFoot, unknownFoot, to, armedCut, packedBench;
         private BlockPos floodOpening, floodWater;
         private Vec3d floor, alternateFloor, aim, buildLow, buildHigh, reverseLeft, reverseRight, outlineCutPoint;
-        private Direction bearing, lane;
+        private Direction bearing, lane, apexSide;
         private Proof proof;
-        private BlockState buildMaterial;
+        private BlockState buildMaterial, apexSourceSupport, apexRiseSupport;
         private Predicate<ItemStack> buildStock;
-        private String surveyActivity, crossingActivity, firstRefusal, lastRefusal;
+        private String surveyActivity, crossingActivity, firstRefusal, lastRefusal, apexRefusal;
         private int deadline, since, view, views, openViews, roofViews, wallViews, handoffAfter;
         private int choice, flatBearings, driving, back, backEnd, rises, levels, cuts, laneCuts;
         private int benchBefore, benchCollectUntil, connectors, builds, buildBefore, buildReserve, anchorChoice;
+        private int apexSearched, handClearSince = -1;
         private long revealedFrame;
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
         private boolean triedLower, built, mineDeparture, floodSource, checkingExit, buildLowProved;
@@ -5884,8 +5888,14 @@ final class AgentProgress {
             if (world != c.world) return;
             order.observeBreak(position);
             if (!position.equals(armedCut)) return;
+            var apex = outline.apexAccess();
+            if (apex != null) {
+                if (!apex.broken(position, material)) return;
+                aim = null;
+            }
             body.forgetSupplyOutlineCut();
             armedCut = null;
+            handClearSince = -1;
             outlineCutPoint = null;
             outlineReaimed = false;
             revealedFrame = body.renderedFrame();
@@ -6069,7 +6079,10 @@ final class AgentProgress {
                 if (!surveying && to == null) status = "supply egress: waiting for a rendered view";
                 return true;
             }
-            if (driving != 0) return drive();
+            var apex = outline.apexAccess();
+            if (restoredApex != null && (!retainsApexSupports(restoredApex) || apexFloodBlocked(restoredApex)))
+                return refuse("the reverified rise changed after returning from the side tread");
+            if (driving != 0) return apex == null ? drive() : driveApexAccess(apex);
             if (packedBench != null && has(table.item, benchBefore + 1)) {
                 packedBench = null;
                 status = "supply egress: recovered the obstructing portable crafting table";
@@ -6083,6 +6096,7 @@ final class AgentProgress {
             }
             if (outline.active() && !actualOutlineFoot(from))
                 return stop("lost actual full, dry outline takeoff support");
+            if (apex != null) return workApexAccess(apex);
             if (!mineDeparture && packedBench == null && ordinaryHandoff(from)) return true;
             if (surveying) return look();
             if (packedBench != null && tick < benchCollectUntil) {
@@ -6417,6 +6431,8 @@ final class AgentProgress {
         private void setCrossing() {
             BlockPos from = order.foot();
             outlineApexChecked = false;
+            apexSourceSupport = apexRiseSupport = null;
+            restoredApex = null;
             order.considered(from.up(2));
             order.considered(from.offset(lane).up());
             order.considered(to.down());
@@ -6434,6 +6450,7 @@ final class AgentProgress {
             since = tick;
             proof = next;
             armedCut = null;
+            handClearSince = -1;
             body.forgetSupplyOutlineCut();
             outlineCutPoint = null;
             outlineReaimed = false;
@@ -6541,6 +6558,8 @@ final class AgentProgress {
                     if (grade == AgentBody.DryRouteVeto.SWEEP && !outlineApexChecked) {
                         // Only the upper band failed: look at the two exact crown cells;
                         // a physical veto alone does not give us a cut target or material.
+                        apexSourceSupport = body.dryCaveContact(from);
+                        apexRiseSupport = body.supplyOutlineState(body.supplyOutlineFace());
                         outlineApexChecked = true;
                         order.considered(from.up(3));
                         phase(Proof.HIGH_CROWN);
@@ -6571,6 +6590,199 @@ final class AgentProgress {
             }
             return tick - since < OUTLINE_LOOK_TICKS
                 || refuse("no matching, stable " + (lip ? "rise lip" : "landing top") + " outline at " + support.toShortString());
+        }
+
+        private boolean beginApexAccess(BlockHitResult hit) {
+            BlockPos from = order.foot();
+            if (proof != Proof.HIGH_CROWN || armedCut != null || !outline.allowsCut(hit.getBlockPos())
+                    || apexSourceSupport == null || apexSourceSupport != body.dryCaveContact(from)
+                    || apexRiseSupport == null || c.world.getBlockState(to.down()) != apexRiseSupport
+                    || body.dryRouteVeto(from, to) != AgentBody.DryRouteVeto.CLEAR
+                    || body.supplyOutlineGradeVeto(from, to) != AgentBody.DryRouteVeto.SWEEP
+                    || !body.walkedLaneDry(from, to, lane)
+                    || !body.supplyOutlineCutObstructedByUnknownOverhead(hit))
+                return false;
+            var apex = outline.beginApexAccess(from, to, hit, body.supplyOutlineState(hit),
+                apexSourceSupport, apexRiseSupport);
+            if (apex == null) return false;
+            body.pauseWork();
+            phase(Proof.HIGH_CROWN);
+            apexSide = null;
+            apexSearched = 1 << lane.ordinal(); // The rise lip is not a spare same-level tread.
+            apexRefusal = null;
+            status = "supply egress: finding a dry side tread outside the outlined apex column";
+            return true;
+        }
+
+        private boolean retainsApexSupports(AgentSupplyEgress.ApexAccess apex) {
+            // Only compare the exact support states already admitted by rendered top witnesses.
+            return c.world.getBlockState(apex.source.down()) == apex.sourceSupport
+                && c.world.getBlockState(apex.rise.down()) == apex.riseSupport;
+        }
+
+        private boolean apexFloodBlocked(AgentSupplyEgress.ApexAccess apex) {
+            return order.avoidFlood(apex.source, tick) || order.avoidFlood(apex.rise, tick)
+                || order.avoidFlood(apex.cell, tick) || apex.side() != null && order.avoidFlood(apex.side(), tick);
+        }
+
+        private boolean apexAccessSafe(AgentSupplyEgress.ApexAccess apex) {
+            return !body.lavaEmergency() && !body.macroLavaNear() && !apexFloodBlocked(apex)
+                && retainsApexSupports(apex)
+                && (apex.side() == null || c.world.getBlockState(apex.side().down()) == apex.sideSupport());
+        }
+
+        private boolean workApexAccess(AgentSupplyEgress.ApexAccess apex) {
+            if (!apexAccessSafe(apex)) return stop("apex approach support or danger changed");
+            if (body.renderedFrame() == revealedFrame) return true;
+            return switch (apex.stage()) {
+                case LOOK_SIDE -> findApexSide(apex);
+                case CUT -> cutApexFromSide(apex);
+                case LOOK_BACK -> checkApexReturn(apex);
+                default -> throw new IllegalStateException("No apex access work in " + apex.stage());
+            };
+        }
+
+        private Direction nextApexSide(BlockPos from) {
+            BlockPos previous = order.previousLevelFoot(from);
+            if (previous != null) {
+                Direction prior = directional(Vec3d.ofBottomCenter(previous).subtract(Vec3d.ofBottomCenter(from)));
+                if ((apexSearched & 1 << prior.ordinal()) == 0) return prior;
+            }
+            Direction opposite = lane.getOpposite();
+            if ((apexSearched & 1 << opposite.ordinal()) == 0) return opposite;
+            Direction right = lane.rotateYClockwise();
+            if ((apexSearched & 1 << right.ordinal()) == 0) return right;
+            Direction left = lane.rotateYCounterclockwise();
+            return (apexSearched & 1 << left.ordinal()) == 0 ? left : null;
+        }
+
+        private Vec3d apexTreadAim(BlockPos foot, Direction outward) {
+            boolean alternate = tick - since >= OUTLINE_REAIM_TICKS;
+            if (aim == null || alternate && !outlineReaimed) {
+                outlineReaimed = alternate;
+                double offset = alternate ? 0.14 : 0.34;
+                aim = Vec3d.ofBottomCenter(foot).add(outward.getOffsetX() * offset, -0.025, outward.getOffsetZ() * offset);
+            }
+            return aim;
+        }
+
+        private boolean findApexSide(AgentSupplyEgress.ApexAccess apex) {
+            if (apexSide == null) {
+                apexSide = nextApexSide(apex.source);
+                if (apexSide == null)
+                    return abandonApexAtSource(apex, "no separately witnessed level support beside the apex");
+                apexSearched |= 1 << apexSide.ordinal();
+                aim = null;
+                since = tick;
+            }
+            BlockPos side = apex.source.offset(apexSide);
+            if (order.avoidFlood(side, tick)) {
+                apexSide = null;
+                return true;
+            }
+            Vec3d sample = apexTreadAim(side, apexSide);
+            body.aim(sample);
+            status = "supply egress: checking the nearby drawn top at " + side.down().toShortString();
+            if (body.supplyOutlineTop(apex.source, side.down())) {
+                BlockState support = body.supplyOutlineState(body.supplyOutlineFace());
+                if (body.walkedLaneDry(apex.source, side, apexSide)
+                        && body.dryRouteVeto(apex.source, side) == AgentBody.DryRouteVeto.CLEAR
+                        && apex.admitOut(side, support)) {
+                    driving = tick;
+                    return driveApexAccess(apex);
+                }
+                apexSide = null;
+            } else if (tick - since >= OUTLINE_LOOK_TICKS) apexSide = null;
+            return true;
+        }
+
+        private boolean cutApexFromSide(AgentSupplyEgress.ApexAccess apex) {
+            if (c.player.getVelocity().horizontalLengthSquared() > 0.0025) return true;
+            body.watchSupplyOutlineCut(apex.cell);
+            if (aim == null) aim = inward(apex.face);
+            body.aim(outlineCutPoint == null ? aim : outlineCutPoint);
+            status = "supply egress: re-witnessing the exact outlined apex from adjacent dry support";
+            BlockHitResult hit = body.supplyOutlineFace();
+            if (hit != null && apex.cell.equals(hit.getBlockPos()) && body.renderedAim(aim, 10)) {
+                if (!apex.matchesCut(hit, body.supplyOutlineState(hit)))
+                    return leaveApexCut(apex, "the exposed apex contact changed");
+                return cutOutline(apex.cell, hit);
+            }
+            if (handClearSince >= 0) {
+                if (hit == null) return continueHandClearance(apex.cell);
+                return leaveApexCut(apex, "the outlined hand-clearance contact changed");
+            }
+            return tick - since < (outlineCutPoint == null ? OUTLINE_LOOK_TICKS : CUT_TICKS)
+                || leaveApexCut(apex, "no fresh match for the exposed apex face from the side tread");
+        }
+
+        private boolean leaveApexCut(AgentSupplyEgress.ApexAccess apex, String why) {
+            apex.abandonCut();
+            apexRefusal = why;
+            body.pauseWork();
+            phase(Proof.HIGH_CROWN);
+            return true;
+        }
+
+        private boolean checkApexReturn(AgentSupplyEgress.ApexAccess apex) {
+            Direction back = apexSide.getOpposite();
+            body.aim(apexTreadAim(apex.source, back));
+            status = "supply egress: rechecking the original takeoff top before walking back";
+            if (body.supplyOutlineTop(apex.side(), apex.source.down())) {
+                if (!body.walkedLaneDry(apex.side(), apex.source, back)
+                        || body.dryRouteVeto(apex.side(), apex.source) != AgentBody.DryRouteVeto.CLEAR
+                        || !apex.admitBack()) return stop("the re-witnessed return sweep no longer holds dry");
+                driving = tick;
+                return driveApexAccess(apex);
+            }
+            return tick - since < OUTLINE_LOOK_TICKS || stop("no freshly drawn return top beneath the original rise");
+        }
+
+        private boolean driveApexAccess(AgentSupplyEgress.ApexAccess apex) {
+            boolean outward = apex.stage() == AgentSupplyEgress.ApexAccess.Stage.WALK_OUT;
+            BlockPos from = outward ? apex.source : apex.side(), target = outward ? apex.side() : apex.source;
+            Direction move = outward ? apexSide : apexSide.getOpposite();
+            if (!apexAccessSafe(apex) || !body.walkedLaneDry(from, target, move)
+                    || body.dryRouteVeto(from, target) != AgentBody.DryRouteVeto.CLEAR)
+                return outward ? abandonApexAtSource(apex, "repositioning did not reach the re-witnessed side top")
+                    : stop("could not settle back onto the original apex takeoff");
+            if (settled(target)) {
+                if (!apex.landed(target, actualOutlineFoot(target)))
+                    return stop("no actual dry support contact on the repositioning tread");
+                // Keep this real leg only for connected-footing and flood safety; it grants no fresh coverage.
+                order.landed(target);
+                body.pauseWork();
+                driving = 0;
+                revealedFrame = body.renderedFrame();
+                phase(Proof.HIGH_CROWN);
+                if (outward) {
+                    status = "supply egress: settled off the apex column at " + target.toShortString();
+                    return true;
+                }
+                if (!outline.finishApexAccess(target)) return stop("no exact apex return receipt");
+                if (!apex.opened()) return refuse(apexRefusal);
+                setCrossing();
+                restoredApex = apex;
+                sourceProved = false;
+                // The earlier dry opening receipts still nominate this exact lane; both tops and
+                // the full-width physical, fluid and apex sweeps must pass again from the takeoff.
+                phase(Proof.LANDING);
+                status = "supply egress: returned to the original rise; rechecking the crossing after the apex cut";
+                return true;
+            }
+            if (tick - driving >= 45)
+                return outward ? abandonApexAtSource(apex, "repositioning did not reach the re-witnessed side top")
+                    : stop("could not settle back onto the original apex takeoff");
+            if (dryFieldFooting() && target.equals(c.player.getBlockPos())) centerSupplyFoot(target);
+            else body.driveDryRoute(from, target, move);
+            status = "supply egress: walking " + (outward ? "off the apex column" : "back toward the original rise");
+            return true;
+        }
+
+        private boolean abandonApexAtSource(AgentSupplyEgress.ApexAccess apex, String why) {
+            if (!settled(apex.source) || !actualOutlineFoot(apex.source) || !outline.finishApexAccess(apex.source))
+                return stop(why);
+            return refuse(why);
         }
 
         private boolean tryFootholdAfterLower() {
@@ -6868,32 +7080,93 @@ final class AgentProgress {
             if (hit != null && cell.equals(hit.getBlockPos())
                     && (outlineCutPoint != null || body.renderedAim(aim, 10)))
                 return cutOutline(cell, hit);
+            if (handClearSince >= 0) {
+                if (hit == null) return continueHandClearance(cell);
+                return rejectOutlineCut("the outlined hand-clearance contact changed");
+            }
             return tick - since < (outlineCutPoint == null ? OUTLINE_LOOK_TICKS : CUT_TICKS)
                 || refuse("no matching close cut face or positive backstop for " + area() + " at " + cell.toShortString());
         }
 
         private boolean cutOutline(BlockPos cell, BlockHitResult hit) {
-            if (order.avoidFlood(cell, tick)) return refuse("will not cut into the recent flood neighborhood");
+            if (order.avoidFlood(cell, tick)) return rejectOutlineCut("will not cut into the recent flood neighborhood");
             if (built || cell.equals(to.down()) || underMineFootprint(cell) || protectRecoveryBlock(cell))
-                return refuse("outlined " + area() + " would disturb supporting or protected footing");
-            if (!body.supplyOutlineCutSafe(hit))
-                return refuse("unsafe outlined cut face or overhead cap at " + cell.toShortString());
+                return rejectOutlineCut("outlined " + area() + " would disturb supporting or protected footing");
             if (laneCuts >= (outlineApexChecked ? 5 : MAX_LANE_CUTS)
                     || cuts >= MAX_CUTS || armedCut == null && !outline.allowsCut(cell))
-                return refuse("short outline cut limit or repeated cut target at " + cell.toShortString());
-            if (tick - since >= CUT_TICKS) return refuse("no confirmed outlined break at " + cell.toShortString());
+                return rejectOutlineCut("short outline cut limit or repeated cut target at " + cell.toShortString());
+            if (!body.supplyOutlineCutSafe(hit)) {
+                if (outline.apexAccess() == null && beginApexAccess(hit)) return true;
+                return rejectOutlineCut("unsafe outlined cut face or overhead cap at " + cell.toShortString());
+            }
+            if (handClearSince >= 0) {
+                if (tick - handClearSince >= OUTLINE_HAND_TICKS)
+                    return rejectOutlineCut("no confirmed hand clearance at " + cell.toShortString());
+                return handleHandClearance(cell, body.clearSupplyOutline(hit));
+            }
+            if (tick - since >= CUT_TICKS)
+                return rejectOutlineCut("no confirmed outlined break at " + cell.toShortString());
             if (outlineCutPoint == null) outlineCutPoint = hit.getPos();
             status = "supply egress: targeting an outlined " + area() + " cut at " + cell.toShortString();
-            // The native actuator vetoes an unsuitable equipped tool without identifying the dark block.
-            Predicate<ItemStack> pick = has(STONE_PICK, 1) ? STONE_PICK : has(WOOD_PICK, 1) ? WOOD_PICK : DEEP_PICK;
-            if (has(pick, 1) && !hands.equipForUse(pick)) return true;
-            if (body.mineSupplyOutline(hit) && armedCut == null) {
-                outline.attemptedCut(cell);
-                armedCut = cell;
+            // Consult only the currently authenticated natural face, never an unseen stock or cover cell.
+            BlockState material = body.supplyOutlineState(hit);
+            if (material == null) return true;
+            var inventory = c.player.getInventory();
+            if (material.isToolRequired() && !inventory.getMainHandStack().isSuitableFor(material)) {
+                for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+                    ItemStack pick = inventory.getStack(slot);
+                    if (pick.isIn(ItemTags.PICKAXES) && pick.isSuitableFor(material)) {
+                        hands.equipSlot(slot);
+                        return true;
+                    }
+                }
+                if (!outline.allowsHandClearance(cell))
+                    return rejectOutlineCut("short outlined hand-clearance limit at " + cell.toShortString());
+                if (!hands.equipForUse(EMPTY_HAND)) return true;
+                return handleHandClearance(cell, body.clearSupplyOutline(hit));
             }
+            if (body.mineSupplyOutline(hit)) armOutlineCut(cell);
             if (armedCut != null) status = "supply egress: attempted outlined cut at " + cell.toShortString();
-            if (body.miningFootingRefused(cell)) return refuse("cut would remove actual supporting footprint");
+            if (body.miningFootingRefused(cell)) return rejectOutlineCut("cut would remove actual supporting footprint");
             return true;
+        }
+
+        private void armOutlineCut(BlockPos cell) {
+            if (armedCut != null) return;
+            outline.attemptedCut(cell);
+            armedCut = cell;
+            var apex = outline.apexAccess();
+            if (apex != null) apex.requestedCut();
+        }
+
+        private boolean continueHandClearance(BlockPos cell) {
+            if (tick - handClearSince >= OUTLINE_HAND_TICKS)
+                return rejectOutlineCut("no confirmed hand clearance at " + cell.toShortString());
+            return handleHandClearance(cell, body.continueSupplyOutlineClearance(cell));
+        }
+
+        private boolean handleHandClearance(BlockPos cell, AgentBody.OutlineClearance result) {
+            return switch (result) {
+                case REQUESTED -> {
+                    if (handClearSince < 0) {
+                        handClearSince = tick;
+                        outline.attemptHandClearance(cell);
+                    }
+                    armOutlineCut(cell);
+                    status = "supply egress: attempting bounded hand clearance at " + cell.toShortString();
+                    yield true;
+                }
+                case WAIT -> true;
+                case UNSAFE -> rejectOutlineCut("outlined hand clearance lost its safe contact");
+                case TOO_SLOW -> rejectOutlineCut("the outlined hand cut cannot finish inside its bound");
+                case STALLED -> rejectOutlineCut("no observed crack progress from the outlined hand cut");
+                case EXPIRED -> rejectOutlineCut("the outlined hand clearance expired without a break");
+            };
+        }
+
+        private boolean rejectOutlineCut(String why) {
+            var apex = outline.apexAccess();
+            return apex == null ? refuse(why) : leaveApexCut(apex, why);
         }
 
         private String area() {
@@ -7020,6 +7293,7 @@ final class AgentProgress {
                 boolean reachedReturnEnd = returning && --back <= backEnd;
                 if (reachedReturnEnd) returning = false;
                 to = null;
+                restoredApex = null;
                 driving = 0;
                 firstRefusal = lastRefusal = null;
                 sourceProved = !outlined;
@@ -7088,6 +7362,8 @@ final class AgentProgress {
             outline.abandonLanding();
             body.forgetSupplyOutlineCut();
             outlineCutPoint = null;
+            handClearSince = -1;
+            restoredApex = null;
             to = null;
             armedCut = null;
             driving = 0;
@@ -7113,6 +7389,8 @@ final class AgentProgress {
             outline.reset();
             body.forgetSupplyOutlineCut();
             outlineCutPoint = null;
+            handClearSince = -1;
+            restoredApex = null;
         }
 
         private boolean ready(BlockPos from, String why) {

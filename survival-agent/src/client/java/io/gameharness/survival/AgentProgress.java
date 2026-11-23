@@ -724,6 +724,7 @@ final class AgentProgress {
     }
 
     void saveMemory(boolean force) {
+        if (c.player != null && c.player.isDead()) memory.forgetForaging();
         memory.save(c.world, trail, force);
     }
 
@@ -997,6 +998,7 @@ final class AgentProgress {
     void afterRespawn() {
         nearbyBenchReturn = null;
         nearbyBenchPoint = null;
+        memory.forgetForaging();
         navigator.reset();
         mineResite.reset();
         firstStone.afterRespawn();
@@ -1576,7 +1578,8 @@ final class AgentProgress {
         ordinaryRouteTarget = target;
         ordinaryRouteArrival = arrival;
         ordinaryRouteBand = null;
-        return navigationResult(job, navigator.step(job, target, arrival, tick));
+        return navigationResult(job, job == Job.FOOD && target == null && ordinaryCaveDrops
+            ? navigator.scoutFood(memory, tick) : navigator.step(job, target, arrival, tick));
     }
 
     private Result navigate(Job job, AgentResourceStance goal) {
@@ -6476,7 +6479,7 @@ final class AgentProgress {
                 handoffAfter = tick + 5;
                 float yaw = body.defensiveViewYaw();
                 if (order.handoffWoodland(body.dryCaveProbeView(), Direction.fromHorizontalDegrees(yaw), woodlandLane))
-                    return surfaceReady(from, yaw, "confirmed walkable woodland after short outline passage");
+                    return surfaceReady(from, yaw, true, "confirmed walkable woodland after short outline passage");
                 return false;
             }
             if (tick < handoffAfter) return !foodExit && handoffTimber(false);
@@ -6496,7 +6499,7 @@ final class AgentProgress {
             float yaw = body.defensiveViewYaw();
             if (body.dryCaveContact(from) != null && order.handoffWoodland(body.dryCaveProbeView(),
                     Direction.fromHorizontalDegrees(yaw), woodlandLane))
-                return surfaceReady(from, yaw, "confirmed walkable woodland");
+                return surfaceReady(from, yaw, true, "confirmed walkable woodland");
             if (foodExit) return false;
             if (collectLocalDrop(LOG) || collectLocalDrop(PLANK))
                 return ready("ordinary pickup from connected footing");
@@ -6750,7 +6753,7 @@ final class AgentProgress {
                 if (!aligned && tick - since < LOOK_TICKS) return true;
                 if ((!outline.active() || aligned && outline.canHandoff())
                         && order.handoffSurface(body.dryCaveProbeView(), bearing, woodlandLane))
-                    return surfaceReady(from, outward, outline.active()
+                    return surfaceReady(from, outward, false, outline.active()
                         ? "confirmed open ground with a connected lane after short outline passage"
                         : "confirmed open ground with a connected lane");
                 // Seeing daylight through a hole doesn't put the player's feet on its rim.
@@ -7810,7 +7813,10 @@ final class AgentProgress {
                 caves.walkedDry(old, from);
                 caves.witnessedDry(from, old);
                 body.recordWalkedLeg(old, from);
-                if (!mineDeparture) navigator.rememberWalked(old, from);
+                if (!mineDeparture) {
+                    boolean twoWay = navigator.rememberWalked(old, from);
+                    if (ordinaryCaveDrops) memory.observeSupplyLanding(c.world, old, from, twoWay);
+                }
                 if (from.getY() > old.getY()) {
                     rises++;
                     if (!mineDeparture) stallGuard.navigationArrival(old, from);
@@ -7921,9 +7927,12 @@ final class AgentProgress {
             return true;
         }
 
-        private boolean surfaceReady(BlockPos from, float yaw, String why) {
+        private boolean surfaceReady(BlockPos from, float yaw, boolean woodland, String why) {
             body.pauseWork();
             observeOpenFoot(from);
+            if (ordinaryCaveDrops && !mineDeparture && woodland && outdoors()
+                    && settled(from) && body.supplyFootContact(from) != null)
+                memory.confirmForagingExit(c.world, from);
             heading = yaw;
             headingUntil = tick + 125;
             approachGoal = null;

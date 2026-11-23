@@ -4,7 +4,11 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.Strictness;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
 import java.io.IOException;
+import java.io.StringReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -26,15 +30,17 @@ import net.minecraft.world.World;
 final class AgentMemory {
     private static final int MAX_BYTES = 32 * 1024;
     static final int MAX_CELLS = 1024;
+    private static final int MAX_FORAGING_CELLS = 96;
     private static final long SAVE_INTERVAL = 750_000_000L;
     private static final String DIMENSION = "minecraft:overworld";
     private static final Set<PosixFilePermission> PRIVATE_PERMISSIONS = PosixFilePermissions.fromString("rw-------");
 
     private record Snapshot(List<BlockPos> trail, List<BlockPos> dormant, BlockPos workbench, BlockPos furnace,
-                            BlockPos ownedWorkbench) {}
+                            BlockPos ownedWorkbench, List<BlockPos> foragingExit) {}
     record Rejoin(List<BlockPos> prefix, int activeIndex, int resumeAt) {}
-    private static final Snapshot EMPTY = new Snapshot(List.of(), List.of(), null, null, null);
+    private static final Snapshot EMPTY = new Snapshot(List.of(), List.of(), null, null, null, List.of());
     private final Path file;
+    private final ForagingTrail foraging;
     private Snapshot saved;
     private List<BlockPos> parentTrail;
     private List<BlockPos> dormant;
@@ -56,6 +62,7 @@ final class AgentMemory {
     AgentMemory(Path directory) {
         file = directory.resolve("agent-memory.json");
         saved = read();
+        foraging = new ForagingTrail(saved.foragingExit);
         parentTrail = saved.trail;
         dormant = saved.dormant;
         workbench = saved.workbench;
@@ -88,6 +95,79 @@ final class AgentMemory {
 
     private static boolean nearby(BlockPos position, Vec3d eye) {
         return position != null && eye.squaredDistanceTo(Vec3d.ofCenter(position)) <= 20.25;
+    }
+
+    void observeSupplyLanding(ClientWorld world, BlockPos from, BlockPos to, boolean twoWay) {
+        if (world != null && world == overworld) foraging.landed(from, to, twoWay);
+    }
+
+    void confirmForagingExit(ClientWorld world, BlockPos foot) {
+        if (world != null && world == overworld) foraging.confirm(foot);
+    }
+
+    BlockPos nextForagingStep(ClientWorld world, BlockPos foot) {
+        return world != null && world == overworld ? foraging.next(foot) : null;
+    }
+
+    void refuseForagingStep(ClientWorld world, BlockPos from, BlockPos to) {
+        if (world != null && world == overworld) foraging.refuse(from, to);
+    }
+
+    void forgetForaging() { foraging.clear(); }
+
+    /** Current-life receipts only. The final foot must separately prove a connection to woodland. */
+    static final class ForagingTrail {
+        private final List<BlockPos> walked = new ArrayList<>();
+        private List<BlockPos> proved;
+
+        ForagingTrail(List<BlockPos> previouslyProved) {
+            proved = previouslyProved;
+        }
+
+        void landed(BlockPos from, BlockPos to, boolean twoWay) {
+            if (!twoWay || !valid(from) || !valid(to) || !cardinalStep(from, to)) {
+                walked.clear();
+                return;
+            }
+            int begin = walked.lastIndexOf(from);
+            if (begin < 0) {
+                walked.clear();
+                walked.add(from.toImmutable());
+            } else if (begin + 1 < walked.size()) walked.subList(begin + 1, walked.size()).clear();
+            int revisit = walked.lastIndexOf(to);
+            if (revisit >= 0) {
+                walked.subList(revisit + 1, walked.size()).clear();
+            } else {
+                if (walked.size() == MAX_FORAGING_CELLS) walked.removeFirst();
+                walked.add(to.toImmutable());
+            }
+        }
+
+        void confirm(BlockPos foot) {
+            if (walked.size() < 2 || !foot.equals(walked.getLast())) return;
+            // Finishing again from a higher tread does not discard the lower return.
+            int start = proved.indexOf(walked.getFirst());
+            if (start < 0 || !walked.equals(proved.subList(start, proved.size()))) proved = List.copyOf(walked);
+        }
+
+        List<BlockPos> proved() { return proved; }
+
+        BlockPos next(BlockPos foot) {
+            int at = proved.indexOf(foot);
+            return at >= 0 && at + 1 < proved.size() ? proved.get(at + 1) : null;
+        }
+
+        void refuse(BlockPos from, BlockPos to) {
+            int fromIndex = proved.indexOf(from);
+            if (fromIndex < 0 || fromIndex + 1 >= proved.size() || !to.equals(proved.get(fromIndex + 1))) return;
+            proved = fromIndex + 2 < proved.size()
+                ? List.copyOf(proved.subList(fromIndex + 1, proved.size())) : List.of();
+        }
+
+        void clear() {
+            walked.clear();
+            proved = List.of();
+        }
     }
 
     Rejoin rejoin(ClientWorld world, BlockPos standing, List<BlockPos> trail, boolean routing) {
@@ -265,20 +345,27 @@ final class AgentMemory {
         }
         List<BlockPos> inactive = !dormant.isEmpty() ? dormant : trail == parentTrail ? List.of() : parentTrail;
         int activeLength = length + (extra == null ? 0 : 1);
-        int dormantLength = Math.min(inactive.size(), MAX_CELLS - activeLength);
+        List<BlockPos> exit = foraging.proved();
+        int exitLength = Math.min(exit.size(), MAX_CELLS - activeLength);
+        if (exitLength < 2) exitLength = 0;
+        int exitStart = exit.size() - exitLength;
+        int dormantLength = Math.min(inactive.size(), MAX_CELLS - activeLength - exitLength);
         if (dormantLength < 2) dormantLength = 0;
         if (sameTrail(saved.trail, trail, start, length, extra) && sameTrail(saved.dormant, inactive, 0, dormantLength, null)
+            && sameTrail(saved.foragingExit, exit, exitStart, exitLength, null)
             && Objects.equals(workbench, saved.workbench)
             && Objects.equals(furnace, saved.furnace)
             && Objects.equals(ownedWorkbench, saved.ownedWorkbench)) return;
-        StringBuilder json = new StringBuilder(96 + (activeLength + dormantLength) * 14);
+        StringBuilder json = new StringBuilder(96 + (activeLength + dormantLength + exitLength) * 14);
         json.append("{\"version\":1,\"dimension\":\"").append(DIMENSION).append("\",\"trail\":");
         encodeTrail(json, trail, start, length, extra);
         if (dormantLength > 0) encodeTrail(json.append(",\"dormant\":"), inactive, 0, dormantLength, null);
         if (workbench != null) encode(json.append(",\"workbench\":"), workbench);
         if (furnace != null) encode(json.append(",\"furnace\":"), furnace);
         if (ownedWorkbench != null) encode(json.append(",\"ownedWorkbench\":"), ownedWorkbench);
+        if (exitLength > 0) encodeTrail(json.append(",\"foragingExit\":"), exit, exitStart, exitLength, null);
         json.append('}');
+        if (json.length() > MAX_BYTES) return; // The encoder writes ASCII only.
         Path tmp = null;
         try {
             tmp = Files.createTempFile(file.getParent(), "agent-memory-", ".tmp",
@@ -294,7 +381,8 @@ final class AgentMemory {
                 recorded = extended;
             } else recorded = List.copyOf(recorded);
             saved = new Snapshot(recorded,
-                List.copyOf(inactive.subList(0, dormantLength)), workbench, furnace, ownedWorkbench);
+                List.copyOf(inactive.subList(0, dormantLength)), workbench, furnace, ownedWorkbench,
+                exitStart == 0 ? exit : List.copyOf(exit.subList(exitStart, exit.size())));
         } catch (IOException ignored) {
             // Optional memory must not interrupt play or emit recorded positions.
         } finally {
@@ -330,32 +418,43 @@ final class AgentMemory {
             try (var input = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
                 byte[] bytes = input.readNBytes(MAX_BYTES + 1);
                 if (bytes.length == 0 || bytes.length > MAX_BYTES) return EMPTY;
-                JsonObject object = JsonParser.parseString(new String(bytes, StandardCharsets.UTF_8)).getAsJsonObject();
+                var json = new JsonReader(new StringReader(new String(bytes, StandardCharsets.UTF_8)));
+                json.setStrictness(Strictness.STRICT);
+                JsonObject object = JsonParser.parseReader(json).getAsJsonObject();
+                if (json.peek() != JsonToken.END_DOCUMENT) return EMPTY;
                 JsonElement dimension = object.get("dimension");
                 if (integer(object.get("version")) != 1 || !dimension.isJsonPrimitive()
                     || !dimension.getAsJsonPrimitive().isString() || !DIMENSION.equals(dimension.getAsString())
                     || object.size() != 3 + (object.has("dormant") ? 1 : 0) + (object.has("workbench") ? 1 : 0)
-                        + (object.has("furnace") ? 1 : 0) + (object.has("ownedWorkbench") ? 1 : 0))
+                        + (object.has("furnace") ? 1 : 0) + (object.has("ownedWorkbench") ? 1 : 0)
+                        + (object.has("foragingExit") ? 1 : 0))
                     return EMPTY;
-                List<BlockPos> cells = decodeTrail(object.getAsJsonArray("trail"), MAX_CELLS);
+                List<BlockPos> cells = decodeTrail(object.getAsJsonArray("trail"), MAX_CELLS, false);
                 List<BlockPos> inactive = object.has("dormant")
-                    ? decodeTrail(object.getAsJsonArray("dormant"), MAX_CELLS - cells.size()) : List.of();
+                    ? decodeTrail(object.getAsJsonArray("dormant"), MAX_CELLS - cells.size(), false) : List.of();
+                List<BlockPos> exit = List.of();
+                if (object.has("foragingExit")) {
+                    int available = MAX_CELLS - cells.size() - inactive.size();
+                    exit = decodeTrail(object.getAsJsonArray("foragingExit"), Math.min(MAX_FORAGING_CELLS, available), true);
+                    if (exit.size() < 2) return EMPTY;
+                }
                 return new Snapshot(cells, inactive, object.has("workbench") ? decode(object.get("workbench")) : null,
                     object.has("furnace") ? decode(object.get("furnace")) : null,
-                    object.has("ownedWorkbench") ? decode(object.get("ownedWorkbench")) : null);
+                    object.has("ownedWorkbench") ? decode(object.get("ownedWorkbench")) : null, exit);
             }
         } catch (IOException | RuntimeException ignored) {
             return EMPTY;
         }
     }
 
-    private static List<BlockPos> decodeTrail(JsonArray route, int limit) {
+    private static List<BlockPos> decodeTrail(JsonArray route, int limit, boolean requireCardinal) {
         if (route.size() > limit) throw new IllegalArgumentException();
         List<BlockPos> cells = new ArrayList<>(route.size());
         var seen = new HashSet<BlockPos>();
         for (JsonElement entry : route) {
             BlockPos cell = decode(entry);
-            if (!seen.add(cell) || !cells.isEmpty() && !adjacent(cells.getLast(), cell)) throw new IllegalArgumentException();
+            if (!seen.add(cell) || !cells.isEmpty() && !(requireCardinal
+                    ? cardinalStep(cells.getLast(), cell) : adjacent(cells.getLast(), cell))) throw new IllegalArgumentException();
             cells.add(cell);
         }
         return cells;
@@ -368,6 +467,10 @@ final class AgentMemory {
 
     private static boolean adjacent(BlockPos a, BlockPos b) {
         return Math.abs((long) a.getY() - b.getY()) <= 1 && adjacentColumn(a, b);
+    }
+
+    private static boolean cardinalStep(BlockPos a, BlockPos b) {
+        return adjacent(a, b) && (a.getX() != b.getX() || a.getZ() != b.getZ());
     }
 
     private static boolean adjacentColumn(BlockPos a, BlockPos b) {

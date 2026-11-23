@@ -169,6 +169,7 @@ final class AgentOrdinaryNavigator {
     private double radius, minY, maxY;
     private long goalCell = NO_CELL;
     private BlockPos from, to;
+    private AgentMemory foragingRecall;
     private Direction bearing;
     private Vec3d gradeAim;
     private long rendered = -1, lookAt = NO_CELL, lookCue = NO_CELL, adjustAt = NO_CELL;
@@ -270,13 +271,14 @@ final class AgentOrdinaryNavigator {
     }
 
     /** Bridge an independently receipted, exact dry tread without manufacturing an ordinary arrival. */
-    void rememberWalked(BlockPos from, BlockPos to) {
+    boolean rememberWalked(BlockPos from, BlockPos to) {
         if (world != client.world || player != client.player) reset();
         if (!AgentRouteGraph.cardinalStep(from.asLong(), to.asLong()) || !body.ordinaryRouteContact(to)
-                || body.ordinaryRouteLane(from, to) != AgentBody.DryRouteVeto.CLEAR) return;
+                || body.ordinaryRouteLane(from, to) != AgentBody.DryRouteVeto.CLEAR) return false;
         int action = body.actionTick();
-        remember(from, to, action);
+        boolean twoWay = remember(from, to, action);
         travel.noteLanding(from, to, action);
+        return twoWay;
     }
 
     /** Restore only a look cue; no saved trail entry becomes a graph edge or a landed receipt. */
@@ -303,7 +305,16 @@ final class AgentOrdinaryNavigator {
             destination == null ? 0 : destination.y + 1.05, tick);
     }
 
+    Result scoutFood(AgentMemory memory, int tick) {
+        return step(Job.FOOD, null, 0, 0, 0, tick, memory);
+    }
+
     Result step(Job requested, Vec3d destination, double arrivalRadius, double minFootY, double maxFootY, int tick) {
+        return step(requested, destination, arrivalRadius, minFootY, maxFootY, tick, null);
+    }
+
+    private Result step(Job requested, Vec3d destination, double arrivalRadius, double minFootY, double maxFootY,
+                        int tick, AgentMemory memory) {
         if (world != client.world || player != client.player) reset();
         foodScoutHandoff = false;
         exhaustedFoodView = false;
@@ -343,6 +354,7 @@ final class AgentOrdinaryNavigator {
         if (from == null && (!grounded || !foot.equals(travel.landedTo))) travel.forgetLanding();
 
         if (travel.crossing && grounded && foot.equals(to) && settledAlong()) {
+            boolean recalledLanding = foragingRecall != null;
             boolean foodHandoff = requested == Job.FOOD && destination == null && !straightSuccessor();
             remember(from, to, tick);
             body.recordWalkedLeg(from, to);
@@ -358,7 +370,7 @@ final class AgentOrdinaryNavigator {
                 // grounded frame before committing the next turn or grade.
                 foodScoutHandoff = true;
                 body.pauseWork();
-                stage = "settled for a food-search handoff";
+                stage = recalledLanding ? "settled a remembered foraging tread" : "settled for a food-search handoff";
                 return Result.OBSERVING;
             }
         }
@@ -396,21 +408,31 @@ final class AgentOrdinaryNavigator {
                     return Result.BLOCKED;
                 }
                 long here = foot.asLong();
-                route.plan(here, tick);
-                long next = route.hop(0);
-                if (next == NO_CELL) {
-                    if (route.exact() && route.endpoint() == here) return fineArrival(foot, destination, tick);
-                    return observeFrontier(here, tick);
+                BlockPos recalledStep = memory == null ? null : memory.nextForagingStep(world, foot);
+                if (recalledStep == null) {
+                    route.plan(here, tick);
+                    long next = route.hop(0);
+                    if (next == NO_CELL) {
+                        if (route.exact() && route.endpoint() == here) return fineArrival(foot, destination, tick);
+                        return observeFrontier(here, tick);
+                    }
+                    to = BlockPos.fromLong(next);
+                } else {
+                    // Exact current contact joins the old path. Do not add an uninspected
+                    // suffix to the graph, or make yesterday's woodland the current goal.
+                    to = recalledStep;
+                    foragingRecall = memory;
                 }
                 from = foot;
-                to = BlockPos.fromLong(next);
-                bearing = BEARINGS[AgentRouteGraph.slot(here, next) / 3];
+                bearing = BEARINGS[AgentRouteGraph.slot(here, to.asLong()) / 3];
                 travel.begin(action, tick);
-                justWalkedReturn = travel.recentFlatReturn(from, to, action);
-                retraceYaw = travel.flatRetraceYaw(from, to, route.hop(1), bearing, player.getYaw(), action);
+                if (foragingRecall == null) {
+                    justWalkedReturn = travel.recentFlatReturn(from, to, action);
+                    retraceYaw = travel.flatRetraceYaw(from, to, route.hop(1), bearing, player.getYaw(), action);
+                }
                 lookAt = lookCue = NO_CELL;
             }
-            if (!travel.crossing && from.getY() != to.getY() && tick - gradeAt > GRADE_AGE) {
+            if (!travel.crossing && (foragingRecall != null || from.getY() != to.getY()) && tick - gradeAt > GRADE_AGE) {
                 long frame = body.renderedFrame();
                 if (grounded && foot.equals(from) && lastScan == tick && frame == rendered) {
                     byte seen = sight[gridIndex(foot.asLong(), to.asLong())];
@@ -427,7 +449,8 @@ final class AgentOrdinaryNavigator {
                         continue;
                     }
                     aimGrade();
-                    stage = "rechecking the exact queued grade top";
+                    stage = foragingRecall == null ? "rechecking the exact queued grade top"
+                        : "rechecking a remembered foraging tread";
                     return Result.OBSERVING;
                 }
             }
@@ -530,7 +553,7 @@ final class AgentOrdinaryNavigator {
     }
 
     private boolean straightSuccessor() {
-        if (from.getY() != to.getY() || route.hop(0) != to.asLong()) return false;
+        if (foragingRecall != null || from.getY() != to.getY() || route.hop(0) != to.asLong()) return false;
         long successor = route.hop(1);
         if (successor != neighbor(to.asLong(), bearingIndex(bearing), 0)) return false;
         set(sightTo, successor);
@@ -538,16 +561,18 @@ final class AgentOrdinaryNavigator {
             && !body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 2.4 - along());
     }
 
-    private void remember(BlockPos from, BlockPos to, int tick) {
+    private boolean remember(BlockPos from, BlockPos to, int tick) {
         route.landed(from.asLong(), to.asLong(), tick);
         // A second, mechanically compatible direction joins the two physically occupied
         // supports. This is not a license to accept other unseen adjoining cells.
-        if (body.ordinaryRouteLane(to, from) == AgentBody.DryRouteVeto.CLEAR)
-            route.rememberReturn(to.asLong(), from.asLong(), tick);
+        if (body.ordinaryRouteLane(to, from) != AgentBody.DryRouteVeto.CLEAR) return false;
+        route.rememberReturn(to.asLong(), from.asLong(), tick);
+        return true;
     }
 
     private void reject(String why, int retry) {
         route.retire(from.asLong(), to.asLong(), retry);
+        if (foragingRecall != null) foragingRecall.refuseForagingStep(world, from, to);
         lastVeto = why;
         releaseEdge();
     }
@@ -565,6 +590,7 @@ final class AgentOrdinaryNavigator {
 
     private void releaseEdge() {
         from = to = null;
+        foragingRecall = null;
         bearing = null;
         retraceYaw = Float.NaN;
         justWalkedReturn = false;
@@ -764,7 +790,8 @@ final class AgentOrdinaryNavigator {
         return "ordinary " + job + " goal=" + (route.returningForFood() ? "foraging-ground"
             : goalCell == NO_CELL ? "frontier" : display(goalCell))
             + (route.exact() ? " destination=" : " proxy=") + display(route.endpoint())
-            + " next=" + display(route.hop(0)) + " suffix=" + route.remaining() + " plan=" + route.plans()
+            + " next=" + display(foragingRecall == null ? route.hop(0) : to.asLong())
+            + " suffix=" + route.remaining() + " plan=" + route.plans()
             + " " + stage + (lastVeto.isEmpty() ? "" : " replan=" + lastVeto);
     }
 

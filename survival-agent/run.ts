@@ -33,6 +33,8 @@ import { readSavedPlayerStats, retainsCompletedProgram, savedDeathDelta, verifyS
 import { MACRO_TRIAL_GOAL, MACRO_TRIAL_SECONDS, macroTrialActor, parseMacroTrialLaunch,
   reportMacroTrial, watchMacroTrialOwner, type MacroTrialLaunch } from "./macro-trial.ts";
 import { openOperatorStop, serverSaveEvidence } from "./operator-stop.ts";
+import { adjacentCells, decodeAgentMemory, isCell, MEMORY_BYTES, MEMORY_CELLS, OVERWORLD,
+  type AgentMemory, type Cell } from "./agent-memory.ts";
 
 const ROOT = path.resolve(import.meta.dir, "..");
 const RUNTIME = path.join(ROOT, "local/runtime");
@@ -63,9 +65,6 @@ const SERVER_SHUTDOWN_LIMITS = {
 } as const;
 const MEMORY_FILE = "agent-memory.json";
 const HISTORIC_MEMORY_FILE = "pilot-memory.json";
-const MEMORY_BYTES = 32 * 1024;
-const MEMORY_CELLS = 1024;
-const OVERWORLD = "minecraft:overworld";
 const DETERMINISTIC_STRATEGY = {
   strategy: "deterministic", model: null, task: null, limits: { maxRequests: 0, maxRuntimeMs: 0, requestTimeoutMs: 0 },
 } as const;
@@ -474,61 +473,21 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
     await regular(path.join(world, "level.dat"));
     await regular(path.join(world, "session.lock"));
     const hadDeath = outcome.status === "died" || (outcome.lifecycle?.deaths ?? 0) > 0;
-    const pendingSeal = !historic && !hadDeath && outcome.lifecycle?.evidenceReadable === true &&
+    const cleanFirstLife = !historic && !hadDeath && outcome.lifecycle?.evidenceReadable === true &&
       outcome.lifecycle.nativeDeaths === 0 && outcome.lifecycle.savedDeaths?.attempt === 0 &&
       outcome.lifecycle.savedDeaths?.agreesWithObserved === true && outcome.lifecycle.life === 1 &&
       outcome.progress?.alive === true && outcome.progress.life === 1 && outcome.progress.life_phase === "playing" &&
-      outcome.exits?.client?.code === 0 && outcome.exits.client.signal === null ? outcome.pendingFurnace : undefined;
+      outcome.exits?.client?.code === 0 && outcome.exits.client.signal === null;
+    const pendingSeal = cleanFirstLife ? outcome.pendingFurnace : undefined;
+    const foragingSealed = cleanFirstLife && outcome.progress.dimension === OVERWORLD &&
+      (outcome.claimScope === "fresh-attempt" || outcome.claimScope === "continuation-chain") &&
+      (outcome.benchmark?.strategy?.strategy === "deterministic" ||
+        outcome.benchmark?.strategy?.mode === "expedition_advisory");
     return { root, rootInode, device, world, historic, progress: hadDeath ? null : outcome.progress as Progress | null,
-      parentDeath: closedParentDeath(parentRun, outcome), pendingSeal };
+      parentDeath: closedParentDeath(parentRun, outcome), pendingSeal, foragingSealed };
   } catch {
     signal.throwIfAborted();
     throw invalid();
-  }
-}
-
-type Cell = [number, number, number];
-type AgentMemory = {
-  version: 1; dimension: typeof OVERWORLD; trail: Cell[]; dormant?: Cell[]; workbench?: Cell; furnace?: Cell;
-  ownedWorkbench?: Cell;
-};
-
-function isCell(value: unknown): value is Cell {
-  return Array.isArray(value) && value.length === 3 && value.every(Number.isInteger) &&
-    Math.abs(value[0]) <= 30_000_000 && value[1] >= -64 && value[1] <= 320 &&
-    Math.abs(value[2]) <= 30_000_000;
-}
-
-function adjacentCells(a: Cell, b: Cell) {
-  return Math.abs(a[1] - b[1]) <= 1 && Math.abs(a[0] - b[0]) + Math.abs(a[2] - b[2]) <= 1;
-}
-
-function validTrail(trail: unknown, limit: number): trail is Cell[] {
-  if (!Array.isArray(trail) || trail.length > limit) return false;
-  const seen = new Set<string>();
-  let previous: Cell | undefined;
-  for (const cell of trail) {
-    if (!isCell(cell) || previous && !adjacentCells(previous, cell)) return false;
-    const key = cell.join(",");
-    if (seen.has(key)) return false;
-    seen.add(key);
-    previous = cell;
-  }
-  return true;
-}
-
-function decodeAgentMemory(text: string): AgentMemory | null {
-  try {
-    const value = JSON.parse(text);
-    if (value?.version !== 1 || value?.dimension !== OVERWORLD || !validTrail(value.trail, MEMORY_CELLS) ||
-        ("dormant" in value && !validTrail(value.dormant, MEMORY_CELLS - value.trail.length)) ||
-        Object.keys(value).some((key) =>
-          !["version", "dimension", "trail", "dormant", "workbench", "furnace", "ownedWorkbench"].includes(key)) ||
-        ("workbench" in value && !isCell(value.workbench)) || ("furnace" in value && !isCell(value.furnace)) ||
-        ("ownedWorkbench" in value && !isCell(value.ownedWorkbench))) return null;
-    return value;
-  } catch {
-    return null;
   }
 }
 
@@ -674,10 +633,13 @@ async function pinSavedRun(source: Pick<SavedWorld, "root" | "rootInode" | "devi
   }
 }
 
-async function copyAgentMemory(source: SavedWorld, destination: string, read: ReadAgentArtifact, signal: AbortSignal) {
+async function copyAgentMemory(source: SavedWorld, destination: string, read: ReadAgentArtifact, signal: AbortSignal,
+    allowForaging: boolean) {
   const text = await read(source.historic ? HISTORIC_MEMORY_FILE : MEMORY_FILE, MEMORY_BYTES, true);
   const memory = text === undefined ? await recoverAgentTrail(source.progress, read) : text ? decodeAgentMemory(text) : null;
   if (!memory) return;
+  // Unlike legacy mining breadcrumbs, a foraging route has no log-based recovery.
+  if (!allowForaging || !source.foragingSealed) delete memory.foragingExit;
   signal.throwIfAborted();
   const file = await open(path.join(destination, MEMORY_FILE), "wx", 0o600);
   try {
@@ -871,6 +833,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       throw new Error("Crash autosave source changed during exclusive admission.");
     const source = recovery ? {
       ...recovery, historic: false, progress: null, parentDeath: null, pendingSeal: undefined,
+      foragingSealed: false,
     } : parentRun ? await savedWorld(parentRun, goal, signal) : null;
     const dir = macroTrial ? path.join(runs, macroTrial.run) :
       await mkdtemp(path.join(runs, `${new Date().toISOString().replaceAll(":", "-")}-${goal}-`));
@@ -1072,7 +1035,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         await checkWorldTree(source.world, source.device, copyStopBytes - bytesBefore, startup);
         const pinned = await pinSavedRun(source, startup);
         try {
-          const copyFd = recovery ? pinned?.fd : undefined;
+          const copyFd = pinned?.fd;
           if (recovery && copyFd === undefined) throw new Stop("failed", "Could not pin the original crash autosave run.");
           const pendingSource = !recovery && !diagnostic && parentRun && !source.historic && pinned ? {
             run: parentRun, world: pinned.world, device: source.device, read: pinned.read,
@@ -1089,7 +1052,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           startup.throwIfAborted();
           if (exit.code !== 0) throw new Stop("failed", "Could not copy the saved Survival world.");
           await checkWorldTree(destination, worldDevice, copyStopBytes - bytesBefore, startup);
-          if (pinned && !recovery) await copyAgentMemory(source, dir, pinned.read, startup);
+          if (pinned && !recovery) await copyAgentMemory(source, dir, pinned.read, startup, !diagnostic && !terraDeclaration);
           if (!diagnostic) await preparePendingFurnace(dir, live.run, { world: destination, device: worldDevice, signal: startup },
             pendingSource, pendingParent);
         } finally { await pinned?.close(); }

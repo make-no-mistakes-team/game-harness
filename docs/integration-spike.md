@@ -629,7 +629,11 @@ count as another win just by loading its save. The runner accepts no external wo
 saved vanilla world, including player inventory and statistics, into a new
 attempt directory before starting a new server and recording. Only the
 agent's own observed route and confirmed workstations can carry over as
-navigation memory. The runner does not inspect the seed or map. The declaration and outcome mark the new attempt
+navigation memory. A clean ordinary Overworld save can also carry one
+walked exit to confirmed woodland. When looking for food, the player
+rejoins the path from actual footing and checks each step again before
+walking it. Crash recovery does not import this route.
+The runner does not inspect the seed or map. The declaration and outcome mark the new attempt
 as `world.fresh: false` and name its `world.parentRun`. Saved statistics can
 corroborate progress anywhere in that chain; a continued win is not evidence
 of an uninterrupted fresh run. Omit the flag for the fresh-world benchmark.

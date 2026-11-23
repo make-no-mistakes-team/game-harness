@@ -336,6 +336,14 @@ final class AgentSupplyEgress {
             && state.contains(LeavesBlock.PERSISTENT) && !state.get(LeavesBlock.PERSISTENT);
     }
 
+    /** Vanilla updates leaf distance after a neighboring cut. A different block or a decaying crown is not this support. */
+    static boolean sameLivingLeaf(BlockState prior, BlockState contact) {
+        return prior != null && contact != null && prior.getBlock() == contact.getBlock()
+            && naturalDryLeaf(prior) && naturalDryLeaf(contact) && contact.contains(LeavesBlock.DISTANCE)
+            && contact.get(LeavesBlock.DISTANCE) < 7
+            && prior.with(LeavesBlock.DISTANCE, contact.get(LeavesBlock.DISTANCE)) == contact;
+    }
+
     static boolean canopyContact(BlockState support, boolean bootstrap, boolean returning) {
         return bootstrap && !returning && support != null && naturalDryLeaf(support);
     }

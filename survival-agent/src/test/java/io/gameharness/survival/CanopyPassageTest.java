@@ -36,6 +36,16 @@ final class CanopyPassageTest {
     }
 
     @Test
+    void aLeafDistanceUpdateDoesNotTurnTheSameOccupiedCrownIntoAnUnusableStand() {
+        var first = Blocks.BIRCH_LEAVES.getDefaultState().with(LeavesBlock.DISTANCE, 2);
+        assertTrue(AgentSupplyEgress.sameLivingLeaf(first, first.with(LeavesBlock.DISTANCE, 3)));
+        assertFalse(AgentSupplyEgress.sameLivingLeaf(first, first.with(LeavesBlock.DISTANCE, 7)));
+        assertFalse(AgentSupplyEgress.sameLivingLeaf(first, first.with(Properties.WATERLOGGED, true)));
+        assertFalse(AgentSupplyEgress.sameLivingLeaf(first, Blocks.DARK_OAK_LEAVES.getDefaultState()));
+        assertFalse(AgentSupplyEgress.sameLivingLeaf(first, null));
+    }
+
+    @Test
     void crownRiseStartsOnlyOnTheOrdinaryMotorAndSettlesOnActualUpperContact() {
         var leaves = Blocks.OAK_LEAVES.getDefaultState();
         BlockPos to = FOOT.north().up();

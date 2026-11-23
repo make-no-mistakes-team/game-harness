@@ -13516,7 +13516,30 @@ final class AgentProgress {
 
         private boolean stepCrown() {
             if (crownSettleUntil != 0) return resumeCrownContact();
-            if (body.caveLipFooting(from) != source) return blocked("the dry crown support changed");
+            BlockState current = body.caveLipFooting(from);
+            if (current != source) {
+                // Drop all authority to cross or cut before trying to keep this
+                // survey on the same occupied leaf. The landing is never inferred.
+                tread = null;
+                mask = null;
+                crownCutPoint = null;
+                attackRequested = false;
+                measuredCandidate = null;
+                measuredPoint = null;
+                if (AgentSupplyEgress.sameLivingLeaf(source, current) && body.supplyFootContact(from) == current) {
+                    source = current;
+                    openedFrame = body.renderedFrame();
+                    since = tick;
+                    status = "rechecking the crown after the occupied leaves changed";
+                    return true;
+                }
+                if (current == null && from.equals(c.player.getBlockPos()) && c.player.isOnGround()
+                        && !c.player.isTouchingWater() && c.player.hurtTime == 0) {
+                    crownSettleUntil = tick + 12;
+                    return resumeCrownContact();
+                }
+                return blocked("the dry crown support changed");
+            }
             if (tread != null) {
                 if (body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65)
                         || tread.ordinaryDescent() && !canCrownDescend(from.getY() - tread.to.getY())) {

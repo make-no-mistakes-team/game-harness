@@ -3140,7 +3140,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     private boolean dryLandingControls(boolean allowCrouching) {
-        if (!hasView() || lavaEmergency || client.options.forwardKey.isUnbound() || client.options.getAutoJump().getValue())
+        return hasView() && dryLandingInputs(allowCrouching);
+    }
+
+    private boolean dryLandingInputs(boolean allowCrouching) {
+        if (lavaEmergency || client.options.forwardKey.isUnbound() || client.options.getAutoJump().getValue())
             return false;
         var player = client.player;
         return (player.getPose() == EntityPose.STANDING || allowCrouching && player.getPose() == EntityPose.CROUCHING)
@@ -3634,15 +3638,16 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return !state.getFluidState().isEmpty() || AgentProgress.dangerous(state) || state.isOf(Blocks.COBWEB);
     }
 
-    boolean ordinaryRouteControls() {
-        return dryLandingControls(true) && client.isWindowFocused() && client.getOverlay() == null
+    /** A missing render withdraws this tick's keys, not the caller's exact movement intent. */
+    boolean ordinaryRouteInputs() {
+        return ready() && dryLandingInputs(true) && client.isWindowFocused() && client.getOverlay() == null
             && ordinaryGradePose(client.player) && !client.player.isGliding()
-            && !client.player.hasNoGravity() && !client.player.isSpectator()
+            && !client.player.hasNoGravity() && !client.player.isSpectator() && !client.player.isInLava()
             && client.player.getAttributeValue(EntityAttributes.SAFE_FALL_DISTANCE) >= 1.35;
     }
 
     boolean ordinaryRouteContact(BlockPos foot) {
-        return ordinaryRouteControls() && ordinaryRoutePhysicalContact(foot) && ordinaryRouteSupport(foot);
+        return hasView() && ordinaryRouteInputs() && ordinaryRoutePhysicalContact(foot) && ordinaryRouteSupport(foot);
     }
 
     /** Contact can identify a restored stance before the first render, but cannot authorize motion. */
@@ -3751,11 +3756,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return client.world.isSpaceEmpty(client.player, sweep) ? DryRouteVeto.CLEAR : DryRouteVeto.SWEEP;
     }
 
-    enum OrdinaryMotor { KEY, COAST, ALIGN, CENTER, VIEW, VETO }
+    enum OrdinaryMotor { KEY, COAST, ALIGN, CENTER, VETO }
 
     /** Use ordinary keys and the existing final lava/headroom/input arbitration, never another look. */
     OrdinaryMotor driveOrdinaryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry, boolean crossing) {
-        if (!ordinaryRouteControls()) return OrdinaryMotor.VIEW;
+        if (!hasView() || !ordinaryRouteInputs()) return OrdinaryMotor.VETO;
         var player = client.player;
         int dx = bearing.getOffsetX(), dz = bearing.getOffsetZ(), rise = to.getY() - from.getY();
         double fx = player.getX() - from.getX() - 0.5, fz = player.getZ() - from.getZ() - 0.5;
@@ -3770,7 +3775,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 || hazardAhead(bearing.getPositiveHorizontalDegrees(), Math.max(0.68, 1.42 - along)))
             return OrdinaryMotor.VETO;
         float yaw = bearing.getPositiveHorizontalDegrees();
-        if (Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > 5) return OrdinaryMotor.ALIGN;
+        boolean aligned = Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) <= (rise < 0 ? 1 : 5);
+        // Once a descent starts the source remains the trailing lip, not a new centering target.
+        // Its neutral coast must still fit even on the tick vanilla has not dropped onGround yet.
+        if (rise < 0 && crossing) return driveOrdinaryDescent(from, to, bearing, aligned);
+        if (!aligned) return OrdinaryMotor.ALIGN;
         double margin = rise == 0 ? 0.205 : 0.18;
         if (Math.abs(across) > margin || Math.abs(across + sideDrift) > margin
                 || rise != 0 && !crossing && Math.abs(along) > 0.25) {
@@ -3778,6 +3787,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             return ordinaryRouteAdjust(from, from.getX() + 0.5, from.getZ() + 0.5)
                 ? OrdinaryMotor.CENTER : OrdinaryMotor.VETO;
         }
+        if (rise < 0) return driveOrdinaryDescent(from, to, bearing, true);
         boolean takeoff = rise > 0 && player.isOnGround() && player.getY() < to.getY() - 0.055;
         if (takeoff) {
             double jump = player.getAttributeValue(EntityAttributes.JUMP_STRENGTH);
@@ -3800,6 +3810,38 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         driveDryRoute(from, to, bearing, carry, true, takeoff, 5);
         ordinaryRiseKey = forward && takeoff;
         return forward || backward ? OrdinaryMotor.KEY : OrdinaryMotor.COAST;
+    }
+
+    private OrdinaryMotor driveOrdinaryDescent(BlockPos from, BlockPos to, Direction bearing, boolean aligned) {
+        var player = client.player;
+        if (player.getPose() != EntityPose.STANDING) return OrdinaryMotor.COAST;
+        boolean grounded = player.isOnGround();
+        Vec3d feet = player.getPos(), velocity = player.getVelocity();
+        BlockPos source = from.down(), support = player.supportingBlockPos.orElse(null);
+        boolean upper = feet.y >= from.getY() - 0.055;
+        if (grounded && (upper ? support != null && !source.equals(support) : !to.down().equals(support)))
+            return OrdinaryMotor.VETO;
+
+        double radius = player.getWidth() * 0.5, height = player.getHeight(), gravity = player.getFinalGravity();
+        var coast = AgentDryLanding.ordinaryDescentCoast(from, to, bearing, feet, velocity, radius,
+            height, gravity, grounded, 0, 0, caveLandingSpace, caveLandingDry);
+        if (coast == AgentDryLanding.CaveMotion.LANDING) return OrdinaryMotor.COAST;
+        if (coast != AgentDryLanding.CaveMotion.SOURCE || !grounded || !source.equals(support)
+                || !EdgeStance.overlaps(source, feet, player.getBoundingBox())) return OrdinaryMotor.VETO;
+        if (!aligned) return OrdinaryMotor.ALIGN;
+
+        // Only a forward tick followed by a checked neutral stop may leave this exact support.
+        // Never countersteer across the lip or issue another press once coasting reaches the lower tread.
+        float angle = player.getYaw() * MathHelper.RADIANS_PER_DEGREE;
+        double step = player.getMovementSpeed() * 0.98f;
+        var pulse = AgentDryLanding.ordinaryDescentCoast(from, to, bearing, feet, velocity, radius,
+            height, gravity, grounded, -MathHelper.sin(angle) * step, MathHelper.cos(angle) * step,
+            caveLandingSpace, caveLandingDry);
+        if (pulse != AgentDryLanding.CaveMotion.SOURCE && pulse != AgentDryLanding.CaveMotion.LANDING)
+            return OrdinaryMotor.COAST;
+        dryRouteWalk = true;
+        walkDownTo(Vec3d.ofBottomCenter(to));
+        return OrdinaryMotor.KEY;
     }
 
     /** Move inward on the exact occupied top only, with ordinary slow directional input. */
@@ -4252,7 +4294,9 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return remaining > Math.max(0.12, coast + 0.025) ? DryLevelInput.FORWARD : DryLevelInput.COAST;
     }
 
-    static boolean dryStrideContact(double remaining) { return Math.abs(remaining) <= 0.22; }
+    static final double DRY_STRIDE_ARRIVAL = 0.22;
+
+    static boolean dryStrideContact(double remaining) { return Math.abs(remaining) <= DRY_STRIDE_ARRIVAL; }
 
     /** A visible drop can veto walking. An unseen item is not evidence either way. */
     boolean macroNoVisiblePickup(Vec3d landing) {
@@ -4936,8 +4980,12 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
         private static boolean overlaps(BlockPos support, Vec3d feet, Box body) {
             return Math.abs(feet.y - support.getY() - 1) <= 0.035
-                && Math.min(body.maxX, support.getX() + 1) - Math.max(body.minX, support.getX()) >= 0.05
-                && Math.min(body.maxZ, support.getZ() + 1) - Math.max(body.minZ, support.getZ()) >= 0.05;
+                && overlapsAxis(support.getX(), body.minX, body.maxX, 0, 0)
+                && overlapsAxis(support.getZ(), body.minZ, body.maxZ, 0, 0);
+        }
+
+        private static boolean overlapsAxis(int support, double min, double max, double shiftMin, double shiftMax) {
+            return min + shiftMax < support + 1 && max + shiftMin > support;
         }
 
         boolean holds(BlockPos contact, Vec3d feet, Box body) {
@@ -4960,6 +5008,10 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             double pressX = COAST * (motion.x + inputX), pressZ = COAST * (motion.z + inputZ);
             if (!inwardAxis(origin.x, feet.x, center.x, coastX, pressX)
                     || !inwardAxis(origin.z, feet.z, center.z, coastZ, pressZ)
+                    || !overlapsAxis(support.getX(), standing.minX, standing.maxX,
+                        Math.min(coastX, pressX), Math.max(coastX, pressX))
+                    || !overlapsAxis(support.getZ(), standing.minZ, standing.maxZ,
+                        Math.min(coastZ, pressZ), Math.max(coastZ, pressZ))
                     || origin.squaredDistanceTo(feet.x + coastX, feet.y, feet.z + coastZ) > LIMIT * LIMIT
                     || origin.squaredDistanceTo(feet.x + pressX, feet.y, feet.z + pressZ) > LIMIT * LIMIT) return null;
             return new Box(

@@ -78,7 +78,9 @@ briefly away from a resource, jump up, or step down. If a crossing is
 blocked, the player checks another path toward the same destination;
 it does not turn to all four compass points to calculate a path. Where
 the route is still unknown it can head for a reachable vantage point.
-Reaching that vantage is not the same as reaching the resource.
+Reaching that vantage is not the same as reaching the resource. A
+missing frame releases the movement keys; it does not cancel a checked
+one-block descent if the same player is still making that crossing.
 When gathering timber on uneven ground,
 it approaches a stance where it can collect the log, not just reach
 the trunk with a swing. It makes the first pick as soon as it can pay

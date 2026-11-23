@@ -33,10 +33,49 @@ final class AgentOrdinaryNavigator {
     private static final Direction[] BEARINGS = {Direction.EAST, Direction.WEST, Direction.SOUTH, Direction.NORTH};
     private static final byte SEEN = 1, HIDDEN = 2, QUEUED = 3;
 
+    /** Body-turn ownership and observed motion are independent of render availability. */
+    static final class EdgeTravel {
+        private final AgentWalkedRoute.Motion motion = new AgentWalkedRoute.Motion();
+        private int lastAction, since, lastProgress;
+        private double bestAlong;
+        private boolean crossing;
+
+        void begin(int action, int tick) {
+            lastAction = action;
+            since = lastProgress = tick;
+            bestAlong = Double.NEGATIVE_INFINITY;
+        }
+
+        private boolean ownsTurn(int action) { return action == lastAction || action == lastAction + 1; }
+
+        boolean keepTurn(int action) {
+            if (!ownsTurn(action)) return false;
+            lastAction = action;
+            return true;
+        }
+
+        void startMotion(Vec3d pos) {
+            motion.start(pos.x, pos.y, pos.z);
+            crossing = true;
+        }
+
+        boolean observe(Vec3d pos) { return motion.observe(pos.x, pos.y, pos.z); }
+
+        boolean traversed() { return motion.traversed(); }
+
+        boolean expired(int tick, double along) {
+            if (along > bestAlong + 0.025) {
+                bestAlong = along;
+                lastProgress = tick;
+            }
+            return tick - since >= EDGE_TICKS || crossing && tick - lastProgress >= 16;
+        }
+    }
+
     private final MinecraftClient client;
     private final AgentBody body;
     private final AgentOrdinaryRoute route = new AgentOrdinaryRoute();
-    private final AgentWalkedRoute.Motion motion = new AgentWalkedRoute.Motion();
+    private final EdgeTravel travel = new EdgeTravel();
     private final byte[] sight = new byte[VIEW_CELLS];
     private final short[] checked = new short[VIEW_CELLS];
     private final long[] sightQueue = new long[SIGHT_NODES];
@@ -53,11 +92,10 @@ final class AgentOrdinaryNavigator {
     private Vec3d gradeAim;
     private long rendered = -1, lookAt = NO_CELL, lookFrame, lookCue = NO_CELL, adjustAt = NO_CELL;
     private long recallAt = NO_CELL, recalled = NO_CELL, gradeFrame = -1;
-    private int lastScan = -100, lookSince, lastEdgeAction = -100, edgeSince, adjustSince, gradeAt = -100;
-    private int unavailableSince = -1, lastProgress;
+    private int lastScan = -100, lookSince, adjustSince, gradeAt = -100;
+    private int unavailableSince = -1;
     private float lookYaw, lookPitch;
-    private double bestAlong;
-    private boolean crossing, foodScoutHandoff;
+    private boolean foodScoutHandoff;
     private AgentBody.EdgeStance edgeStance;
     private BlockPos stanceSupport;
     private int stanceSince;
@@ -82,7 +120,7 @@ final class AgentOrdinaryNavigator {
         stanceSupport = null;
         stanceRefused = false;
         rendered = -1;
-        lastEdgeAction = lastScan = -100;
+        lastScan = -100;
         unavailableSince = -1;
         foodScoutHandoff = false;
         stage = "idle";
@@ -91,11 +129,14 @@ final class AgentOrdinaryNavigator {
     }
 
     boolean driving() {
-        return crossing && player == client.player && world == client.world
-            && body.actionTick() - lastEdgeAction <= 1;
+        return travel.crossing && player == client.player && world == client.world && travel.ownsTurn(body.actionTick());
     }
 
     boolean driving(Job owner) { return job == owner && driving(); }
+
+    boolean hasObservedPath(BlockPos from, BlockPos to, int tick) {
+        return world == client.world && player == client.player && route.hasPath(from.asLong(), to.asLong(), tick);
+    }
 
     boolean foodScoutHandoff() { return foodScoutHandoff; }
 
@@ -146,46 +187,54 @@ final class AgentOrdinaryNavigator {
         if (world != client.world || player != client.player) reset();
         foodScoutHandoff = false;
         int action = body.actionTick();
+        boolean inputs = body.ordinaryRouteInputs();
+        // A genuinely different owner, unsupported controls, or a skipped turn cannot
+        // certify the same body path. A neutral turn due only to render loss can.
+        if (from != null && (!inputs || job != requested || !travel.keepTurn(action))) releaseEdge();
         boolean changed = changed(requested, destination, arrivalRadius, minFootY, maxFootY);
-        // A higher-level goal cannot switch inputs halfway across a short dry jump/drop.
-        if (changed && !(driving() && player != null && !player.isOnGround())) {
+        // The same job cannot change destinations midair or while still crossing a
+        // descent: vanilla's grounded flag can stay set past the source cell line.
+        if (changed && !(travel.crossing && (!player.isOnGround() || to.getY() < from.getY()))) {
             setIntent(requested, destination, arrivalRadius, minFootY, maxFootY);
             changed = false;
         }
-        if (player == null || !body.ordinaryRouteControls()) {
+        if (travel.crossing && !travel.observe(player.getPos())) reject("discontinuous motion", Integer.MAX_VALUE);
+        if (!inputs || !body.hasRecentView()) {
+            if (from != null && travel.expired(tick, along())) {
+                reject("edge progress bound", Integer.MAX_VALUE);
+                stage = "waiting for render after edge bound";
+                return Result.BLOCKED;
+            }
             if (unavailableSince < 0) unavailableSince = tick;
-            stage = "waiting for safe rendered dry controls";
+            stage = from == null ? "waiting for safe rendered dry controls" : "waiting for render on queued edge";
             if (tick - unavailableSince < LOOK_TICKS) return Result.OBSERVING;
+            releaseEdge();
             stage = "dry controls/render bound";
             return Result.BLOCKED;
         }
         unavailableSince = -1;
 
-        // Another owner may have walked, been pushed, used a GUI, or taken a protected fall
-        // during the gap. A route suffix still exists, but no new traversal can be inferred.
-        if (from != null && action - lastEdgeAction > 1) releaseEdge();
         BlockPos foot = player.getBlockPos();
         boolean grounded = body.ordinaryRouteContact(foot);
         if (from != null && grounded && !foot.equals(from) && !foot.equals(to)) releaseEdge();
 
-        if (from != null && crossing) {
-            Vec3d pos = player.getPos();
-            if (!motion.observe(pos.x, pos.y, pos.z)) reject("discontinuous motion", Integer.MAX_VALUE);
-            else if (grounded && foot.equals(to) && settledAlong()) {
-                boolean foodHandoff = requested == Job.FOOD && destination == null && !straightSuccessor();
-                remember(from, to, tick);
-                body.recordWalkedLeg(from, to);
-                this.arrival = new Arrival(from, to);
-                releaseEdge();
-                if (changed) return Result.MOVING;
-                if (foodHandoff) {
-                    // Keep a continuous level lane, but give the food owner a
-                    // grounded frame before committing the next turn or grade.
-                    foodScoutHandoff = true;
-                    body.pauseWork();
-                    stage = "settled for a food-search handoff";
-                    return Result.OBSERVING;
-                }
+        if (travel.crossing && grounded && foot.equals(to) && settledAlong()) {
+            boolean foodHandoff = requested == Job.FOOD && destination == null && !straightSuccessor();
+            remember(from, to, tick);
+            body.recordWalkedLeg(from, to);
+            this.arrival = new Arrival(from, to);
+            releaseEdge();
+            if (changed) {
+                stage = "settled on queued edge";
+                return Result.MOVING;
+            }
+            if (foodHandoff) {
+                // Keep a continuous level lane, but give the food owner a
+                // grounded frame before committing the next turn or grade.
+                foodScoutHandoff = true;
+                body.pauseWork();
+                stage = "settled for a food-search handoff";
+                return Result.OBSERVING;
             }
         }
 
@@ -207,7 +256,7 @@ final class AgentOrdinaryNavigator {
             }
             // Reuse the current projection and render budget. This scan observes many
             // admissible lanes while the camera follows an already selected one.
-            if (lookAt != here && (from == null || from.getY() == to.getY() || crossing))
+            if (lookAt != here && (from == null || from.getY() == to.getY() || travel.crossing))
                 observe(here, tick, false);
         }
 
@@ -229,12 +278,10 @@ final class AgentOrdinaryNavigator {
                 from = foot;
                 to = BlockPos.fromLong(next);
                 bearing = BEARINGS[AgentRouteGraph.slot(here, next) / 3];
-                edgeSince = lastProgress = tick;
-                bestAlong = Double.NEGATIVE_INFINITY;
+                travel.begin(action, tick);
                 lookAt = lookCue = NO_CELL;
             }
-            lastEdgeAction = action;
-            if (!crossing && from.getY() != to.getY() && tick - gradeAt > GRADE_AGE) {
+            if (!travel.crossing && from.getY() != to.getY() && tick - gradeAt > GRADE_AGE) {
                 long frame = body.renderedFrame();
                 if (grounded && foot.equals(from) && lastScan == tick && frame == rendered) {
                     byte seen = sight[gridIndex(foot.asLong(), to.asLong())];
@@ -246,7 +293,7 @@ final class AgentOrdinaryNavigator {
                     if (body.ordinaryRouteFreshGrade(from, to, RAY_RESERVE)) gradeAt = tick;
                 }
                 if (tick - gradeAt > GRADE_AGE) {
-                    if (tick - edgeSince >= LOOK_TICKS) {
+                    if (tick - travel.since >= LOOK_TICKS) {
                         reject("adjacent grade top not re-witnessed", tick + RETRY_TICKS);
                         continue;
                     }
@@ -260,29 +307,17 @@ final class AgentOrdinaryNavigator {
                 reject(veto.name(), tick + RETRY_TICKS);
                 continue;
             }
-            double along = along();
-            if (along > bestAlong + 0.025) {
-                bestAlong = along;
-                lastProgress = tick;
-            }
-            if (tick - edgeSince >= EDGE_TICKS || crossing && tick - lastProgress >= 16) {
+            if (travel.expired(tick, along())) {
                 reject("edge progress bound", Integer.MAX_VALUE);
                 continue;
             }
             boolean carry = straightSuccessor();
-            AgentBody.OrdinaryMotor turn = body.driveOrdinaryRoute(from, to, bearing, carry, crossing);
+            AgentBody.OrdinaryMotor turn = body.driveOrdinaryRoute(from, to, bearing, carry, travel.crossing);
             if (turn == AgentBody.OrdinaryMotor.VETO) {
                 reject("live body sweep or hazard", Integer.MAX_VALUE);
                 continue;
             }
-            if (turn == AgentBody.OrdinaryMotor.VIEW) {
-                stage = "waiting for render on queued edge";
-                return Result.OBSERVING;
-            }
-            if (!crossing && turn == AgentBody.OrdinaryMotor.KEY) {
-                motion.start(player.getX(), player.getY(), player.getZ());
-                crossing = true;
-            }
+            if (!travel.crossing && turn == AgentBody.OrdinaryMotor.KEY) travel.startMotion(player.getPos());
             float pitch = to.getY() > from.getY() ? 19 : to.getY() < from.getY() ? 43 : TRAVEL_PITCH;
             // Look beyond the adjacent contact along a continuous level prefix. Reaching
             // one tile of that prefix does not create a new yaw or a separate observation.
@@ -293,7 +328,7 @@ final class AgentOrdinaryNavigator {
                 case COAST -> "coasting on proved edge";
                 default -> pitch == 19 ? "jumping queued rise" : pitch == 43 ? "walking queued descent" : "walking queued flat";
             };
-            return crossing || turn == AgentBody.OrdinaryMotor.CENTER ? Result.MOVING : Result.OBSERVING;
+            return travel.crossing || turn == AgentBody.OrdinaryMotor.CENTER ? Result.MOVING : Result.OBSERVING;
         }
         stage = "local edge repair bound";
         return Result.OBSERVING;
@@ -346,7 +381,7 @@ final class AgentOrdinaryNavigator {
     }
 
     private boolean settledAlong() {
-        if (!motion.traversed() || !AgentBody.dryStrideContact(1 - along())) return false;
+        if (!travel.traversed() || !AgentBody.dryStrideContact(1 - along())) return false;
         return straightSuccessor() || player.getVelocity().horizontalLengthSquared() <= 0.0036;
     }
 
@@ -381,7 +416,7 @@ final class AgentOrdinaryNavigator {
     private void releaseEdge() {
         from = to = null;
         bearing = null;
-        crossing = false;
+        travel.crossing = false;
         gradeAim = null;
         gradeFrame = -1;
         gradeAt = -100;

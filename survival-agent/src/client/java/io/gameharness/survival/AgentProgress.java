@@ -12305,7 +12305,7 @@ final class AgentProgress {
             BlockState shown = state(hit);
             if (!shown.isIn(BlockTags.DIRT) && !shown.isOf(Blocks.MOSS_BLOCK)) continue;
             double distance = eye.squaredDistanceTo(hit.getPos());
-            if (distance < cost) {
+            if (distance < cost && navigator.hasObservedPath(foot, floor.up(), tick)) {
                 cost = distance;
                 best = floor;
             }
@@ -12789,7 +12789,8 @@ final class AgentProgress {
         foodTravelBand = stance;
         Result result = foodTravelResult = stance == null ? navigate(Job.FOOD, point, arrival) : navigate(Job.FOOD, stance);
         if (point == null && ordinaryArrival != null) lastFoodVantage = ordinaryArrival.to();
-        String detail = point == null ? "scouting for food"
+        String detail = result == Result.BLOCKED ? "food route blocked"
+            : point == null ? "scouting for food"
             : forage == null ? "settling after a food approach" : "approaching " + forageLabel();
         healingStatus(detail + " (" + navigator.status() + ")");
         return result;

@@ -72,17 +72,18 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
     enum CaveMotion { SOURCE, LANDING, RANGE, UPPER_COLLISION, LOWER_COLLISION, UPPER_HAZARD, LOWER_HAZARD }
 
     boolean overlapsLip(Vec3d feet, double radius) {
-        return along(feet.x, feet.z) < 0.5 + radius;
+        return along(source, bearing, feet.x, feet.z) < 0.5 + radius;
     }
 
-    private double along(double x, double z) {
+    private static double along(BlockPos source, Direction bearing, double x, double z) {
         return (x - source.getX() - 0.5) * bearing.getOffsetX() + (z - source.getZ() - 0.5) * bearing.getOffsetZ();
     }
 
-    private boolean inCaveLane(double x, double z, double radius) {
-        double distance = along(x, z);
+    private static boolean inCaveLane(BlockPos source, Direction bearing, double x, double z, double radius,
+                                      double stoppingEnd) {
+        double distance = along(source, bearing, x, z);
         double across = (x - source.getX() - 0.5) * bearing.getOffsetZ() - (z - source.getZ() - 0.5) * bearing.getOffsetX();
-        return distance >= -0.42 && distance <= STOPPING_END && Math.abs(across) + radius + CAVE_SIDE_PAD < 0.5;
+        return distance >= -0.42 && distance <= stoppingEnd && Math.abs(across) + radius + CAVE_SIDE_PAD < 0.5;
     }
 
     /**
@@ -92,8 +93,23 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
      */
     CaveMotion caveCoast(Vec3d feet, Vec3d velocity, double radius, double height, double gravity, boolean grounded,
                         int presses, double ax, double az, Predicate<Box> clear, Predicate<Box> dry) {
+        return coast(source, to, bearing, feet, velocity, radius, height, gravity, grounded, presses,
+            STOPPING_END, ax, az, clear, dry);
+    }
+
+    /** Ordinary traversal stops within its landing receipt band, without a blind follow-up key. */
+    static CaveMotion ordinaryDescentCoast(BlockPos source, BlockPos to, Direction bearing, Vec3d feet, Vec3d velocity,
+                                          double radius, double height, double gravity, boolean grounded,
+                                          double ax, double az, Predicate<Box> clear, Predicate<Box> dry) {
+        return coast(source, to, bearing, feet, velocity, radius, height, gravity, grounded, ax == 0 && az == 0 ? 0 : 1,
+            1 + AgentBody.DRY_STRIDE_ARRIVAL, ax, az, clear, dry);
+    }
+
+    private static CaveMotion coast(BlockPos source, BlockPos to, Direction bearing, Vec3d feet, Vec3d velocity,
+                                   double radius, double height, double gravity, boolean grounded, int presses,
+                                   double stoppingEnd, double ax, double az, Predicate<Box> clear, Predicate<Box> dry) {
         double x = feet.x, y = feet.y, z = feet.z, lip = source.getY(), lower = to.getY();
-        if (!inCaveLane(x, z, radius) || y < lower - BOUNDARY || y > lip + BOUNDARY
+        if (!inCaveLane(source, bearing, x, z, radius, stoppingEnd) || y < lower - BOUNDARY || y > lip + BOUNDARY
                 || velocity.y > 0.003 || velocity.y < -0.65) return CaveMotion.RANGE;
         double vx = velocity.x, vy = velocity.y, vz = velocity.z;
         double rx = radius + (bearing.getAxis() == Direction.Axis.X ? CAVE_ALONG_PAD : CAVE_SIDE_PAD);
@@ -101,15 +117,16 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
         for (int i = 0; i < 32; ++i) {
             vx = Math.abs(vx) < 0.003 ? 0 : vx;
             vz = Math.abs(vz) < 0.003 ? 0 : vz;
-            if (i < presses && grounded && y >= lip - BOUNDARY && along(x, z) < 0.5 + radius) {
+            double along = along(source, bearing, x, z);
+            if (i < presses && grounded && y >= lip - BOUNDARY && along < 0.5 + radius) {
                 vx += ax;
                 vz += az;
             }
-            double topY = y >= lip - BOUNDARY && along(x, z) < 0.5 + radius ? lip : lower;
+            double topY = y >= lip - BOUNDARY && along < 0.5 + radius ? lip : lower;
             // Vanilla moves vertically before horizontally, and samples drag before moving.
             double freeY = y + Math.min(0, vy), nextY = Math.max(topY, freeY);
             double nextX = x + vx, nextZ = z + vz;
-            if (!inCaveLane(nextX, nextZ, radius)) return CaveMotion.RANGE;
+            if (!inCaveLane(source, bearing, nextX, nextZ, radius, stoppingEnd)) return CaveMotion.RANGE;
             if (clear != null) {
                 Box body = new Box(x - rx, nextY, z - rz, x + rx, nextY + height + CAVE_ALONG_PAD, z + rz);
                 if (nextY != y) {
@@ -121,8 +138,8 @@ record AgentDryLanding(BlockPos source, BlockState upper, BlockHitResult top, Bl
             }
             boolean floorContact = freeY < topY;
             if (i + 1 >= presses && vx == 0 && vz == 0) {
-                if (nextY == lower && along(x, z) >= 0.5) return CaveMotion.LANDING;
-                if (nextY == lip && along(x, z) < 0.5 + radius) return CaveMotion.SOURCE;
+                if (nextY == lower && along >= 0.5) return CaveMotion.LANDING;
+                if (nextY == lip && along < 0.5 + radius) return CaveMotion.SOURCE;
             }
             double drag = grounded ? 0.6f * 0.91f : 0.91f;
             x = nextX;

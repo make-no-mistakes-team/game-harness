@@ -110,6 +110,52 @@ final class FootholdGeometryTest {
     }
 
     @Test
+    void aSmallPositiveGroundedOverlapPermitsOnlyRecoveryOntoThatSameTop() {
+        var tread = new BlockPos(0, 0, 0);
+        var edge = new Vec3d(1.27, 1, 0.57);
+        var body = standingBox(edge);
+        var stance = AgentBody.EdgeStance.start(tread, edge, body);
+        assertNotNull(stance, "vanilla supports the last 0.03 blocks of the trailing body");
+        assertNotNull(stance.sweep(tread, edge, body, Vec3d.ZERO, -0.038, 0));
+        assertNull(stance.sweep(null, edge, body, Vec3d.ZERO, -0.038, 0));
+        assertNull(stance.sweep(tread.east().down(), edge, body, Vec3d.ZERO, -0.038, 0));
+        assertNull(AgentBody.EdgeStance.start(tread, edge.add(0.03, 0, 0), body.offset(0.03, 0, 0)));
+
+        var almostClear = new Vec3d(1.298, 1, 0.5);
+        var smallOverlap = AgentBody.EdgeStance.start(tread, almostClear, standingBox(almostClear));
+        assertNotNull(smallOverlap);
+        assertNull(smallOverlap.sweep(tread, almostClear, standingBox(almostClear),
+            new Vec3d(0.0018, 0, 0), -0.038, 0), "neutral outward drift must not clear the last positive overlap");
+    }
+
+    @Test
+    void aGroundedTrailingLipCanPulseThenCoastToTheWitnessedLowerTread() {
+        var from = new BlockPos(0, 1, 0);
+        var to = from.east().down();
+        var lip = new Vec3d(1.268, 1, 0.572);
+        var rested = new Vec3d(0, -0.0784, 0);
+        var fullSupport = new Box(from.down());
+        var lowerSupport = new Box(to.down());
+        Predicate<Box> clear = body -> !body.intersects(fullSupport) && !body.intersects(lowerSupport);
+
+        assertEquals(AgentDryLanding.CaveMotion.SOURCE, AgentDryLanding.ordinaryDescentCoast(
+            from, to, Direction.EAST, lip, rested, 0.30, 1.8, 0.08, true, 0, 0, clear, body -> true));
+        assertEquals(AgentDryLanding.CaveMotion.LANDING, AgentDryLanding.ordinaryDescentCoast(
+            from, to, Direction.EAST, lip, rested, 0.30, 1.8, 0.08, true, 0.098, 0, clear, body -> true));
+        assertEquals(AgentDryLanding.CaveMotion.LOWER_HAZARD, AgentDryLanding.ordinaryDescentCoast(
+            from, to, Direction.EAST, lip, rested, 0.30, 1.8, 0.08, true, 0.098, 0, clear,
+            body -> body.minY >= 0.5));
+        assertEquals(AgentDryLanding.CaveMotion.RANGE, AgentDryLanding.ordinaryDescentCoast(
+            from, to, Direction.EAST, lip, new Vec3d(0.1, -0.0784, 0), 0.30, 1.8, 0.08,
+            true, 0.098, 0, clear, body -> true), "reject input without stopping room on the exact lower tread");
+
+        var beyondLip = lip.add(0.098, 0, 0);
+        assertEquals(AgentDryLanding.CaveMotion.LANDING, AgentDryLanding.ordinaryDescentCoast(
+            from, to, Direction.EAST, beyondLip, new Vec3d(0.054, -0.0784, 0), 0.30, 1.8,
+            0.08, true, 0, 0, clear, body -> true), "the grounded flag may briefly outlive the actual upper contact");
+    }
+
+    @Test
     void onlyTheExactVisibleStableDryTopCanAuthorizeEdgeCentering() {
         var tread = new BlockPos(-15, 36, -22);
         var edge = new Vec3d(-14.52, 37, -20.98);

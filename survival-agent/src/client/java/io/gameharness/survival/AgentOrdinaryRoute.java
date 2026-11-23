@@ -22,6 +22,9 @@ final class AgentOrdinaryRoute {
     private final int[] looked = new int[NODES + 1];
     private final short[] queue = new short[NODES], parent = new short[NODES + 1], depth = new short[NODES + 1];
     private final long[] suffix = new long[NODES];
+    private final boolean[] connected = new boolean[NODES + 1];
+    private int connectedTick = -1, connectedRevision;
+    private long connectedFrom = NO_CELL;
 
     private int nodes, intent = 1, plans, revision, examinedRevision, examinedTick;
     private int cursor, length;
@@ -38,6 +41,7 @@ final class AgentOrdinaryRoute {
         Arrays.fill(visited, 0);
         Arrays.fill(looked, 0);
         nodes = plans = revision = 0;
+        connectedFrom = NO_CELL;
         intent = 1;
         renew();
     }
@@ -70,6 +74,31 @@ final class AgentOrdinaryRoute {
     }
 
     boolean walked(long foot) { return grounded[find(foot)]; }
+
+    /** Admission for an optional detour. Do not replace the current search with a proxy for a proxy. */
+    boolean hasPath(long from, long to, int tick) {
+        int start = find(from), end = find(to);
+        if (start == 0 || end == 0) return false;
+        if (connectedFrom != from || connectedTick != tick || connectedRevision != revision) {
+            Arrays.fill(connected, 1, nodes + 1, false);
+            connectedFrom = from;
+            connectedTick = tick;
+            connectedRevision = revision;
+            connected[start] = true;
+            queue[0] = (short) start;
+            int tail = 1;
+            for (int head = 0; head < tail; head++) {
+                int first = queue[head] * SLOTS;
+                for (int edge = first; edge < first + SLOTS; edge++) {
+                    short next = edges[edge];
+                    if (next == 0 || connected[next] || !usable(edge, tick)) continue;
+                    connected[next] = true;
+                    queue[tail++] = next;
+                }
+            }
+        }
+        return connected[end];
+    }
 
     void observe(long from, long to, int tick) { attest(from, to, tick, false); }
 

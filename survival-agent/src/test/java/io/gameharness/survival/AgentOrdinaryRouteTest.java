@@ -12,6 +12,22 @@ final class AgentOrdinaryRouteTest {
     private final AgentOrdinaryRoute route = new AgentOrdinaryRoute();
 
     @Test
+    void optionalFoodVantageNeedsAWitnessedRouteAndCannotReplaceTheCurrentIntent() {
+        long start = cell(0, 70, 0), ahead = cell(1, 70, 0), field = cell(2, 69, 0);
+        chain(start, ahead);
+        route.contact(field, 1);
+        route.explore(1, 0);
+        route.plan(start, 2);
+        assertFalse(route.hasPath(start, field, 2));
+        assertEquals(ahead, route.hop(0));
+        route.observe(ahead, field, 3);
+        assertTrue(route.hasPath(start, field, 3));
+        assertEquals(ahead, route.hop(0));
+        route.retire(ahead, field, 20);
+        assertFalse(route.hasPath(start, field, 3));
+    }
+
+    @Test
     void recheckingAReturnEdgeDoesNotConsumeTheWalkHome() {
         long home = cell(0, 64, 0), ledge = cell(1, 65, 0);
         chain(home, ledge);

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { decodeAgentMemory } from "../survival-agent/agent-memory.ts";
+import { decodeAgentMemory, type AgentMemory, type Cell } from "../survival-agent/agent-memory.ts";
 
-const base = { version: 1, dimension: "minecraft:overworld", trail: [] };
-const exit = [[-15, 27, -34], [-15, 28, -33], [-14, 28, -33]];
+const base: AgentMemory = { version: 1, dimension: "minecraft:overworld", trail: [] };
+const exit: Cell[] = [[-15, 27, -34], [-15, 28, -33], [-14, 28, -33]];
 
 test("ordinary continuation accepts one simple exit leading from walked treads to foraging ground", () => {
   const value = { ...base, foragingExit: exit };

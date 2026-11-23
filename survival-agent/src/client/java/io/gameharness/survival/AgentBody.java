@@ -88,6 +88,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private static final Predicate<BlockState> DEFENSIVE_DANGER = AgentBody::dryCaveDanger;
     private static final String SUPPORTING_FOOTPRINT = "supporting_footprint";
     private static final double[] MACRO_FLOOR_OFFSETS = {0, -0.36, 0.36};
+    private static final double SUPPLY_OUTLINE_REACH = 4.25;
     static final int SUPPLY_OPEN = 1, SUPPLY_ROOF = 2, SUPPLY_WALL = 4;
 
     enum Contact {
@@ -98,6 +99,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         PRECISE("precise_use", true, 0.022),
         BUCKET("pour", true, 0.022),
         RIM("rim_place", true, 0.022),
+        SUPPLY_MINE("supply_outline_mine", false, 0.012),
+        SUPPLY_PLACE("supply_outline_place", true, 0.022),
         OUTLINE("outline_use", true, 0.022);
 
         final String action;
@@ -110,6 +113,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             this.predictionSeconds = predictionSeconds;
         }
 
+        boolean supplyOutline() { return this == SUPPLY_MINE || this == SUPPLY_PLACE; }
         boolean allowsOutline() { return this == RIM || this == BUCKET || this == OUTLINE; }
     }
 
@@ -201,6 +205,12 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private long frameSequence;
     private HitResult renderedCrosshair;
     private HitResult tickCrosshair;
+    private boolean ordinaryOutlineExitEnabled;
+    private BlockState renderedSupplyOutline;
+    private BlockHitResult checkedSupplyOutline;
+    private Vec3d checkedSupplyEye;
+    private int supplyOutlineTick = -1;
+    private long supplyOutlineFrame = -1;
     private Vec3d aimPoint;
     private float aimYaw;
     private float aimPitch;
@@ -528,7 +538,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         observedAtNanos = now;
         ++frameSequence;
         renderedCrosshair = client.crosshairTarget;
-        if (contact != null && tick - contactTick <= 1) noteRenderedEntry();
+        renderedSupplyOutline = null;
+        if (contact != null && !contactMode.supplyOutline() && tick - contactTick <= 1) noteRenderedEntry();
         viewProjection.set(context.projectionMatrix()).mul(context.positionMatrix());
         inverseViewProjection.set(viewProjection).invert();
     }
@@ -538,6 +549,9 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         observedPlayer = null;
         eye = null;
         renderedCrosshair = null;
+        renderedSupplyOutline = null;
+        checkedSupplyOutline = null;
+        checkedSupplyEye = null;
         observedAtNanos = 0;
         visibleHorizon.forgetIdleAim();
         levelWallSight.forget();
@@ -997,6 +1011,138 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             && now.getBlockPos().equals(hit.getBlockPos()) && now.getSide() == hit.getSide() ? now : null;
     }
 
+    void bindOrdinaryOutlineExit(boolean enabled) { ordinaryOutlineExitEnabled = enabled; }
+
+    boolean ordinaryOutlineExitEnabled() { return ordinaryOutlineExitEnabled; }
+
+    /** Receipt from the vanilla draw itself, not from merely aiming at an outline-shaped block. */
+    void observeSupplyOutline(Entity camera, BlockPos pos, BlockState state) {
+        if (ordinaryOutlineExitEnabled && hasView() && camera == observedPlayer
+                && client.crosshairTarget == renderedCrosshair && renderedCrosshair instanceof BlockHitResult hit
+                && hit.getType() == HitResult.Type.BLOCK && pos.equals(hit.getBlockPos())) {
+            renderedSupplyOutline = state;
+            if (contact != null && contactMode.supplyOutline() && tick - contactTick <= 1) noteRenderedEntry();
+        }
+    }
+
+    /** Geometry only from the selected face actually drawn on the recent first-person frame. */
+    BlockHitResult supplyOutlineFace() {
+        if (!ordinaryOutlineExitEnabled || renderedSupplyOutline == null || !hasView() || client.options.hudHidden)
+            return null;
+        long age = System.nanoTime() - observedAtNanos;
+        if (age > AgentSupplyOutline.MAX_FRAME_NANOS) return null;
+        if (supplyOutlineTick == tick && supplyOutlineFrame == frameSequence) return checkedSupplyOutline;
+        supplyOutlineTick = tick;
+        supplyOutlineFrame = frameSequence;
+        checkedSupplyOutline = null;
+        checkedSupplyEye = null;
+        var player = client.player;
+        if (player.isTouchingWater() || player.isSubmergedInWater() || player.isInLava() || player.hasVehicle())
+            return null;
+        var shown = (BlockHitResult) renderedCrosshair;
+        BlockHitResult now = selectedFace();
+        Vec3d liveEye = player.getEyePos();
+        double reach = Math.min(SUPPLY_OUTLINE_REACH, player.getBlockInteractionRange());
+        if (!AgentSupplyOutline.admits(true, tick - observedAtTick, age, eye, liveEye,
+                MathHelper.wrapDegrees(player.getYaw() - observedYaw), player.getPitch() - observedPitch,
+                shown, now, reach) || !inView(shown.getPos()) || !inView(now.getPos())
+                || dryCaveDanger(renderedSupplyOutline)
+                || client.world.getBlockState(now.getBlockPos()) != renderedSupplyOutline
+                || !supplyOutlineRay(eye, shown, null, reach)
+                || !(eye.equals(liveEye) && shown.getPos().equals(now.getPos()))
+                    && !supplyOutlineRay(liveEye, now, null, reach)) return null;
+        checkedSupplyEye = liveEye;
+        return checkedSupplyOutline = now;
+    }
+
+    private boolean supplyOutlineRay(Vec3d origin, BlockHitResult backstop, Vec3d sample, double reach) {
+        if (raysLeft < 2) return false;
+        raysLeft -= 2;
+        if (rayShapeContext == null) rayShapeContext = ShapeContext.of(client.player);
+        return sample == null
+            ? AgentSupplyOutline.drySelectedFace(client.world, rayShapeContext, origin, backstop, reach)
+            : AgentSupplyOutline.dryPrefix(client.world, rayShapeContext, origin, backstop, sample, reach);
+    }
+
+    /** Physical source contact is independent of the chosen top and must be true now. */
+    private boolean supplyOutlineGrounded(BlockPos from) {
+        var player = client.player;
+        return !lavaEmergency && !player.isOnFire() && !player.isClimbing() && !player.isSpectator()
+            && !player.getAbilities().flying && player.hurtTime == 0 && dryCaveContact(from) != null
+            && !client.world.isSpaceEmpty(player, player.getBoundingBox().offset(0, -0.025, 0));
+    }
+
+    private static boolean supplyOutlineCell(BlockPos from, int x, int y, int z, int low, int high) {
+        int dy = y - from.getY();
+        return dy >= low && dy <= high && Math.abs(x - from.getX()) + Math.abs(z - from.getZ()) <= 1;
+    }
+
+    /** The selected top may be the actual bearing cell or one cardinal neighboring tread. */
+    boolean supplyOutlineTop(BlockPos from, BlockPos floor) {
+        BlockHitResult now = supplyOutlineFace();
+        return supplyOutlineCell(from, floor.getX(), floor.getY(), floor.getZ(), -2, 0)
+            && (from.getX() != floor.getX() || from.getZ() != floor.getZ() || floor.getY() == from.getY() - 1)
+            && matchesDryRouteTop(now, floor) && matchesDryRouteTop((BlockHitResult) renderedCrosshair, floor)
+            && stableDryRouteTop(floor, renderedSupplyOutline) && supplyOutlineGrounded(from);
+    }
+
+    /** A line prefix, not a whole cell, collision sweep, or a new terrain query. */
+    boolean supplyOutlineClear(Vec3d sample) {
+        BlockHitResult now = supplyOutlineFace();
+        if (now == null) return false;
+        BlockPos from = client.player.getBlockPos();
+        if (!supplyOutlineCell(from, MathHelper.floor(sample.x), MathHelper.floor(sample.y), MathHelper.floor(sample.z), -2, 3)
+                || !inView(sample) || !supplyOutlineGrounded(from)) return false;
+        BlockHitResult shown = (BlockHitResult) renderedCrosshair;
+        double reach = Math.min(SUPPLY_OUTLINE_REACH, client.player.getBlockInteractionRange());
+        return supplyOutlineRay(eye, shown, sample, reach)
+            && (eye.equals(checkedSupplyEye) && shown.getPos().equals(now.getPos())
+                || supplyOutlineRay(checkedSupplyEye, now, sample, reach));
+    }
+
+    /** A negative-only guard for an exact cut chosen by the active supply owner. */
+    boolean supplyOutlineCutSafe(BlockHitResult witness) {
+        BlockHitResult now = supplyOutlineFace();
+        if (!AgentSupplyOutline.matchesFace(witness, now)) return false;
+        var player = client.player;
+        BlockPos cell = now.getBlockPos();
+        BlockPos from = player.getBlockPos();
+        if (!supplyOutlineCell(from, cell.getX(), cell.getY(), cell.getZ(), 0, 3)
+                || !supplyOutlineGrounded(from) || player.getBoundingBox().intersects(new Box(cell))) return false;
+        BlockState state = client.world.getBlockState(cell);
+        if (state != renderedSupplyOutline || state.hasBlockEntity() || state.getBlock() instanceof FallingBlock
+                || !fullStepSupport(cell, state) || !naturalSupplyCut(state)) return false;
+        // No cap identity or geometry is reported. A falling or wet load may only veto this cut.
+        BlockState cap = client.world.getBlockState(overlandProbe.set(cell).move(Direction.UP));
+        return !dryCaveDanger(cap) && !(cap.getBlock() instanceof FallingBlock);
+    }
+
+    private static boolean naturalSupplyCut(BlockState state) {
+        return state.isIn(BlockTags.BASE_STONE_OVERWORLD) || state.isIn(BlockTags.DIRT) || state.isOf(Blocks.GRASS_BLOCK)
+            || state.isOf(Blocks.TUFF) || state.isOf(Blocks.CALCITE) || state.isOf(Blocks.CLAY)
+            || state.isOf(Blocks.DRIPSTONE_BLOCK);
+    }
+
+    /** Negative physical placement checks, only across the attached and currently outlined face. */
+    boolean supplyOutlinePlacementSafe(BlockHitResult witness, BlockPos destination, BlockState material) {
+        BlockHitResult now = supplyOutlineFace();
+        if (!AgentSupplyOutline.matchesFace(witness, now) || now.getSide() == Direction.DOWN
+                || !placementCell(now).equals(destination)) return false;
+        var player = client.player;
+        BlockPos from = player.getBlockPos();
+        BlockHitResult shown = (BlockHitResult) renderedCrosshair;
+        return supplyOutlineCell(from, destination.getX(), destination.getY(), destination.getZ(), -2, 0)
+            && (from.getX() != destination.getX() || from.getZ() != destination.getZ())
+            && supplyOutlineGrounded(from)
+            && AgentSupplyOutline.entersAttachment(eye, shown, destination)
+            && AgentSupplyOutline.entersAttachment(checkedSupplyEye, now, destination)
+            && stableFootholdAnchor(now.getBlockPos())
+            && !dryCaveDanger(material) && !(material.getBlock() instanceof FallingBlock)
+            && fullStepSupport(destination, material) && client.world.getBlockState(destination).isAir()
+            && !player.getBoundingBox().intersects(new Box(destination))
+            && canPlaceRangedCoverAcross(now, material);
+    }
+
     /** A motor veto on the selected support only. Never probe or expose the destination's state. */
     boolean canPlaceStationAcross(BlockHitResult support) {
         BlockHitResult now = selectedFace();
@@ -1193,6 +1339,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private boolean prepareContact(BlockHitResult witness, Contact mode) {
         if (!hasView() || witness.getType() != HitResult.Type.BLOCK || witness.isInsideBlock()
                 || mode == Contact.LEAP_PLACE && witness.getSide() != Direction.UP) return false;
+        if (mode.supplyOutline()) {
+            BlockHitResult selected = supplyOutlineFace();
+            if (!AgentSupplyOutline.matchesFace(witness, selected)) return false;
+            witness = selected;
+        }
         if (!inView(witness.getPos())) {
             if (mode != Contact.LEAP_PLACE) aimContactFallback(witness.getPos(), mode);
             return false;
@@ -1207,7 +1358,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         if (freshContact) {
             // Re-admit a candidate from an earlier sighting before using its present outline
             // shape. A stale witness can guide the view but never exposes a hidden shape.
-            BlockHitResult live = contactRay(witness.getPos(), reach);
+            BlockHitResult live = mode.supplyOutline() ? witness : contactRay(witness.getPos(), reach);
             if (!sameBlockFace(witness, live) && mode.allowsOutline()) {
                 live = selectedFace();
                 if (live != null && mode != Contact.OUTLINE && !litFace(live)) live = null;
@@ -1239,6 +1390,12 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         // A jump has one geometrical bearing and a short window in which its top
         // becomes visible. Acquiring that top authorizes contact, not a new turn.
         if (mode == Contact.LEAP_PLACE) return true;
+        if (mode.supplyOutline()) {
+            // An inset is steering only. It never counts as a selected surface until actually rendered.
+            Vec3d point = witness.getPos();
+            aimRegion(contact, contact.admits(witness) ? point : contact.inset(point), mode.precise);
+            return true;
+        }
         boolean stalled = contactPoint != null && tick - contactProbeTick >= 5 && aligned(contactPoint)
             && (!(renderedCrosshair instanceof BlockHitResult seen) || !contact.admits(seen));
         if ((contactPoint == null || stalled) && contactProbeFrame != frameSequence && tick - contactProbeTick >= 2) {
@@ -1316,7 +1473,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     private void noteRenderedEntry() {
         if (renderedCrosshair instanceof BlockHitResult seen && contact.admits(seen)) {
-            if (firstValidNanos == 0 && (contactMode == Contact.OUTLINE || litFace(seen))) {
+            if (firstValidNanos == 0 && (contactMode.supplyOutline() ? renderedSupplyOutline == contactState
+                    : contactMode == Contact.OUTLINE || litFace(seen))) {
                 firstValidNanos = observedAtNanos;
                 firstValidTick = observedAtTick;
             }
@@ -1346,6 +1504,10 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 || !(currentCrosshair() instanceof BlockHitResult now) || !contact.matches(now))
             return "ray_disagree";
         if (!contact.admits(seen) || !contact.admits(now)) return "outside_region";
+        if (contactMode.supplyOutline()) {
+            return supplyOutlineFace() == now && renderedSupplyOutline == contactState
+                && client.world.getBlockState(now.getBlockPos()) == contactState ? null : "vetoed";
+        }
         if (!inView(now.getPos()) || contactMode != Contact.OUTLINE && (!litFace(seen) || !litFace(now)))
             return "vetoed";
         if (!contactMode.allowsOutline() && !visibleContact(seen.getPos(), client.player.getBlockInteractionRange()))
@@ -1404,6 +1566,18 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
 
     /** Observe the same contact during preparation, but only READY may emit a use edge. */
     boolean useContact(BlockHitResult witness, Contact mode, Preparation preparation) {
+        return !mode.supplyOutline() && requestContactUse(witness, mode, preparation);
+    }
+
+    boolean placeSupplyOutline(BlockHitResult witness, BlockPos destination, BlockState material,
+                               Preparation preparation) {
+        if (!supplyOutlinePlacementSafe(witness, destination, material)) return false;
+        if (preparation == Preparation.READY && (!(client.player.getMainHandStack().getItem() instanceof BlockItem item)
+                || item.getBlock() != material.getBlock())) return false;
+        return requestContactUse(witness, Contact.SUPPLY_PLACE, preparation);
+    }
+
+    private boolean requestContactUse(BlockHitResult witness, Contact mode, Preparation preparation) {
         if (!prepareContact(witness, mode)) return false;
         String problem = contactProblem(true);
         if (problem == null && mode == Contact.BUCKET) {
@@ -2099,7 +2273,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     void holdUse() { eating = true; }
 
     boolean miningFootingRefused(BlockPos target) {
-        return contactTick == tick && contactMode == Contact.MINE && contact != null
+        return contactTick == tick && (contactMode == Contact.MINE || contactMode == Contact.SUPPLY_MINE) && contact != null
             && target.equals(contact.pos) && SUPPORTING_FOOTPRINT.equals(contactStatus);
     }
 
@@ -2134,7 +2308,18 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     boolean mine(BlockHitResult witness) {
-        if (!prepareContact(witness, Contact.MINE)) return false;
+        return requestMine(witness, Contact.MINE);
+    }
+
+    boolean mineSupplyOutline(BlockHitResult witness) {
+        if (!supplyOutlineCutSafe(witness)) return false;
+        var held = client.player.getMainHandStack();
+        if (renderedSupplyOutline.isToolRequired() && !held.isSuitableFor(renderedSupplyOutline)) return false;
+        return requestMine(witness, Contact.SUPPLY_MINE);
+    }
+
+    private boolean requestMine(BlockHitResult witness, Contact mode) {
+        if (!prepareContact(witness, mode)) return false;
         boolean held = witness.getBlockPos().equals(lastHeldMine) && lastHeldMineTick == tick - 1;
         String problem = contactProblem(!held);
         if (problem == null && (client.options.attackKey.isUnbound() || !client.isWindowFocused()
@@ -3417,6 +3602,13 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return dryRouteVeto(from, to, true, 0.27, true) == DryRouteVeto.CLEAR;
     }
 
+    /** For an outlined grade already chosen by the exit owner; SWEEP means physical obstruction. */
+    DryRouteVeto supplyOutlineGradeVeto(BlockPos from, BlockPos to) {
+        if (!ordinaryOutlineExitEnabled || !hasView()) return DryRouteVeto.VIEW;
+        if (Math.abs(from.getY() - to.getY()) != 1 || !ordinaryGradePose(client.player)) return DryRouteVeto.DRIFT;
+        return dryRouteVeto(from, to, true, 0.27, true);
+    }
+
     void trackWalkedRoutes(AgentWalkedRoute routes) { walkedRoutes = routes; }
 
     /** Called by an ordinary actuator on actual grounded arrival, never from idle position samples. */
@@ -3624,18 +3816,16 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         double cross = Math.abs(drift) > Math.abs(across) ? drift : across;
         Box approach = high.stretch(cross * dz, 0, -cross * dx);
         Box sweep = approach.stretch(dx, 0, dz);
+        Box lowerSweep = null;
         if (ordinaryGrade) {
-            if (Math.abs(dy) != 1 || player.isSprinting() || player.isUsingItem() || player.isClimbing()
-                    || player.getAbilities().flying || player.hasStatusEffect(StatusEffects.JUMP_BOOST)
-                    || player.hasStatusEffect(StatusEffects.SLOW_FALLING)) return DryRouteVeto.SWEEP;
+            if (Math.abs(dy) != 1 || !ordinaryGradePose(player)) return DryRouteVeto.SWEEP;
             sweep = sweep.stretch(0, 0.30, 0); // include vanilla jump apex, even with lateral drift
-            if (!dryGradeVolume(sweep)) return DryRouteVeto.HAZARD;
+            lowerSweep = lowerGradeColumn(approach, dx, dy, dz);
+            if (!dryGradeVolume(sweep) || !dryGradeVolume(lowerSweep)) return DryRouteVeto.HAZARD;
         }
         if (!client.world.isSpaceEmpty(player, sweep)) return DryRouteVeto.SWEEP;
         if (dy != 0) {
-            Box lowerColumn = dy > 0 ? approach : approach.offset(dx, 0, dz);
-            Box lowerSweep = lowerColumn.stretch(0, -1, 0);
-            if (ordinaryGrade && !dryGradeVolume(lowerSweep)) return DryRouteVeto.HAZARD;
+            if (lowerSweep == null) lowerSweep = lowerGradeColumn(approach, dx, dy, dz);
             if (!client.world.isSpaceEmpty(player, lowerSweep)) return DryRouteVeto.SWEEP;
         }
         // The source's reverse support is positive grounded body contact, not an
@@ -3645,6 +3835,15 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         Box landingContact = sourceContact.offset(dx, dy, dz);
         return client.world.isSpaceEmpty(player, sourceContact) || requireLandingSupport && client.world.isSpaceEmpty(player, landingContact)
             ? DryRouteVeto.SUPPORT : DryRouteVeto.CLEAR;
+    }
+
+    private static boolean ordinaryGradePose(ClientPlayerEntity player) {
+        return !player.isSprinting() && !player.isUsingItem() && !player.isClimbing() && !player.getAbilities().flying
+            && !player.hasStatusEffect(StatusEffects.JUMP_BOOST) && !player.hasStatusEffect(StatusEffects.SLOW_FALLING);
+    }
+
+    private static Box lowerGradeColumn(Box approach, int dx, int dy, int dz) {
+        return (dy > 0 ? approach : approach.offset(dx, 0, dz)).stretch(0, -1, 0);
     }
 
     /** Negative-only hazard check on the swept body volume of two already witnessed contacts. */

@@ -35,6 +35,7 @@ import net.minecraft.client.gui.screen.ingame.InventoryScreen;
 import net.minecraft.client.network.ClientPlayNetworkHandler;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.Entity;
 import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.Item;
 import net.minecraft.registry.Registries;
@@ -367,6 +368,11 @@ public final class AgentClient implements ClientModInitializer {
         if (actor != null && actor.visual != null && !actor.ended) actor.visual.renderTail(actor.body, actor.tick);
     }
 
+    public static void observeVanillaBlockOutline(Entity camera, BlockPos pos, BlockState state) {
+        var actor = active;
+        if (actor != null && actor.body != null && !actor.ended) actor.body.observeSupplyOutline(camera, pos, state);
+    }
+
     public static void steerFrame() {
         if (active != null && active.progress != null && !active.ended) {
             MinecraftClient client = MinecraftClient.getInstance();
@@ -443,6 +449,8 @@ public final class AgentClient implements ClientModInitializer {
 
     private void bindPolicy(MinecraftClient client) {
         body = new AgentBody(client, this::recordContact, this::recordLook, lookSeed + respawns);
+        body.bindOrdinaryOutlineExit(macro == null && allowRespawn && directory.getParent() != null
+            && !directory.getParent().endsWith("diagnostic-runs"));
         if (visual != null) body.bindVisual(visual);
         hands = new AgentHands(client);
         progress = new AgentProgress(client, body, hands, goal, new AgentMemory(directory), expedition, pendingFurnaceMemory);

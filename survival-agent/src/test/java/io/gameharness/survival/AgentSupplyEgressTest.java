@@ -139,4 +139,54 @@ final class AgentSupplyEgressTest {
         egress.observeBreak(LOWER.down());
         assertNull(egress.flood(APPROACH, OPENING, WATER, false, 304), "don't offer a leg through a known broken support");
     }
+
+    @Test
+    void anOutlineAndAnAttemptDoNotCreateAWalkedLandingOrPermitHandoff() {
+        var passage = new AgentSupplyEgress.OutlinePassage();
+        passage.begin(REFUGE, 10);
+        assertFalse(passage.landed(LOWER, true), "no admitted crossing");
+        passage.attemptedCut(LOWER.up());
+        assertFalse(passage.canHandoff());
+        assertTrue(passage.admitLanding(REFUGE, LOWER));
+        assertFalse(passage.landed(FIRST_DRY, true), "not the selected tread");
+        assertFalse(passage.landed(LOWER, false), "not settled on actual dry support");
+        assertEquals(0, passage.steps());
+        assertFalse(passage.canHandoff());
+        passage.abandonLanding();
+        assertFalse(passage.landed(LOWER, true), "a vetoed leg cannot be booked on a late arrival");
+
+        assertTrue(passage.admitLanding(REFUGE, LOWER));
+        assertTrue(passage.landed(LOWER, true));
+        assertEquals(1, passage.steps());
+        assertTrue(passage.canHandoff(), "physical arrival permits checking the ordinary handoff, not declaring one");
+        assertFalse(passage.landed(LOWER, true), "one landing cannot count twice");
+    }
+
+    @Test
+    void aShortOutlinePassageNeverDropsRevisitsOrRenewsItsLimits() {
+        var passage = new AgentSupplyEgress.OutlinePassage();
+        passage.begin(REFUGE, 10);
+        assertFalse(passage.admitLanding(REFUGE, REFUGE.south().down()));
+        assertFalse(passage.admitLanding(REFUGE, REFUGE.south().east()));
+        BlockPos current = REFUGE;
+        for (int i = 0; i < 6; i++) {
+            BlockPos next = current.south();
+            assertTrue(passage.admitLanding(current, next));
+            assertTrue(passage.landed(next, true));
+            assertFalse(passage.admitLanding(next, current), "a revisited stance cannot buy another dark step");
+            current = next;
+        }
+        assertFalse(passage.admitLanding(current, current.south().up()));
+
+        for (int i = 0; i < 15; i++) {
+            BlockPos cut = REFUGE.east(i).up(2);
+            assertTrue(passage.allowsCut(cut));
+            passage.attemptedCut(cut);
+            assertFalse(passage.allowsCut(cut), "a refused cut cannot be chosen again on a different bearing");
+        }
+        assertFalse(passage.allowsCut(REFUGE.up(3)));
+        passage.begin(current, 800);
+        assertTrue(passage.withinTime(909));
+        assertFalse(passage.withinTime(910));
+    }
 }

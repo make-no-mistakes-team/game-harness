@@ -3,7 +3,7 @@
   "package": "io.gameharness.survival.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "AgentRenderMixin",
+    "AgentRenderMixin", "AgentSupplyOutlineRenderMixin",
     "AgentVisualHudAccess", "AgentVisualBossAccess", "AgentVisualChatAccess", "AgentVisualToastAccess",
     "AgentHandledScreenAccess", "AgentMouseAccess", "AgentKeyboardAccess", "AgentCraftScreenMixin",
     "AgentMiningAccess", "AgentFurnaceSyncMixin", "AgentFurnaceBlockMixin", "AgentWaterUseMixin"

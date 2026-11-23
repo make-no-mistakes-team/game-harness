@@ -89,6 +89,11 @@ do not count toward a pickaxe. If a short prospect yields only those
 blocks, the miner tries different ground with uses left on its pick.
 In an enclosed quarry it can use the supply stair to reach another
 worksite, stopping if it finds collectible stone on the way.
+Without a torch, the player can use a nearby face that Minecraft
+actually outlines under the crosshair to check a short way out. It
+must stand on real dry support and check the next tread before moving.
+An empty ray, darkness or a sound is not proof of a safe step. This
+does not reveal ore behind a wall or brighten the game for the model.
 If a short shaft is clear overhead, the player can build upward with
 spare rock. It checks for a side exit after each landing rather than
 building a tower with no way off.

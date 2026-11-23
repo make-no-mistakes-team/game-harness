@@ -223,6 +223,63 @@ final class AgentSupplyEgress {
             && naturalDryLeaf(state);
     }
 
+    /** Budget and physical receipts for a short climb, not a replacement for visual or motor admission. */
+    static final class OutlinePassage {
+        private static final int TICKS = 900, STEPS = 6, CUTS = 15;
+        private final Set<BlockPos> visited = new HashSet<>(), attemptedCuts = new HashSet<>();
+        private BlockPos foot, pending;
+        private int until;
+
+        boolean active() { return foot != null; }
+        boolean withinTime(int tick) { return tick < until; }
+        int steps() { return active() ? visited.size() - 1 : 0; }
+
+        boolean canHandoff() { return steps() > 0 && pending == null; }
+
+        void begin(BlockPos from, int tick) {
+            if (active()) return;
+            foot = from.toImmutable();
+            visited.add(foot);
+            until = tick + TICKS;
+        }
+
+        boolean allowsLeg(BlockPos from, BlockPos to) {
+            if (!from.equals(foot) || steps() >= STEPS || visited.contains(to)) return false;
+            int dy = to.getY() - from.getY();
+            return dy >= 0 && dy <= 1
+                && Math.abs(to.getX() - from.getX()) + Math.abs(to.getZ() - from.getZ()) == 1;
+        }
+
+        boolean allowsCut(BlockPos cell) {
+            return attemptedCuts.size() < CUTS && !attemptedCuts.contains(cell);
+        }
+
+        void attemptedCut(BlockPos cell) { attemptedCuts.add(cell.toImmutable()); }
+
+        boolean admitLanding(BlockPos from, BlockPos to) {
+            if (pending != null || !allowsLeg(from, to)) return false;
+            pending = to.toImmutable();
+            return true;
+        }
+
+        boolean landed(BlockPos actual, boolean settledDryContact) {
+            if (!settledDryContact || !actual.equals(pending)) return false;
+            foot = pending;
+            pending = null;
+            visited.add(foot);
+            return true;
+        }
+
+        void abandonLanding() { pending = null; }
+
+        void reset() {
+            foot = pending = null;
+            visited.clear();
+            attemptedCuts.clear();
+            until = 0;
+        }
+    }
+
     /** Keep finite, exact leaf premises separate from a successful cut or a traversed lane. */
     static final class CanopyPassage {
         private static final int MAX_CUTS = 6, MAX_ATTEMPTS = 12, CUTS_AT_SITE = 2, ATTEMPTS_AT_SITE = 3;

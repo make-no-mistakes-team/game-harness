@@ -5783,8 +5783,7 @@ final class AgentProgress {
             if (surfaceApproach.workTimberFrontier(reachable) || reachable) return;
         }
         if (localOnly) return;
-        if (!canopy && ordinaryRouteTick != tick - 1 && supplyEgress.seek(supplies)) return;
-        if (expedition != null && bootstrapTimber && applyWoodPreference()) return;
+        boolean firstOverlandSearch = ordinarySurfaceWork && bootstrapTimber;
         BlockHitResult log = canopy ? null
             : body.find(state -> state.isIn(BlockTags.LOGS), 22, this::timberCandidate).orElse(null);
         if (log != null) {
@@ -5796,10 +5795,19 @@ final class AgentProgress {
             rememberTimberSite(exhaustedCanopies, BlockPos.ofFloored(timberCanopy));
             timberCanopy = null;
         }
-        if (!canopy && surveyTimber()) return;
+        if (bootstrapTimber && seekSurfaceSupply()) return;
+        if (expedition != null && bootstrapTimber && applyWoodPreference()) return;
+        if (!canopy && !firstOverlandSearch && ordinaryRouteTick != tick - 1 && supplyEgress.seek(supplies)) return;
+        if (!canopy && supplyLandmark == null && surveyTimber()) return;
         if (!ordinarySurfaceWork) return;
-        if (bootstrapTimber && (woodPreference != WOODLAND || tick >= woodPreferenceUntil) && seekSurfaceSupply()) return;
-        seekTimberGround();
+        boolean scouting = supplyLandmark == null;
+        Result result = seekTimberGround();
+        // Unknown sky at a spawn beside a recess is not cave evidence by itself.
+        // Give the normal exterior route its paid frontier before falling back
+        // to the enclosed egress routine; real canopy has its own handoff.
+        if (!canopy && firstOverlandSearch && scouting && result == Result.BLOCKED
+                && navigator.spentFrontier(foot) == Job.TIMBER && !navigator.witnessedTimberExterior(foot))
+            supplyEgress.seek(supplies);
     }
 
     private boolean woodPickupPending() {
@@ -5889,7 +5897,7 @@ final class AgentProgress {
             beginTimberChop(plank, false);
             return true;
         }
-        if (supplyLandmark != null) return false;
+        if (supplyLandmark != null || woodPreference == WOODLAND && tick < woodPreferenceUntil) return false;
         var landmark = body.find(SUPPLY_WOOD, 16,
             hit -> !timberInReach(hit) && newSupplyLandmark(hit.getBlockPos())).orElse(null);
         if (landmark != null && expedition != null && !woodOffered) {
@@ -5917,13 +5925,13 @@ final class AgentProgress {
         return true;
     }
 
-    private void seekTimberGround() {
+    private Result seekTimberGround() {
         if (supplyLandmark != null) {
             Result result = navigate(Job.TIMBER, Vec3d.ofBottomCenter(supplyLandmark), 2.4);
             if (result == Result.BLOCKED || result == Result.ARRIVED) supplyLandmark = null;
-            return;
+            return result;
         }
-        navigate(Job.TIMBER, null, 0);
+        return navigate(Job.TIMBER, null, 0);
     }
 
     private void witnessTimber(BlockHitResult log) {

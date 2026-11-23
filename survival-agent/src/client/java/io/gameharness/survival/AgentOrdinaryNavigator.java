@@ -8,11 +8,13 @@ import static io.gameharness.survival.AgentRouteGraph.z;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Predicate;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
@@ -161,6 +163,7 @@ final class AgentOrdinaryNavigator {
     private final long[] sightQueue = new long[SIGHT_NODES];
     private final BlockPos.Mutable sightFrom = new BlockPos.Mutable(), sightTo = new BlockPos.Mutable();
     private final BlockPos.Mutable foodFloor = new BlockPos.Mutable();
+    private final Predicate<BlockHitResult> timberHabitatAhead = this::timberHabitatAhead;
 
     private ClientWorld world;
     private ClientPlayerEntity player;
@@ -174,6 +177,7 @@ final class AgentOrdinaryNavigator {
     private Vec3d gradeAim;
     private long rendered = -1, lookAt = NO_CELL, lookCue = NO_CELL, adjustAt = NO_CELL;
     private long recallAt = NO_CELL, recalled = NO_CELL, gradeFrame = -1;
+    private long timberSkyFoot = NO_CELL;
     private int lastScan = -100, lookSince, adjustSince, gradeAt = -100;
     private int unavailableSince = -1;
     private float lookYaw, lookPitch;
@@ -209,6 +213,7 @@ final class AgentOrdinaryNavigator {
         unavailableSince = -1;
         foodScoutHandoff = false;
         exhaustedAt = NO_CELL;
+        timberSkyFoot = NO_CELL;
         stage = "idle";
         lastVeto = "";
         releaseEdge();
@@ -243,6 +248,17 @@ final class AgentOrdinaryNavigator {
         return world == client.world && player == client.player && exhaustedAt == foot.asLong() ? job : null;
     }
 
+    boolean witnessedTimberExterior(BlockPos foot) {
+        return witnessedTimberExterior(foot.asLong());
+    }
+
+    private boolean witnessedTimberExterior(long foot) {
+        if (world != client.world || player != client.player || timberSkyFoot == NO_CELL
+                || Math.abs(y(foot) - y(timberSkyFoot)) > 1) return false;
+        int dx = x(foot) - x(timberSkyFoot), dz = z(foot) - z(timberSkyFoot);
+        return dx * dx + dz * dz <= 9;
+    }
+
     void resetFoodSearch() { route.resetFoodSearch(); }
 
     /** The supply owner already verified the landing; remember it even if its lane is not ordinarily visible. */
@@ -265,6 +281,26 @@ final class AgentOrdinaryNavigator {
     private static boolean forageHabitat(BlockState support) {
         return support != null && (support.isOf(Blocks.GRASS_BLOCK) || support.isOf(Blocks.PODZOL)
             || support.isOf(Blocks.MYCELIUM) || AgentSupplyEgress.naturalDryLeaf(support));
+    }
+
+    private static boolean timberHabitat(BlockState visible) {
+        return visible.isOf(Blocks.GRASS_BLOCK) || visible.isOf(Blocks.PODZOL)
+            || AgentSupplyEgress.naturalDryLeaf(visible);
+    }
+
+    private boolean timberHabitatAhead(BlockHitResult hit) {
+        Vec3d point = hit.getPos();
+        return horizontalSquared(point.x - player.getX(), point.z - player.getZ()) >= 6.25
+            && route.freshTimberArea(hit.getBlockPos().asLong());
+    }
+
+    private void observeTimberHorizon(long here, int tick) {
+        // The trunk/salvage search has already sampled this render. A greener
+        // first hit guides direction; only the normal terrain proof admits treads.
+        var habitat = body.findSampled(AgentOrdinaryNavigator::timberHabitat, 22, timberHabitatAhead).orElse(null);
+        if (habitat != null) route.witnessTimberHorizon(here, habitat.getBlockPos().asLong(), tick);
+        if (!witnessedTimberExterior(here) && body.generalRaysRemaining() >= DIRECTED_RAYS + 3
+                && body.renderedSurfaceSky() != AgentNightWorksite.Sky.UNKNOWN) timberSkyFoot = here;
     }
 
     Arrival takeArrival() {
@@ -364,7 +400,8 @@ final class AgentOrdinaryNavigator {
 
         if (travel.crossing && grounded && foot.equals(to) && settledAlong()) {
             boolean recalledLanding = foragingRecall != null;
-            boolean foodHandoff = requested == Job.FOOD && destination == null && !straightSuccessor();
+            boolean scoutHandoff = destination == null && (requested == Job.FOOD || requested == Job.TIMBER)
+                && !straightSuccessor();
             remember(from, to, tick);
             body.recordWalkedLeg(from, to);
             this.arrival = new Arrival(from, to);
@@ -374,12 +411,13 @@ final class AgentOrdinaryNavigator {
                 stage = "settled on queued edge";
                 return Result.MOVING;
             }
-            if (foodHandoff) {
-                // Keep a continuous level lane, but give the food owner a
-                // grounded frame before committing the next turn or grade.
-                foodScoutHandoff = true;
+            if (scoutHandoff) {
+                // Keep a continuous level lane, but let the supply owner check
+                // for real sources on a settled turn or grade.
+                foodScoutHandoff = requested == Job.FOOD;
                 body.pauseWork();
-                stage = recalledLanding ? "settled a remembered foraging tread" : "settled for a food-search handoff";
+                stage = requested == Job.TIMBER ? "settled for a timber source check"
+                    : recalledLanding ? "settled a remembered foraging tread" : "settled for a food-search handoff";
                 return Result.OBSERVING;
             }
         }
@@ -397,6 +435,7 @@ final class AgentOrdinaryNavigator {
             if (requested == Job.FOOD && forageHabitat(world.getBlockState(foodFloor.set(
                     foot.getX(), foot.getY() - 1, foot.getZ())))) route.rememberForagingFoot(here, tick);
             else route.contact(here, tick);
+            if (from == null && requested == Job.TIMBER && destination == null) observeTimberHorizon(here, tick);
             if (from == null && !changed && arrived(destination, arrivalRadius, minFootY, maxFootY)) {
                 body.pauseWork();
                 stage = "grounded arrival";
@@ -527,6 +566,7 @@ final class AgentOrdinaryNavigator {
         else {
             double yaw = Math.toRadians(player == null ? 0 : player.getYaw());
             if (job == Job.FOOD) route.exploreFood(-Math.sin(yaw), Math.cos(yaw));
+            else if (job == Job.TIMBER) route.exploreTimber(-Math.sin(yaw), Math.cos(yaw));
             else route.explore(-Math.sin(yaw), Math.cos(yaw));
         }
     }
@@ -665,7 +705,8 @@ final class AgentOrdinaryNavigator {
             lookSince = tick;
             frontierView.begin(body.renderedFrame());
             float current = player.getYaw();
-            lookYaw = target == null ? current : heading(target.x - player.getX(), target.z - player.getZ(), current);
+            lookYaw = target != null ? heading(target.x - player.getX(), target.z - player.getZ(), current)
+                : job == Job.TIMBER ? route.timberLookYaw(here, tick) : current;
             lookPitch = 55;
             Direction toward = Direction.fromHorizontalDegrees(lookYaw);
             if (body.ordinaryRouteRiseCue(player.getBlockPos(), toward, RAY_RESERVE))

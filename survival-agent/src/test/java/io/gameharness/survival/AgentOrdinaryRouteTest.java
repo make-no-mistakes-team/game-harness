@@ -105,6 +105,121 @@ final class AgentOrdinaryRouteTest {
     }
 
     @Test
+    void timberScoutTakesAWitnessedDuneShoulderInsteadOfTheConnectedCaveDescent() {
+        long start = cell(0, 65, 0), mouth = cell(1, 64, 0), floor = cell(2, 63, 0);
+        long shoulder = cell(0, 66, -1), crest = cell(0, 67, -2);
+        chain(start, mouth, floor, cell(3, 62, 0));
+        chain(start, shoulder, crest);
+        route.contact(cell(1, 69, -1), 1); // A remembered high ledge without a route.
+
+        route.exploreTimber(1, 0);
+        route.plan(start, 2);
+        assertEquals(shoulder, route.hop(0));
+        assertEquals(crest, route.endpoint());
+
+        route.destination(2.5, 0.5, 0.35, 63, 63);
+        route.plan(start, 3);
+        assertEquals(mouth, route.hop(0), "actual salvage can justify the very same descent");
+        assertEquals(floor, route.endpoint());
+        assertTrue(route.exact());
+    }
+
+    @Test
+    void aRenderedGreenHorizonBiasesOnlyTheConnectedSearch() {
+        long start = cell(0, 65, 0), dune = cell(1, 66, 0);
+        long bank = cell(0, 65, -1), further = cell(0, 64, -2);
+        long green = cell(0, 64, -12);
+        chain(start, dune);
+        chain(start, bank, further);
+        route.contact(green, 1);
+        route.exploreTimber(1, 0);
+
+        route.witnessTimberHorizon(start, green, 2);
+        route.plan(start, 2);
+
+        assertEquals(bank, route.hop(0));
+        assertFalse(route.exact(), "habitat steers exploration but is not a wood destination");
+        assertFalse(route.hasPath(start, green, 2), "a rendered horizon cannot join the route graph");
+    }
+
+    @Test
+    void timberKeepsItsCourseAndPaidFrontiersAfterATargetedDetour() {
+        long start = cell(0, 65, 0), side = cell(0, 65, 1);
+        long ahead = cell(1, 65, 0), behind = cell(-1, 65, 0);
+        chain(start, side);
+        route.exploreTimber(1, 0);
+        route.plan(start, 1);
+        route.consumeLook(start);
+        route.landed(start, side, 2);
+        route.consumeLook(side);
+        route.destination(0.5, 0.5, 0.35, 65, 65);
+        route.plan(side, 3);
+        route.landed(side, start, 4);
+        chain(start, ahead);
+        chain(start, behind);
+
+        route.exploreTimber(-1, 0); // The last walk/camera direction is not a new search course.
+        route.plan(start, 5);
+        assertEquals(ahead, route.hop(0));
+        assertFalse(route.canLook(side), "a supply detour did not unspend the way out");
+
+        route.retire(start, ahead, Integer.MAX_VALUE);
+        route.plan(start, 6);
+        assertEquals(behind, route.hop(0), "a real alternate is still legal against the course");
+    }
+
+    @Test
+    void timberAvoidsTheWalkedDryAreaWhenAnotherSectorHasAConnectedApproach() {
+        long start = cell(0, 65, 0), dry = cell(1, 65, 0), fresh = cell(-1, 65, 0);
+        route.exploreTimber(1, 0);
+        long foot = cell(7, 65, 1);
+        for (int x = 6; x >= 0; x--) {
+            long next = cell(x, 65, 1);
+            chain(foot, next);
+            route.plan(foot, 1);
+            route.landed(foot, next, 1);
+            foot = next;
+        }
+        chain(foot, start);
+        route.landed(foot, start, 2);
+        chain(start, dry);
+        chain(start, fresh);
+
+        route.plan(start, 3);
+        assertEquals(fresh, route.hop(0), "new ground outranks a few unvisited squares in the same dry bend");
+
+        route.retire(start, fresh, Integer.MAX_VALUE);
+        route.plan(start, 4);
+        assertEquals(dry, route.hop(0), "coarse private coverage is a preference, not a movement veto");
+    }
+
+    @Test
+    void timberCanRecoverToAnUnspentHighViewInsteadOfGoingDeeperAfterSupplyWork() {
+        long low = cell(0, 64, 0), shoulder = cell(-1, 65, 0), crest = cell(-2, 66, 0);
+        long mouth = cell(1, 63, 0), pit = cell(2, 62, 0);
+        chain(low, shoulder, crest);
+        route.exploreTimber(1, 0);
+        route.plan(low, 1);
+        route.landed(low, shoulder, 2);
+        route.landed(shoulder, crest, 3);
+
+        route.destination(0.5, 0.5, 0.35, 64, 64);
+        route.plan(crest, 3);
+        route.landed(crest, shoulder, 4);
+        route.landed(shoulder, low, 5);
+        chain(low, mouth, pit);
+
+        route.exploreTimber(1, 0);
+        route.plan(low, 6);
+        assertEquals(shoulder, route.hop(0));
+        assertEquals(crest, route.endpoint(), "a connected, still-unexamined crest is worth the recovery");
+
+        route.retire(shoulder, crest, Integer.MAX_VALUE);
+        route.plan(low, 7);
+        assertEquals(mouth, route.hop(0), "a refused climb does not block the remaining normal detour");
+    }
+
+    @Test
     void foodScoutReturnsToWitnessedGroundWithoutReopeningSpentViews() {
         long surface = cell(0, 66, 0), slope = cell(1, 65, 0);
         long lip = cell(2, 64, 0), shaft = cell(3, 63, 0), depth = cell(4, 62, 0);

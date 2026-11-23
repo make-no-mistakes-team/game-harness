@@ -12,6 +12,8 @@ import java.util.Arrays;
 final class AgentOrdinaryRoute {
     private static final int NODES = 192, SLOTS = 12, SIGHT_TICKS = 100;
     private static final int UNCUED_FOOD_DROP = 2, EGRESS_SCOUT_DROP = 1;
+    private static final int TIMBER_TILE_SHIFT = 3, TIMBER_TILE_BITS = 6, TIMBER_TILE_LIMIT = 10;
+    private static final int TIMBER_TILES = 1 << TIMBER_TILE_BITS;
     private final long[] feet = new long[NODES + 1];
     private final short[] index = new short[512];
     private final short[] edges = new short[(NODES + 1) * SLOTS];
@@ -23,7 +25,11 @@ final class AgentOrdinaryRoute {
     private final int[] looked = new int[NODES + 1];
     private final int[] forageSeen = new int[NODES + 1];
     private final boolean[] foodVisited = new boolean[NODES + 1], foodLooked = new boolean[NODES + 1];
+    private final boolean[] timberVisited = new boolean[NODES + 1], timberLooked = new boolean[NODES + 1];
+    private final long[] timberTiles = new long[TIMBER_TILES];
+    private final byte[] timberCoverage = new byte[TIMBER_TILES];
     private final short[] queue = new short[NODES], parent = new short[NODES + 1], depth = new short[NODES + 1];
+    private final short[] routeLow = new short[NODES + 1];
     private final long[] suffix = new long[NODES];
     private final boolean[] connected = new boolean[NODES + 1];
     private int connectedTick = -1, connectedRevision;
@@ -33,9 +39,12 @@ final class AgentOrdinaryRoute {
     private int cursor, length;
     private long origin = NO_CELL, endpoint = NO_CELL;
     private long forageFoot = NO_CELL, egressShoulder = NO_CELL;
+    private long timberCue = NO_CELL;
+    private int timberCueTick;
     private int firstFoodY = Integer.MIN_VALUE, egressHighY = Integer.MIN_VALUE;
-    private boolean directed, exact, foodSearch, returningForFood, viaFoodConnector;
+    private boolean directed, exact, foodSearch, returningForFood, viaFoodConnector, timberSearch, timberCourse;
     private double goalX, goalZ, radiusSquared, minY, maxY, axisX, axisZ;
+    private double timberX, timberZ;
 
     void clear() {
         Arrays.fill(index, (short) 0);
@@ -51,6 +60,11 @@ final class AgentOrdinaryRoute {
         intent = 1;
         forageFoot = NO_CELL;
         foodSearch = false;
+        timberSearch = timberCourse = false;
+        timberCue = NO_CELL;
+        Arrays.fill(timberVisited, false);
+        Arrays.fill(timberLooked, false);
+        Arrays.fill(timberCoverage, (byte) 0);
         resetFoodSearch();
         renew();
     }
@@ -58,7 +72,7 @@ final class AgentOrdinaryRoute {
     void destination(double x, double z, double arrival, double minFootY, double maxFootY) {
         renew();
         directed = true;
-        foodSearch = false;
+        foodSearch = timberSearch = false;
         goalX = x;
         goalZ = z;
         radiusSquared = arrival * arrival;
@@ -69,7 +83,7 @@ final class AgentOrdinaryRoute {
     void explore(double dx, double dz) {
         renew();
         directed = false;
-        foodSearch = false;
+        foodSearch = timberSearch = false;
         axisX = dx;
         axisZ = dz;
     }
@@ -77,6 +91,68 @@ final class AgentOrdinaryRoute {
     void exploreFood(double dx, double dz) {
         explore(dx, dz);
         foodSearch = true;
+    }
+
+    void exploreTimber(double dx, double dz) {
+        if (!timberCourse) {
+            timberX = dx;
+            timberZ = dz;
+            timberCourse = true;
+        }
+        explore(timberX, timberZ);
+        timberSearch = true;
+    }
+
+    /** A first hit can steer the search; it cannot certify a foothold or a timber destination. */
+    void witnessTimberHorizon(long from, long cue, int tick) {
+        if (!timberSearch || !freshTimberArea(cue)) return;
+        if (timberCueLive(from, tick)) {
+            if (timberCue == cue) timberCueTick = tick;
+            return;
+        }
+        timberCue = cue;
+        timberCueTick = tick;
+        clearSuffix();
+    }
+
+    float timberLookYaw(long foot, int tick) {
+        boolean green = timberCueLive(foot, tick);
+        return (float) Math.toDegrees(Math.atan2(green ? x(foot) - x(timberCue) : -timberX,
+            green ? z(timberCue) - z(foot) : timberZ));
+    }
+
+    private boolean timberCueLive(long foot, int tick) {
+        if (timberCue == NO_CELL || tick - timberCueTick > SIGHT_TICKS || !freshTimberArea(timberCue)) return false;
+        int dx = x(timberCue) - x(foot), dz = z(timberCue) - z(foot);
+        return dx * dx + dz * dz > 4;
+    }
+
+    boolean freshTimberArea(long foot) { return timberCoverage(foot) < TIMBER_TILE_LIMIT / 2; }
+
+    private static long timberTile(long foot) {
+        return AgentRouteGraph.cell(x(foot) >> TIMBER_TILE_SHIFT, 0, z(foot) >> TIMBER_TILE_SHIFT);
+    }
+
+    private static int timberTileSlot(long tile) {
+        return (int) ((tile ^ tile >>> 27) * 0x9e3779b97f4a7c15L >>> (Long.SIZE - TIMBER_TILE_BITS));
+    }
+
+    private int timberCoverage(long foot) {
+        long tile = timberTile(foot);
+        int slot = timberTileSlot(tile);
+        return timberTiles[slot] == tile ? timberCoverage[slot] : 0;
+    }
+
+    private void occupyTimberFoot(int node) {
+        if (timberVisited[node]) return;
+        timberVisited[node] = true;
+        long tile = timberTile(feet[node]);
+        int slot = timberTileSlot(tile);
+        if (timberTiles[slot] != tile) {
+            timberTiles[slot] = tile;
+            timberCoverage[slot] = 0;
+        }
+        if (timberCoverage[slot] < TIMBER_TILE_LIMIT) timberCoverage[slot]++;
     }
 
     void resetFoodSearch() {
@@ -188,9 +264,9 @@ final class AgentOrdinaryRoute {
     void landed(long from, long to, int tick) {
         attest(from, to, tick, true);
         if (origin == from && hop(0) == to) {
-            // Exploration has no fixed B. After a real detour, look ahead from
-            // the completed crossing instead of steering back to the spawn yaw.
-            if (!directed) {
+            // Generic scouting follows its last edge; timber retains a coarse
+            // course so a necessary dogleg cannot turn it back into a dry pocket.
+            if (!directed && !timberSearch) {
                 axisX = x(to) - x(from);
                 axisZ = z(to) - z(from);
             }
@@ -253,15 +329,23 @@ final class AgentOrdinaryRoute {
         int node = find(foot);
         if (node != 0 && !looked(node)) {
             if (foodSearch) foodLooked[node] = true;
+            else if (timberSearch) timberLooked[node] = true;
             else looked[node] = intent;
             revision++;
         }
     }
 
-    private boolean looked(int node) { return foodSearch ? foodLooked[node] : looked[node] == intent; }
+    private boolean looked(int node) {
+        return timberSearch ? timberLooked[node] : foodSearch ? foodLooked[node] : looked[node] == intent;
+    }
+
+    private boolean visited(int node) {
+        return timberSearch ? timberVisited[node] : foodSearch ? foodVisited[node] : visited[node] == intent;
+    }
 
     private void markVisited(int node) {
         if (foodSearch) foodVisited[node] = true;
+        else if (timberSearch) occupyTimberFoot(node);
         else visited[node] = intent;
     }
 
@@ -340,6 +424,14 @@ final class AgentOrdinaryRoute {
         // prunes sideways or away legs, and disconnected witnesses cannot become a route.
         Arrays.fill(depth, 1, nodes + 1, (short) -1);
         depth[start] = 0;
+        if (timberSearch) routeLow[start] = (short) y(current);
+        double timberBiasX = timberX * 1.15, timberBiasZ = timberZ * 1.15;
+        if (timberSearch && timberCueLive(current, tick)) {
+            int dx = x(timberCue) - x(current), dz = z(timberCue) - z(current);
+            double weight = 3 / Math.sqrt(dx * dx + dz * dz);
+            timberBiasX = dx * weight;
+            timberBiasZ = dz * weight;
+        }
         queue[0] = (short) start;
         int tail = 1, frontier = 0, viewpoint = 0;
         double best = Double.POSITIVE_INFINITY;
@@ -348,25 +440,28 @@ final class AgentOrdinaryRoute {
             int at = queue[head];
             long foot = feet[at];
             if (returning ? foot == forageFoot : fits(foot)) return at;
-            if (!returning && !(foodSearch ? foodVisited[at] : visited[at] == intent)
+            if (!returning && !visited(at)
                     && (!connector || y(foot) >= egressHighY || freshForagingTop(at, tick))) {
                 double dx = x(foot) - x(current), dz = z(foot) - z(current);
                 double score = directed
                     ? Math.hypot(x(foot) + 0.5 - goalX, z(foot) + 0.5 - goalZ)
                         + 1.3 * Math.max(0, Math.max(minY - y(foot), y(foot) - maxY)) + depth[at] * 0.20
-                    : -dx * axisX - dz * axisZ - 0.55 * Math.hypot(dx, dz) + depth[at] * 0.28;
+                    : timberSearch ? timberFrontierCost(at, current, dx, dz, timberBiasX, timberBiasZ)
+                        : -dx * axisX - dz * axisZ - 0.55 * Math.hypot(dx, dz) + depth[at] * 0.28;
                 if (foodSearch && !freshForagingTop(at, tick)) score += 1.75 * Math.max(0, y(current) - y(foot));
                 if (foot == endpoint || (frontier == 0 || feet[frontier] != endpoint) && score < best) {
                     frontier = at;
                     best = score;
                 }
-            } else if (!directed && !returning && !connector && looked(start) && grounded[at] && !looked(at)
+            } else if (!directed && !returning && !connector && grounded[at] && !looked(at)
+                    && (looked(start) || timberSearch && y(foot) > y(current))
                     && (keepingEgress ? foot == egressShoulder
                         : !foodSearch || y(foot) >= y(current) || freshForagingTop(at, tick))) {
                 // Ordinary scouting requires a distinct viewpoint. After a
                 // failed climb, only the last high shoulder earns that revisit.
                 int dx = x(foot) - x(current), dz = z(foot) - z(current);
-                double cost = depth[at] + 2 * Math.max(0, y(foot) - y(current));
+                double cost = timberSearch ? timberFrontierCost(at, current, dx, dz, timberBiasX, timberBiasZ)
+                    : depth[at] + 2 * Math.max(0, y(foot) - y(current));
                 if ((keepingEgress ? at != start : dx * dx + dz * dz >= 4) && cost < viewpointCost) {
                     viewpoint = at;
                     viewpointCost = cost;
@@ -382,11 +477,24 @@ final class AgentOrdinaryRoute {
                     continue;
                 }
                 depth[next] = (short) (depth[at] + 1);
+                if (timberSearch) routeLow[next] = (short) Math.min(routeLow[at], y(feet[next]));
                 parent[next] = (short) at;
                 queue[tail++] = next;
             }
         }
+        if (timberSearch && viewpoint != 0 && frontier != 0
+                && y(feet[viewpoint]) > y(current) && y(feet[frontier]) < y(current) && viewpointCost + 1 < best)
+            return viewpoint;
         return frontier != 0 ? frontier : viewpoint;
+    }
+
+    private double timberFrontierCost(int at, long current, double dx, double dz, double biasX, double biasZ) {
+        long foot = feet[at];
+        int rise = y(foot) - y(current), dip = y(current) - routeLow[at];
+        // A connected high shoulder and unsearched area beat another trip into
+        // bare low ground. Neither a detour nor a descent is forbidden.
+        return depth[at] * 0.55 - dx * biasX - dz * biasZ + timberCoverage(foot) * 0.8
+            - 2.15 * Math.min(3, Math.max(0, rise)) + 2.6 * Math.max(0, -rise) + 1.8 * Math.max(0, dip - 1);
     }
 
     private boolean foodBandAllows(int edge, int to, int tick, int floor, boolean connector) {
@@ -476,6 +584,7 @@ final class AgentOrdinaryRoute {
         grounded[victim] = false;
         visited[victim] = looked[victim] = forageSeen[victim] = 0;
         foodVisited[victim] = foodLooked[victim] = false;
+        timberVisited[victim] = timberLooked[victim] = false;
         revision++;
         return victim;
     }

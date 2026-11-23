@@ -12,6 +12,28 @@ final class AgentOrdinaryRouteTest {
     private final AgentOrdinaryRoute route = new AgentOrdinaryRoute();
 
     @Test
+    void exhaustedScoutCanReturnToADistinctUnexaminedJunctionWithoutRepeatingItsLook() {
+        long start = cell(0, 64, 0), mid = cell(1, 64, 0), tip = cell(2, 64, 0);
+        chain(start, mid, tip);
+        route.contact(cell(6, 63, 0), 1); // Another remembered place, but no connecting path.
+        route.explore(1, 0);
+        route.plan(start, 1);
+        route.landed(start, mid, 2);
+        route.landed(mid, tip, 3);
+        route.plan(tip, 3);
+        assertEquals(NO_CELL, route.hop(0), "first inspect the present view");
+        route.consumeLook(tip);
+        route.plan(tip, 4);
+        assertEquals(start, route.endpoint());
+        assertEquals(mid, route.hop(0));
+        route.landed(tip, mid, 5);
+        route.landed(mid, start, 6);
+        route.consumeLook(start);
+        route.plan(start, 7);
+        assertEquals(NO_CELL, route.hop(0), "do not bounce back to the same spent perspective");
+    }
+
+    @Test
     void optionalFoodVantageNeedsAWitnessedRouteAndCannotReplaceTheCurrentIntent() {
         long start = cell(0, 70, 0), ahead = cell(1, 70, 0), field = cell(2, 69, 0);
         chain(start, ahead);

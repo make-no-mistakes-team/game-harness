@@ -155,7 +155,10 @@ final class AgentOrdinaryRoute {
 
     void consumeLook(long foot) {
         int node = find(foot);
-        if (node != 0) looked[node] = intent;
+        if (node != 0 && looked[node] != intent) {
+            looked[node] = intent;
+            revision++;
+        }
     }
 
     long endpoint() { return endpoint; }
@@ -193,8 +196,9 @@ final class AgentOrdinaryRoute {
         Arrays.fill(depth, 1, nodes + 1, (short) -1);
         depth[start] = 0;
         queue[0] = (short) start;
-        int tail = 1, frontier = 0, goal = 0;
+        int tail = 1, frontier = 0, goal = 0, viewpoint = 0;
         double best = Double.POSITIVE_INFINITY;
+        double viewpointCost = Double.POSITIVE_INFINITY;
         for (int head = 0; head < tail; head++) {
             int at = queue[head];
             long foot = feet[at];
@@ -212,6 +216,16 @@ final class AgentOrdinaryRoute {
                     frontier = at;
                     best = score;
                 }
+            } else if (!directed && looked[start] == intent && grounded[at] && looked[at] != intent) {
+                // All nearby treads may already be walked. A dry junction we
+                // crossed without looking can expose new ground from a different
+                // angle. Do not turn around for another view one block away.
+                int dx = x(foot) - x(current), dz = z(foot) - z(current);
+                double cost = depth[at] + 2 * Math.max(0, y(foot) - y(current));
+                if (dx * dx + dz * dz >= 4 && cost < viewpointCost) {
+                    viewpoint = at;
+                    viewpointCost = cost;
+                }
             }
             int first = at * SLOTS;
             for (int edge = first; edge < first + SLOTS; edge++) {
@@ -223,7 +237,7 @@ final class AgentOrdinaryRoute {
             }
         }
         if (goal == 0 && keep) return; // A new view must not churn an outstanding proxy.
-        int end = goal == 0 ? frontier : goal;
+        int end = goal != 0 ? goal : frontier != 0 ? frontier : viewpoint;
         if (end == 0) {
             clearSuffix();
             examinedRevision = revision;

@@ -164,6 +164,80 @@ final class AgentOrdinaryRouteTest {
     }
 
     @Test
+    void failedFoodEgressPaysForOneBacktrackInsteadOfDescendingToReplayBothRises() {
+        long start = cell(0, 50, 0), lower = cell(1, 49, 0), dryBranch = cell(2, 48, 0);
+        long shoulder = cell(0, 51, -1), apex = cell(0, 52, -2);
+        chain(start, lower, dryBranch);
+        chain(start, shoulder, apex);
+        route.landed(start, lower, 1);
+        route.landed(lower, dryBranch, 1);
+        route.exploreFood(1, 0);
+        route.plan(start, 1);
+        route.foodEgressLanded(start, shoulder, 1);
+        route.consumeLook(shoulder);
+        assertTrue(route.foodEgressLanded(shoulder, apex, 1));
+        route.consumeLook(apex);
+
+        route.plan(apex, 2);
+        assertEquals(shoulder, route.hop(0), "back up to the last landed shoulder, even against the search heading");
+        route.landed(apex, shoulder, 3);
+        route.consumeLook(shoulder);
+        route.plan(shoulder, 3);
+        assertEquals(NO_CELL, route.hop(0), "an unchanged dry branch cannot carry the scout down to the old start");
+        assertFalse(route.foodEgressLanded(shoulder, apex, 4), "replaying the same rise does not buy another excursion");
+        route.plan(apex, 4);
+        assertEquals(NO_CELL, route.hop(0));
+    }
+
+    @Test
+    void failedFoodEgressCanStillFollowANewWitnessedExitOrFreshForagingGround() {
+        long shoulder = cell(0, 51, -1), apex = cell(0, 52, -2);
+        long stair = cell(-1, 50, -1), flank = cell(-2, 51, -1), exit = cell(-3, 52, -1);
+        chain(shoulder, apex);
+        route.exploreFood(1, 0);
+        route.foodEgressLanded(shoulder, apex, 1);
+        route.consumeLook(apex);
+        route.plan(apex, 2);
+        route.landed(apex, shoulder, 3);
+        route.consumeLook(shoulder);
+
+        chain(shoulder, stair, flank);
+        route.observe(flank, exit, 4);
+        route.plan(shoulder, 4);
+        assertEquals(NO_CELL, route.hop(0), "an unwalked lower connector does not pay for the detour");
+        route.landed(shoulder, stair, 5);
+        route.plan(shoulder, 5);
+        assertEquals(stair, route.hop(0), "a walked lower connector may lead to a distinct route back up");
+        assertEquals(exit, route.endpoint());
+
+        route.retire(flank, exit, Integer.MAX_VALUE);
+        route.witnessForagingTop(stair, 6);
+        route.plan(shoulder, 6);
+        assertEquals(stair, route.hop(0), "a fresh foraging destination also justifies a descent");
+    }
+
+    @Test
+    void flatAndUnlandedFoodEgressDoNotCreateAHighWaterMark() {
+        long start = cell(0, 50, 0), flat = cell(1, 50, 0), lower = cell(2, 49, 0);
+        chain(start, flat, lower);
+        route.observe(flat, cell(1, 51, -1), 1);
+        route.exploreFood(1, 0);
+        assertFalse(route.foodEgressLanded(start, flat, 1));
+        route.observe(flat, lower, 102); // Only the attempted rise has gone out of sight.
+        route.plan(flat, 102);
+        assertEquals(lower, route.hop(0), "an aimed rise without landing does not restrict the ordinary band");
+    }
+
+    @Test
+    void aSpentFoodEgressDoesNotRetryForConsumedStockButCanRetryWithANewPickOrLight() {
+        var spent = new AgentProgress.FoodEgressStock(35, 35, 0, 0);
+        assertFalse(new AgentProgress.FoodEgressStock(0, 0, 0, 0).improves(spent));
+        assertFalse(new AgentProgress.FoodEgressStock(35, 35, 0, 0).improves(spent));
+        assertTrue(new AgentProgress.FoodEgressStock(131, 131, 0, 0).improves(spent));
+        assertTrue(new AgentProgress.FoodEgressStock(35, 35, 0, 1).improves(spent));
+    }
+
+    @Test
     void routesAroundAnOpenUThroughWitnessedSidewaysAndAwayTreads() {
         long start = cell(0, 64, 0), goal = cell(2, 64, 0);
         long[] dogleg = {

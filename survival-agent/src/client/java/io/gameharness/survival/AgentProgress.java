@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.function.BiPredicate;
@@ -546,6 +547,7 @@ final class AgentProgress {
     private double foodTravelArrival;
     private AgentResourceStance foodTravelBand;
     private String lastMealReceipt, lastFoodPickup;
+    private String healingDetail, displayedHealing;
     private BlockPos lastFoodVantage;
     private Forage forage;
     private Entity forageEntity;
@@ -5200,6 +5202,11 @@ final class AgentProgress {
                 int needed = AgentMineLight.tripTorches(unlit + AgentMineLight.routeSteps(trail.getLast().getY(), depth));
                 if (torches < needed && (atSupplyStop && workOre(resource, REACH - 0.35, false)
                     || craftTorches(needed) || prepareLight(needed, atSupplyStop))) return;
+                // A table in reach is useful for lighting this stop, but it will
+                // not be in reach underground. Pack our own table before leaving
+                // and take a reachable low log if the trip's handles are still short.
+                if (ordinaryCaveDrops && atSupplyStop && (!has(table.item, 1) && fieldBench.pack()
+                        || fieldWood.step(needed, true))) return;
             }
             resumeTunnel();
             return;
@@ -6014,6 +6021,13 @@ final class AgentProgress {
         timberCollectionFace = null;
     }
 
+    record FoodEgressStock(int pickUses, int stoneUses, int deepUses, int usableLights) {
+        boolean improves(FoodEgressStock spent) {
+            return pickUses > spent.pickUses || stoneUses > spent.stoneUses || deepUses > spent.deepUses
+                || usableLights > spent.usableLights;
+        }
+    }
+
     /** The supply caller retains its job only until an ordinary alternative or a physical refusal. */
     private final class SupplyEgress {
         private enum Proof {
@@ -6027,18 +6041,23 @@ final class AgentProgress {
         private static final int OUTLINE_LOOK_TICKS = 46, OUTLINE_REAIM_TICKS = 23;
         private static final int LIGHT_SIDE_TICKS = 18, LIGHT_REAR_TICKS = 26, LIGHT_CONTACT_TICKS = 20;
         private static final int LIGHT_RECEIPT_TICKS = 14, LIGHT_RESERVE = 1;
+        private static final int FOOD_REFUSALS = 24;
         private static final Predicate<ItemStack> ANDESITE_FOOTHOLD = item(Items.ANDESITE), DIRT_FOOTHOLD = item(Items.DIRT);
         private static final Predicate<ItemStack> EMPTY_HAND = ItemStack::isEmpty;
         private static final float SURVEY_PITCH = -42;
         private final List<BlockPos> walked = new ArrayList<>();
+        private final LinkedHashMap<BlockPos, FoodRefusal> foodRefusals = new LinkedHashMap<>();
+        private record FoodRefusal(FoodEgressStock stock, boolean terminal) {}
         private final AgentSupplyEgress order = new AgentSupplyEgress();
         private final AgentSupplyEgress.OutlinePassage outline = new AgentSupplyEgress.OutlinePassage();
         private AgentSupplyEgress.ApexAccess restoredApex;
         private final BiPredicate<BlockPos, Direction> woodlandLane = this::woodlandLaneClear;
         private final Predicate<BlockPos> witnessedDryFlood = this::witnessedDryFloodCell;
         private boolean firstStoneExit, foodExit;
+        private int foodNewHighY = Integer.MIN_VALUE;
         private ClientWorld world;
         private BlockPos openFoot, unknownFoot, to, armedCut, packedBench;
+        private BlockPos foodStart, foodContinuation;
         private BlockPos floodOpening, floodWater;
         private Vec3d floor, alternateFloor, aim, riseLook, buildLow, buildHigh, reverseLeft, reverseRight, outlineCutPoint;
         private Vec3d lightNeed, lightLook;
@@ -6069,6 +6088,11 @@ final class AgentProgress {
         void observeBreak(BlockPos position, BlockState material) {
             if (world != c.world) return;
             order.observeBreak(position);
+            if (!foodActive() && !foodRefusals.isEmpty()) foodRefusals.keySet().removeIf(foot -> {
+                int rise = position.getY() - foot.getY();
+                return rise >= -1 && rise <= 3
+                    && Math.abs(position.getX() - foot.getX()) + Math.abs(position.getZ() - foot.getZ()) <= 1;
+            });
             if (!position.equals(armedCut)) return;
             if (handClearSince >= 0 && !body.supplyHandClearanceBroke(position, material)) return;
             var apex = outline.apexAccess();
@@ -6109,6 +6133,7 @@ final class AgentProgress {
             if (!order.blocksFloodWork(foot, tick)) {
                 openFoot = foot;
                 navigator.rememberForagingFoot(foot, tick);
+                resetFoodSearch();
             }
         }
 
@@ -6119,12 +6144,29 @@ final class AgentProgress {
         boolean foodActive() { return foodExit && active(); }
 
         boolean foodCrossing() {
-            return foodActive() && driving != 0
+            return active() && !mineDeparture && driving != 0
                 && (!c.player.isOnGround() || !c.player.getBlockPos().equals(order.foot()));
         }
 
         void releaseFood() {
             if (foodActive()) yieldToWorkshop();
+            foodContinuation = null;
+        }
+
+        void resetFoodSearch() {
+            foodRefusals.clear();
+            foodStart = foodContinuation = null;
+            foodNewHighY = Integer.MIN_VALUE;
+        }
+
+        boolean resumeFoodSurface(boolean freshScan) {
+            if (active()) return seekFoodSurface();
+            if (world != c.world || (!freshScan && foodContinuation == null) || !hands.stableCraftFooting())
+                return false;
+            BlockPos foot = c.player.getBlockPos();
+            if (foot.equals(foodContinuation)) return seekFoodSurface();
+            var spent = freshScan ? foodRefusals.get(foot) : null;
+            return spent != null && foodStock().improves(spent.stock()) && seek("foraging ground", true, true);
         }
 
         boolean seekFoodSurface() {
@@ -6134,6 +6176,7 @@ final class AgentProgress {
                 if (driving != 0 || outline.apexAccess() != null || restoredApex != null)
                     changedCrossingIntent = true;
                 else if (order.carriedSupport() != null) resurveyTakeoff();
+                beginFoodAttempt(order.foot());
             }
             foodExit = true;
             firstStoneExit = false;
@@ -6141,6 +6184,10 @@ final class AgentProgress {
         }
 
         private boolean seek(String need, boolean forFood) {
+            return seek(need, forFood, false);
+        }
+
+        private boolean seek(String need, boolean forFood, boolean improvedStock) {
             if (c.player.hasVehicle()) return false;
             boolean grounded = dryFieldFooting();
             if (world != c.world) {
@@ -6159,11 +6206,48 @@ final class AgentProgress {
                         != (AgentBody.SUPPLY_ROOF | AgentBody.SUPPLY_WALL)) return false;
             }
             if (grounded) order.recheckFloods(standing, tick, witnessedDryFlood);
+            if (forFood && grounded && !order.blocksFloodWork(standing, tick)) {
+                var spent = foodRefusals.get(standing);
+                if (improvedStock || standing.equals(foodContinuation)) order.reconsiderDryRefusal(standing);
+                else if (spent != null && (!spent.terminal() || order.refusal(standing, tick) != null)) return false;
+            }
             if (!order.begin(standing, grounded, tick)) return false;
             start(c.player.getHorizontalFacing(), tick + JOB_TICKS, false);
             foodExit = forFood;
+            if (forFood) beginFoodAttempt(standing);
             surveyActivity = "supply egress: surveying the rendered roof and opening for " + need;
             return step();
+        }
+
+        private void beginFoodAttempt(BlockPos start) {
+            foodStart = start;
+            foodContinuation = null;
+            foodNewHighY = Integer.MIN_VALUE;
+        }
+
+        private FoodEgressStock foodStock() {
+            int pick = 0, stone = 0, deep = 0;
+            var inventory = c.player.getInventory();
+            for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
+                ItemStack stack = inventory.getStack(slot);
+                if (!stack.isIn(ItemTags.PICKAXES)) continue;
+                int uses = stack.getMaxDamage() - stack.getDamage();
+                pick += uses;
+                if (DEEP_PICK.test(stack)) deep += uses;
+                if (RETURNABLE_PICKS.test(stack)) stone += uses;
+            }
+            return new FoodEgressStock(pick, stone, deep, Math.max(0, hands.count(TORCH) - LIGHT_RESERVE));
+        }
+
+        private void spendFoodAttempt(BlockPos terminal, boolean timedOut) {
+            if (order.refusal(terminal, tick) == null) return;
+            var stock = foodStock();
+            if (foodStart != null && !foodStart.equals(terminal)) foodRefusals.put(foodStart, new FoodRefusal(stock, false));
+            foodRefusals.put(terminal, new FoodRefusal(stock, true));
+            while (foodRefusals.size() > FOOD_REFUSALS) foodRefusals.pollFirstEntry();
+            // A new landed high can retain the work once from the current
+            // support. A stalled aim, flat crossing, or repeated rise cannot.
+            if (timedOut && terminal.getY() == foodNewHighY && settled(terminal)) foodContinuation = terminal;
         }
 
         boolean beginMineDeparture(BlockPos standing, Direction direction, int end) {
@@ -6235,7 +6319,17 @@ final class AgentProgress {
                 body.pauseWork();
                 return true;
             }
+            BlockPos priorFoodFoot = foodExit ? order.foot() : null;
+            boolean foodAtBudget = foodExit && (tick >= deadline
+                || driving == 0 && outline.active() && !outline.withinTime(tick));
             boolean consumed = workStep();
+            if (priorFoodFoot != null) {
+                if (!active()) spendFoodAttempt(priorFoodFoot, foodAtBudget);
+                else if (!priorFoodFoot.equals(order.foot()) && order.carriedSupport() != null
+                        && navigator.rememberFoodEgressLanding(priorFoodFoot, order.foot(), tick)
+                        && foodStart != null && order.foot().getY() > foodStart.getY())
+                    foodNewHighY = order.foot().getY();
+            }
             if (active()) stallGuard.navigationWork();
             return consumed;
         }
@@ -12543,17 +12637,20 @@ final class AgentProgress {
         appleStand.reset();
         foodCanopy.reset();
         supplyEgress.releaseFood();
+        supplyEgress.resetFoodSearch();
         mealUntil = mealRetry = mealQuietUntil = 0;
         emergencyMealJob = 0;
         mealItem = null;
         mealHealth = Float.NaN;
         lastMealReceipt = lastFoodPickup = null;
+        healingDetail = displayedHealing = null;
         lastFoodVantage = null;
     }
 
     private void beginOrdinaryHealing() {
         healingOwnsWork = true;
         navigator.resetFoodSearch();
+        supplyEgress.resetFoodSearch();
         if (ordinaryApproach != null) body.stopHorizonTravel(ordinaryApproach);
         ordinaryApproach = null;
         body.pauseWork();
@@ -12567,7 +12664,10 @@ final class AgentProgress {
     }
 
     private void healingStatus(String detail) {
-        status = "healing: " + detail + "; hunger " + c.player.getHungerManager().getFoodLevel()
+        // Movement can keep its current activity for several ticks. Its last
+        // public description is not a new activity to nest inside itself.
+        if (detail != displayedHealing) healingDetail = detail;
+        status = displayedHealing = "healing: " + healingDetail + "; hunger " + c.player.getHungerManager().getFoodLevel()
             + "; HP " + c.player.getHealth() + "/" + c.player.getMaxHealth()
             + (lastFoodVantage == null ? "" : "; last scout landing " + lastFoodVantage.toShortString())
             + (lastFoodPickup == null ? "" : "; last pickup " + lastFoodPickup)
@@ -12695,7 +12795,10 @@ final class AgentProgress {
             return recovering;
         }
         if (recovering && foodCanopy.active()) return foodCanopy.step();
-        if (recovering && supplyEgress.foodActive() && stepFoodEgress()) return true;
+        if (recovering && supplyEgress.resumeFoodSurface(scanned)) {
+            healingStatus(status);
+            return true;
+        }
         if (recovering && navigateFood(null, 0) == Result.BLOCKED && scanned && navigator.foodFrontierExhausted()
                 && hands.stableCraftFooting()) {
             BlockPos foot = player.getBlockPos();
@@ -12715,7 +12818,7 @@ final class AgentProgress {
     }
 
     private boolean stepFoodEgress() {
-        if (!supplyEgress.step()) return false;
+        if (!supplyEgress.seekFoodSurface()) return false;
         healingStatus(status);
         return true;
     }

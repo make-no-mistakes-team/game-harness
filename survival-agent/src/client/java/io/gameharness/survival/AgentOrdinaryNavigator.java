@@ -236,6 +236,12 @@ final class AgentOrdinaryNavigator {
 
     void resetFoodSearch() { route.resetFoodSearch(); }
 
+    /** The supply owner already verified the landing; remember it even if its lane is not ordinarily visible. */
+    boolean rememberFoodEgressLanding(BlockPos from, BlockPos to, int tick) {
+        if (world != client.world || player != client.player) reset();
+        return route.foodEgressLanded(from.asLong(), to.asLong(), tick);
+    }
+
     /** A settled canopy descent or completed surface egress already witnessed this footing. */
     void rememberForagingFoot(BlockPos foot, int tick) {
         if (world != client.world || player != client.player) reset();

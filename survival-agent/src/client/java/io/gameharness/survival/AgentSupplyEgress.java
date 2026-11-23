@@ -134,6 +134,12 @@ final class AgentSupplyEgress {
         return refusal.detail();
     }
 
+    /** A new dry work premise cannot clear an established flood veto. */
+    void reconsiderDryRefusal(BlockPos standing) {
+        var refusal = refusals.get(standing);
+        if (refusal != null && refusal.floodPremise() == null) refusals.remove(standing);
+    }
+
     boolean begin(BlockPos standing, boolean grounded, int tick) {
         if (!grounded || active() || refusal(standing, tick) != null || blocksFloodWork(standing, tick)) return false;
         landed(standing);

@@ -11,7 +11,7 @@ import java.util.Arrays;
 /** Directed, rolling dry-foot memory. Only its adapter can see, settle on, or drive an edge. */
 final class AgentOrdinaryRoute {
     private static final int NODES = 192, SLOTS = 12, SIGHT_TICKS = 100;
-    private static final int UNCUED_FOOD_DROP = 2;
+    private static final int UNCUED_FOOD_DROP = 2, EGRESS_SCOUT_DROP = 1;
     private final long[] feet = new long[NODES + 1];
     private final short[] index = new short[512];
     private final short[] edges = new short[(NODES + 1) * SLOTS];
@@ -32,9 +32,9 @@ final class AgentOrdinaryRoute {
     private int nodes, intent = 1, plans, revision, examinedRevision, examinedTick, examinedRetry;
     private int cursor, length;
     private long origin = NO_CELL, endpoint = NO_CELL;
-    private long forageFoot = NO_CELL;
-    private int firstFoodY = Integer.MIN_VALUE;
-    private boolean directed, exact, foodSearch, returningForFood;
+    private long forageFoot = NO_CELL, egressShoulder = NO_CELL;
+    private int firstFoodY = Integer.MIN_VALUE, egressHighY = Integer.MIN_VALUE;
+    private boolean directed, exact, foodSearch, returningForFood, viaFoodConnector;
     private double goalX, goalZ, radiusSquared, minY, maxY, axisX, axisZ;
 
     void clear() {
@@ -83,13 +83,37 @@ final class AgentOrdinaryRoute {
         Arrays.fill(foodVisited, false);
         Arrays.fill(foodLooked, false);
         firstFoodY = Integer.MIN_VALUE;
+        clearFoodEgress();
         returningForFood = false;
         if (foodSearch) clearSuffix();
+    }
+
+    void clearFoodEgress() {
+        if (egressHighY == Integer.MIN_VALUE) return;
+        egressHighY = Integer.MIN_VALUE;
+        egressShoulder = NO_CELL;
+        if (foodSearch) clearSuffix();
+    }
+
+    /** Called only for a completed supply crossing, not a target or a visible lip. */
+    boolean foodEgressLanded(long from, long to, int tick) {
+        int source = node(from, tick, to), landing = node(to, tick, from);
+        grounded[source] = grounded[landing] = true;
+        foodVisited[source] = foodVisited[landing] = true;
+        if (foodSearch) clearSuffix();
+        if (y(to) <= y(from) || y(to) <= egressHighY) return false;
+        egressHighY = y(to);
+        egressShoulder = from;
+        // Pay for at most one look back into the junction after a genuinely
+        // higher landing; the prior look may predate the opened passage.
+        foodLooked[source] = false;
+        return true;
     }
 
     /** Record an occupied resource habitat, not merely a sighting of one across a gap. */
     void rememberForagingFoot(long foot, int tick) {
         contact(foot, tick);
+        clearFoodEgress();
         if (forageFoot == foot) return;
         if (returningForFood) clearSuffix();
         if (forageFoot == NO_CELL || y(forageFoot) != y(foot)) revision++;
@@ -271,6 +295,8 @@ final class AgentOrdinaryRoute {
         markVisited(start);
         boolean returning = returningForFood();
         int scoutFloor = foodSearch && !returning ? foodFloor() : Integer.MIN_VALUE;
+        boolean keepingEgress = foodSearch && !returning && egressHighY != Integer.MIN_VALUE;
+        if (keepingEgress) scoutFloor = Math.max(scoutFloor, Math.min(egressHighY - EGRESS_SCOUT_DROP, y(current)));
         boolean keep = remaining() > 0 && suffixUsable(current, tick, scoutFloor);
         if (keep && (exact || !directed || examinedRevision == revision)) return;
         if (exact && endpoint == current) return;
@@ -281,22 +307,44 @@ final class AgentOrdinaryRoute {
         examinedTick = tick;
         examinedRetry = Integer.MAX_VALUE;
 
+        int end = findEndpoint(current, start, tick, scoutFloor, returning, keepingEgress, false);
+        boolean connector = end == 0 && keepingEgress && looked(start);
+        if (connector) end = findEndpoint(current, start, tick, scoutFloor, false, true, true);
+        boolean reachedGoal = end != 0 && (returning ? feet[end] == forageFoot : fits(feet[end]));
+        if (keep && !reachedGoal) return; // A new view must not churn an outstanding proxy.
+        if (end == 0) {
+            clearSuffix();
+            examinedRevision = revision;
+            return;
+        }
+        endpoint = feet[end];
+        exact = reachedGoal;
+        viaFoodConnector = connector;
+        cursor = 0;
+        length = depth[end];
+        for (int step = length - 1; step >= 0; step--) {
+            suffix[step] = feet[end];
+            end = parent[end];
+        }
+        plans++;
+    }
+
+    private int findEndpoint(long current, int start, int tick, int scoutFloor, boolean returning,
+                             boolean keepingEgress, boolean connector) {
         // A breadth-first walk over positively attested edges. No destination heuristic
         // prunes sideways or away legs, and disconnected witnesses cannot become a route.
         Arrays.fill(depth, 1, nodes + 1, (short) -1);
         depth[start] = 0;
         queue[0] = (short) start;
-        int tail = 1, frontier = 0, goal = 0, viewpoint = 0;
+        int tail = 1, frontier = 0, viewpoint = 0;
         double best = Double.POSITIVE_INFINITY;
         double viewpointCost = Double.POSITIVE_INFINITY;
         for (int head = 0; head < tail; head++) {
             int at = queue[head];
             long foot = feet[at];
-            if (returning ? foot == forageFoot : fits(foot)) {
-                goal = at;
-                break;
-            }
-            if (!returning && !(foodSearch ? foodVisited[at] : visited[at] == intent)) {
+            if (returning ? foot == forageFoot : fits(foot)) return at;
+            if (!returning && !(foodSearch ? foodVisited[at] : visited[at] == intent)
+                    && (!connector || y(foot) >= egressHighY || freshForagingTop(at, tick))) {
                 double dx = x(foot) - x(current), dz = z(foot) - z(current);
                 double score = directed
                     ? Math.hypot(x(foot) + 0.5 - goalX, z(foot) + 0.5 - goalZ)
@@ -307,14 +355,14 @@ final class AgentOrdinaryRoute {
                     frontier = at;
                     best = score;
                 }
-            } else if (!directed && !returning && looked(start) && grounded[at] && !looked(at)
-                    && (!foodSearch || y(foot) >= y(current) || freshForagingTop(at, tick))) {
-                // All nearby treads may already be walked. A dry junction we
-                // crossed without looking can expose new ground from a different
-                // angle. Do not turn around for another view one block away.
+            } else if (!directed && !returning && !connector && looked(start) && grounded[at] && !looked(at)
+                    && (keepingEgress ? foot == egressShoulder
+                        : !foodSearch || y(foot) >= y(current) || freshForagingTop(at, tick))) {
+                // Ordinary scouting requires a distinct viewpoint. After a
+                // failed climb, only the last high shoulder earns that revisit.
                 int dx = x(foot) - x(current), dz = z(foot) - z(current);
                 double cost = depth[at] + 2 * Math.max(0, y(foot) - y(current));
-                if (dx * dx + dz * dz >= 4 && cost < viewpointCost) {
+                if ((keepingEgress ? at != start : dx * dx + dz * dz >= 4) && cost < viewpointCost) {
                     viewpoint = at;
                     viewpointCost = cost;
                 }
@@ -322,7 +370,8 @@ final class AgentOrdinaryRoute {
             int first = at * SLOTS;
             for (int edge = first; edge < first + SLOTS; edge++) {
                 short next = edges[edge];
-                if (next == 0 || depth[next] >= 0 || outsideScoutBand(next, tick, scoutFloor)) continue;
+                if (next == 0 || depth[next] >= 0 || !foodBandAllows(edge, next, tick, scoutFloor, connector))
+                    continue;
                 if (!usable(edge, tick)) {
                     if (seen[edge] == Integer.MAX_VALUE) examinedRetry = Math.min(examinedRetry, retryAfter[edge]);
                     continue;
@@ -332,31 +381,24 @@ final class AgentOrdinaryRoute {
                 queue[tail++] = next;
             }
         }
-        if (goal == 0 && keep) return; // A new view must not churn an outstanding proxy.
-        int end = goal != 0 ? goal : frontier != 0 ? frontier : viewpoint;
-        if (end == 0) {
-            clearSuffix();
-            examinedRevision = revision;
-            return;
-        }
-        endpoint = feet[end];
-        exact = end == goal;
-        cursor = 0;
-        length = depth[end];
-        for (int step = length - 1; step >= 0; step--) {
-            suffix[step] = feet[end];
-            end = parent[end];
-        }
-        plans++;
+        return frontier != 0 ? frontier : viewpoint;
+    }
+
+    private boolean foodBandAllows(int edge, int to, int tick, int floor, boolean connector) {
+        if (!outsideScoutBand(to, tick, floor)) return true;
+        // Below the scout band, use settled legs only, and only as a connector
+        // to another high outlet or fresh habitat; lower rock is not a goal.
+        return connector && seen[edge] == Integer.MAX_VALUE;
     }
 
     private boolean suffixUsable(long from, int tick, int scoutFloor) {
+        if (viaFoodConnector && y(endpoint) < egressHighY && !freshForagingTop(find(endpoint), tick)) return false;
         for (int i = cursor; i < length; i++) {
             long to = suffix[i];
             int n = find(from), slot = AgentRouteGraph.slot(from, to);
             int edge = n * SLOTS + slot;
             if (n == 0 || slot < 0 || edges[edge] == 0 || feet[edges[edge]] != to || !usable(edge, tick)
-                    || outsideScoutBand(edges[edge], tick, scoutFloor))
+                    || !foodBandAllows(edge, edges[edge], tick, scoutFloor, viaFoodConnector))
                 return false;
             from = to;
         }
@@ -372,6 +414,7 @@ final class AgentOrdinaryRoute {
         cursor = length = 0;
         endpoint = NO_CELL;
         exact = false;
+        viaFoodConnector = false;
         examinedRevision = -1;
     }
 

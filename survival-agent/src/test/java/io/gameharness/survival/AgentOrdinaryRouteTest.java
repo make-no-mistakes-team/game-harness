@@ -12,6 +12,18 @@ final class AgentOrdinaryRouteTest {
     private final AgentOrdinaryRoute route = new AgentOrdinaryRoute();
 
     @Test
+    void recheckingAReturnEdgeDoesNotConsumeTheWalkHome() {
+        long home = cell(0, 64, 0), ledge = cell(1, 65, 0);
+        chain(home, ledge);
+        route.destination(0.5, 0.5, 0.4, 64, 64);
+        route.plan(ledge, 10);
+        route.rememberReturn(ledge, home, 10);
+        assertEquals(home, route.hop(0));
+        route.landed(ledge, home, 19);
+        assertEquals(0, route.remaining());
+    }
+
+    @Test
     void aFoodScoutDoesNotTurnBackAlongItsLastEdgeForAnEquallyWorkableFrontier() {
         long start = cell(0, 71, 0), perch = cell(1, 72, 0);
         long ahead = cell(2, 72, 0), alternate = cell(-1, 71, 0);

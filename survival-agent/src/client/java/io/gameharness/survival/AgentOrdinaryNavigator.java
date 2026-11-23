@@ -7,6 +7,7 @@ import static io.gameharness.survival.AgentRouteGraph.y;
 import static io.gameharness.survival.AgentRouteGraph.z;
 
 import java.util.Arrays;
+import java.util.List;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.world.ClientWorld;
@@ -23,8 +24,10 @@ final class AgentOrdinaryNavigator {
 
     private static final int RANGE = 5, HEIGHT = 3, SIDE = 2 * RANGE + 1;
     private static final int VIEW_CELLS = SIDE * SIDE * (2 * HEIGHT + 1);
-    private static final int SIGHT_RAYS = 48, SIGHT_NODES = 48;
-    private static final int LOOK_TICKS = 34, RETRY_TICKS = 24, EDGE_TICKS = 54;
+    private static final int SIGHT_RAYS = 48, SIGHT_NODES = 48, RAY_RESERVE = 12;
+    // Up to two first-hit rays on each of twelve adjacent supports, plus outline proof.
+    private static final int DIRECTED_RAYS = RAY_RESERVE + 24 + 8;
+    private static final int LOOK_TICKS = 34, RETRY_TICKS = 24, EDGE_TICKS = 54, STANCE_TICKS = 52, GRADE_AGE = 12;
     private static final float TRAVEL_PITCH = 31;
     private static final int[] GRADES = {0, 1, -1};
     private static final Direction[] BEARINGS = {Direction.EAST, Direction.WEST, Direction.SOUTH, Direction.NORTH};
@@ -47,12 +50,18 @@ final class AgentOrdinaryNavigator {
     private long goalCell = NO_CELL;
     private BlockPos from, to;
     private Direction bearing;
-    private long rendered = -1, lookAt = NO_CELL, adjustAt = NO_CELL;
-    private int lastScan = -100, lookSince, lastMotor = -100, edgeSince, adjustSince;
+    private Vec3d gradeAim;
+    private long rendered = -1, lookAt = NO_CELL, lookFrame, lookCue = NO_CELL, adjustAt = NO_CELL;
+    private long recallAt = NO_CELL, recalled = NO_CELL, gradeFrame = -1;
+    private int lastScan = -100, lookSince, lastEdgeAction = -100, edgeSince, adjustSince, gradeAt = -100;
     private int unavailableSince = -1, lastProgress;
     private float lookYaw, lookPitch;
     private double bestAlong;
-    private boolean crossing;
+    private boolean crossing, foodScoutHandoff;
+    private AgentBody.EdgeStance edgeStance;
+    private BlockPos stanceSupport;
+    private int stanceSince;
+    private boolean stanceRefused;
     private Arrival arrival;
     private String stage = "idle", lastVeto = "";
 
@@ -67,11 +76,15 @@ final class AgentOrdinaryNavigator {
         route.clear();
         job = null;
         target = null;
-        goalCell = lookAt = adjustAt = NO_CELL;
+        goalCell = lookAt = lookCue = adjustAt = recallAt = recalled = NO_CELL;
         arrival = null;
+        edgeStance = null;
+        stanceSupport = null;
+        stanceRefused = false;
         rendered = -1;
-        lastMotor = lastScan = -100;
+        lastEdgeAction = lastScan = -100;
         unavailableSince = -1;
+        foodScoutHandoff = false;
         stage = "idle";
         lastVeto = "";
         releaseEdge();
@@ -79,10 +92,12 @@ final class AgentOrdinaryNavigator {
 
     boolean driving() {
         return crossing && player == client.player && world == client.world
-            && body.actionTick() - lastMotor <= 1;
+            && body.actionTick() - lastEdgeAction <= 1;
     }
 
     boolean driving(Job owner) { return job == owner && driving(); }
+
+    boolean foodScoutHandoff() { return foodScoutHandoff; }
 
     Arrival takeArrival() {
         Arrival value = arrival;
@@ -103,6 +118,25 @@ final class AgentOrdinaryNavigator {
         remember(from, to, body.actionTick());
     }
 
+    /** Restore only a look cue; no saved trail entry becomes a graph edge or a landed receipt. */
+    void recallTrail(List<BlockPos> observedTrail, BlockPos grounded) {
+        if (world != client.world || player != client.player) reset();
+        recallAt = recalled = NO_CELL;
+        if (grounded == null || !body.ordinaryRoutePhysicalContact(grounded)) return;
+        BlockPos predecessor = recalledPredecessor(observedTrail, grounded);
+        if (predecessor != null) {
+            recallAt = grounded.asLong();
+            recalled = predecessor.asLong();
+        }
+    }
+
+    static BlockPos recalledPredecessor(List<BlockPos> trail, BlockPos grounded) {
+        int at = trail.lastIndexOf(grounded);
+        if (at <= 0) return null;
+        BlockPos before = trail.get(at - 1);
+        return before != null && AgentRouteGraph.cardinalStep(grounded.asLong(), before.asLong()) ? before : null;
+    }
+
     Result step(Job requested, Vec3d destination, double arrival, int tick) {
         return step(requested, destination, arrival, destination == null ? 0 : destination.y - 1.05,
             destination == null ? 0 : destination.y + 1.05, tick);
@@ -110,6 +144,7 @@ final class AgentOrdinaryNavigator {
 
     Result step(Job requested, Vec3d destination, double arrivalRadius, double minFootY, double maxFootY, int tick) {
         if (world != client.world || player != client.player) reset();
+        foodScoutHandoff = false;
         int action = body.actionTick();
         boolean changed = changed(requested, destination, arrivalRadius, minFootY, maxFootY);
         // A higher-level goal cannot switch inputs halfway across a short dry jump/drop.
@@ -128,7 +163,7 @@ final class AgentOrdinaryNavigator {
 
         // Another owner may have walked, been pushed, used a GUI, or taken a protected fall
         // during the gap. A route suffix still exists, but no new traversal can be inferred.
-        if (from != null && action - lastMotor > 1) releaseEdge();
+        if (from != null && action - lastEdgeAction > 1) releaseEdge();
         BlockPos foot = player.getBlockPos();
         boolean grounded = body.ordinaryRouteContact(foot);
         if (from != null && grounded && !foot.equals(from) && !foot.equals(to)) releaseEdge();
@@ -137,16 +172,33 @@ final class AgentOrdinaryNavigator {
             Vec3d pos = player.getPos();
             if (!motion.observe(pos.x, pos.y, pos.z)) reject("discontinuous motion", Integer.MAX_VALUE);
             else if (grounded && foot.equals(to) && settledAlong()) {
+                boolean foodHandoff = requested == Job.FOOD && destination == null && !straightSuccessor();
                 remember(from, to, tick);
                 body.recordWalkedLeg(from, to);
                 this.arrival = new Arrival(from, to);
                 releaseEdge();
                 if (changed) return Result.MOVING;
+                if (foodHandoff) {
+                    // Keep a continuous level lane, but give the food owner a
+                    // grounded frame before committing the next turn or grade.
+                    foodScoutHandoff = true;
+                    body.pauseWork();
+                    stage = "settled for a food-search handoff";
+                    return Result.OBSERVING;
+                }
             }
         }
 
+        if (from == null && (!grounded || edgeStance != null)) {
+            Result stance = reconnectFooting(foot, tick);
+            if (stance != null) return stance;
+            grounded = body.ordinaryRouteContact(foot);
+        }
         if (grounded) {
             long here = foot.asLong();
+            if (recallAt != here) recallAt = recalled = NO_CELL;
+            if (lookAt != here) lookAt = lookCue = NO_CELL;
+            if (edgeStance == null) stanceSupport = null;
             route.contact(here, tick);
             if (from == null && !changed && arrived(destination, arrivalRadius, minFootY, maxFootY)) {
                 body.pauseWork();
@@ -155,7 +207,8 @@ final class AgentOrdinaryNavigator {
             }
             // Reuse the current projection and render budget. This scan observes many
             // admissible lanes while the camera follows an already selected one.
-            observe(here, tick, false);
+            if (lookAt != here && (from == null || from.getY() == to.getY() || crossing))
+                observe(here, tick, false);
         }
 
         // Retry a bounded number of invalidated outgoing edges before returning to
@@ -178,7 +231,29 @@ final class AgentOrdinaryNavigator {
                 bearing = BEARINGS[AgentRouteGraph.slot(here, next) / 3];
                 edgeSince = lastProgress = tick;
                 bestAlong = Double.NEGATIVE_INFINITY;
-                lookAt = NO_CELL;
+                lookAt = lookCue = NO_CELL;
+            }
+            lastEdgeAction = action;
+            if (!crossing && from.getY() != to.getY() && tick - gradeAt > GRADE_AGE) {
+                long frame = body.renderedFrame();
+                if (grounded && foot.equals(from) && lastScan == tick && frame == rendered) {
+                    byte seen = sight[gridIndex(foot.asLong(), to.asLong())];
+                    if (seen == SEEN || seen == QUEUED) gradeAt = tick;
+                }
+                if (tick - gradeAt > GRADE_AGE && frame != gradeFrame
+                        && body.generalRaysRemaining() >= RAY_RESERVE + 10) {
+                    gradeFrame = frame;
+                    if (body.ordinaryRouteFreshGrade(from, to, RAY_RESERVE)) gradeAt = tick;
+                }
+                if (tick - gradeAt > GRADE_AGE) {
+                    if (tick - edgeSince >= LOOK_TICKS) {
+                        reject("adjacent grade top not re-witnessed", tick + RETRY_TICKS);
+                        continue;
+                    }
+                    aimGrade();
+                    stage = "rechecking the exact queued grade top";
+                    return Result.OBSERVING;
+                }
             }
             AgentBody.DryRouteVeto veto = body.ordinaryRouteLane(from, to);
             if (veto != AgentBody.DryRouteVeto.CLEAR) {
@@ -195,7 +270,7 @@ final class AgentOrdinaryNavigator {
                 continue;
             }
             boolean carry = straightSuccessor();
-            AgentBody.OrdinaryMotor turn = body.driveOrdinaryRoute(from, to, bearing, carry);
+            AgentBody.OrdinaryMotor turn = body.driveOrdinaryRoute(from, to, bearing, carry, crossing);
             if (turn == AgentBody.OrdinaryMotor.VETO) {
                 reject("live body sweep or hazard", Integer.MAX_VALUE);
                 continue;
@@ -204,7 +279,6 @@ final class AgentOrdinaryNavigator {
                 stage = "waiting for render on queued edge";
                 return Result.OBSERVING;
             }
-            lastMotor = action;
             if (!crossing && turn == AgentBody.OrdinaryMotor.KEY) {
                 motion.start(player.getX(), player.getY(), player.getZ());
                 crossing = true;
@@ -241,7 +315,7 @@ final class AgentOrdinaryNavigator {
         minY = low;
         maxY = high;
         goalCell = destination == null ? NO_CELL : BlockPos.ofFloored(destination).asLong();
-        lookAt = adjustAt = NO_CELL;
+        lookAt = lookCue = adjustAt = NO_CELL;
         lastVeto = "";
         unavailableSince = -1;
         if (destination != null) route.destination(destination.x, destination.z, r, low, high);
@@ -295,7 +369,7 @@ final class AgentOrdinaryNavigator {
         // A second, mechanically compatible direction joins the two physically occupied
         // supports. This is not a license to accept other unseen adjoining cells.
         if (body.ordinaryRouteLane(to, from) == AgentBody.DryRouteVeto.CLEAR)
-            route.landed(to.asLong(), from.asLong(), tick);
+            route.rememberReturn(to.asLong(), from.asLong(), tick);
     }
 
     private void reject(String why, int retry) {
@@ -308,6 +382,53 @@ final class AgentOrdinaryNavigator {
         from = to = null;
         bearing = null;
         crossing = false;
+        gradeAim = null;
+        gradeFrame = -1;
+        gradeAt = -100;
+    }
+
+    private Result reconnectFooting(BlockPos foot, int tick) {
+        BlockPos support = player.supportingBlockPos.orElse(null);
+        if (!player.isOnGround() || support == null || Math.abs(player.getY() - support.getY() - 1) > 0.035
+                || edgeStance == null && AgentBody.sameSurveySupport(support, player.getPos())) {
+            edgeStance = null;
+            return null;
+        }
+        if (!support.equals(stanceSupport)) {
+            edgeStance = null;
+            stanceSupport = support;
+            stanceSince = tick;
+            stanceRefused = false;
+        }
+        body.pauseWork();
+        if (!stanceRefused && tick - stanceSince < STANCE_TICKS) {
+            if (edgeStance == null) edgeStance = body.edgeStance();
+            if (edgeStance == null) {
+                stage = "waiting to settle on actual dry support";
+                return Result.OBSERVING;
+            }
+            switch (body.settleEdgeStance(edgeStance)) {
+                case WORKING -> {
+                    stage = "centering on actual edge support";
+                    return Result.OBSERVING;
+                }
+                case SETTLED -> {
+                    edgeStance = null;
+                    return null;
+                }
+                case REFUSED -> stanceRefused = true;
+            }
+        }
+        edgeStance = null;
+        if (body.ordinaryRouteContact(foot)) return null;
+        stage = "actual dry support centering bound";
+        return Result.BLOCKED;
+    }
+
+    private void aimGrade() {
+        if (gradeAim == null) gradeAim = new Vec3d(to.getX() + 0.5 + 0.38 * bearing.getOffsetX(),
+            to.getY() - 0.025, to.getZ() + 0.5 + 0.38 * bearing.getOffsetZ());
+        body.aim(gradeAim);
     }
 
     private Result observeFrontier(long here, int tick) {
@@ -317,21 +438,31 @@ final class AgentOrdinaryNavigator {
                 stage = "no connected dry route; directed view spent";
                 return Result.BLOCKED;
             }
-            route.consumeLook(here);
             lookAt = here;
             lookSince = tick;
+            lookFrame = body.renderedFrame();
             float current = player.getYaw();
             lookYaw = target == null ? current : heading(target.x - player.getX(), target.z - player.getZ(), current);
-            lookPitch = 47;
-            // If the current render already includes the intended lane, one nearby flank
-            // can expose its edge. Never cycle bearings or rotate to test a floor candidate.
-            if (body.renderedDirection(lookYaw, lookPitch, 13))
-                lookYaw += body.hazardAhead(lookYaw + 32, 2.0) ? -34 : 34;
+            lookPitch = 55;
+            Direction toward = Direction.fromHorizontalDegrees(lookYaw);
+            if (body.ordinaryRouteRiseCue(player.getBlockPos(), toward, RAY_RESERVE))
+                lookCue = neighbor(here, bearingIndex(toward), 1);
+            else if (recallAt == here) lookCue = recalled;
+            if (lookCue != NO_CELL) {
+                Direction cue = BEARINGS[AgentRouteGraph.slot(here, lookCue) / 3];
+                Vec3d eye = player.getEyePos();
+                double dx = x(lookCue) + 0.5 + 0.38 * cue.getOffsetX() - eye.x;
+                double dz = z(lookCue) + 0.5 + 0.38 * cue.getOffsetZ() - eye.z;
+                lookYaw = heading(dx, dz, lookYaw);
+                lookPitch = (float) Math.toDegrees(Math.atan2(eye.y - y(lookCue) + 0.025, Math.hypot(dx, dz)));
+            }
         }
-        if (tick - lookSince >= LOOK_TICKS || body.renderedDirection(lookYaw, lookPitch, 5)) {
-            observe(here, tick, true);
+        if (body.renderedFrame() > lookFrame && body.renderedDirection(lookYaw, lookPitch, 5)
+                && observe(here, tick, true)) {
+            route.consumeLook(here);
+            if (lookCue == recalled) recallAt = recalled = NO_CELL;
             route.plan(here, tick);
-            lookAt = NO_CELL;
+            lookAt = lookCue = NO_CELL;
             if (route.hop(0) == NO_CELL) {
                 body.pauseWork();
                 stage = "no connected dry route; directed view exhausted";
@@ -340,21 +471,39 @@ final class AgentOrdinaryNavigator {
             stage = "found a reachable route after directed look";
             return Result.OBSERVING;
         }
+        if (tick - lookSince >= LOOK_TICKS) {
+            // A missing or starved render is not observed terrain. Stop turning, but
+            // let a later matching frame finish this pending view or take good footing
+            // from the current projection after another owner has moved the camera.
+            if (observe(here, tick, false)) {
+                route.plan(here, tick);
+                if (route.hop(0) != NO_CELL) {
+                    lookAt = lookCue = NO_CELL;
+                    stage = "found a reachable route in the current view";
+                    return Result.OBSERVING;
+                }
+            }
+            body.pauseWork();
+            stage = "directed view awaiting usable render";
+            return Result.BLOCKED;
+        }
         body.turn(lookYaw, lookPitch);
-        stage = "one directed terrain look";
+        stage = lookCue == NO_CELL ? "one directed terrain look" : "reconnecting to a witnessed terrain cue";
         return Result.OBSERVING;
     }
 
-    private void observe(long here, int tick, boolean force) {
+    private boolean observe(long here, int tick, boolean directed) {
         long frame = body.renderedFrame();
-        if (frame == rendered || !force && tick - lastScan < 3) return;
+        if (frame == rendered || !directed && tick - lastScan < 3) return false;
         int available = body.generalRaysRemaining();
-        if (available < 14) return;
+        if (available < (directed ? DIRECTED_RAYS : RAY_RESERVE + 2)) return false;
         rendered = frame;
         lastScan = tick;
-        int leaveRays = Math.max(12, available - SIGHT_RAYS);
+        int leaveRays = Math.max(RAY_RESERVE, available - SIGHT_RAYS);
         Arrays.fill(sight, (byte) 0);
         Arrays.fill(checked, (short) 0);
+        long outlined = available >= leaveRays + 10 ? body.ordinaryRouteOutlinedFoot(player.getBlockPos()) : NO_CELL;
+        if (outlined != NO_CELL) sight[gridIndex(here, outlined)] = SEEN;
         sightQueue[0] = here;
         sight[gridIndex(here, here)] = QUEUED;
         int tail = 1;
@@ -384,6 +533,7 @@ final class AgentOrdinaryNavigator {
                 }
             }
         }
+        return outlined != NO_CELL || body.generalRaysRemaining() < available;
     }
 
     private static int gridIndex(long origin, long foot) {

@@ -73,6 +73,9 @@ final class AgentOrdinaryRoute {
 
     void observe(long from, long to, int tick) { attest(from, to, tick, false); }
 
+    /** The reverse of a real crossing is a route candidate, not a second landing. */
+    void rememberReturn(long from, long to, int tick) { attest(from, to, tick, true); }
+
     /** Records physical contact and optionally consumes the current route's next exact edge. */
     void landed(long from, long to, int tick) {
         attest(from, to, tick, true);

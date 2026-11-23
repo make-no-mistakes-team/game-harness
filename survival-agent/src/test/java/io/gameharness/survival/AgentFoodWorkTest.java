@@ -5,10 +5,13 @@ import static org.junit.jupiter.api.Assertions.*;
 import com.google.gson.JsonParser;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.CaveVines;
+import net.minecraft.block.LeavesBlock;
 import net.minecraft.block.SweetBerryBushBlock;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
+import net.minecraft.util.math.Vec3d;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -96,6 +99,56 @@ final class AgentFoodWorkTest {
         assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.dropAction(standing, drop, false, true, true));
         assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.dropAction(standing, drop, true, false, true));
         assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.dropAction(standing, drop, true, true, false));
+    }
+
+    @Test
+    void fallingFoodBelowThePickupEnvelopeCannotRequestMovement() {
+        var standing = new Box(-0.3, 64, -0.3, 0.3, 65.8, 0.3);
+        var apple = new Box(0.25, 63.3, 0, 0.5, 63.55, 0.25);
+        assertEquals(AgentFoodWork.SourceAction.CONTACT, AgentFoodWork.dropAction(standing, apple, false, true, true));
+        var missed = apple.offset(0, -0.2, 0);
+        assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.dropAction(standing, missed, false, true, true));
+        assertEquals(AgentFoodWork.SourceAction.REFUSE, AgentFoodWork.dropAction(standing, missed, true, true, false));
+        assertEquals(AgentFoodWork.SourceAction.APPROACH, AgentFoodWork.dropAction(standing, missed, true, true, true));
+        var lowerFoot = AgentFoodWork.dropStance(missed, standing.maxY - standing.minY);
+        assertFalse(lowerFoot.reached(new Vec3d(0.375, 64, 0.125)),
+            "the navigator must not count the lip above the item as arrival");
+        assertTrue(lowerFoot.reached(new Vec3d(0.375, 63, 0.125)));
+    }
+
+    @Test
+    void aForageFaceNeedsAppleBearingLeavesAndACollectibleLanding() {
+        var foot = new BlockPos(0, 64, 0);
+        var player = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        var next = foot.east();
+        assertTrue(AgentFoodWork.appleLeaf(Blocks.OAK_LEAVES.getDefaultState()));
+        assertTrue(AgentFoodWork.appleLeaf(Blocks.DARK_OAK_LEAVES.getDefaultState()));
+        assertFalse(AgentFoodWork.appleLeaf(Blocks.BIRCH_LEAVES.getDefaultState()));
+        assertFalse(AgentFoodWork.appleLeaf(Blocks.OAK_LEAVES.getDefaultState().with(LeavesBlock.WATERLOGGED, true)));
+        assertFalse(AgentFoodWork.leafClearOfStance(foot, player, foot.down()));
+        assertFalse(AgentFoodWork.leafClearOfStance(foot, player, foot.up()));
+        assertTrue(AgentFoodWork.leafClearOfStance(foot, player, next));
+        assertTrue(AgentFoodWork.appleCatch(player, next.getX(), 64, next.getZ()));
+        assertFalse(AgentFoodWork.appleCatch(player, next.getX(), 63, next.getZ()));
+        assertFalse(AgentFoodWork.appleCatch(player, next.getX() + 1, 64, next.getZ()));
+    }
+
+    @Test
+    void anAppleStandTriesSeveralDifferentFacesButCannotRoamOrCycleOneFace() {
+        var stand = new AgentFoodWork.AppleStand();
+        var foot = new BlockPos(0, 64, 0);
+        assertTrue(stand.canStart(foot, 100));
+        stand.start(foot, 100);
+        for (int n = 0; n < AgentFoodWork.AppleStand.MAX_FACES; n++) {
+            var face = foot.east(n + 1);
+            assertTrue(stand.canTry(face, 100 + n));
+            stand.tryFace(face, 100 + n);
+            assertFalse(stand.canTry(face, 100 + n));
+        }
+        assertFalse(stand.canTry(foot.west(), 108));
+        assertFalse(stand.active(foot.east(), 108));
+        assertFalse(stand.canStart(foot, 108));
+        assertTrue(stand.canStart(foot, 100 + AgentFoodWork.AppleStand.RETRY_TICKS));
     }
 
     @Test

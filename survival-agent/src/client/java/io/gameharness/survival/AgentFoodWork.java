@@ -14,6 +14,7 @@ import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 
 /** Local meal policy and exact model-authorized food sources. */
@@ -115,10 +116,74 @@ final class AgentFoodWork {
         if (AgentPickup.passiveOverlap(player, drop)) return SourceAction.CONTACT;
         if (!grounded) return SourceAction.REFUSE;
         if (directed) return SourceAction.APPROACH;
+        if (!pickupHeight(player, drop)) return SourceAction.REFUSE;
         double dx = (drop.minX + drop.maxX - player.minX - player.maxX) * 0.5;
         double dz = (drop.minZ + drop.maxZ - player.minZ - player.maxZ) * 0.5;
-        return Math.abs(drop.minY - player.minY) <= 1.2 && dx * dx + dz * dz <= 1.6 * 1.6
-            ? SourceAction.CONTACT : SourceAction.REFUSE;
+        return dx * dx + dz * dz <= 1.6 * 1.6 ? SourceAction.CONTACT : SourceAction.REFUSE;
+    }
+
+    private static boolean pickupHeight(Box player, Box drop) {
+        return drop.maxY > player.minY - 0.5 && drop.minY < player.maxY + 0.5;
+    }
+
+    static AgentResourceStance dropStance(Box drop, double height) {
+        return new AgentResourceStance(drop.getCenter(), 0.65, drop.minY - height - 0.49, drop.maxY + 0.49);
+    }
+
+    static boolean appleLeaf(BlockState state) {
+        return (state.isOf(Blocks.OAK_LEAVES) || state.isOf(Blocks.DARK_OAK_LEAVES)) && state.getFluidState().isEmpty();
+    }
+
+    static boolean leafClearOfStance(BlockPos foot, Box player, BlockPos leaf) {
+        int x = leaf.getX(), y = leaf.getY(), z = leaf.getZ();
+        // A stationary stand still leaves a little room for braking/knockback.
+        return y >= foot.getY() && !player.intersects(x - 0.1, y, z - 0.1, x + 1.1, y + 1, z + 1.1);
+    }
+
+    /** A candidate catch, not a prediction of an apple or its random bounce. */
+    static boolean appleCatch(Box player, int x, int landingY, int z) {
+        return landingY + 0.25 > player.minY - 0.5 && landingY < player.maxY + 0.5
+            && x + 0.25 > player.minX - 1 && x + 0.75 < player.maxX + 1
+            && z + 0.25 > player.minZ - 1 && z + 0.75 < player.maxZ + 1;
+    }
+
+    static final class AppleStand {
+        static final int MAX_FACES = 6, STAND_TICKS = 145, RETRY_TICKS = 200, FACE_TICKS = 28;
+        private final long[] faces = new long[MAX_FACES];
+        private BlockPos foot;
+        private int start, targetSince, attempted;
+
+        void reset() { foot = null; }
+
+        boolean canStart(BlockPos at, int tick) {
+            return !at.equals(foot) || tick - start >= RETRY_TICKS;
+        }
+
+        void start(BlockPos at, int tick) {
+            foot = at;
+            start = tick;
+            attempted = 0;
+        }
+
+        boolean active(BlockPos at, int tick) {
+            return at.equals(foot) && tick - start < STAND_TICKS;
+        }
+
+        boolean canTry(BlockPos leaf, int tick) {
+            if (foot == null || tick - start >= STAND_TICKS || attempted == MAX_FACES) return false;
+            long pos = leaf.asLong();
+            for (int i = 0; i < attempted; i++) if (faces[i] == pos) return false;
+            return true;
+        }
+
+        void tryFace(BlockPos leaf, int tick) {
+            faces[attempted++] = leaf.asLong();
+            targetSince = tick;
+        }
+
+        boolean faceExpired(int tick) { return tick - targetSince >= FACE_TICKS; }
+
+        int attempted() { return attempted; }
     }
 
     static boolean mealConfirmed(int beforeHunger, int hunger, int beforeCount, int count) {

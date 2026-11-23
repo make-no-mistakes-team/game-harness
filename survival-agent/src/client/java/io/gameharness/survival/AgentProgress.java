@@ -159,7 +159,7 @@ final class AgentProgress {
     private enum Firing { NONE, IRON, CHARCOAL }
     enum FurnaceSite { PAID, LOCAL, RETURN, ESTABLISH }
     private enum FurnaceSide { TORCHES, LIGHT, STICKS, PICK }
-    private enum Forage { ANIMAL, BERRIES, DROP, APPLE_LEAVES }
+    private enum Forage { ANIMAL, BERRIES, DROP, GROUND, APPLE_LEAVES }
     private enum WorkshopView {
         CURRENT, GROUND, FIRST_WALL, FIRST_FLOOR, SECOND_WALL, SECOND_FLOOR, EXHAUSTED;
 
@@ -537,6 +537,8 @@ final class AgentProgress {
     private int foodTravelTick = -2;
     private Vec3d foodTravelTarget;
     private double foodTravelArrival;
+    private AgentResourceStance foodTravelBand;
+    private Result foodTravelResult;
     private String lastMealReceipt, lastFoodPickup;
     private BlockPos lastFoodVantage;
     private Forage forage;
@@ -545,10 +547,14 @@ final class AgentProgress {
     private Vec3d foragePoint, forageOrigin, animalSighting;
     private AgentFoodWork.Source forageSource;
     private ItemStack forageDropStock;
+    private AgentResourceStance forageStance;
+    private boolean forageDropGrounded;
     private int forageUntil, forageSeen, forageAction, forageStock, forageScan, forageSwings;
     private Entity refusedFoodEntity;
     private BlockPos refusedFoodBlock;
-    private int refusedFoodEntityUntil, refusedFoodBlockUntil, leafRetry;
+    private int refusedFoodEntityUntil, refusedFoodBlockUntil;
+    private final AgentFoodWork.AppleStand appleStand = new AgentFoodWork.AppleStand();
+    private final BlockPos.Mutable appleCatchProbe = new BlockPos.Mutable();
     private int returnAge;
     private int returnClear;
     private int returnLitIndex = -1;
@@ -615,6 +621,7 @@ final class AgentProgress {
         BlockPos standing = grounded ? c.player.getBlockPos() : null;
         List<BlockPos> known = memory.restore(c.world, standing, c.player.getEyePos());
         if (known.isEmpty()) return true;
+        navigator.recallTrail(known, standing);
         trail.addAll(known);
         int index = trail.lastIndexOf(standing);
         litIndex = index + 1; // Periodic light counts new steps; darkness can still demand a light immediately.
@@ -11966,7 +11973,8 @@ final class AgentProgress {
                     && body.find(state -> state.isIn(BlockTags.LOGS), Math.min(REACH, player.getBlockInteractionRange()),
                         this::timberCandidate).isEmpty()
                     && (foodNutrition() >= FOOD_RESERVE || body.visibleEntity(entity -> AgentFoodWork.adult(entity) != null
-                        && localForagePoint(entity.getPos()), 6).isEmpty())) return false;
+                        && foodEntityEligible(entity) && dryPrey(entity)
+                        && Math.abs(entity.getY() - player.getY()) <= 1.2, 6).isEmpty())) return false;
             var bench = body.find(TABLE_BLOCK, REACH).orElse(null);
             if (bench == null && (c.options.sneakKey.isUnbound() || !has(table.item, 1))) return false;
             earlyAxe = earlyAxeStock(bench == null ? null : bench.getBlockPos());
@@ -12133,10 +12141,12 @@ final class AgentProgress {
         healingOwnsWork = false;
         foodTravelTick = -2;
         foodTravelTarget = null;
+        foodTravelBand = null;
+        foodTravelResult = null;
         finishForage(0);
         refusedFoodEntity = null;
         refusedFoodBlock = null;
-        leafRetry = 0;
+        appleStand.reset();
         mealUntil = mealRetry = mealQuietUntil = 0;
         emergencyMealJob = 0;
         mealItem = null;
@@ -12191,7 +12201,7 @@ final class AgentProgress {
         // Finish a real airborne crossing without changing targets. Grounded
         // walking still observes food, including along a continuous scout lane.
         if (traveling && (!player.isOnGround() || !body.hasRecentView())) {
-            navigateFood(foodTravelTarget, foodTravelArrival);
+            navigateFood(foodTravelTarget, foodTravelArrival, foodTravelBand);
             return true;
         }
         if (!player.isOnGround()) {
@@ -12223,23 +12233,28 @@ final class AgentProgress {
             if (recovering) holdHealing("waiting for a rendered food-search view");
             return recovering;
         }
+        boolean surface = player.getBlockY() > 48 && activeTrail() <= 1;
+        if (forage == null && !recovering
+                && (!surface || !needsTimberKit() || firing != Firing.NONE || foodNutrition() >= FOOD_RESERVE))
+            return false;
+        boolean scoutHandoff = foodTravelTick == tick - 1 && ordinaryArrival != null && navigator.foodScoutHandoff();
+        boolean settled = !traveling && (foodTravelTick != tick - 1 || scoutHandoff
+            || foodTravelResult == Result.BLOCKED || foodTravelResult == Result.ARRIVED);
+        if ((forage == null || forage == Forage.APPLE_LEAVES || forage == Forage.GROUND)
+                && (tick >= forageScan || scoutHandoff || forage == Forage.APPLE_LEAVES)) {
+            forageScan = tick + (recovering ? 4 : 12);
+            if (!findFood(recovering) && recovering && settled && hands.stableCraftFooting()) {
+                if (forage == null || forage == Forage.APPLE_LEAVES) {
+                    BlockPos foot = player.getBlockPos();
+                    if (!findFoodGround(foot) && forage == null) findAppleStand(foot);
+                }
+            }
+        }
         if (forage != null) {
             if (continueForage(recovering)) return true;
             refuseForage();
             if (recovering && foodTravelTick != tick) holdHealing("released an unsafe, lost or exhausted food source");
             return recovering;
-        }
-        boolean surface = player.getBlockY() > 48 && activeTrail() <= 1;
-        if (!recovering && (!surface || !needsTimberKit() || firing != Firing.NONE || foodNutrition() >= FOOD_RESERVE))
-            return false;
-        if (tick >= forageScan) {
-            forageScan = tick + (recovering ? 4 : 12);
-            if (findFood(recovering)) {
-                if (continueForage(recovering)) return true;
-                refuseForage();
-                if (recovering && foodTravelTick != tick) holdHealing("refusing a food source without a safe approach");
-                return recovering;
-            }
         }
         if (recovering) navigateFood(null, 0);
         return recovering;
@@ -12247,7 +12262,9 @@ final class AgentProgress {
 
     private boolean findFood(boolean recovering) {
         double sight = recovering ? FOOD_SIGHT : REACH - 0.25;
-        ItemEntity drop = visibleMealDrop(FOOD, sight, recovering);
+        ItemEntity drop = visibleMealDrop(FOOD, sight, recovering, null);
+        if (drop == null && recovering && needsEmergencyFood(c.player.getHungerManager().getFoodLevel()))
+            drop = visibleMealDrop(FLESH_MEAL, sight, true, null);
         if (drop != null) {
             startForage(Forage.DROP, drop, null, drop.getPos(), null, 140);
             return true;
@@ -12267,24 +12284,37 @@ final class AgentProgress {
                 return true;
             }
         }
-        if (!recovering) return false;
-        if (tick >= leafRetry && !c.options.attackKey.isUnbound()) {
-            BlockHitResult leaf = body.find(state -> state.isOf(Blocks.OAK_LEAVES), REACH - 0.25,
-                hit -> foodBlockEligible(hit) && safeLeafFace(hit)).orElse(null);
-            if (leaf != null && appleHand() >= 0) {
-                leafRetry = tick + 160;
-                startForage(Forage.APPLE_LEAVES, null, leaf.getBlockPos(), leaf.getPos(), null, 45);
-                return true;
-            }
-        }
-        if (needsEmergencyFood(c.player.getHungerManager().getFoodLevel())) {
-            ItemEntity flesh = visibleMealDrop(FLESH_MEAL, sight, true);
-            if (flesh != null) {
-                startForage(Forage.DROP, flesh, null, flesh.getPos(), null, 140);
-                return true;
-            }
-        }
         return false;
+    }
+
+    private boolean findFoodGround(BlockPos foot) {
+        if (!body.ordinaryRouteContact(foot)) return false;
+        BlockPos support = c.player.supportingBlockPos.orElse(null);
+        if (support == null || !c.world.getBlockState(support).isIn(BlockTags.LEAVES)) return false;
+        BlockPos best = null;
+        double cost = Double.POSITIVE_INFINITY;
+        Vec3d eye = c.player.getEyePos();
+        int seen = body.sampleNearGround();
+        for (int i = 0; i < seen; i++) {
+            var hit = body.nearGroundTop(i);
+            if (!foodBlockEligible(hit)) continue;
+            BlockPos floor = hit.getBlockPos();
+            int drop = foot.getY() - floor.getY() - 1;
+            int sideways = Math.abs(foot.getX() - floor.getX()) + Math.abs(foot.getZ() - floor.getZ());
+            if (drop < 1 || drop > 3 || sideways < drop) continue;
+            BlockState shown = state(hit);
+            if (!shown.isIn(BlockTags.DIRT) && !shown.isOf(Blocks.MOSS_BLOCK)) continue;
+            double distance = eye.squaredDistanceTo(hit.getPos());
+            if (distance < cost) {
+                cost = distance;
+                best = floor;
+            }
+        }
+        if (best == null) return false;
+        var stance = AgentResourceStance.exact(best.up());
+        startForage(Forage.GROUND, null, best, stance.point(), null, 115);
+        forageStance = stance;
+        return true;
     }
 
     private void confirmMeal(int hunger) {
@@ -12394,6 +12424,8 @@ final class AgentProgress {
         forageUntil = tick + duration;
         forageSeen = tick;
         forageSource = source;
+        forageStance = null;
+        forageDropStock = null;
         forageAction = forageSwings = 0;
         if (entity instanceof ItemEntity drop) watchMealDrop(drop);
     }
@@ -12403,6 +12435,8 @@ final class AgentProgress {
         forageEntity = drop;
         foragePoint = drop.getPos();
         forageDropStock = drop.getStack().copy();
+        forageDropGrounded = drop.isOnGround();
+        forageStance = null;
         forageStock = carriedForageStock();
         forageSeen = tick;
     }
@@ -12454,6 +12488,7 @@ final class AgentProgress {
             case DROP -> collectMealDrop(recovering);
             case BERRIES -> harvestBerries(recovering);
             case ANIMAL -> huntMeal(recovering);
+            case GROUND -> reachFoodGround();
             case APPLE_LEAVES -> forageLeaf();
         };
     }
@@ -12463,7 +12498,7 @@ final class AgentProgress {
             refusedFoodEntity = forageEntity;
             refusedFoodEntityUntil = tick + 100;
         }
-        if (forageBush != null) {
+        if (forageBush != null && forage != Forage.APPLE_LEAVES) {
             refusedFoodBlock = forageBush;
             refusedFoodBlockUntil = tick + 100;
         }
@@ -12477,11 +12512,8 @@ final class AgentProgress {
         foragePoint = forageOrigin = animalSighting = null;
         forageSource = null;
         forageDropStock = null;
+        forageStance = null;
         forageScan = tick + delay;
-    }
-
-    private boolean localForagePoint(Vec3d point) {
-        return Math.abs(point.y - c.player.getY()) <= 1.2;
     }
 
     private boolean foodEntityEligible(Entity entity) {
@@ -12492,27 +12524,42 @@ final class AgentProgress {
         return !hit.getBlockPos().equals(refusedFoodBlock) || tick >= refusedFoodBlockUntil;
     }
 
-    private ItemEntity visibleMealDrop(Predicate<ItemStack> matches, double sight, boolean directed) {
-        return body.dropped(matches, sight, drop -> foodEntityEligible(drop) && !drop.isTouchingWater()
-            && !drop.isInLava() && (directed || localForagePoint(drop.getPos()))
-            && (drop.isOnGround() || AgentPickup.passiveOverlap(c.player.getBoundingBox(), drop.getBoundingBox()))
-            && (foragePoint == null || drop.getPos().squaredDistanceTo(foragePoint) <= 9)).orElse(null);
+    private boolean usableMealDrop(ItemEntity drop) {
+        if (drop.cannotPickup() || drop.isTouchingWater() || drop.isInLava() || drop.isOnFire()) return false;
+        Entity owner = drop.getOwner();
+        if (owner != null && owner != c.player) return false;
+        var inventory = c.player.getInventory();
+        return inventory.getEmptySlot() >= 0 || inventory.getOccupiedSlotWithRoomForStack(drop.getStack()) >= 0;
+    }
+
+    private ItemEntity visibleMealDrop(Predicate<ItemStack> matches, double sight, boolean directed, Vec3d near) {
+        var player = c.player.getBoundingBox();
+        return body.dropped(matches, sight, drop -> foodEntityEligible(drop) && usableMealDrop(drop)
+            && (near == null || drop.getPos().squaredDistanceTo(near) <= 9)
+            && AgentFoodWork.dropAction(player, drop.getBoundingBox(), drop.isOnGround(), true, directed)
+                != AgentFoodWork.SourceAction.REFUSE).orElse(null);
     }
 
     private boolean collectMealDrop(boolean recovering) {
         if (!(forageEntity instanceof ItemEntity seen)) return false;
-        if (!body.seesDrop(seen, FOOD_SIGHT)) return reacquireFood("food drop", recovering, 0.12);
+        if (!body.seesDrop(seen, FOOD_SIGHT))
+            return forageDropGrounded && reacquireFood("food drop", recovering, 0.12);
         Vec3d pos = seen.getPos();
-        if (!ItemStack.areItemsAndComponentsEqual(seen.getStack(), forageDropStock)
+        if (!usableMealDrop(seen) || !ItemStack.areItemsAndComponentsEqual(seen.getStack(), forageDropStock)
                 || forageOrigin.squaredDistanceTo(pos) > FOOD_LEASH_SQUARED) return false;
         if (seen.getStack().getCount() > forageDropStock.getCount()) forageDropStock.setCount(seen.getStack().getCount());
+        if (!pos.equals(foragePoint)) forageStance = null;
         foragePoint = pos;
+        forageDropGrounded = seen.isOnGround();
         forageSeen = tick;
-        boolean dry = !seen.isTouchingWater() && !seen.isInLava() && !seen.isOnFire()
-            && !dangerInForageLane(pos.add(0, 0.22, 0));
+        boolean dry = !dangerInForageLane(pos.add(0, 0.22, 0));
         return switch (AgentFoodWork.dropAction(c.player.getBoundingBox(), seen.getBoundingBox(),
-                seen.isOnGround(), dry, recovering)) {
-            case APPROACH -> approachFood(pos, 0.65);
+                forageDropGrounded, dry, recovering)) {
+            case APPROACH -> {
+                if (forageStance == null)
+                    forageStance = AgentFoodWork.dropStance(seen.getBoundingBox(), c.player.getHeight());
+                yield approachFood(forageStance);
+            }
             case CONTACT -> {
                 var result = body.pickUpVisible(seen, null, false);
                 foodStatus("collecting visible " + Registries.ITEM.getId(forageDropStock.getItem()), recovering);
@@ -12523,7 +12570,7 @@ final class AgentProgress {
     }
 
     private boolean lookForMealDrop() {
-        ItemEntity food = visibleMealDrop(this::matchesForageStock, 6, true);
+        ItemEntity food = visibleMealDrop(this::matchesForageStock, 6, true, foragePoint);
         if (food == null) return false;
         watchMealDrop(food);
         forageUntil = Math.max(forageUntil, tick + 26);
@@ -12610,11 +12657,48 @@ final class AgentProgress {
             && !animal.hasVehicle() && !animal.hasPassengers();
     }
 
-    private boolean safeLeafFace(BlockHitResult leaf) {
+    private boolean safeLeafFace(BlockHitResult leaf, BlockPos foot) {
         BlockPos at = leaf.getBlockPos();
-        return at.getY() >= c.player.getBlockY() && !protectRecoveryBlock(at)
-            && !new Box(at).intersects(c.player.getBoundingBox().expand(0.3, 0, 0.3))
-            && state(leaf).getFluidState().isEmpty();
+        return !leaf.isInsideBlock() && at.getY() <= foot.getY() + 2
+            && AgentFoodWork.leafClearOfStance(foot, c.player.getBoundingBox(), at)
+            && !surfaceApproach.protectedCanopyLeaf(at);
+    }
+
+    private boolean collectibleLeaf(BlockHitResult leaf, BlockPos foot) {
+        if (!safeLeafFace(leaf, foot)) return false;
+        BlockPos at = leaf.getBlockPos();
+        int x = at.getX(), z = at.getZ(), feetY = foot.getY();
+        int sideways = Math.abs(x - foot.getX()) + Math.abs(z - foot.getZ());
+        Box player = c.player.getBoundingBox();
+        // Above the actual tread or within the envelope of a nearby falling item.
+        if ((sideways == 0 || at.getY() >= feetY + 2) && AgentFoodWork.appleCatch(player, x, feetY, z)) return true;
+        if (sideways != 1) return false;
+        for (int y = Math.min(at.getY(), feetY + 1); y >= feetY - 1; --y) {
+            appleCatchProbe.set(x, y, z);
+            if (body.ordinaryRouteTop(appleCatchProbe, 6)
+                    && (AgentFoodWork.appleCatch(player, x, y, z)
+                        || body.ordinaryRouteLane(foot, appleCatchProbe) == AgentBody.DryRouteVeto.CLEAR))
+                return true;
+        }
+        return false;
+    }
+
+    private BlockHitResult visibleAppleLeaf(BlockPos foot, BlockPos except, boolean started) {
+        double reach = Math.min(REACH, c.player.getBlockInteractionRange()) - 0.10;
+        return body.find(AgentFoodWork::appleLeaf, reach, hit -> !hit.getBlockPos().equals(except)
+            && (!started || appleStand.canTry(hit.getBlockPos(), tick)) && collectibleLeaf(hit, foot)).orElse(null);
+    }
+
+    private boolean findAppleStand(BlockPos foot) {
+        if (!appleStand.canStart(foot, tick) || c.options.attackKey.isUnbound()
+                || !body.ordinaryRouteContact(foot) || appleHand() < 0) return false;
+        BlockHitResult first = visibleAppleLeaf(foot, null, false);
+        if (first == null || visibleAppleLeaf(foot, first.getBlockPos(), false) == null) return false;
+        appleStand.start(foot, tick);
+        startForage(Forage.APPLE_LEAVES, null, first.getBlockPos(), first.getPos(), null,
+            AgentFoodWork.AppleStand.STAND_TICKS);
+        appleStand.tryFace(first.getBlockPos(), tick);
+        return true;
     }
 
     private int appleHand() {
@@ -12627,19 +12711,29 @@ final class AgentProgress {
     }
 
     private boolean forageLeaf() {
-        if (forageAction != 0 && lookForMealDrop()) return collectMealDrop(true);
-        BlockHitResult leaf = perceive(foragePoint, REACH);
-        if (leaf == null || !leaf.getBlockPos().equals(forageBush) || !state(leaf).isOf(Blocks.OAK_LEAVES)) {
-            if (forageAction == 0) return reacquireFood("oak leaves", true, 0);
-            if (tick - forageAction > 16) return false;
-            holdHealing("checking whether the foraged oak leaf dropped an apple");
-            return true;
-        }
-        if (!safeLeafFace(leaf)) return false;
+        BlockPos foot = c.player.getBlockPos();
+        if (!appleStand.active(foot, tick) || !hands.stableCraftFooting() || !body.ordinaryRouteContact(foot)) return false;
         int slot = appleHand();
         if (slot < 0) return false;
+        BlockHitResult leaf = perceive(foragePoint, REACH);
+        boolean visible = leaf != null && leaf.getBlockPos().equals(forageBush) && AgentFoodWork.appleLeaf(state(leaf));
+        if (!visible || appleStand.faceExpired(tick)) {
+            if (!visible && forageAction != 0 && tick - forageAction <= 12) {
+                holdHealing("checking for a real apple drop before cutting another face");
+                return true;
+            }
+            if (!visible && forageAction == 0 && !appleStand.faceExpired(tick) && tick - forageSeen <= 5)
+                return reacquireFood("apple-bearing leaves", true, 0);
+            leaf = visibleAppleLeaf(foot, null, true);
+            if (leaf == null) return false;
+            forageBush = leaf.getBlockPos();
+            foragePoint = leaf.getPos();
+            forageAction = 0;
+            appleStand.tryFace(forageBush, tick);
+        }
+        if (!safeLeafFace(leaf, foot)) return false;
         forageSeen = tick;
-        healingStatus("foraging one visible oak leaf for a possible apple");
+        healingStatus("foraging visible apple-bearing leaves from this dry tread (face " + appleStand.attempted() + ")");
         if (!hands.equipSlot(slot)) return hands.busy();
         if (body.mine(leaf)) {
             if (forageAction == 0) forageStock = carriedForageStock();
@@ -12659,7 +12753,8 @@ final class AgentProgress {
         return switch (forage) {
             case DROP -> Registries.ITEM.getId(forageDropStock.getItem()).toString();
             case ANIMAL, BERRIES -> forageSource.subject;
-            case APPLE_LEAVES -> "oak leaves";
+            case GROUND -> "visible lower foraging ground";
+            case APPLE_LEAVES -> "apple-bearing leaves";
         };
     }
 
@@ -12668,11 +12763,31 @@ final class AgentProgress {
         return result == AgentOrdinaryNavigator.Result.MOVING || result == AgentOrdinaryNavigator.Result.OBSERVING;
     }
 
-    private AgentOrdinaryNavigator.Result navigateFood(Vec3d point, double arrival) {
+    private boolean approachFood(AgentResourceStance stance) {
+        var result = navigateFood(stance.point(), stance.arrival(), stance);
+        return result == Result.MOVING || result == Result.OBSERVING;
+    }
+
+    private boolean reachFoodGround() {
+        var result = navigateFood(forageStance.point(), forageStance.arrival(), forageStance);
+        if (result == Result.ARRIVED) {
+            lastFoodVantage = c.player.getBlockPos();
+            finishForage(0);
+            healingStatus("reached the visible lower foraging ground");
+        }
+        return result != Result.BLOCKED;
+    }
+
+    private Result navigateFood(Vec3d point, double arrival) {
+        return navigateFood(point, arrival, null);
+    }
+
+    private Result navigateFood(Vec3d point, double arrival, AgentResourceStance stance) {
         foodTravelTick = tick;
         foodTravelTarget = point;
         foodTravelArrival = arrival;
-        var result = navigate(AgentOrdinaryNavigator.Job.FOOD, point, arrival);
+        foodTravelBand = stance;
+        Result result = foodTravelResult = stance == null ? navigate(Job.FOOD, point, arrival) : navigate(Job.FOOD, stance);
         if (point == null && ordinaryArrival != null) lastFoodVantage = ordinaryArrival.to();
         String detail = point == null ? "scouting for food"
             : forage == null ? "settling after a food approach" : "approaching " + forageLabel();

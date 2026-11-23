@@ -3642,18 +3642,25 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     }
 
     boolean ordinaryRouteContact(BlockPos foot) {
-        if (!ordinaryRouteControls()) return false;
+        return ordinaryRouteControls() && ordinaryRoutePhysicalContact(foot) && ordinaryRouteSupport(foot);
+    }
+
+    /** Contact can identify a restored stance before the first render, but cannot authorize motion. */
+    boolean ordinaryRoutePhysicalContact(BlockPos foot) {
         var player = client.player;
+        if (player == null || !player.isOnGround() || !player.getBlockPos().equals(foot)
+                || Math.abs(player.getY() - foot.getY()) > 0.055) return false;
         BlockPos support = player.supportingBlockPos.orElse(null);
-        return player.isOnGround()
-            && Math.abs(player.getY() - foot.getY()) <= 0.055 && player.getBlockPos().equals(foot)
-            && support != null
-            && support.getX() == foot.getX() && support.getY() == foot.getY() - 1 && support.getZ() == foot.getZ()
-            && ordinaryRouteSupport(foot);
+        return support != null && support.getX() == foot.getX() && support.getY() == foot.getY() - 1
+            && support.getZ() == foot.getZ();
     }
 
     private boolean ordinaryRouteSupport(BlockPos foot) {
-        BlockPos floor = ordinaryFloorProbe.set(foot.getX(), foot.getY() - 1, foot.getZ());
+        return ordinaryRouteSupport(foot.getX(), foot.getY() - 1, foot.getZ());
+    }
+
+    private boolean ordinaryRouteSupport(int x, int y, int z) {
+        BlockPos floor = ordinaryFloorProbe.set(x, y, z);
         BlockState state = client.world.getBlockState(floor);
         return !dryCaveDanger(state) && normalDryTraction(state) && fullStepSupport(floor, state)
             && overlandLoadHolds(client.world, floor, state, ordinaryFloorProbe);
@@ -3669,6 +3676,45 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         double offset = distance > 0.20 ? 0.38 / distance : 0;
         if (ordinaryTopRay(foot, dx * offset, dz * offset)) return true;
         return raysLeft > leaveRays && ordinaryTopRay(foot, 0, 0);
+    }
+
+    /** In darkness only an exact vanilla-drawn top can substitute for a lit first hit. */
+    private BlockHitResult ordinaryRouteOutlineTop(BlockPos floor) {
+        if (renderedSupplyOutline == null || !(renderedCrosshair instanceof BlockHitResult shown)
+                || !matchesDryRouteTop(shown, floor) || shown.isInsideBlock()) return null;
+        BlockHitResult now = supplyOutlineFace();
+        return matchesDryRouteTop(now, floor) && !now.isInsideBlock() ? now : null;
+    }
+
+    long ordinaryRouteOutlinedFoot(BlockPos from) {
+        if (renderedSupplyOutline == null || !(renderedCrosshair instanceof BlockHitResult hit)
+                || hit.getSide() != Direction.UP) return AgentRouteGraph.NO_CELL;
+        BlockPos floor = hit.getBlockPos();
+        long foot = AgentRouteGraph.cell(floor.getX(), floor.getY() + 1, floor.getZ());
+        return AgentRouteGraph.cardinalStep(from.asLong(), foot) && ordinaryRouteOutlineTop(floor) != null
+                && ordinaryRouteSupport(floor.getX(), floor.getY(), floor.getZ())
+            ? foot : AgentRouteGraph.NO_CELL;
+    }
+
+    boolean ordinaryRouteFreshGrade(BlockPos from, BlockPos to, int leaveRays) {
+        return ordinaryRouteContact(from) && (ordinaryRouteTop(to, leaveRays)
+            || raysLeft >= leaveRays + 8
+                && ordinaryRouteOutlineTop(ordinaryFloorProbe.set(to.getX(), to.getY() - 1, to.getZ())) != null
+                && ordinaryRouteSupport(to));
+    }
+
+    /** A goalward riser face is a look cue only; the exact top and body lane must be proved separately. */
+    boolean ordinaryRouteRiseCue(BlockPos from, Direction bearing, int leaveRays) {
+        if (!hasView() || raysLeft <= leaveRays) return false;
+        var side = selectedFace();
+        if (AgentSurfaceTread.ordinaryRiseSide(from, bearing, side) && inView(side.getPos())
+                && (litFace(side) || raysLeft >= leaveRays + 8 && supplyOutlineFace() == side))
+            return ordinaryRouteSupport(side.getBlockPos().getX(), side.getBlockPos().getY(), side.getBlockPos().getZ());
+        Vec3d point = Vec3d.ofCenter(from.offset(bearing), 0.55);
+        if (!inView(point)) return false;
+        side = litHit(point, Ray.TERRAIN);
+        return AgentSurfaceTread.ordinaryRiseSide(from, bearing, side)
+            && ordinaryRouteSupport(side.getBlockPos().getX(), side.getBlockPos().getY(), side.getBlockPos().getZ());
     }
 
     private boolean ordinaryTopRay(BlockPos foot, double offsetX, double offsetZ) {
@@ -3708,7 +3754,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     enum OrdinaryMotor { KEY, COAST, ALIGN, CENTER, VIEW, VETO }
 
     /** Use ordinary keys and the existing final lava/headroom/input arbitration, never another look. */
-    OrdinaryMotor driveOrdinaryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry) {
+    OrdinaryMotor driveOrdinaryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry, boolean crossing) {
         if (!ordinaryRouteControls()) return OrdinaryMotor.VIEW;
         var player = client.player;
         int dx = bearing.getOffsetX(), dz = bearing.getOffsetZ(), rise = to.getY() - from.getY();
@@ -3725,14 +3771,22 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             return OrdinaryMotor.VETO;
         float yaw = bearing.getPositiveHorizontalDegrees();
         if (Math.abs(MathHelper.wrapDegrees(yaw - player.getYaw())) > 5) return OrdinaryMotor.ALIGN;
-        if (Math.abs(across) > 0.205 || Math.abs(across + sideDrift) > 0.205) {
+        double margin = rise == 0 ? 0.205 : 0.18;
+        if (Math.abs(across) > margin || Math.abs(across + sideDrift) > margin
+                || rise != 0 && !crossing && Math.abs(along) > 0.25) {
             if (!ordinaryRouteContact(from)) return OrdinaryMotor.VETO;
             return ordinaryRouteAdjust(from, from.getX() + 0.5, from.getZ() + 0.5)
                 ? OrdinaryMotor.CENTER : OrdinaryMotor.VETO;
         }
         boolean takeoff = rise > 0 && player.isOnGround() && player.getY() < to.getY() - 0.055;
-        if (takeoff && client.options.jumpKey.isUnbound()) return OrdinaryMotor.VETO;
+        if (takeoff) {
+            double jump = player.getAttributeValue(EntityAttributes.JUMP_STRENGTH);
+            if (client.options.jumpKey.isUnbound() || jump < 0.419 || jump > 0.421) return OrdinaryMotor.VETO;
+            Box launch = player.getBoundingBox().offset(0, 0.005, 0).stretch(0, 0.43, 0);
+            if (ordinaryRouteVolume(launch) != DryRouteVeto.CLEAR) return OrdinaryMotor.VETO;
+        }
         if (player.getPose() != EntityPose.STANDING) return OrdinaryMotor.COAST;
+        if (rise != 0 && dryRouteVeto(from, to, true, 0.51, true) != DryRouteVeto.CLEAR) return OrdinaryMotor.VETO;
         // Check the actual body's next displacement, not just the centered planning envelope.
         // Before a rise the riser itself is expected at knee height; the exact apron and
         // full climb envelope were independently checked by ordinaryRouteLane.
@@ -4072,13 +4126,17 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         Box high = new Box(x - half, upper + 0.015, z - half, x + half, upper + 1.80, z + half);
         double cross = Math.abs(drift) > Math.abs(across) ? drift : across;
         Box approach = high.stretch(cross * dz, 0, -cross * dx);
+        if (ordinaryGrade && across * drift < 0) {
+            double other = cross == drift ? across : drift;
+            approach = approach.stretch(other * dz, 0, -other * dx);
+        }
         Box sweep = approach.stretch(dx, 0, dz);
         Box lowerSweep = null;
         if (ordinaryGrade) {
             if (Math.abs(dy) != 1 || !ordinaryGradePose(player)) return DryRouteVeto.SWEEP;
             sweep = sweep.stretch(0, 0.30, 0); // include vanilla jump apex, even with lateral drift
             lowerSweep = lowerGradeColumn(approach, dx, dy, dz);
-            if (!dryGradeVolume(sweep) || !dryGradeVolume(lowerSweep)) return DryRouteVeto.HAZARD;
+            if (!caveLandingVolumeDry(sweep) || !caveLandingVolumeDry(lowerSweep)) return DryRouteVeto.HAZARD;
         }
         if (!client.world.isSpaceEmpty(player, sweep)) return DryRouteVeto.SWEEP;
         if (dy != 0) {
@@ -4937,6 +4995,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         Vec3d point = center.add(0, -0.025, 0);
         aimFixed(point);
         BlockHitResult hit = inView(point) ? visibleHit(point, Ray.TERRAIN) : null;
+        if (!matchesDryRouteTop(hit, contact)) hit = ordinaryRouteOutlineTop(contact);
         if (!matchesDryRouteTop(hit, contact)) return EdgeStanceResult.WORKING;
         if (!stance.dryTop(hit, client.world.getBlockState(contact), client.world)) return EdgeStanceResult.REFUSED;
 

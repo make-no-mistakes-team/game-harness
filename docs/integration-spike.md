@@ -144,7 +144,10 @@ After danger passes, a badly hurt or hungry player suspends mining to
 find food. It eats suitable carried food, or follows a checked path
 toward a food drop, ripe berries or an edible animal it has seen.
 If none is visible, it searches from new reachable ground rather than
-resuming the stone job. An empty view does not authorize an attack.
+resuming the stone job. From a safe stand beside an oak or dark oak it
+can try several leaves for an apple; breaking a leaf does not mean food
+dropped. A visible meal takes priority over trying another leaf.
+An empty view does not authorize an attack.
 It prefers safe food to rotten flesh. Pickup, eating and health
 recovery are separate outcomes.
 It need not abandon work on a dry bank to chase an unarmed drowned

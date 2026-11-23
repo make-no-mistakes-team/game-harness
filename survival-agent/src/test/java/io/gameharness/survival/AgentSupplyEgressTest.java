@@ -8,6 +8,7 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.EmptyBlockView;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -35,6 +36,41 @@ final class AgentSupplyEgressTest {
     @BeforeAll
     static void initializeVanilla() {
         VanillaTestResources.initialize();
+    }
+
+    @Test
+    void crossingLightChoosesAVisibleFrontOrSideMountBeforeTurningBack() {
+        BlockPos from = BlockPos.ORIGIN, to = from.west().up();
+        Vec3d eye = new Vec3d(0.39, 1.62, 0.50), dark = new Vec3d(-0.5, 2.6, 0.5);
+        var rear = new BlockHitResult(new Vec3d(1.4, 0, 0.5), Direction.UP, from.east().down(), false);
+        var side = new BlockHitResult(new Vec3d(0.10, 1.55, 0), Direction.SOUTH, from.north().up(), false);
+        var front = new BlockHitResult(new Vec3d(-1, 1.6, 0.20), Direction.EAST, to.west(), false);
+        var safeFront = new BlockHitResult(new Vec3d(-1.40, 2, 1.20), Direction.UP, to.west().south(), false);
+        var exposed = new BlockHitResult[]{rear, front, side, safeFront};
+        var pick = AgentSupplyEgress.closestLightFace(null, exposed, exposed.length,
+            hit -> AgentSupplyEgress.lightFaceScore(hit, eye, 90, from, to, Direction.WEST, dark));
+        assertEquals(safeFront, pick, "the smaller turn wins, but the face that would place in the landing does not");
+
+        var shaft = new BlockHitResult[]{rear, front, side};
+        assertEquals(side, AgentSupplyEgress.closestLightFace(null, shaft, shaft.length,
+            hit -> AgentSupplyEgress.lightFaceScore(hit, eye, 450, from, to, Direction.WEST, dark)),
+            "a flush wall torch does not need the default about-face in a one-wide shaft");
+        assertTrue(Blocks.WALL_TORCH.getDefaultState().getCollisionShape(EmptyBlockView.INSTANCE, from.up()).isEmpty());
+    }
+
+    @Test
+    void crossingLightRejectsTheFootingAndOnlyKeepsAUsefulRearFallback() {
+        BlockPos from = BlockPos.ORIGIN, to = from.west().up();
+        Vec3d eye = new Vec3d(0.39, 1.62, 0.50), dark = new Vec3d(-0.5, 1.02, 0.5);
+        var takeoff = new BlockHitResult(new Vec3d(0.1, 0, 0.5), Direction.UP, from.down(), false);
+        var crown = new BlockHitResult(new Vec3d(0.10, 2.55, 0), Direction.SOUTH, from.north().up(2), false);
+        var rear = new BlockHitResult(new Vec3d(1.3, 0, 0.5), Direction.UP, from.east().down(), false);
+        var rearOnly = new BlockHitResult[]{takeoff, crown, rear};
+        assertEquals(rear, AgentSupplyEgress.closestLightFace(null, rearOnly, rearOnly.length,
+            hit -> AgentSupplyEgress.lightFaceScore(hit, eye, 90, from, to, Direction.WEST, dark)));
+        assertNull(AgentSupplyEgress.closestLightFace(null, rearOnly, rearOnly.length,
+            hit -> AgentSupplyEgress.lightFaceScore(hit, eye, 90, from, to, Direction.WEST, dark.add(-4, 0, 0))),
+            "reach to the player is not proof that the torch is near the intended crossing");
     }
 
     @Test

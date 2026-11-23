@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.BiPredicate;
 import java.util.function.Predicate;
+import java.util.function.ToDoubleFunction;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.LeavesBlock;
@@ -19,10 +20,12 @@ import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 
 /** Owns the work exclusion, walked retreat legs, and physical premises of refused exits. */
 final class AgentSupplyEgress {
+    static final double LIGHT_REACH = 2.6;
     private static final int MAX_WALKED_LEGS = 96, MAX_RETURN_LEGS = 8, MAX_REFUSALS = 32;
     private static final int MAX_FLOODS = 6, FLOOD_TICKS = 1200;
 
@@ -69,6 +72,47 @@ final class AgentSupplyEgress {
     /** A trunk above the mouth of a shaft is a landmark, not collected supplies. */
     static boolean timberAtTread(int feetY, int logY) {
         return logY >= feetY && logY <= feetY + 1;
+    }
+
+    static BlockHitResult closestLightFace(BlockHitResult selected, BlockHitResult[] samples, int count,
+                                           ToDoubleFunction<BlockHitResult> score) {
+        BlockHitResult best = null;
+        double bestScore = Double.POSITIVE_INFINITY;
+        for (int i = -1; i < count; i++) {
+            BlockHitResult hit = i < 0 ? selected : samples[i];
+            if (hit == null) continue;
+            double cost = score.applyAsDouble(hit);
+            if (cost < bestScore) {
+                best = hit;
+                bestScore = cost;
+            }
+        }
+        return best;
+    }
+
+    static double lightFaceScore(BlockHitResult hit, Vec3d eye, float yaw, BlockPos from, BlockPos to,
+                                 Direction lane, Vec3d dark) {
+        Direction side = hit.getSide();
+        Vec3d point = hit.getPos();
+        double range = point.squaredDistanceTo(eye);
+        if (hit.isInsideBlock() || side == Direction.DOWN || range > LIGHT_REACH * LIGHT_REACH)
+            return Double.POSITIVE_INFINITY;
+        BlockPos site = hit.getBlockPos().offset(side);
+        if (sameColumn(site, from) && site.getY() >= from.getY() - 1 && site.getY() <= from.getY() + 3) {
+            // The non-colliding wall torch can hug a flank at standing eye height.
+            // Keep the tread, the crown and all landing probes free of a torch.
+            if (site.getY() != from.getY() + 1 || !side.getAxis().isHorizontal() || side.getAxis() == lane.getAxis())
+                return Double.POSITIVE_INFINITY;
+        }
+        if ((to != null && sameColumn(site, to) && site.getY() >= to.getY() - 1 && site.getY() <= to.getY() + 2)
+                || dark.squaredDistanceTo(site.getX() + 0.5, site.getY() + 0.5, site.getZ() + 0.5) > 9)
+            return Double.POSITIVE_INFINITY;
+        float targetYaw = (float) Math.toDegrees(Math.atan2(eye.x - point.x, point.z - eye.z));
+        return Math.abs(MathHelper.wrapDegrees(targetYaw - yaw)) + 0.001 * range;
+    }
+
+    private static boolean sameColumn(BlockPos a, BlockPos b) {
+        return a.getX() == b.getX() && a.getZ() == b.getZ();
     }
 
     boolean holdOrdinary(boolean airborne) {

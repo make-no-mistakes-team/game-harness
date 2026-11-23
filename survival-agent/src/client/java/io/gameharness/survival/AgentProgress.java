@@ -41,6 +41,7 @@ import net.minecraft.registry.Registries;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.state.property.Properties;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
@@ -6010,6 +6011,8 @@ final class AgentProgress {
         private static final int MAX_CONNECTORS = 2, MAX_FOOTHOLDS = 2, FOOTHOLD_RESERVE = 8, ANCHOR_TICKS = 24;
         private static final int OUTLINE_LOOK_TICKS = 46, OUTLINE_REAIM_TICKS = 23;
         private static final int OUTLINE_HAND_TICKS = 190;
+        private static final int LIGHT_SIDE_TICKS = 18, LIGHT_REAR_TICKS = 26, LIGHT_CONTACT_TICKS = 20;
+        private static final int LIGHT_RECEIPT_TICKS = 14, LIGHT_RESERVE = 1;
         private static final Predicate<ItemStack> ANDESITE_FOOTHOLD = item(Items.ANDESITE), DIRT_FOOTHOLD = item(Items.DIRT);
         private static final Predicate<ItemStack> EMPTY_HAND = ItemStack::isEmpty;
         private static final float SURVEY_PITCH = -42;
@@ -6024,6 +6027,8 @@ final class AgentProgress {
         private BlockPos openFoot, unknownFoot, to, armedCut, packedBench;
         private BlockPos floodOpening, floodWater;
         private Vec3d floor, alternateFloor, aim, buildLow, buildHigh, reverseLeft, reverseRight, outlineCutPoint;
+        private Vec3d lightNeed, lightLook;
+        private BlockHitResult lightFace;
         private Direction bearing, lane, apexSide;
         private Proof proof;
         private BlockState buildMaterial, apexSourceSupport, apexRiseSupport;
@@ -6032,9 +6037,11 @@ final class AgentProgress {
         private int deadline, since, view, views, openViews, roofViews, wallViews, handoffAfter;
         private int choice, flatBearings, driving, back, backEnd, rises, levels, cuts, laneCuts;
         private int benchBefore, benchCollectUntil, connectors, builds, buildBefore, buildReserve, anchorChoice;
+        private int lightPhaseSince, lightChosen, lightUsed, lightStock;
         private int apexSearched, handClearSince = -1;
         private long revealedFrame;
         private boolean returning, walkedReturn, enclosed, surveying, sourceProved, lighting, triedLight, triedCraftLight;
+        private boolean lightRear;
         private boolean triedLower, built, mineDeparture, floodSource, checkingExit, buildLowProved;
         private boolean outlineReaimed, outlineApexChecked;
 
@@ -6262,8 +6269,9 @@ final class AgentProgress {
             }
             if (lighting) {
                 status = "supply egress: lighting the selected crossing from settled footing";
-                if (shouldLight(true)) return true;
+                if (lightCrossing(from)) return true;
                 lighting = false;
+                lightFace = null;
                 since = tick;
             }
             if (!sourceProved) {
@@ -6273,7 +6281,7 @@ final class AgentProgress {
                 switch (body.dryRouteTop(aim, from.down())) {
                     case WITNESSED -> { sourceProved = true; aim = null; }
                     case DARK -> {
-                        if (tryLight()) return true;
+                        if (tryLight(aim)) return true;
                         if (!beginOutline(from)) return stop("takeoff top is too dark to verify");
                     }
                     case FLUID -> { return refuseFluid(from.down(), aim, "takeoff has no stable, dry full top"); }
@@ -6362,9 +6370,9 @@ final class AgentProgress {
                 && collectObserved(drop, entity, true);
         }
 
-        private boolean tryLight() {
+        private boolean tryLight(Vec3d dark) {
             if (triedLight) return false;
-            if (!has(TORCH, 1)) {
+            if (!has(TORCH, LIGHT_RESERVE + 1)) {
                 if (triedCraftLight) return false;
                 triedCraftLight = true;
                 if (!craftTorches(4)) return false;
@@ -6372,8 +6380,115 @@ final class AgentProgress {
                 return true;
             }
             triedLight = lighting = true;
-            startReturnableLight();
+            lightNeed = dark;
+            lightFace = null;
+            lightChosen = lightUsed = 0;
+            lightRear = false;
+            lightPhaseSince = tick;
+            BlockPos from = order.foot();
+            Direction forward = to == null ? bearing : lane;
+            var player = c.player;
+            var eye = player.getEyePos();
+            float yaw = player.getYaw();
+            lightFace = body.supplyLightFace(hit -> body.supplyTorchSupport(hit)
+                ? lightScore(hit, from, forward, eye, yaw) : Double.POSITIVE_INFINITY);
+            if (lightFace != null) lightChosen = tick;
+            else {
+                // A single near-side peek can reveal the same flank outside the current steep view.
+                Direction side = forward.rotateYClockwise();
+                Vec3d base = Vec3d.ofBottomCenter(from).add(forward.getOffsetX() * 0.46, 1.58,
+                    forward.getOffsetZ() * 0.46);
+                Vec3d first = base.add(side.getOffsetX() * 0.56, 0, side.getOffsetZ() * 0.56);
+                Vec3d second = base.add(-side.getOffsetX() * 0.56, 0, -side.getOffsetZ() * 0.56);
+                lightLook = Math.abs(MathHelper.wrapDegrees(yaw(first.subtract(eye)) - yaw))
+                    <= Math.abs(MathHelper.wrapDegrees(yaw(second.subtract(eye)) - yaw)) ? first : second;
+            }
             return true;
+        }
+
+        private double lightScore(BlockHitResult hit, BlockPos from, Direction forward, Vec3d eye, float yaw) {
+            BlockPos site = AgentBody.placementCell(hit);
+            if (hit.getBlockPos().equals(armedCut) || !torchSiteOutsideStep(hit)
+                    || walked.contains(site) || order.blocksFloodWork(site, tick)) return Double.POSITIVE_INFINITY;
+            return AgentSupplyEgress.lightFaceScore(hit, eye, yaw, from, to, forward, lightNeed);
+        }
+
+        private boolean lightCrossing(BlockPos from) {
+            Direction forward = to == null ? bearing : lane;
+            if (body.lavaEmergency() || body.macroLavaNear() || floodWater != null
+                    || body.hazardAhead(forward.getPositiveHorizontalDegrees(), 1.5)
+                    || order.blocksFloodWork(from, tick) || to != null && order.blocksFloodWork(to, tick)) return false;
+            if (lightUsed != 0) return confirmCrossingLight();
+            int stock = hands.count(TORCH);
+            if (stock <= LIGHT_RESERVE) return false;
+            var player = c.player;
+            var eye = player.getEyePos();
+            if (lightFace != null && tick - lightChosen >= LIGHT_CONTACT_TICKS) return rearLightLook(from, forward);
+            if (lightFace == null) {
+                int limit = lightRear ? LIGHT_REAR_TICKS : LIGHT_SIDE_TICKS;
+                if (tick - lightPhaseSince >= limit) return rearLightLook(from, forward);
+                BlockHitResult hit = perceive(lightLook, AgentSupplyEgress.LIGHT_REACH);
+                boolean aimed = body.renderedAim(lightLook, 7);
+                if (hit == null && aimed) hit = body.selectedFace(); // Darkness supplies geometry, not material.
+                else if (hit != null && !body.supplyTorchSupport(hit)) hit = null;
+                if (hit != null && Double.isFinite(lightScore(hit, from, forward, eye, player.getYaw()))) {
+                    lightFace = hit;
+                    lightChosen = tick;
+                } else {
+                    if (aimed) return rearLightLook(from, forward);
+                    body.aim(lightLook);
+                    return true;
+                }
+            }
+            Vec3d point = lightFace.getPos();
+            BlockHitResult hit = perceive(point, Math.min(AgentSupplyEgress.LIGHT_REACH, eye.distanceTo(point) + 0.05));
+            boolean visible = sameLightFace(hit) && body.supplyTorchSupport(hit);
+            if (!visible) hit = body.selectedFace();
+            if (!sameLightFace(hit) || !Double.isFinite(lightScore(hit, from, forward, eye, player.getYaw()))) {
+                body.aim(point);
+                return true;
+            }
+            var mode = visible ? AgentBody.Contact.PRECISE : AgentBody.Contact.OUTLINE;
+            if (!body.aimContact(hit, mode) || !hands.equipForUse(TORCH)
+                    || !body.canPlaceSupplyTorchAcross(hit) || !body.useContact(hit, mode)) return true;
+            lightStock = stock;
+            lightUsed = tick;
+            return true;
+        }
+
+        private boolean sameLightFace(BlockHitResult hit) {
+            return hit != null && lightFace.getBlockPos().equals(hit.getBlockPos()) && lightFace.getSide() == hit.getSide();
+        }
+
+        private boolean rearLightLook(BlockPos from, Direction forward) {
+            if (lightRear) return false;
+            lightRear = true;
+            lightFace = null;
+            lightPhaseSince = tick;
+            lightLook = Vec3d.ofCenter(from.offset(forward.getOpposite()).down(), 0.80);
+            body.aim(lightLook);
+            return true;
+        }
+
+        private boolean confirmCrossingLight() {
+            if (tick - lightUsed > LIGHT_RECEIPT_TICKS) return false;
+            if (hands.count(TORCH) != lightStock - 1) return true;
+            Direction side = lightFace.getSide();
+            BlockPos site = AgentBody.placementCell(lightFace);
+            boolean floorTorch = side == Direction.UP;
+            Vec3d point = Vec3d.ofCenter(site, floorTorch ? 0.32 : 0.53)
+                .add(-side.getOffsetX() * 0.31, 0, -side.getOffsetZ() * 0.31);
+            BlockHitResult flame = perceive(point, AgentSupplyEgress.LIGHT_REACH);
+            BlockState placed = flame != null && flame.getBlockPos().equals(site) ? state(flame) : null;
+            if (placed == null || !placed.isOf(floorTorch ? Blocks.TORCH : Blocks.WALL_TORCH)
+                    || !floorTorch && placed.get(Properties.HORIZONTAL_FACING) != side) {
+                body.aim(point);
+                return true;
+            }
+            litIndex = trail.size();
+            torchPlacedTick = tick;
+            stallGuard.stairLightReceipt(site);
+            return false; // The unchanged crossing proof must still see its own light and clearance.
         }
 
         private boolean actualOutlineFoot(BlockPos from) {
@@ -6416,7 +6531,7 @@ final class AgentProgress {
             }
             if (lit == AgentBody.DryRouteTop.FLUID || lit == AgentBody.DryRouteTop.NO_FULL_TOP)
                 return stop("takeoff has no stable, dry full top");
-            if (lit == AgentBody.DryRouteTop.DARK && tryLight()) return true;
+            if (lit == AgentBody.DryRouteTop.DARK && tryLight(aim)) return true;
             if (body.supplyOutlineTop(from, support)) {
                 sourceProved = true;
                 aim = null;
@@ -6681,7 +6796,7 @@ final class AgentProgress {
                 }
                 case DARK -> {
                     if (body.renderedAim(floor, 8)) {
-                        if (tryLight()) return true;
+                        if (tryLight(sample)) return true;
                         if (restartCrossingUnderOutline()) return true;
                         if (tryFootholdAfterLower()) return true;
                         return refuse("not enough visible light to identify the supporting top at " + support.toShortString());
@@ -7180,7 +7295,7 @@ final class AgentProgress {
                 }
                 case FLUID -> { return refuseFluid(cell, aim, "fluid in " + area() + " at " + cell.toShortString()); }
                 case DARK -> {
-                    if (body.renderedAim(aim, 8) && !tryLight()) {
+                    if (body.renderedAim(aim, 8) && !tryLight(aim)) {
                         if (restartCrossingUnderOutline()) return true;
                         if (tryFootholdAfterLower()) return true;
                         return refuse("not enough visible light to identify " + area() + " at " + cell.toShortString());

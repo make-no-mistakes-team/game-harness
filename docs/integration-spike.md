@@ -133,6 +133,9 @@ exit, it can cut a short passage sideways from stable ground. It checks
 the newly exposed floor and headroom before stepping into the opening.
 If a stair is already dark, the player can turn a stick and coal into
 four torches and light its footing before opening the next cave lip.
+On the supply stair, it looks for a nearby visible torch mount before
+turning back. It keeps one torch in reserve and rechecks the crossing
+after seeing the placed torch and counting the item spent.
 If the opening fills with visible water, or no reachable face can be
 found after checking it from the tread, the player tries another
 direction instead of sweeping the pick back and forth over the hole.

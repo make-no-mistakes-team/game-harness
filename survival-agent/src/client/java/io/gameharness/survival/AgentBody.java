@@ -11,6 +11,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
+import java.util.function.ToDoubleFunction;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
@@ -1230,6 +1231,28 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         BlockPos cell = placementCell(now);
         return placement.getBlockPos().equals(cell) && placement.canPlace()
             && client.world.canPlace(material, cell, ShapeContext.absent());
+    }
+
+    /** Veto only the exact vanilla torch placement across the currently selected face. */
+    boolean canPlaceSupplyTorchAcross(BlockHitResult support) {
+        BlockHitResult now = selectedFace();
+        if (!sameBlockFace(support, now) || now.isInsideBlock() || !supplyTorchSupport(now)) return false;
+        var player = client.player;
+        if (!supplyOutlineRay(player.getEyePos(), now, null, AgentSupplyEgress.LIGHT_REACH)) return false;
+        var placement = new ItemPlacementContext(player, Hand.MAIN_HAND, player.getMainHandStack(), now);
+        BlockPos site = placementCell(now);
+        BlockState torch = (now.getSide() == Direction.UP ? Blocks.TORCH : Blocks.WALL_TORCH).getDefaultState();
+        return placement.getBlockPos().equals(site) && placement.canPlace()
+            && client.world.getBlockState(site).isAir()
+            && torch.getCollisionShape(client.world, site).isEmpty();
+    }
+
+    /** Accept only a stable attachment, read through a visible hit or used as a selected-face safety veto. */
+    boolean supplyTorchSupport(BlockHitResult hit) {
+        var anchor = client.world.getBlockState(hit.getBlockPos());
+        return !dryCaveDanger(anchor) && !anchor.hasBlockEntity() && !anchor.isOf(Blocks.CRAFTING_TABLE)
+            && !(anchor.getBlock() instanceof FallingBlock)
+            && anchor.isSideSolidFullSquare(client.world, hit.getBlockPos(), hit.getSide());
     }
 
     static BlockPos placementCell(BlockHitResult support) {
@@ -5612,6 +5635,14 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     static double benchFaceScore(Direction side, int dy, double distanceSquared, double reachSquared) {
         if (side == Direction.UP && dy == 0) return distanceSquared;
         return distanceSquared + reachSquared + 1 + (side == Direction.UP ? 0 : 3) + Math.abs(dy) * 2;
+    }
+
+    BlockHitResult supplyLightFace(ToDoubleFunction<BlockHitResult> score) {
+        if (!hasView()) return null;
+        if (sampleCount == 0) sampleView(AgentSupplyEgress.LIGHT_REACH);
+        BlockHitResult selected = selectedFace();
+        if (selected != null && !litFace(selected)) selected = null;
+        return AgentSupplyEgress.closestLightFace(selected, samples, sampleCount, score);
     }
 
     private void sampleView(double distance) {

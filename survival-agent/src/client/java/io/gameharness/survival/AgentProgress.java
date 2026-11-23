@@ -5397,14 +5397,18 @@ final class AgentProgress {
     }
 
     private BlockHitResult findOre(Resource resource, double range) {
+        BlockHitResult hit = body.find(resource.block, range,
+            resource == Resource.STONE ? ordinaryStoneFace : ordinaryOreFace).orElse(null);
+        return rememberOreFace(resource, hit);
+    }
+
+    private BlockHitResult rememberOreFace(Resource resource, BlockHitResult hit) {
         if (oreWorld != c.world) {
             oreSights.clear();
             rejectedOreSights.clear();
             clearOreProbe();
             oreWorld = c.world;
         }
-        BlockHitResult hit = body.find(resource.block, range,
-            resource == Resource.STONE ? ordinaryStoneFace : ordinaryOreFace).orElse(null);
         if (hit == null || resource == Resource.STONE || !c.player.isOnGround()
             || c.player.isTouchingWater()) return hit;
         BlockPos block = hit.getBlockPos();
@@ -6418,6 +6422,13 @@ final class AgentProgress {
             }
             if (outline.active() && !actualOutlineFoot(from))
                 return stop("lost actual full, dry outline takeoff support");
+            // Landing and braking are different receipts. The first frame on the
+            // new tread can still carry too much speed to mine its next side face.
+            if (outline.active() && order.brakingAfterRise(tick, c.player.getVelocity().horizontalLengthSquared())) {
+                body.pauseWork();
+                status = "supply egress: braking on the landed stair before the next cut";
+                return true;
+            }
             if (apex != null) return workApexAccess(apex);
             if (!mineDeparture && packedBench == null && ordinaryHandoff(from)) return true;
             if (surveying) return look();
@@ -7602,6 +7613,12 @@ final class AgentProgress {
                 return rejectOutlineCut("short outline cut limit or repeated cut target at " + cell.toShortString());
             BlockState material = body.supplyOutlineState(hit);
             if (material == null) return true;
+            if (foodActive() && armedCut == null) {
+                // Remember the selected seam even without a harvest tool. Looking
+                // at it is not permission to break it or to suspend healing.
+                if (Resource.IRON.block.test(material)) rememberOreFace(Resource.IRON, hit);
+                else if (Resource.DIAMOND.block.test(material)) rememberOreFace(Resource.DIAMOND, hit);
+            }
             switch (body.supplyOutlineCutAdmission(hit)) {
                 case ALLOWED -> {}
                 case UNKNOWN_OVERHEAD -> {

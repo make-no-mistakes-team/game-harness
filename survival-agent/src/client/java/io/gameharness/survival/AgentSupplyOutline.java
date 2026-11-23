@@ -21,6 +21,7 @@ import net.minecraft.world.RaycastContext;
 /** Evidence for an outlined supply-exit contact, without classifying hidden cells. */
 final class AgentSupplyOutline {
     static final long MAX_FRAME_NANOS = 200_000_000L;
+    static final double MAX_CUT_SPEED_SQUARED = 0.0025;
     private static final double MIN_PREFIX = 0.05, BEFORE_BACKSTOP = 0.06, LINE_ERROR = 0.065;
 
     private AgentSupplyOutline() {}

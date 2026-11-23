@@ -54,6 +54,10 @@ final class AgentSupplyEgressTest {
             assertTrue(egress.landWitnessed(to, stone, tick, true));
             assertEquals(to, egress.foot());
             assertEquals(Direction.SOUTH, egress.ascentBearing(tick + 1));
+            assertTrue(egress.brakingAfterRise(tick + 1, .09 * .09),
+                "real ground contact precedes the cut-safe speed on the next tick");
+            assertFalse(egress.brakingAfterRise(tick + 3, .03 * .03),
+                "continue the same uphill bearing once walking residuals settle");
             egress.observeSupport(stone);
             assertTrue(egress.retainSupport());
             assertEquals(stone, egress.carriedSupport());

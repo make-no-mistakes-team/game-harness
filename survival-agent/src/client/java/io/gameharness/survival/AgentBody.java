@@ -1170,7 +1170,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         BlockPos from = player.getBlockPos();
         int x = cell.getX(), y = cell.getY(), z = cell.getZ();
         return supplyOutlineCell(from, x, y, z, 0, 3) && supplyOutlineGrounded(from)
-            && player.getVelocity().horizontalLengthSquared() <= 0.0025
+            && player.getVelocity().horizontalLengthSquared() <= AgentSupplyOutline.MAX_CUT_SPEED_SQUARED
             && !hull.intersects(x, y, z, x + 1.0, y + 1.0, z + 1.0);
     }
 

@@ -212,6 +212,10 @@ final class AgentSupplyEgress {
 
     Direction ascentBearing(int tick) { return !carriedSupportLost && tick < ascentUntil ? ascentBearing : null; }
 
+    boolean brakingAfterRise(int tick, double horizontalSpeedSquared) {
+        return ascentBearing(tick) != null && horizontalSpeedSquared > AgentSupplyOutline.MAX_CUT_SPEED_SQUARED;
+    }
+
     void endAscentHandoff() { ascentBearing = null; }
 
     void forgetSupport() {

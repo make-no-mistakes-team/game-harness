@@ -28,15 +28,65 @@ final class AgentOrdinaryNavigator {
     // Up to two first-hit rays on each of twelve adjacent supports, plus outline proof.
     private static final int DIRECTED_RAYS = RAY_RESERVE + 24 + 8;
     private static final int LOOK_TICKS = 34, RETRY_TICKS = 24, EDGE_TICKS = 54, STANCE_TICKS = 52, GRADE_AGE = 12;
+    private static final int FLAT_RETRACE_AGE = 12;
     private static final float TRAVEL_PITCH = 31;
     private static final int[] GRADES = {0, 1, -1};
     private static final Direction[] BEARINGS = {Direction.EAST, Direction.WEST, Direction.SOUTH, Direction.NORTH};
     private static final byte SEEN = 1, HIDDEN = 2, QUEUED = 3;
 
+    enum Sight {
+        STALE_FRAME("stale or shifted frame"), BAD_FACING("not facing the requested view"),
+        RAY_BUDGET("insufficient terrain rays"), READY(""),
+        NO_PROJECTED_SUPPORT("no adjacent support in the projection"),
+        NO_NEIGHBOR("no witnessed dry neighbor"), NEIGHBOR("witnessed a dry neighbor");
+
+        final String detail;
+        Sight(String detail) { this.detail = detail; }
+    }
+
+    /** One paid snapshot belongs to its owner even if subsequent work spends all remaining rays. */
+    static final class FrontierView {
+        private long baseline, paidFrame;
+        private Sight paid;
+        private boolean faced;
+
+        void begin(long frame) {
+            baseline = frame;
+            paid = null;
+        }
+
+        Sight admit(long frame, boolean currentPose, boolean facing, int available) {
+            if (paid != null && frame == paidFrame && currentPose) return paid;
+            paid = null;
+            if (!currentPose || frame <= baseline) return Sight.STALE_FRAME;
+            if (!facing) return Sight.BAD_FACING;
+            return available < DIRECTED_RAYS ? Sight.RAY_BUDGET : Sight.READY;
+        }
+
+        void pay(long frame, Sight outcome, boolean facing) {
+            if (outcome != Sight.NEIGHBOR && outcome != Sight.NO_NEIGHBOR && outcome != Sight.NO_PROJECTED_SUPPORT)
+                return;
+            paidFrame = frame;
+            paid = outcome;
+            faced = facing;
+        }
+
+        boolean complete(AgentOrdinaryRoute route, long here, int tick) {
+            if (paid == null) return false;
+            route.consumeLook(here);
+            route.plan(here, tick);
+            return true;
+        }
+
+        String detail() { return faced ? paid.detail : "facing bound; current view: " + paid.detail; }
+    }
+
     /** Body-turn ownership and observed motion are independent of render availability. */
     static final class EdgeTravel {
         private final AgentWalkedRoute.Motion motion = new AgentWalkedRoute.Motion();
         private int lastAction, since, lastProgress;
+        private BlockPos landedFrom, landedTo;
+        private int landedAction;
         private double bestAlong;
         private boolean crossing;
 
@@ -55,8 +105,35 @@ final class AgentOrdinaryNavigator {
         }
 
         void startMotion(Vec3d pos) {
+            forgetLanding();
             motion.start(pos.x, pos.y, pos.z);
             crossing = true;
+        }
+
+        void noteLanding(BlockPos from, BlockPos to, int action) {
+            landedFrom = from;
+            landedTo = to;
+            landedAction = action;
+        }
+
+        void forgetLanding() { landedFrom = landedTo = null; }
+
+        private boolean recentLanding(int action) {
+            return landedTo != null && action >= landedAction && action - landedAction <= FLAT_RETRACE_AGE;
+        }
+
+        boolean recentFlatReturn(BlockPos from, BlockPos to, int action) {
+            return from.equals(landedTo) && to.equals(landedFrom) && from.getY() == to.getY() && recentLanding(action);
+        }
+
+        float flatRetraceYaw(BlockPos from, BlockPos to, long next, Direction bearing, float yaw, int action) {
+            if (!recentFlatReturn(from, to, action)) return Float.NaN;
+            // A longer return still needs to face the route, including a grade beyond this tread.
+            if (next != NO_CELL && x(next) - to.getX() == bearing.getOffsetX()
+                    && z(next) - to.getZ() == bearing.getOffsetZ()) return Float.NaN;
+            var key = AgentBody.ordinaryFlatKey(yaw, bearing);
+            return key == AgentBody.FlatKey.NONE ? Float.NaN
+                : yaw + MathHelper.wrapDegrees(bearing.getPositiveHorizontalDegrees() - yaw - key.yawOffset);
         }
 
         boolean observe(Vec3d pos) { return motion.observe(pos.x, pos.y, pos.z); }
@@ -76,6 +153,7 @@ final class AgentOrdinaryNavigator {
     private final AgentBody body;
     private final AgentOrdinaryRoute route = new AgentOrdinaryRoute();
     private final EdgeTravel travel = new EdgeTravel();
+    private final FrontierView frontierView = new FrontierView();
     private final byte[] sight = new byte[VIEW_CELLS];
     private final short[] checked = new short[VIEW_CELLS];
     private final long[] sightQueue = new long[SIGHT_NODES];
@@ -90,12 +168,15 @@ final class AgentOrdinaryNavigator {
     private BlockPos from, to;
     private Direction bearing;
     private Vec3d gradeAim;
-    private long rendered = -1, lookAt = NO_CELL, lookFrame, lookCue = NO_CELL, adjustAt = NO_CELL;
+    private long rendered = -1, lookAt = NO_CELL, lookCue = NO_CELL, adjustAt = NO_CELL;
     private long recallAt = NO_CELL, recalled = NO_CELL, gradeFrame = -1;
     private int lastScan = -100, lookSince, adjustSince, gradeAt = -100;
     private int unavailableSince = -1;
     private float lookYaw, lookPitch;
+    private float retraceYaw = Float.NaN;
+    private boolean justWalkedReturn;
     private boolean foodScoutHandoff;
+    private boolean exhaustedFoodView;
     private AgentBody.EdgeStance edgeStance;
     private BlockPos stanceSupport;
     private int stanceSince;
@@ -123,9 +204,11 @@ final class AgentOrdinaryNavigator {
         lastScan = -100;
         unavailableSince = -1;
         foodScoutHandoff = false;
+        exhaustedFoodView = false;
         stage = "idle";
         lastVeto = "";
         releaseEdge();
+        travel.forgetLanding();
     }
 
     boolean driving() {
@@ -134,11 +217,19 @@ final class AgentOrdinaryNavigator {
 
     boolean driving(Job owner) { return job == owner && driving(); }
 
+    /** Pay only for an existing request. This observes terrain but never turns or drives. */
+    void prepareObservation(Job owner, int tick) {
+        if (lookAt == NO_CELL || job != owner || world != client.world || player != client.player) return;
+        BlockPos foot = player.getBlockPos();
+        if (foot.asLong() == lookAt && body.ordinaryRouteContact(foot)) readFrontierView(lookAt, tick);
+    }
+
     boolean hasObservedPath(BlockPos from, BlockPos to, int tick) {
         return world == client.world && player == client.player && route.hasPath(from.asLong(), to.asLong(), tick);
     }
 
     boolean foodScoutHandoff() { return foodScoutHandoff; }
+    boolean foodFrontierExhausted() { return exhaustedFoodView; }
 
     Arrival takeArrival() {
         Arrival value = arrival;
@@ -156,7 +247,9 @@ final class AgentOrdinaryNavigator {
         if (world != client.world || player != client.player) reset();
         if (!AgentRouteGraph.cardinalStep(from.asLong(), to.asLong()) || !body.ordinaryRouteContact(to)
                 || body.ordinaryRouteLane(from, to) != AgentBody.DryRouteVeto.CLEAR) return;
-        remember(from, to, body.actionTick());
+        int action = body.actionTick();
+        remember(from, to, action);
+        travel.noteLanding(from, to, action);
     }
 
     /** Restore only a look cue; no saved trail entry becomes a graph edge or a landed receipt. */
@@ -186,8 +279,10 @@ final class AgentOrdinaryNavigator {
     Result step(Job requested, Vec3d destination, double arrivalRadius, double minFootY, double maxFootY, int tick) {
         if (world != client.world || player != client.player) reset();
         foodScoutHandoff = false;
+        exhaustedFoodView = false;
         int action = body.actionTick();
         boolean inputs = body.ordinaryRouteInputs();
+        if (!inputs) travel.forgetLanding();
         // A genuinely different owner, unsupported controls, or a skipped turn cannot
         // certify the same body path. A neutral turn due only to render loss can.
         if (from != null && (!inputs || job != requested || !travel.keepTurn(action))) releaseEdge();
@@ -201,15 +296,16 @@ final class AgentOrdinaryNavigator {
         if (travel.crossing && !travel.observe(player.getPos())) reject("discontinuous motion", Integer.MAX_VALUE);
         if (!inputs || !body.hasRecentView()) {
             if (from != null && travel.expired(tick, along())) {
-                reject("edge progress bound", Integer.MAX_VALUE);
+                progressBound(tick, body.ordinaryRoutePhysicalContact(from));
                 stage = "waiting for render after edge bound";
                 return Result.BLOCKED;
             }
             if (unavailableSince < 0) unavailableSince = tick;
-            stage = from == null ? "waiting for safe rendered dry controls" : "waiting for render on queued edge";
+            stage = !inputs ? "waiting for safe dry controls"
+                : from == null ? "waiting for a fresh terrain frame" : "waiting for render on queued edge";
             if (tick - unavailableSince < LOOK_TICKS) return Result.OBSERVING;
             releaseEdge();
-            stage = "dry controls/render bound";
+            stage = !inputs ? "dry controls bound" : "stale terrain frame bound";
             return Result.BLOCKED;
         }
         unavailableSince = -1;
@@ -217,12 +313,14 @@ final class AgentOrdinaryNavigator {
         BlockPos foot = player.getBlockPos();
         boolean grounded = body.ordinaryRouteContact(foot);
         if (from != null && grounded && !foot.equals(from) && !foot.equals(to)) releaseEdge();
+        if (from == null && (!grounded || !foot.equals(travel.landedTo))) travel.forgetLanding();
 
         if (travel.crossing && grounded && foot.equals(to) && settledAlong()) {
             boolean foodHandoff = requested == Job.FOOD && destination == null && !straightSuccessor();
             remember(from, to, tick);
             body.recordWalkedLeg(from, to);
             this.arrival = new Arrival(from, to);
+            travel.noteLanding(from, to, action);
             releaseEdge();
             if (changed) {
                 stage = "settled on queued edge";
@@ -279,6 +377,8 @@ final class AgentOrdinaryNavigator {
                 to = BlockPos.fromLong(next);
                 bearing = BEARINGS[AgentRouteGraph.slot(here, next) / 3];
                 travel.begin(action, tick);
+                justWalkedReturn = travel.recentFlatReturn(from, to, action);
+                retraceYaw = travel.flatRetraceYaw(from, to, route.hop(1), bearing, player.getYaw(), action);
                 lookAt = lookCue = NO_CELL;
             }
             if (!travel.crossing && from.getY() != to.getY() && tick - gradeAt > GRADE_AGE) {
@@ -308,25 +408,34 @@ final class AgentOrdinaryNavigator {
                 continue;
             }
             if (travel.expired(tick, along())) {
-                reject("edge progress bound", Integer.MAX_VALUE);
+                progressBound(tick, grounded && foot.equals(from));
                 continue;
             }
-            boolean carry = straightSuccessor();
-            AgentBody.OrdinaryMotor turn = body.driveOrdinaryRoute(from, to, bearing, carry, travel.crossing);
+            if (!travel.crossing && !travel.recentLanding(action)) retraceYaw = Float.NaN;
+            AgentBody.OrdinaryMotor turn = AgentBody.OrdinaryMotor.REORIENT;
+            if (Float.isFinite(retraceYaw))
+                turn = body.driveOrdinaryFlatRetrace(from, to, bearing, travel.crossing);
+            if (turn == AgentBody.OrdinaryMotor.REORIENT) {
+                retraceYaw = Float.NaN;
+                turn = body.driveOrdinaryRoute(from, to, bearing, straightSuccessor(), travel.crossing);
+            }
             if (turn == AgentBody.OrdinaryMotor.VETO) {
-                reject("live body sweep or hazard", Integer.MAX_VALUE);
+                reject("live body sweep or hazard", Float.isFinite(retraceYaw) ? tick + RETRY_TICKS : Integer.MAX_VALUE);
                 continue;
             }
             if (!travel.crossing && turn == AgentBody.OrdinaryMotor.KEY) travel.startMotion(player.getPos());
             float pitch = to.getY() > from.getY() ? 19 : to.getY() < from.getY() ? 43 : TRAVEL_PITCH;
             // Look beyond the adjacent contact along a continuous level prefix. Reaching
             // one tile of that prefix does not create a new yaw or a separate observation.
-            body.turn(bearing.getPositiveHorizontalDegrees(), pitch);
+            // A retrace keeps the previous view; the subsequent edge can steer for itself.
+            boolean retracing = Float.isFinite(retraceYaw);
+            body.turn(retracing ? retraceYaw : bearing.getPositiveHorizontalDegrees(), pitch);
             stage = switch (turn) {
                 case ALIGN -> "aligning with path";
                 case CENTER -> "centering on occupied tread";
                 case COAST -> "coasting on proved edge";
-                default -> pitch == 19 ? "jumping queued rise" : pitch == 43 ? "walking queued descent" : "walking queued flat";
+                default -> retracing ? "retracing one dry tread" : pitch == 19 ? "jumping queued rise"
+                    : pitch == 43 ? "walking queued descent" : "walking queued flat";
             };
             return travel.crossing || turn == AgentBody.OrdinaryMotor.CENTER ? Result.MOVING : Result.OBSERVING;
         }
@@ -413,9 +522,22 @@ final class AgentOrdinaryNavigator {
         releaseEdge();
     }
 
+    private void progressBound(int tick, boolean stoodAtSource) {
+        if (!justWalkedReturn || !stoodAtSource || !route.deferWalked(from.asLong(), to.asLong(), tick + RETRY_TICKS)) {
+            reject("edge progress bound", Integer.MAX_VALUE);
+            return;
+        }
+        // A retry must still pass the live lane and motor checks, and cannot defer again.
+        travel.forgetLanding();
+        lastVeto = "walked return deferred after progress bound";
+        releaseEdge();
+    }
+
     private void releaseEdge() {
         from = to = null;
         bearing = null;
+        retraceYaw = Float.NaN;
+        justWalkedReturn = false;
         travel.crossing = false;
         gradeAim = null;
         gradeFrame = -1;
@@ -471,11 +593,12 @@ final class AgentOrdinaryNavigator {
             if (!route.canLook(here)) {
                 body.pauseWork();
                 stage = "no connected dry route; directed view spent";
+                exhaustedFoodView = job == Job.FOOD && target == null;
                 return Result.BLOCKED;
             }
             lookAt = here;
             lookSince = tick;
-            lookFrame = body.renderedFrame();
+            frontierView.begin(body.renderedFrame());
             float current = player.getYaw();
             lookYaw = target == null ? current : heading(target.x - player.getX(), target.z - player.getZ(), current);
             lookPitch = 55;
@@ -492,46 +615,48 @@ final class AgentOrdinaryNavigator {
                 lookPitch = (float) Math.toDegrees(Math.atan2(eye.y - y(lookCue) + 0.025, Math.hypot(dx, dz)));
             }
         }
-        if (body.renderedFrame() > lookFrame && body.renderedDirection(lookYaw, lookPitch, 5)
-                && observe(here, tick, true)) {
-            route.consumeLook(here);
+        Sight observation = readFrontierView(here, tick);
+        if (frontierView.complete(route, here, tick)) {
             if (lookCue == recalled) recallAt = recalled = NO_CELL;
-            route.plan(here, tick);
             lookAt = lookCue = NO_CELL;
             if (route.hop(0) == NO_CELL) {
                 body.pauseWork();
-                stage = "no connected dry route; directed view exhausted";
+                stage = "no connected dry route; " + frontierView.detail();
+                exhaustedFoodView = job == Job.FOOD && target == null;
                 return Result.BLOCKED;
             }
-            stage = "found a reachable route after directed look";
+            stage = "found a reachable route after directed look; " + frontierView.detail();
             return Result.OBSERVING;
         }
         if (tick - lookSince >= LOOK_TICKS) {
-            // A missing or starved render is not observed terrain. Stop turning, but
-            // let a later matching frame finish this pending view or take good footing
-            // from the current projection after another owner has moved the camera.
-            if (observe(here, tick, false)) {
-                route.plan(here, tick);
-                if (route.hop(0) != NO_CELL) {
-                    lookAt = lookCue = NO_CELL;
-                    stage = "found a reachable route in the current view";
-                    return Result.OBSERVING;
-                }
-            }
+            // A missing or starved render is not terrain evidence. Stop turning;
+            // an affordable frame at this stance can still resolve the request.
             body.pauseWork();
-            stage = "directed view awaiting usable render";
+            stage = "directed view deferred: " + observation.detail;
             return Result.BLOCKED;
         }
         body.turn(lookYaw, lookPitch);
-        stage = lookCue == NO_CELL ? "one directed terrain look" : "reconnecting to a witnessed terrain cue";
+        stage = (lookCue == NO_CELL ? "one directed terrain look" : "reconnecting to a witnessed terrain cue")
+            + ": " + observation.detail;
         return Result.OBSERVING;
     }
 
-    private boolean observe(long here, int tick, boolean directed) {
+    private Sight readFrontierView(long here, int tick) {
         long frame = body.renderedFrame();
-        if (frame == rendered || !directed && tick - lastScan < 3) return false;
+        boolean facing = body.renderedDirection(lookYaw, lookPitch, 5);
+        Sight admission = frontierView.admit(frame, body.ordinaryRouteViewCurrent(),
+            facing || tick - lookSince >= LOOK_TICKS, body.generalRaysRemaining());
+        if (admission != Sight.READY) return admission;
+        Sight result = observe(here, tick, true);
+        frontierView.pay(frame, result, facing);
+        return result;
+    }
+
+    private Sight observe(long here, int tick, boolean directed) {
+        long frame = body.renderedFrame();
+        if (frame == rendered || !directed && tick - lastScan < 3) return Sight.STALE_FRAME;
         int available = body.generalRaysRemaining();
-        if (available < (directed ? DIRECTED_RAYS : RAY_RESERVE + 2)) return false;
+        if (available < (directed ? DIRECTED_RAYS : RAY_RESERVE + 2)) return Sight.RAY_BUDGET;
         rendered = frame;
         lastScan = tick;
         int leaveRays = Math.max(RAY_RESERVE, available - SIGHT_RAYS);
@@ -542,6 +667,7 @@ final class AgentOrdinaryNavigator {
         sightQueue[0] = here;
         sight[gridIndex(here, here)] = QUEUED;
         int tail = 1;
+        boolean neighbor = false;
         for (int head = 0; head < tail && body.generalRaysRemaining() > leaveRays; head++) {
             long source = sightQueue[head];
             set(sightFrom, source);
@@ -558,7 +684,10 @@ final class AgentOrdinaryNavigator {
                     checked[at] |= (short) (1 << slot);
                     checked[n] |= (short) (1 << ((direction ^ 1) * 3 - rise + 1));
                     boolean forward = body.ordinaryRouteLane(sightFrom, sightTo) == AgentBody.DryRouteVeto.CLEAR;
-                    if (forward) route.observe(source, next, tick);
+                    if (forward) {
+                        route.observe(source, next, tick);
+                        if (source == here) neighbor = true;
+                    }
                     if (rise == 0 ? forward : body.ordinaryRouteLane(sightTo, sightFrom) == AgentBody.DryRouteVeto.CLEAR)
                         route.observe(next, source, tick);
                     if (forward && sight[n] == SEEN && tail < SIGHT_NODES) {
@@ -568,7 +697,8 @@ final class AgentOrdinaryNavigator {
                 }
             }
         }
-        return outlined != NO_CELL || body.generalRaysRemaining() < available;
+        if (neighbor) return Sight.NEIGHBOR;
+        return outlined != NO_CELL || body.generalRaysRemaining() < available ? Sight.NO_NEIGHBOR : Sight.NO_PROJECTED_SUPPORT;
     }
 
     private static int gridIndex(long origin, long foot) {

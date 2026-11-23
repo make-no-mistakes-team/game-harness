@@ -1261,6 +1261,8 @@ final class AgentProgress {
             } else if (c.currentScreen != null) {
                 holdHealing("waiting for the screen to close");
             } else {
+                if (ordinaryRouteTick == tick - 1 && ordinaryRouteJob == Job.FOOD)
+                    navigator.prepareObservation(Job.FOOD, tick);
                 eatOrHunt(hunger, true);
             }
             caves.interruptLight();
@@ -1282,6 +1284,9 @@ final class AgentProgress {
             dropReclaim.step();
             return;
         }
+        // Safety has its turn first. Pay the active route's pending terrain view
+        // before broad target scans, without changing who can act on this turn.
+        if (ordinaryRouteTick == tick - 1) navigator.prepareObservation(ordinaryRouteJob, tick);
         if (eatOrHunt(hunger, false)) {
             caves.interruptLight();
             stallGuard.priorityAim();

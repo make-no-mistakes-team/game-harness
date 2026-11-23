@@ -26,7 +26,7 @@ final class AgentOrdinaryRoute {
     private int connectedTick = -1, connectedRevision;
     private long connectedFrom = NO_CELL;
 
-    private int nodes, intent = 1, plans, revision, examinedRevision, examinedTick;
+    private int nodes, intent = 1, plans, revision, examinedRevision, examinedTick, examinedRetry;
     private int cursor, length;
     private long origin = NO_CELL, endpoint = NO_CELL;
     private boolean directed, exact;
@@ -128,7 +128,8 @@ final class AgentOrdinaryRoute {
         int a = node(from, tick, to), b = node(to, tick, from);
         int edge = a * SLOTS + slot;
         if (!walked && retryAfter[edge] > tick) return;
-        if (edges[edge] != b || seen[edge] != Integer.MAX_VALUE && (walked || !usable(edge, tick))) revision++;
+        if (edges[edge] != b || seen[edge] != Integer.MAX_VALUE && (walked || !usable(edge, tick))
+                || walked && retryAfter[edge] > tick) revision++;
         edges[edge] = (short) b;
         if (walked) {
             seen[edge] = Integer.MAX_VALUE;
@@ -146,6 +147,17 @@ final class AgentOrdinaryRoute {
         // A valid old traversal records contact, not continuing clearance after a veto.
         seen[edge] = 0;
         revision++;
+    }
+
+    /** A motor timeout without a geometry veto can pause, but not erase, a walked tread. */
+    boolean deferWalked(long from, long to, int retry) {
+        int node = find(from), slot = AgentRouteGraph.slot(from, to);
+        if (node == 0 || slot < 0) return false;
+        int edge = node * SLOTS + slot;
+        if (seen[edge] != Integer.MAX_VALUE || edges[edge] == 0 || feet[edges[edge]] != to) return false;
+        retryAfter[edge] = retry;
+        revision++;
+        return true;
     }
 
     boolean canLook(long foot) {
@@ -187,9 +199,11 @@ final class AgentOrdinaryRoute {
         if (keep && (exact || !directed || examinedRevision == revision)) return;
         if (exact && endpoint == current) return;
         if (!keep && remaining() > 0) examinedRevision = -1;
-        if (examinedRevision == revision && endpoint == NO_CELL && tick - examinedTick < SIGHT_TICKS) return;
+        if (examinedRevision == revision && endpoint == NO_CELL
+                && tick < examinedRetry && tick - examinedTick < SIGHT_TICKS) return;
         examinedRevision = revision;
         examinedTick = tick;
+        examinedRetry = Integer.MAX_VALUE;
 
         // A breadth-first walk over positively attested edges. No destination heuristic
         // prunes sideways or away legs, and disconnected witnesses cannot become a route.
@@ -230,7 +244,11 @@ final class AgentOrdinaryRoute {
             int first = at * SLOTS;
             for (int edge = first; edge < first + SLOTS; edge++) {
                 short next = edges[edge];
-                if (next == 0 || depth[next] >= 0 || !usable(edge, tick)) continue;
+                if (next == 0 || depth[next] >= 0) continue;
+                if (!usable(edge, tick)) {
+                    if (seen[edge] == Integer.MAX_VALUE) examinedRetry = Math.min(examinedRetry, retryAfter[edge]);
+                    continue;
+                }
                 depth[next] = (short) (depth[at] + 1);
                 parent[next] = (short) at;
                 queue[tail++] = next;
@@ -267,7 +285,8 @@ final class AgentOrdinaryRoute {
     }
 
     private boolean usable(int edge, int tick) {
-        return seen[edge] != 0 && (seen[edge] == Integer.MAX_VALUE || tick - seen[edge] <= SIGHT_TICKS);
+        return retryAfter[edge] <= tick && seen[edge] != 0
+            && (seen[edge] == Integer.MAX_VALUE || tick - seen[edge] <= SIGHT_TICKS);
     }
 
     private void clearSuffix() {

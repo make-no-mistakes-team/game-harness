@@ -186,6 +186,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
     private final BlockPos.Mutable walkedProbe = new BlockPos.Mutable();
     private final BlockPos.Mutable ordinaryFloorProbe = new BlockPos.Mutable();
     private boolean ordinaryRiseKey;
+    private FlatKey ordinaryFlatKey = FlatKey.NONE;
+    private double ordinaryFlatReach;
     private final Predicate<Box> caveLandingSpace = this::caveLandingSpaceEmpty;
     private final Predicate<Box> caveLandingDry = this::caveLandingVolumeDry;
     private int dryFootingTick;
@@ -419,6 +421,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         checkedEmergencyWalk = false;
         dryRouteWalk = false;
         ordinaryRiseKey = false;
+        ordinaryFlatKey = FlatKey.NONE;
         wetEscapeWalk = false;
         horizonIntent = null;
         reconInputGrant = null;
@@ -600,6 +603,8 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         boolean rolling = horizonIntent != null;
         boolean pickupWalk = pickupInput != AgentPickup.Input.WAIT;
         int pickupSide = pickupInput.right;
+        boolean retraceWalk = !rolling && !pickupWalk && ordinaryFlatKey != FlatKey.NONE;
+        int retraceSide = 0;
         boolean horizonHazardVeto = false;
         if (horizonCrossing != null && horizonCrossingOwner != horizonIntent)
             interruptHorizonWade(Refusal.INPUT_UNAVAILABLE);
@@ -613,6 +618,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         } else if (pickupWalk) {
             advance = pickupInput.forward > 0;
             retreat = pickupInput.forward < 0;
+            jump = crouch = false;
+        } else if (retraceWalk) {
+            advance = ordinaryFlatKey == FlatKey.FORWARD;
+            retreat = ordinaryFlatKey == FlatKey.BACK;
+            retraceSide = ordinaryFlatKey == FlatKey.LEFT ? -1 : ordinaryFlatKey == FlatKey.RIGHT ? 1 : 0;
             jump = crouch = false;
         } else if (flatWalk && advance) {
             // The caller has checked a dry lane and sweep. Never inherit the ordinary
@@ -702,12 +712,18 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 attack = mining.equals(contact.pos) && contact.admits(hit);
             }
         }
+        if (retraceWalk && (crouch || attack || use)) {
+            advance = retreat = false;
+            retraceSide = 0;
+        }
         boolean sprintRequested = advance && !crouch && (rolling ? horizonSprint
-            : !pickupWalk && fast && ground == Ground.CLEAR);
-        if (advance || retreat || rolling && horizonSide != 0 || pickupSide != 0) {
-            float heading = rolling ? horizonHeading : player.getYaw() + (pickupWalk ? pickupInput.yawOffset : retreat ? 180 : 0);
+            : !pickupWalk && !retraceWalk && fast && ground == Ground.CLEAR);
+        if (advance || retreat || rolling && horizonSide != 0 || pickupSide != 0 || retraceSide != 0) {
+            float heading = rolling ? horizonHeading : player.getYaw() + (pickupWalk ? pickupInput.yawOffset
+                : retraceWalk ? ordinaryFlatKey.yawOffset : retreat ? 180 : 0);
             double reach = rolling ? horizonReach
-                : pickupWalk ? pickupLane.braking() : jump ? 3.2 : sprintRequested || player.isSprinting() ? 2.35 : crouch ? 0.70 : 1.35;
+                : pickupWalk ? pickupLane.braking() : retraceWalk ? ordinaryFlatReach
+                    : jump ? 3.2 : sprintRequested || player.isSprinting() ? 2.35 : crouch ? 0.70 : 1.35;
             if (dryLanding != null && advance && !jump && !sprintRequested && !player.isSprinting() && player.isOnGround()) {
                 double dx = dryLanding.x - player.getX(), dz = dryLanding.z - player.getZ();
                 double distance = Math.hypot(dx, dz);
@@ -724,8 +740,9 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                 advance = retreat = sprintRequested = false;
                 horizonSide = 0;
                 pickupSide = 0;
+                retraceSide = 0;
                 horizonWade = false;
-                jump = !rolling && !pickupWalk && !dive && !wetEscapeWalk && player.isSubmergedInWater();
+                jump = !rolling && !pickupWalk && !retraceWalk && !dive && !wetEscapeWalk && player.isSubmergedInWater();
             }
         } else if (jump && !player.isTouchingWater()) {
             Vec3d motion = player.getVelocity();
@@ -735,15 +752,17 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
                         Math.sqrt(drift) * 9, 1.1, false, tick) > 0) jump = false;
         }
         // Vanilla latches sprint when Ctrl is released. Let up on W to brake, then walk again.
-        if ((advance || rolling || pickupWalk) && !sprintRequested && player.isSprinting()) {
+        if ((advance || rolling || pickupWalk || retraceWalk) && !sprintRequested && player.isSprinting()) {
             advance = false;
             horizonSide = 0;
-            if (pickupWalk) retreat = false;
+            if (pickupWalk || retraceWalk) retreat = false;
             pickupSide = 0;
+            retraceSide = 0;
         }
         if (reconInputGrant != null && !reconInputGrant.getAsBoolean()) {
             advance = retreat = jump = sprintRequested = attack = use = false;
             horizonSide = 0;
+            retraceSide = 0;
         }
         boolean centerKeys = centerLanding != null && controlledBoat == null
             && player.isOnGround() && !player.isTouchingWater() && player.getVehicle() == null;
@@ -777,9 +796,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
             options.leftKey.setPressed(dry && rowLeft);
             options.rightKey.setPressed(dry && rowRight);
             ownsRowKeys = true;
-        } else if (rolling || pickupWalk || centerKeys) {
-            options.leftKey.setPressed(rolling ? horizonSide < 0 : pickupWalk ? pickupSide < 0 : centerLeft);
-            options.rightKey.setPressed(rolling ? horizonSide > 0 : pickupWalk ? pickupSide > 0 : centerRight);
+        } else if (rolling || pickupWalk || retraceWalk || centerKeys) {
+            options.leftKey.setPressed(rolling ? horizonSide < 0
+                : pickupWalk ? pickupSide < 0 : centerKeys ? centerLeft : retraceSide < 0);
+            options.rightKey.setPressed(rolling ? horizonSide > 0
+                : pickupWalk ? pickupSide > 0 : centerKeys ? centerRight : retraceSide > 0);
             ownsRowKeys = true;
         } else {
             releaseRowKeys();
@@ -787,7 +808,7 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         // A second forward press can start vanilla sprint even with the sprint key up.
         // A paced approach can coast at the lip; don't turn its next pulse into a double-tap.
         if (advance && !options.forwardKey.isPressed()) {
-            if ((flatWalk || dryRouteWalk || pickupWalk || rolling && !crouch)
+            if ((flatWalk || dryRouteWalk || pickupWalk || retraceWalk || rolling && !crouch)
                     && !sprintRequested && tick - lastForwardPress < 8) {
                 advance = false;
                 if (rolling) {
@@ -3650,6 +3671,11 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return hasView() && ordinaryRouteInputs() && ordinaryRoutePhysicalContact(foot) && ordinaryRouteSupport(foot);
     }
 
+    boolean ordinaryRouteViewCurrent() {
+        return hasView() && System.nanoTime() - observedAtNanos <= 160_000_000L
+            && eye.squaredDistanceTo(client.player.getEyePos()) <= 0.36 * 0.36;
+    }
+
     /** Contact can identify a restored stance before the first render, but cannot authorize motion. */
     boolean ordinaryRoutePhysicalContact(BlockPos foot) {
         var player = client.player;
@@ -3756,7 +3782,97 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return client.world.isSpaceEmpty(client.player, sweep) ? DryRouteVeto.CLEAR : DryRouteVeto.SWEEP;
     }
 
-    enum OrdinaryMotor { KEY, COAST, ALIGN, CENTER, VETO }
+    enum OrdinaryMotor { KEY, COAST, ALIGN, CENTER, REORIENT, VETO }
+
+    enum FlatKey {
+        NONE(0), FORWARD(0), RIGHT(90), BACK(180), LEFT(-90);
+
+        final int yawOffset;
+
+        FlatKey(int yawOffset) { this.yawOffset = yawOffset; }
+    }
+
+    private static final double ORDINARY_FLAT_DRAG = 0.546;
+    private static final double ORDINARY_FLAT_COAST = 1 / (1 - ORDINARY_FLAT_DRAG);
+
+    static FlatKey ordinaryFlatKey(float yaw, Direction bearing) {
+        if (!Float.isFinite(yaw)) return FlatKey.NONE;
+        float relative = MathHelper.wrapDegrees(bearing.getPositiveHorizontalDegrees() - yaw);
+        int quarters = Math.round(relative / 90);
+        if (Math.abs(relative - quarters * 90) > 5) return FlatKey.NONE;
+        return switch (quarters) {
+            case 0 -> FlatKey.FORWARD;
+            case 1 -> FlatKey.RIGHT;
+            case -1 -> FlatKey.LEFT;
+            default -> FlatKey.BACK;
+        };
+    }
+
+    /** The next vanilla step and its full neutral stop must fit the two verified tops. */
+    static Box ordinaryFlatSweep(BlockPos from, BlockPos to, Box hull, double vx, double vz, double padding) {
+        if (from.getY() != to.getY()
+                || Math.abs(to.getX() - from.getX()) + Math.abs(to.getZ() - from.getZ()) != 1) return null;
+        double x = vx * ORDINARY_FLAT_COAST, z = vz * ORDINARY_FLAT_COAST;
+        double minX = hull.minX + Math.min(0, x) - padding, maxX = hull.maxX + Math.max(0, x) + padding;
+        double minZ = hull.minZ + Math.min(0, z) - padding, maxZ = hull.maxZ + Math.max(0, z) + padding;
+        if (minX < Math.min(from.getX(), to.getX()) || maxX > Math.max(from.getX(), to.getX()) + 1
+                || minZ < Math.min(from.getZ(), to.getZ()) || maxZ > Math.max(from.getZ(), to.getZ()) + 1) return null;
+        return new Box(minX, hull.minY + 0.005, minZ, maxX, hull.maxY + 0.005, maxZ);
+    }
+
+    /** One just-walked level edge only. The navigator has already rechecked both supports and the lane. */
+    OrdinaryMotor driveOrdinaryFlatRetrace(BlockPos from, BlockPos to, Direction bearing, boolean crossing) {
+        if (!hasView() || !ordinaryRouteInputs() || from.getY() != to.getY()) return OrdinaryMotor.VETO;
+        var player = client.player;
+        var foot = player.getBlockPos();
+        BlockPos support = player.supportingBlockPos.orElse(null);
+        if (!player.isOnGround() || Math.abs(player.getY() - from.getY()) > 0.055
+                || !foot.equals(from) && (!crossing || !foot.equals(to))
+                || !flatSupport(from, support) && (!crossing || !flatSupport(to, support)))
+            return OrdinaryMotor.VETO;
+        if (player.getPose() != EntityPose.STANDING) return OrdinaryMotor.COAST;
+        int dx = bearing.getOffsetX(), dz = bearing.getOffsetZ();
+        double along = (player.getX() - from.getX() - 0.5) * dx + (player.getZ() - from.getZ() - 0.5) * dz;
+        if (hazardAhead(bearing.getPositiveHorizontalDegrees(), Math.max(0.68, 1.42 - along)))
+            return OrdinaryMotor.VETO;
+        Vec3d velocity = player.getVelocity();
+        Box hull = player.getBoundingBox();
+        Box coast = ordinaryFlatSweep(from, to, hull, velocity.x, velocity.z, 0);
+        if (coast == null) return crossing ? OrdinaryMotor.VETO : OrdinaryMotor.REORIENT;
+        if (ordinaryRouteVolume(coast) != DryRouteVeto.CLEAR) return OrdinaryMotor.VETO;
+
+        double speed = Math.max(0, velocity.x * dx + velocity.z * dz);
+        DryLevelInput input = dryLevelInput(1 - along, speed, ORDINARY_FLAT_DRAG, false);
+        if (input == DryLevelInput.COAST) return OrdinaryMotor.COAST;
+        Direction movement = input == DryLevelInput.BRAKE ? bearing.getOpposite() : bearing;
+        FlatKey key = ordinaryFlatKey(player.getYaw(), movement);
+        if (key == FlatKey.NONE || Math.abs(observedYawSpeed) > 45) return OrdinaryMotor.ALIGN;
+        var options = client.options;
+        KeyBinding binding = switch (key) {
+            case FORWARD -> options.forwardKey;
+            case RIGHT -> options.rightKey;
+            case BACK -> options.backKey;
+            case LEFT -> options.leftKey;
+            case NONE -> throw new AssertionError(key);
+        };
+        if (binding.isUnbound()) return crossing ? OrdinaryMotor.VETO : OrdinaryMotor.REORIENT;
+        float angle = (player.getYaw() + key.yawOffset) * MathHelper.RADIANS_PER_DEGREE;
+        double step = player.getMovementSpeed() * 0.98f;
+        double vx = velocity.x - MathHelper.sin(angle) * step, vz = velocity.z + MathHelper.cos(angle) * step;
+        // Absorb small yaw motion between issuing the pulse and vanilla consuming it.
+        Box pulse = ordinaryFlatSweep(from, to, hull, vx, vz, 0.025);
+        if (pulse == null) return !crossing && velocity.horizontalLengthSquared() < 0.0004
+            ? OrdinaryMotor.REORIENT : OrdinaryMotor.COAST;
+        if (ordinaryRouteVolume(pulse) != DryRouteVeto.CLEAR) return OrdinaryMotor.VETO;
+        ordinaryFlatKey = key;
+        ordinaryFlatReach = 0.14 + Math.hypot(vx, vz) * ORDINARY_FLAT_COAST;
+        return OrdinaryMotor.KEY;
+    }
+
+    private static boolean flatSupport(BlockPos foot, BlockPos support) {
+        return support != null && support.getX() == foot.getX()
+            && support.getY() == foot.getY() - 1 && support.getZ() == foot.getZ();
+    }
 
     /** Use ordinary keys and the existing final lava/headroom/input arbitration, never another look. */
     OrdinaryMotor driveOrdinaryRoute(BlockPos from, BlockPos to, Direction bearing, boolean carry, boolean crossing) {

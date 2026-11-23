@@ -2,9 +2,12 @@ package io.gameharness.survival;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import org.junit.jupiter.api.Test;
 
@@ -53,6 +56,23 @@ final class DryStrideTest {
         assertFalse(AgentSurfaceTread.straightLevelContinuation(from, to, to.north(), Direction.EAST));
         assertFalse(AgentSurfaceTread.straightLevelContinuation(from, to, to.east().down(), Direction.EAST));
         assertFalse(AgentSurfaceTread.straightLevelContinuation(from, to, from, Direction.EAST));
+    }
+
+    @Test
+    void aFlatRetraceIncludesItsWholeBrakingSweepAndCannotUseAThirdTread() {
+        var source = new BlockPos(-62, 72, 22);
+        var target = source.north();
+        var body = new Box(-61.8, 72, 22.2, -61.2, 73.8, 22.8);
+        var back = AgentBody.ordinaryFlatSweep(source, target, body, 0, -0.10, 0.025);
+        assertNotNull(back);
+        assertTrue(back.minZ < target.getZ() + 1, "include the next tick and its neutral braking distance");
+        assertNull(AgentBody.ordinaryFlatSweep(source, target, body, 0.10, -0.10, 0.025),
+            "even a clear-looking strafe must not drift sideways out of the two treads");
+        assertNull(AgentBody.ordinaryFlatSweep(source, target, body, 0, 0.10, 0),
+            "residual velocity toward the original tip must not cross its outside edge");
+        assertNull(AgentBody.ordinaryFlatSweep(source, target, body.offset(0, 0, -1), 0, -0.10, 0.025),
+            "a second powered pulse cannot run on past the return destination");
+        assertNull(AgentBody.ordinaryFlatSweep(source, target.down(), body, 0, -0.10, 0.025));
     }
 
     /** Feed the motor ordinary vanilla walking dynamics on a level stone lane. */

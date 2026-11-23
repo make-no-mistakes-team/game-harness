@@ -77,6 +77,12 @@ final class AgentOrdinaryRoute {
     void landed(long from, long to, int tick) {
         attest(from, to, tick, true);
         if (origin == from && hop(0) == to) {
+            // Exploration has no fixed B. After a real detour, look ahead from
+            // the completed crossing instead of steering back to the spawn yaw.
+            if (!directed) {
+                axisX = x(to) - x(from);
+                axisZ = z(to) - z(from);
+            }
             origin = to;
             visited[find(to)] = intent;
             cursor++;

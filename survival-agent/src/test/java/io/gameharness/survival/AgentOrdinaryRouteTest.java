@@ -12,6 +12,26 @@ final class AgentOrdinaryRouteTest {
     private final AgentOrdinaryRoute route = new AgentOrdinaryRoute();
 
     @Test
+    void aFoodScoutDoesNotTurnBackAlongItsLastEdgeForAnEquallyWorkableFrontier() {
+        long start = cell(0, 71, 0), perch = cell(1, 72, 0);
+        long ahead = cell(2, 72, 0), alternate = cell(-1, 71, 0);
+        chain(start, perch);
+        route.explore(-1, 0); // The only witnessed way out initially goes against our heading.
+        route.plan(start, 1);
+        route.landed(start, perch, 2);
+
+        chain(perch, ahead);
+        chain(start, alternate);
+        route.plan(perch, 3);
+        assertEquals(ahead, route.hop(0), "a search without a known target can keep its new heading");
+
+        route.retire(perch, ahead, 100);
+        route.plan(perch, 4);
+        assertEquals(start, route.hop(0), "turn back when it is the only real route to a new vantage");
+        assertEquals(alternate, route.endpoint());
+    }
+
+    @Test
     void routesAroundAnOpenUThroughWitnessedSidewaysAndAwayTreads() {
         long start = cell(0, 64, 0), goal = cell(2, 64, 0);
         long[] dogleg = {

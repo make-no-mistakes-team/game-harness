@@ -1336,7 +1336,8 @@ final class AgentProgress {
         // which just centered its body is still the timber owner while braking;
         // otherwise one skipped tick retires the only witnessed tree.
         if (surfaceApproach.timberFrontier.active()) {
-            if (ordinaryCaveDrops && bootstrapTimber && !has(LOG, 1) && !has(PLANK, 1)) {
+            if (ordinaryCaveDrops && bootstrapTimber
+                    && !affordsWood(localTableWood() + (has(STONE, 3) ? 0 : 3), PICK_HANDLES)) {
                 seekTimber();
                 return;
             }
@@ -1360,7 +1361,8 @@ final class AgentProgress {
         // itself correctly refuses moving footing; it cannot own the continuation here.
         if (ordinaryRouteTick == tick - 1 && !mineResite.active()) {
             if (ordinarySurfaceWork && ordinaryRouteJob == Job.TIMBER
-                    && (navigator.driving(Job.TIMBER) || navigator.centering(Job.TIMBER, tick))
+                    && (navigator.driving(Job.TIMBER) || navigator.centering(Job.TIMBER, tick)
+                        || !body.hasRecentView() && navigator.hasEdgeTurn(Job.TIMBER))
                     && safePickupStance() && nextFoot == null && !oreProbeReturning) {
                 if (timberResourceTick == tick - 1) timberResourceTick = tick;
                 if (ordinaryRouteBand != null) navigate(Job.TIMBER, ordinaryRouteBand);
@@ -5772,6 +5774,9 @@ final class AgentProgress {
         BlockPos foot = player.getBlockPos();
         boolean canopy = bootstrapCanopy(foot);
         if (timberWitness != null) {
+            // A dark oak can expose a neighboring stem at the same height as soon
+            // as a log breaks. Work that collectible face before looking up an empty column.
+            if (canopy && timberLastCut != null && startCrownTimber()) return;
             if (canopy && !closeTimberStance(timberWitness)) clearTimberWitness();
             else if (tendTimber()) {
                 surfaceApproach.timberFrontier.finish();
@@ -5966,6 +5971,11 @@ final class AgentProgress {
         witnessTimber(wood);
         cutFromSettledTimberStance(wood);
         return true;
+    }
+
+    static boolean crownWorkHand(ItemStack held) {
+        // A left click with a log in hand still punches leaves and spends no wood.
+        return held.isEmpty() || !held.isDamageable() && (LOG.test(held) || PLANK.test(held) || STICK.test(held));
     }
 
     private boolean crownTimberCandidate(BlockHitResult hit) {
@@ -9596,7 +9606,7 @@ final class AgentProgress {
 
         private boolean workTimberFrontier(boolean reachableWood) {
             boolean bareHanded = bootstrapTimber && c.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL
-                && c.player.getMainHandStack().isEmpty();
+                && crownWorkHand(c.player.getMainHandStack());
             if (timberFrontier.active()) {
                 if (reachableWood || !bareHanded) {
                     timberFrontier.finish();
@@ -12809,10 +12819,12 @@ final class AgentProgress {
             if (recovering) holdHealing("holding clear of danger before resuming food work");
             return recovering;
         }
-        boolean traveling = foodTravelTick == tick - 1 && navigator.driving(AgentOrdinaryNavigator.Job.FOOD);
+        boolean lastFoodTurn = foodTravelTick == tick - 1;
+        boolean traveling = lastFoodTurn && navigator.driving(Job.FOOD);
         // Finish a real airborne crossing without changing targets. Grounded
         // walking still observes food, including along a continuous scout lane.
-        if (traveling && (!player.isOnGround() || !body.hasRecentView())) {
+        if (traveling && !player.isOnGround() || lastFoodTurn && !body.hasRecentView()
+                && (navigator.hasEdgeTurn(Job.FOOD) || navigator.centering(Job.FOOD, tick))) {
             navigateFood(foodTravelTarget, foodTravelArrival, foodTravelBand);
             return true;
         }
@@ -13053,6 +13065,7 @@ final class AgentProgress {
         private long openedFrame;
         private int since, continued, uncuedLandings, crownView, columnCuts, centerUntil, crownSettleUntil;
         private boolean seenGround, attackRequested, crownRiseSpent;
+        private int crownWood;
 
         CanopyExit(Job owner) { this.owner = owner; }
 
@@ -13092,6 +13105,7 @@ final class AgentProgress {
             uncuedLandings = 0;
             quietAfter = 0;
             restoreHealth = 0;
+            crownWood = 0;
         }
 
         boolean protects(BlockPos leaf) {
@@ -13100,6 +13114,17 @@ final class AgentProgress {
         }
 
         boolean begin(BlockPos foot) {
+            if (owner == Job.TIMBER) {
+                int secured = hands.count(LOG) * 4 + hands.count(PLANK);
+                if (secured > crownWood) {
+                    // A changed view after a real pickup is worth revisiting.
+                    // Other spent stands remain spent and their supports stay protected.
+                    tried.remove(foot);
+                    refusedCrown.clear();
+                    attemptedLeaves.clear();
+                    crownWood = secured;
+                }
+            }
             if (tried.size() >= MAX_STANDS || tried.contains(foot) || activeTrail() > 1 || returnIndex >= 0
                     || resumeIndex >= 0 || !body.ordinaryRouteContact(foot)) return false;
             BlockState upper = body.caveLipFooting(foot);
@@ -13447,7 +13472,7 @@ final class AgentProgress {
         }
 
         private boolean openCrownColumn() {
-            if (!c.player.getMainHandStack().isEmpty()) return blocked("the empty hand is no longer equipped");
+            if (!crownWorkHand(c.player.getMainHandStack())) return blocked("the held item is not a bare-hand timber supply");
             if (tick - since >= CUT_TICKS) {
                 return nextCrownView();
             }

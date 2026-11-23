@@ -226,6 +226,12 @@ final class AgentOrdinaryNavigator {
 
     boolean driving(Job owner) { return job == owner && driving(); }
 
+    /** Alignment is part of the same bounded edge before the first forward key. */
+    boolean hasEdgeTurn(Job owner) {
+        return from != null && job == owner && player == client.player && world == client.world
+            && travel.ownsTurn(body.actionTick());
+    }
+
     /** An inward shift on actual support is also a movement turn, even before the next route edge. */
     boolean centering(Job owner, int tick) {
         return job == owner && world == client.world && player == client.player && edgeStance != null

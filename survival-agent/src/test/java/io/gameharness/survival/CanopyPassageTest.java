@@ -8,6 +8,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import net.minecraft.block.Blocks;
 import net.minecraft.block.LeavesBlock;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
@@ -21,6 +23,16 @@ final class CanopyPassageTest {
 
     @BeforeAll
     static void initializeVanilla() { VanillaTestResources.initialize(); }
+
+    @Test
+    void pickingUpTheFirstLogDoesNotDisableTheBareHandBootstrap() {
+        assertTrue(AgentProgress.crownWorkHand(ItemStack.EMPTY));
+        assertTrue(AgentProgress.crownWorkHand(new ItemStack(Items.DARK_OAK_LOG)));
+        assertTrue(AgentProgress.crownWorkHand(new ItemStack(Items.OAK_PLANKS)));
+        assertFalse(AgentProgress.crownWorkHand(new ItemStack(Items.WOODEN_PICKAXE)),
+            "this local leaf opening must not spend tool durability");
+        assertFalse(AgentProgress.crownWorkHand(new ItemStack(Items.BREAD)));
+    }
 
     @Test
     void crownRiseStartsOnlyOnTheOrdinaryMotorAndSettlesOnActualUpperContact() {

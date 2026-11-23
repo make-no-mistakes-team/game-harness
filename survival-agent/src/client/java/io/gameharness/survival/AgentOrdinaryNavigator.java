@@ -24,6 +24,7 @@ import net.minecraft.util.math.Vec3d;
 final class AgentOrdinaryNavigator {
     enum Job { FOOD, STONE, TIMBER, EXPLORE, RETURN }
     enum Result { MOVING, OBSERVING, ARRIVED, BLOCKED }
+    enum OutletView { WAIT, SPENT, ROUTE }
     record Arrival(BlockPos from, BlockPos to) {}
 
     private static final int RANGE = 5, HEIGHT = 3, SIDE = 2 * RANGE + 1;
@@ -254,6 +255,29 @@ final class AgentOrdinaryNavigator {
         return world == client.world && player == client.player && exhaustedAt == foot.asLong() ? job : null;
     }
 
+    boolean beginFoodOutlet(BlockPos foot) {
+        return spentFrontier(foot) == Job.FOOD && route.beginFoodOutlet(foot.asLong());
+    }
+
+    OutletView observeFoodOutlet(BlockPos foot, int tick) {
+        if (spentFrontier(foot) != Job.FOOD || !body.ordinaryRouteViewCurrent()) return OutletView.WAIT;
+        long here = foot.asLong();
+        route.plan(here, tick);
+        if (route.hop(0) != NO_CELL) return OutletView.ROUTE;
+        Sight seen = observe(here, tick, true);
+        if (seen == Sight.RAY_BUDGET || seen == Sight.STALE_FRAME) return OutletView.WAIT;
+        route.plan(here, tick);
+        return route.hop(0) == NO_CELL ? OutletView.SPENT : OutletView.ROUTE;
+    }
+
+    boolean armFoodOutletCut(BlockPos foot) {
+        return spentFrontier(foot) == Job.FOOD && route.armFoodOutletCut(foot.asLong());
+    }
+
+    boolean foodOutletOpened(BlockPos foot) {
+        return spentFrontier(foot) == Job.FOOD && route.foodOutletOpened(foot.asLong());
+    }
+
     boolean witnessedTimberExterior(BlockPos foot) {
         return witnessedTimberExterior(foot.asLong());
     }
@@ -284,7 +308,7 @@ final class AgentOrdinaryNavigator {
             || world == client.world && player == client.player && route.atForagingFoot(foot.asLong());
     }
 
-    private static boolean forageHabitat(BlockState support) {
+    static boolean forageHabitat(BlockState support) {
         return support != null && (support.isOf(Blocks.GRASS_BLOCK) || support.isOf(Blocks.PODZOL)
             || support.isOf(Blocks.MYCELIUM) || AgentSupplyEgress.naturalDryLeaf(support));
     }

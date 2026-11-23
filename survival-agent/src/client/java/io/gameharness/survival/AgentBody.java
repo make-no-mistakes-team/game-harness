@@ -3701,6 +3701,22 @@ final class AgentBody implements AgentEmergencyFootwork.Terrain {
         return AgentNightWorksite.Sky.UNKNOWN;
     }
 
+    static Vec3d foodOutletSkyPoint(Vec3d eye) { return eye.add(0, MAX_RANGE, 0); }
+
+    /** A side opening out of a cave is not the sky above the occupied column. */
+    boolean foodOutletSky() {
+        return ordinaryRouteViewCurrent()
+            && client.world.getDimensionEffects().getSkyType()
+                == net.minecraft.client.render.DimensionEffects.SkyType.NORMAL
+            && clearSight(foodOutletSkyPoint(eye), Ray.FLUIDS);
+    }
+
+    BlockHitResult foodOutletSelectedFace() {
+        BlockHitResult selected = selectedFace();
+        return selected != null && ordinaryRouteViewCurrent() && inView(selected.getPos()) && litFace(selected)
+            ? selected : null;
+    }
+
     /** Frustum preview only; no outside-view raycast or new world observation. */
     boolean macroRetainsView(Vec3d point, Vec3d feet, float yaw, float pitch) {
         if (!hasView()) return false;

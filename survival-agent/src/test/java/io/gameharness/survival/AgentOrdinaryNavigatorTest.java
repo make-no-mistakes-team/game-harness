@@ -15,6 +15,21 @@ import org.junit.jupiter.api.Test;
 
 final class AgentOrdinaryNavigatorTest {
     @Test
+    void anActuallySpentBootstrapCanYieldWithoutStealingAnotherEdgeOrAnotherGoal() {
+        var spent = new AgentProgress.SpentSurfaceRoute();
+        var foot = new BlockPos(4, 75, 8);
+        var job = AgentOrdinaryNavigator.Job.STONE;
+        spent.observe(job, foot, 3, true, false);
+        assertFalse(spent.yields(job, foot, 65, true), "one old refusal cannot release a route");
+        for (int tick = 100; tick <= 160; tick += 5) spent.observe(job, foot, tick, true, false);
+        assertTrue(spent.yields(job, foot, 161, false), "a permanently exhausted first-stone search must let recovery act");
+        assertFalse(spent.yields(AgentOrdinaryNavigator.Job.FOOD, foot, 161, false));
+        assertFalse(spent.yields(job, foot.east(), 161, true), "a different stance gets its own normal route");
+        spent.observe(job, foot, 162, false, true);
+        assertFalse(spent.yields(job, foot, 163, true), "a genuinely available route takes back the work");
+    }
+
+    @Test
     void aPaidFrontierViewSurvivesLaterResourceScansWithoutInventingARoute() {
         var view = new AgentOrdinaryNavigator.FrontierView();
         var route = new AgentOrdinaryRoute();

@@ -174,6 +174,53 @@ final class ReturnableMineStartTest {
     }
 
     @Test
+    void foodClearanceRequiresSettledExposedSandAndTheExactDrySideOfTheBlocker() {
+        var terrain = new Terrain(new HashMap<>());
+        var sand = Blocks.SAND.getDefaultState();
+        var stone = Blocks.STONE.getDefaultState();
+        BlockPos side = RIM.east(), roof = RIM.up(3);
+        Vec3d eye = Vec3d.ofBottomCenter(RIM).add(0, 1.62, 0), sky = AgentBody.foodOutletSkyPoint(eye);
+        Box hull = new Box(0.2, 64, 0.2, 0.8, 65.8, 0.8);
+        var probe = new BlockPos.Mutable();
+        terrain.blocks.put(RIM.down(), sand);
+        terrain.blocks.put(RIM.down(2), stone);
+        terrain.blocks.put(side, sand);
+        terrain.blocks.put(side.down(), stone);
+        // A ray from standing eye height to the block center first crosses
+        // its top. Aim just inside the near vertical face instead.
+        var face = terrain.ray(eye, Vec3d.ofCenter(side).add(-0.42, 0, 0));
+        assertEquals(Direction.WEST, face.getSide());
+
+        assertTrue(AgentReturnableMine.foodSandSide(terrain, RIM, EAST, face, hull, sand, eye, 4.5, probe));
+        assertFalse(AgentOrdinaryNavigator.forageHabitat(sand), "open sand is an outlet, not habitat");
+        assertTrue(AgentReturnableMine.foodSandCutClear(terrain, side));
+        assertEquals(HitResult.Type.MISS, terrain.ray(eye, sky).getType());
+        for (var ceiling : new BlockState[]{stone, Blocks.OAK_LEAVES.getDefaultState()}) {
+            terrain.blocks.put(roof, ceiling);
+            assertEquals(HitResult.Type.BLOCK, terrain.ray(eye, sky).getType(), "cave and canopy block the required sky ray");
+        }
+        terrain.blocks.remove(roof);
+        terrain.blocks.remove(RIM.down(2));
+        assertFalse(AgentReturnableMine.foodSandSide(terrain, RIM, EAST, face, hull, sand, eye, 4.5, probe),
+            "unsupported sand cannot be the stationary contact");
+        terrain.blocks.put(RIM.down(2), stone);
+        assertFalse(AgentReturnableMine.foodSandSide(terrain, RIM, EAST, face, hull, stone, eye, 4.5, probe));
+        assertFalse(AgentReturnableMine.foodSandSide(terrain, RIM, EAST, face, hull.offset(0.25, 0, 0), sand, eye, 4.5, probe));
+        assertFalse(AgentReturnableMine.foodSandSide(terrain, RIM, EAST, top(RIM.down()), hull, sand, eye, 4.5, probe));
+        assertFalse(AgentReturnableMine.foodSandSide(terrain, RIM, EAST, top(side), hull, sand, eye, 4.5, probe));
+        assertFalse(AgentReturnableMine.foodSandSide(terrain, RIM, EAST,
+            new BlockHitResult(face.getPos(), Direction.NORTH, side, false), hull, sand, eye, 4.5, probe));
+
+        for (var cover : new BlockState[]{sand, Blocks.OAK_PLANKS.getDefaultState(), Blocks.TORCH.getDefaultState()}) {
+            terrain.blocks.put(side.up(), cover);
+            assertFalse(AgentReturnableMine.foodSandCutClear(terrain, side), "do not undercut material or construction");
+        }
+        terrain.blocks.remove(side.up());
+        terrain.blocks.put(side.east(), Blocks.WATER.getDefaultState());
+        assertFalse(AgentReturnableMine.foodSandCutClear(terrain, side), "do not open a local fluid breach");
+    }
+
+    @Test
     void aGravelBreakAndAFallingEntityCannotStandInForFreshSettledClearance() {
         var work = new AgentReturnableMine.GravelWork();
         assertTrue(work.canCut());

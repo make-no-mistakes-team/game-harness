@@ -25,6 +25,7 @@ final class AgentOrdinaryRoute {
     private final int[] looked = new int[NODES + 1];
     private final int[] forageSeen = new int[NODES + 1];
     private final boolean[] foodVisited = new boolean[NODES + 1], foodLooked = new boolean[NODES + 1];
+    private final boolean[] foodOutletTried = new boolean[NODES + 1];
     private final boolean[] timberVisited = new boolean[NODES + 1], timberLooked = new boolean[NODES + 1];
     private final long[] timberTiles = new long[TIMBER_TILES];
     private final byte[] timberCoverage = new byte[TIMBER_TILES];
@@ -39,6 +40,8 @@ final class AgentOrdinaryRoute {
     private int cursor, length;
     private long origin = NO_CELL, endpoint = NO_CELL;
     private long forageFoot = NO_CELL, egressShoulder = NO_CELL;
+    private long foodCutAt = NO_CELL;
+    private boolean foodCutReopened;
     private long timberCue = NO_CELL;
     private int timberCueTick;
     private int firstFoodY = Integer.MIN_VALUE, egressHighY = Integer.MIN_VALUE;
@@ -158,6 +161,9 @@ final class AgentOrdinaryRoute {
     void resetFoodSearch() {
         Arrays.fill(foodVisited, false);
         Arrays.fill(foodLooked, false);
+        Arrays.fill(foodOutletTried, false);
+        foodCutAt = NO_CELL;
+        foodCutReopened = false;
         firstFoodY = Integer.MIN_VALUE;
         clearFoodEgress();
         returningForFood = false;
@@ -335,6 +341,33 @@ final class AgentOrdinaryRoute {
         }
     }
 
+    boolean beginFoodOutlet(long foot) {
+        int n = find(foot);
+        if (!foodSearch || n == 0 || !grounded[n] || !foodLooked[n] || foodOutletTried[n] || hop(0) != NO_CELL)
+            return false;
+        foodOutletTried[n] = true;
+        revision++;
+        return true;
+    }
+
+    boolean armFoodOutletCut(long foot) {
+        int n = find(foot);
+        if (!foodSearch || n == 0 || !foodOutletTried[n] || !foodLooked[n] || hop(0) != NO_CELL
+                || foodCutAt != NO_CELL) return false;
+        foodCutAt = foot;
+        return true;
+    }
+
+    /** A verified edit can buy one fresh view, not an edge, an occupied tread, or food evidence. */
+    boolean foodOutletOpened(long foot) {
+        int n = find(foot);
+        if (!foodSearch || n == 0 || foodCutAt != foot || foodCutReopened || !foodLooked[n]) return false;
+        foodCutReopened = true;
+        foodLooked[n] = false;
+        revision++;
+        return true;
+    }
+
     private boolean looked(int node) {
         return timberSearch ? timberLooked[node] : foodSearch ? foodLooked[node] : looked[node] == intent;
     }
@@ -434,6 +467,7 @@ final class AgentOrdinaryRoute {
         }
         queue[0] = (short) start;
         int tail = 1, frontier = 0, viewpoint = 0;
+        boolean localOutlet = foodSearch && foodOutletTried[start];
         double best = Double.POSITIVE_INFINITY;
         double viewpointCost = Double.POSITIVE_INFINITY;
         for (int head = 0; head < tail; head++) {
@@ -456,13 +490,13 @@ final class AgentOrdinaryRoute {
             } else if (!directed && !returning && !connector && grounded[at] && !looked(at)
                     && (looked(start) || timberSearch && y(foot) > y(current))
                     && (keepingEgress ? foot == egressShoulder
-                        : !foodSearch || y(foot) >= y(current) || freshForagingTop(at, tick))) {
+                        : !foodSearch || y(foot) >= y(current) - (localOutlet ? 1 : 0) || freshForagingTop(at, tick))) {
                 // Ordinary scouting requires a distinct viewpoint. After a
                 // failed climb, only the last high shoulder earns that revisit.
                 int dx = x(foot) - x(current), dz = z(foot) - z(current);
                 double cost = timberSearch ? timberFrontierCost(at, current, dx, dz, timberBiasX, timberBiasZ)
                     : depth[at] + 2 * Math.max(0, y(foot) - y(current));
-                if ((keepingEgress ? at != start : dx * dx + dz * dz >= 4) && cost < viewpointCost) {
+                if ((keepingEgress ? at != start : dx * dx + dz * dz >= (localOutlet ? 1 : 4)) && cost < viewpointCost) {
                     viewpoint = at;
                     viewpointCost = cost;
                 }
@@ -584,6 +618,7 @@ final class AgentOrdinaryRoute {
         grounded[victim] = false;
         visited[victim] = looked[victim] = forageSeen[victim] = 0;
         foodVisited[victim] = foodLooked[victim] = false;
+        foodOutletTried[victim] = false;
         timberVisited[victim] = timberLooked[victim] = false;
         revision++;
         return victim;

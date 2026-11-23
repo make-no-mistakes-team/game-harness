@@ -279,6 +279,53 @@ final class AgentOrdinaryRouteTest {
     }
 
     @Test
+    void aSettledSandOutletReopensOnlyItsPaidViewAfterOneCheckedCut() {
+        long sand = cell(0, 64, 0), previous = cell(1, 64, 0), opened = cell(0, 64, 1);
+        route.exploreFood(0, 1);
+        chain(sand, previous);
+        route.landed(sand, previous, 1);
+        route.plan(previous, 1);
+        route.consumeLook(previous);
+        route.plan(sand, 2);
+        assertFalse(route.beginFoodOutlet(sand), "the ordinary frontier has not been paid");
+
+        route.consumeLook(sand);
+        route.plan(sand, 3);
+        assertTrue(route.beginFoodOutlet(sand));
+        assertFalse(route.beginFoodOutlet(sand), "the side survey is bounded at this stance");
+        assertFalse(route.foodOutletOpened(sand), "a survey or stationary turn is not a cut");
+        assertTrue(route.armFoodOutletCut(sand));
+        assertFalse(route.foodOutletOpened(previous), "only the exact edited stance can replan");
+        assertTrue(route.foodOutletOpened(sand));
+        assertFalse(route.foodOutletOpened(sand), "one cut buys one fresh look");
+        assertTrue(route.canLook(sand));
+        assertFalse(route.canLook(previous));
+        assertFalse(route.atForagingFoot(sand), "open sand is not a food habitat");
+        assertFalse(route.hasPath(sand, opened, 4), "a cut is not an observed edge or a landing");
+
+        route.consumeLook(sand);
+        route.plan(sand, 5);
+        assertFalse(route.armFoodOutletCut(sand), "a paid replan cannot start another cut");
+    }
+
+    @Test
+    void aSandOutletPrefersAConnectedUnexaminedViewToCutting() {
+        long sand = cell(0, 64, 0), lower = cell(-1, 63, 0);
+        chain(sand, lower);
+        route.exploreFood(1, 0);
+        route.plan(lower, 1);
+        route.landed(lower, sand, 2);
+        route.consumeLook(sand);
+        route.plan(sand, 3);
+        assertEquals(NO_CELL, route.hop(0), "ordinary scouting did not revisit the adjacent lower viewpoint");
+
+        assertTrue(route.beginFoodOutlet(sand));
+        route.plan(sand, 4);
+        assertEquals(lower, route.hop(0), "the settled outlet check prefers a real, untouched alternate view");
+        assertFalse(route.armFoodOutletCut(sand));
+    }
+
+    @Test
     void failedFoodEgressPaysForOneBacktrackInsteadOfDescendingToReplayBothRises() {
         long start = cell(0, 50, 0), lower = cell(1, 49, 0), dryBranch = cell(2, 48, 0);
         long shoulder = cell(0, 51, -1), apex = cell(0, 52, -2);

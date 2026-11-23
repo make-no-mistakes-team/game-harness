@@ -604,9 +604,13 @@ final class AgentReturnableMine {
                 from.getX() + 1 + Math.max(dx, 0), from.getY() + 6, from.getZ() + 1 + Math.max(dz, 0));
         }
         // This is only a local veto on a falling entity entering the two exact columns, not a block/height survey.
-        world.collectEntitiesByType(FALLING_ENTITIES, fallVolume, FallingBlockEntity::isAlive, fallingBlocks, 1);
-        if (fallingBlocks.isEmpty()) return false;
-        fallingBlocks.clear();
+        return fallingInVolume(world, fallVolume, fallingBlocks);
+    }
+
+    static boolean fallingInVolume(ClientWorld world, Box volume, ArrayList<FallingBlockEntity> scratch) {
+        world.collectEntitiesByType(FALLING_ENTITIES, volume, FallingBlockEntity::isAlive, scratch, 1);
+        if (scratch.isEmpty()) return false;
+        scratch.clear();
         return true;
     }
 
@@ -1988,16 +1992,47 @@ final class AgentReturnableMine {
     static Face lateralGravelFace(BlockView world, BlockPos foot, Direction bearing, BlockHitResult hit,
                                   Box hull, BlockState support, Vec3d eye, double reach, boolean drift) {
         if (support == null || support.getBlock() instanceof FallingBlock
-                || AgentBody.dryCaveDanger(support) || !insideFooting(foot, hull)) return Face.FOOTPRINT;
+                || AgentBody.dryCaveDanger(support)) return Face.FOOTPRINT;
+        Face geometry = lateralFallingFace(foot, bearing, hit, hull, eye, reach, drift ? 0 : -1, true);
+        if (geometry != Face.MINEABLE) return geometry;
+        BlockPos cell = hit.getBlockPos();
+        if (!world.getBlockState(cell).isOf(Blocks.GRAVEL)) return Face.MATERIAL;
+        return protectedCutAttachment(world, cell) ? Face.PROTECTED : Face.MINEABLE;
+    }
+
+    static boolean foodSand(BlockState state) {
+        return state != null && (state.isOf(Blocks.SAND) || state.isOf(Blocks.RED_SAND));
+    }
+
+    /** Food only: a true side of the body-height blocker, not the top of a possible tread. */
+    static boolean foodSandSide(BlockView world, BlockPos foot, Direction bearing, BlockHitResult hit,
+                                Box hull, BlockState support, Vec3d eye, double reach, BlockPos.Mutable probe) {
+        return foodSand(support)
+            && lateralFallingFace(foot, bearing, hit, hull, eye, reach, 0, false) == Face.MINEABLE
+            && foodSand(world.getBlockState(hit.getBlockPos()))
+            && world.getBlockState(probe.set(foot.getX(), foot.getY() - 1, foot.getZ())) == support
+            && AgentBody.overlandLoadHolds(world, probe, support, probe);
+    }
+
+    static boolean foodSandCutClear(BlockView world, BlockPos cell) {
+        // Refuse an unproved undercut. These local states can only veto a cut already witnessed.
+        if (!world.getBlockState(cell.up()).isAir() || protectedCutAttachment(world, cell)) return false;
+        for (Direction side : ADJACENT)
+            if (AgentBody.dryCaveDanger(world.getBlockState(cell.offset(side)))) return false;
+        return true;
+    }
+
+    private static Face lateralFallingFace(BlockPos foot, Direction bearing, BlockHitResult hit, Box hull,
+                                           Vec3d eye, double reach, int minHeight, boolean allowTop) {
+        if (!insideFooting(foot, hull)) return Face.FOOTPRINT;
         if (hit == null || bearing.getOffsetY() != 0 || hit.getType() != HitResult.Type.BLOCK || hit.isInsideBlock()
                 || hit.getPos().squaredDistanceTo(eye) > reach * reach) return Face.OCCLUDED;
         BlockPos cell = hit.getBlockPos();
         int height = cell.getY() - foot.getY();
         if (cell.getX() != foot.getX() + bearing.getOffsetX() || cell.getZ() != foot.getZ() + bearing.getOffsetZ()
-                || height < (drift ? 0 : -1) || height > 1) return Face.FOOTPRINT;
-        if (hit.getSide() != bearing.getOpposite() && !AgentBody.matchesDryRouteTop(hit, cell)) return Face.OCCLUDED;
-        if (!world.getBlockState(cell).isOf(Blocks.GRAVEL)) return Face.MATERIAL;
-        return protectedCutAttachment(world, cell) ? Face.PROTECTED : Face.MINEABLE;
+                || height < minHeight || height > 1) return Face.FOOTPRINT;
+        return hit.getSide() == bearing.getOpposite() || allowTop && AgentBody.matchesDryRouteTop(hit, cell)
+            ? Face.MINEABLE : Face.OCCLUDED;
     }
 
     static Face gravelCover(BlockView world, BlockPos cell, BlockHitResult hit) {

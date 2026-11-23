@@ -91,6 +91,7 @@ final class AgentProgress {
     private static final Predicate<ItemStack> STICK = item(Items.STICK);
     private static final Predicate<ItemStack> WOOD_PICK = item(Items.WOODEN_PICKAXE);
     private static final Predicate<ItemStack> STONE_PICK = item(Items.STONE_PICKAXE);
+    private static final Predicate<ItemStack> GOLD_PICK = item(Items.GOLDEN_PICKAXE);
     private static final Predicate<ItemStack> IRON_PICK = item(Items.IRON_PICKAXE);
     private static final Predicate<ItemStack> DIAMOND_PICK = item(Items.DIAMOND_PICKAXE);
     private static final Predicate<ItemStack> WATER_BUCKET = item(Items.WATER_BUCKET);
@@ -379,7 +380,7 @@ final class AgentProgress {
     private BlockPos pickupLightFoot;
     private boolean timberReady;
     private boolean departureKit;
-    private boolean ordinarySurfaceWork, bootstrapTimber;
+    private boolean ordinarySurfaceWork, bootstrapTimber, bootstrapStone;
     private int nextLoadoutCheck;
     private boolean ordinaryCaveDrops;
     private final NightWorksite nightSite = new NightWorksite();
@@ -604,6 +605,7 @@ final class AgentProgress {
     }
 
     void observeMemoryFooting(long observedTick) {
+        if (surfaceApproach.separateCanopyDrop()) return;
         if (mineResite.oneWayInFlight()) {
             mineResite.discardCrossedDropSuffix();
             return;
@@ -718,8 +720,10 @@ final class AgentProgress {
         }
         returnableMine.observeBreak(position, state);
         supplyEgress.observeBreak(position, state);
-        if (aperture) overland.changedTimberFooting(position);
-        else overland.changed(position);
+        if (aperture) {
+            overland.changedTimberFooting(position);
+            if (surfaceApproach.canopyStone) firstStone.route.changed(position);
+        } else overland.changed(position);
         mineResite.changed(position);
         memory.forgetOwnedWorkbench(c.world, position);
         if (c.world == oreWorld) forgetOre(position);
@@ -963,6 +967,7 @@ final class AgentProgress {
         surfaceApproach.abandonBootstrapPassage();
         surfaceApproach.canopy.reset();
         surfaceApproach.canopyGroundChecks.clear();
+        surfaceApproach.resetStoneCanopy();
         overland.clearTimberRefusals();
         timberScouting = false;
         rangedOwnsLocalWork = false;
@@ -986,7 +991,10 @@ final class AgentProgress {
         if (stoneCutFoot != null && (!stoneCutFoot.equals(c.player.getBlockPos()) || has(STONE, stoneCutStock + 1)))
             stoneCutFoot = null;
         ordinarySurfaceWork = macro == null || !macro.engaged();
-        bootstrapTimber = ordinarySurfaceWork && !has(DEEP_PICK, 1) && !has(STONE_PICK, 1) && !has(WOOD_PICK, 1);
+        boolean starterTools = ordinarySurfaceWork && !has(DEEP_PICK, 1) && !has(STONE_PICK, 1);
+        boolean wooden = starterTools && has(WOOD_PICK, 1);
+        bootstrapTimber = starterTools && !wooden;
+        bootstrapStone = wooden && !has(STONE, 3) && !has(GOLD_PICK, 1);
         ordinaryCaveDrops = macro == null;
         hands.allowOrdinaryLoadout(ordinaryCaveDrops);
         observeStairLight();
@@ -1005,7 +1013,7 @@ final class AgentProgress {
         stallGuard.observe(tick, confirmedFrameBlocks(), mealsEaten, status,
             returnableMine.hasProgressLease() || supplyEgress.active() || overland.leased(tick) || mineResite.leased()
                 || firstStone.traveling()
-                || surfaceApproach.canopy.active() != null
+                || surfaceApproach.canopy.active() != null || surfaceApproach.stoneCanopyWorking()
                 || defense.ordinaryRangedActive()
                 || ordinarySurfaceWork && localFurnace != null && !localFurnace.lost
                     && localFurnace.watch.active() && !localFurnace.watch.recheckDue(tick), bootstrapTimber);
@@ -1065,7 +1073,7 @@ final class AgentProgress {
         }
         int priorLandings = fall.waterSuccesses() + fall.boatSuccesses();
         if ((defense.meleeActive() || defense.ordinaryRangedActive()
-                || !caves.controlsShortFall(tick) && !mineResite.controlsShortFall())
+                || !caves.controlsShortFall(tick) && !mineResite.controlsShortFall() && !surfaceApproach.controlsCanopyFall())
                 && fall.step(safetySpend)) {
             nightSite.interrupt();
             body.interruptHorizonWade(AgentVisibleHorizon.Refusal.SOURCE_UNGROUNDED);
@@ -1241,6 +1249,7 @@ final class AgentProgress {
             stepOverland();
             return;
         }
+        if (ordinarySurfaceWork && firstStone.continueTravel()) return;
         if (!mineResite.ascending() && supplyEgress.step()) return;
         // A planned retreat owns its advancing waypoints, not the local stall
         // incident it is trying to leave. Danger, hands and paid work ran first.
@@ -1251,6 +1260,7 @@ final class AgentProgress {
             return;
         }
         if (caveRetreat.step()) return;
+        if (surfaceApproach.seekStoneCanopy()) return;
         boolean mineRetryLease = returnableMine.hasRetryProgressLease() || firstStone.witnessedProbeWork();
         if (!returnableMine.surveyingCave() && stallGuard.caveSurveyStalled(mineRetryLease)) {
             AgentCaves.Opening opening = caves.drySurveyOpening();
@@ -1297,7 +1307,6 @@ final class AgentProgress {
             workReturnableMine(c.player.getBlockPos(), returnableMine.depth());
             return;
         }
-        if (ordinarySurfaceWork && firstStone.continueTravel()) return;
         if (continuingTimberTread()) {
             if (timberShelfTread != null) stepTimberShelf();
             else if (pickupTread != null) advancePickupTread();
@@ -1770,6 +1779,8 @@ final class AgentProgress {
     boolean macroWorkWalk(Vec3d point, boolean levelOnly) { return approach(point, false, false, levelOnly) != Walk.BLOCKED; }
 
     private void recordStallFooting(BlockPos reached) {
+        BlockState base = stallGuard.confirmedStepBase(reached);
+        if (base != null) surfaceApproach.raisedFromCanopy(reached, base);
         // This callback identifies a landing, not the crossing that reached it.
         if (!mineResite.retreating() && returnIndex >= 0 && dryFieldFooting() && !rejoinReturn(reached))
             abandonReturn(reached);
@@ -5446,9 +5457,31 @@ final class AgentProgress {
     }
 
     private BlockState bootstrapSupport(BlockPos from) {
-        if (!bootstrapTimber || !safePickupStance() || c.player.getHealth() < 10 || resumeIndex >= 0
+        return bootstrapTimber ? exactCanopyContact(from) : null;
+    }
+
+    private BlockState exactCanopyContact(BlockPos from) {
+        if (!safePickupStance() || c.player.getHealth() < 10 || resumeIndex >= 0
                 || !from.down().equals(c.player.supportingBlockPos.orElse(null))) return null;
         return body.dryCaveContact(from);
+    }
+
+    record CanopyStep(BlockPos foot, BlockState top, int landedTick) {
+        private static final int MAX_AGE = 240;
+
+        static CanopyStep confirmed(BlockPos foot, BlockState base, BlockState top, int tick) {
+            return base != null && top != null && AgentSupplyEgress.naturalDryLeaf(base)
+                ? new CanopyStep(foot.toImmutable(), top, tick) : null;
+        }
+
+        private boolean supports(BlockPos foot, BlockState contact, int tick) {
+            return this.foot.equals(foot) && top == contact && tick - landedTick <= MAX_AGE;
+        }
+    }
+
+    static boolean firstStoneCanopyContact(BlockPos foot, BlockState support, CanopyStep step, int tick) {
+        return support != null && (AgentSupplyEgress.naturalDryLeaf(support)
+            || step != null && step.supports(foot, support, tick));
     }
 
     private void seekTimber(String supplies, boolean localOnly) {
@@ -7976,7 +8009,7 @@ final class AgentProgress {
         private int view, viewUntil, probeUntil, probeCheckAt, probeHeight, starterSteps, sideProbes, travelTick, walkUntil;
         private BlockPos cutting;
         private int lastProbeContact;
-        private boolean started, exhausted, backtracking, triedSupplyExit;
+        private boolean started, exhausted, backtracking, triedSupplyExit, canopyBranchWalk;
 
         boolean working() {
             return probeTo != null || tread != null || walkUntil != 0 || target != null && quarryingStoneStock;
@@ -7988,7 +8021,7 @@ final class AgentProgress {
         }
 
         boolean traveling() {
-            return travelTick == tick - 1 && (tread != null || walkUntil != 0 && route.leased(tick));
+            return travelTick == tick - 1 && (tread != null || canopyBranchWalk || walkUntil != 0 && route.leased(tick));
         }
 
         void interrupt() {
@@ -8030,15 +8063,20 @@ final class AgentProgress {
             refusedFaces.clear();
         }
 
-        void step() {
+        private void observeWorld() {
             if (world != c.world) {
                 interrupt();
                 world = c.world;
+                route.restart(c.player.getHorizontalFacing());
                 retired.clear();
                 triedProbes.clear();
                 refusedReturns.clear();
                 started = false;
             }
+        }
+
+        void step() {
+            observeWorld();
             if (continueTravel()) return;
             if (sought != Resource.STONE) {
                 sought = Resource.STONE;
@@ -8154,13 +8192,20 @@ final class AgentProgress {
         }
 
         boolean continueTravel() {
-            if (tread == null && !route.driving()) return false;
+            if (tread == null && !canopyBranchWalk && !route.driving()) return false;
             if (travelTick != tick - 1 || world != c.world || !safePickupStance()) {
                 interrupt();
                 return false;
             }
+            if (canopyBranchWalk && !bootstrapStone && !route.driving()) {
+                stopWalk();
+                return false;
+            }
             if (tread != null) stepTread();
-            else walk(c.player.getBlockPos());
+            else {
+                travelTick = tick;
+                walk(c.player.getBlockPos());
+            }
             return true;
         }
 
@@ -8193,6 +8238,7 @@ final class AgentProgress {
             status = (sightBlock == null ? "leaving a depleted stone prospect; " : "approaching exposed stone; ") + route.status();
             var arrival = route.takeArrival();
             if (arrival != null) {
+                canopyBranchWalk = false;
                 if (adjacent(arrival.from(), arrival.foot())) recordDryCaveFooting(arrival.from(), arrival.foot());
                 else stallGuard.navigationArrival(arrival.from(), arrival.foot());
                 if (departure != null && !retiredAt(arrival.foot())) {
@@ -8213,10 +8259,37 @@ final class AgentProgress {
 
         private void stopWalk() {
             walkUntil = 0;
+            canopyBranchWalk = false;
             departure = sightBlock = null;
             sightPoint = null;
             goal = null;
             route.interrupt();
+        }
+
+        private void recheckCanopyBranch(BlockPos foot, Direction bearing) {
+            observeWorld();
+            forgetProbe();
+            if (walkUntil == 0) {
+                departure = foot;
+                walkUntil = tick + WALK_TICKS;
+            }
+            route.recheckCanopyBranch(foot, bearing);
+            canopyBranchWalk = true;
+            travelTick = tick;
+            status = "rechecking a branch toward visible ground below the canopy";
+        }
+
+        private void landedBelowCanopy(AgentSurfaceTread crossing) {
+            observeWorld();
+            interrupt();
+            if (crossing.ordinaryDescent()) {
+                route.restart(crossing.edge.down());
+                recordCaveFooting(crossing.to);
+                stallGuard.navigationArrival(crossing.from, crossing.to);
+            } else {
+                route.landedCanopyTread(crossing.from, crossing.to, crossing.edge.down());
+                recordDryCaveFooting(crossing.from, crossing.to);
+            }
         }
 
         private Direction directionAt(int step) {
@@ -9023,6 +9096,8 @@ final class AgentProgress {
     /** A new surface mine starts from walked ground, not from the top of a tree or scaffold. */
     private final class SurfaceApproach {
         private static final int APERTURE_TICKS = 50, OPEN_LOOK_TICKS = 24, GROUND_CHECK_LIMIT = 16;
+        private static final int STONE_CANOPY_LOOK_TICKS = 18;
+        private static final float STONE_CANOPY_PITCH = 58;
         private record CanopyGround(BlockPos from, BlockPos to) {}
 
         private final BlockPos[] visited = new BlockPos[24];
@@ -9035,8 +9110,13 @@ final class AgentProgress {
         private BlockPos cut, routeCut;
         private Vec3d cutAim;
         private AgentSurfaceTread canopyTread;
-        private boolean natural, canopyRecovery, canopyHandoff;
+        private ClientWorld stoneCanopyWorld;
+        private BlockPos stoneCanopyFoot;
+        private CanopyStep raisedCanopy;
+        private Direction stoneCanopyBranch, stoneCanopyStart, stoneCanopyAperture;
+        private boolean natural, canopyRecovery, canopyHandoff, canopyStone, canopyDropSeparated;
         private int canopySince, canopyTreadTick;
+        private int stoneCanopyView, stoneCanopyUntil, stoneCanopyTick;
         private int view, since, proof, cuts, cutSince, visitedCursor, backtracks, equippedCheck;
         private float surveyYaw;
 
@@ -9050,15 +9130,160 @@ final class AgentProgress {
         }
 
         private boolean protectedCanopyLeaf(BlockPos leaf) {
-            return protectRecoveryBlock(leaf) || overland.walkedSupport(leaf) || canopy.walkedSupport(leaf);
+            return protectRecoveryBlock(leaf) || overland.walkedSupport(leaf)
+                || canopy.walkedSupport(leaf) || firstStone.world == c.world && firstStone.route.walkedSupport(leaf);
+        }
+
+        private void resetStoneCanopy() {
+            stoneCanopyWorld = c.world;
+            stoneCanopyFoot = null;
+            raisedCanopy = null;
+            stoneCanopyTick = 0;
+        }
+
+        private void raisedFromCanopy(BlockPos foot, BlockState base) {
+            if (stoneCanopyWorld != c.world) resetStoneCanopy();
+            raisedCanopy = CanopyStep.confirmed(foot, base, exactCanopyContact(foot), tick);
+        }
+
+        private BlockState stoneCanopySupport(BlockPos foot) {
+            if (!bootstrapStone) return null;
+            BlockState contact = exactCanopyContact(foot);
+            return firstStoneCanopyContact(foot, contact, stoneCanopyWorld == c.world ? raisedCanopy : null, tick)
+                ? contact : null;
+        }
+
+        private boolean stoneCanopyWorking() {
+            return bootstrapStone && (stoneCanopyTick == tick - 1
+                || canopyStone && canopyTread != null && canopyTreadTick == tick - 1);
+        }
+
+        private boolean seekStoneCanopy() {
+            if (!bootstrapStone || returnIndex >= 0 || exitStart != null || oreProbeReturning || workshopReturn != null
+                    || returnableMine.active() || supplyEgress.active() || mineResite.active()
+                    || caves.active() || caves.routingDry() || to != null || continuingTimberTread()
+                    || portal != null && portal.locallyStopped()
+                    || stallGuard.ownsRecovery() && !stallGuard.waitingForEvidence()
+                    || firstStone.witnessedProbeWork() || finishingOreCut(Resource.STONE)) return false;
+            if (stoneCanopyWorld != c.world) resetStoneCanopy();
+            BlockPos foot = c.player.getBlockPos();
+            BlockState source = stoneCanopySupport(foot);
+            if (source == null) return false;
+            if (foot.equals(stoneCanopyFoot) && stoneCanopyView >= 4) return false;
+            if (!hands.stableCraftFooting() || !body.hasRecentView()) return false;
+            if (!foot.equals(stoneCanopyFoot)) {
+                if (workOre(Resource.STONE, REACH - 0.35, false)) return true;
+                stoneCanopyFoot = foot.toImmutable();
+                stoneCanopyStart = c.player.getHorizontalFacing();
+                stoneCanopyView = 0;
+                stoneCanopyUntil = tick + STONE_CANOPY_LOOK_TICKS;
+                stoneCanopyBranch = stoneCanopyAperture = null;
+            }
+            Direction bearing = switch (stoneCanopyView) {
+                case 0 -> stoneCanopyStart;
+                case 1 -> stoneCanopyStart.rotateYClockwise();
+                case 2 -> stoneCanopyStart.rotateYCounterclockwise();
+                default -> stoneCanopyStart.getOpposite();
+            };
+            body.pauseWork();
+            float yaw = bearing.getPositiveHorizontalDegrees();
+            if (body.renderedDirection(yaw, STONE_CANOPY_PITCH, 8) && !body.dryRouteRaysSpent()) {
+                if (!body.hazardAhead(yaw, 1.65)) {
+                    BlockPos side = foot.offset(bearing);
+                    if (takeStoneCanopyTread(foot, source, side, bearing)) return true;
+                    BlockPos beyond = side.offset(bearing);
+                    for (int depth = 2; depth <= 4; depth++) {
+                        BlockPos floor = beyond.down(depth);
+                        BlockState ground = body.overlandTop(floor, bearing, AgentBody::dryCaveDanger);
+                        if (ground == null || !naturalGround(ground)) continue;
+                        if (stoneCanopyBranch == null) stoneCanopyBranch = bearing;
+                        if (noteBootstrapLane(foot, bearing, false, null, false, floor) && stoneCanopyAperture == null)
+                            stoneCanopyAperture = bearing;
+                        break;
+                    }
+                }
+                advanceStoneCanopyView();
+            } else if (tick >= stoneCanopyUntil) {
+                advanceStoneCanopyView();
+            }
+            if (stoneCanopyView >= 4) {
+                if (stoneCanopyAperture != null && beginBootstrapPassage(foot, stoneCanopyAperture, false, true))
+                    return true;
+                if (stoneCanopyBranch != null) {
+                    firstStone.recheckCanopyBranch(foot, stoneCanopyBranch);
+                    return true;
+                }
+                return false;
+            }
+            stoneCanopyTick = tick;
+            body.turnFine(yaw, STONE_CANOPY_PITCH);
+            status = "checking downhill from contacted canopy for dry ground and collectible stone";
+            return true;
+        }
+
+        private void advanceStoneCanopyView() {
+            stoneCanopyView++;
+            stoneCanopyUntil = tick + STONE_CANOPY_LOOK_TICKS;
+        }
+
+        private boolean takeStoneCanopyTread(BlockPos foot, BlockState source, BlockPos side, Direction bearing) {
+            BlockPos lower = side.down();
+            if (!stallGuard.refusedCrossing(foot, lower)) {
+                var edge = body.witnessedOrdinaryTread(foot, lower, bearing);
+                if (edge != null && naturalGround(edge.lowerSupport())) {
+                    beginCanopyTread(AgentSurfaceTread.ordinaryStock(edge, foot, tick));
+                    return true;
+                }
+            }
+            if (body.caveLipFooting(foot) != source) return false;
+            for (int height = 1; height <= AgentDryLanding.MAX_DROP; height++) {
+                if (!permitsOneWayCaveDrop(height)) continue;
+                BlockPos landing = side.down(height);
+                if (stallGuard.refusedCrossing(foot, landing)) continue;
+                BlockState floor = body.overlandTop(landing.down(), bearing, AgentBody::dryCaveDanger);
+                if (floor == null || !naturalGround(floor) || floor.getBlock() instanceof FallingBlock) continue;
+                // Both supports are witnessed. The ordinary descent motor still
+                // proves the exact lit top, low-impact coast and stable landing.
+                var edge = new AgentSurfaceTread.Edge(foot, source, landing, floor, bearing);
+                beginCanopyTread(AgentSurfaceTread.recall(edge, false, tick, AgentSurfaceTread.RecallPolicy.ORDINARY));
+                return true;
+            }
+            return false;
+        }
+
+        private void beginCanopyTread(AgentSurfaceTread tread) {
+            canopyStone = true;
+            canopyTread = tread;
+            canopyTreadTick = tick;
+            status = "preparing the checked descent toward visibly solid ground below the canopy";
+        }
+
+        private boolean controlsCanopyFall() {
+            return bootstrapStone && canopyStone && canopyTread != null && canopyTread.ordinaryDescent()
+                && canopyTread.controlsShortFall(c, body, tick);
+        }
+
+        private boolean separateCanopyDrop() {
+            var tread = canopyTread;
+            if (tread == null || !tread.ordinaryDescent() || !tread.leftTakeoff(c)) return false;
+            if (!canopyDropSeparated) {
+                detachMine(tread.from);
+                canopyDropSeparated = true;
+            }
+            return true;
         }
 
         private boolean noteBootstrapLane(BlockPos foot, Direction bearing, boolean lowerTop, BlockPos riser,
                                           boolean refusedLane) {
+            return noteBootstrapLane(foot, bearing, lowerTop, riser, refusedLane, null);
+        }
+
+        private boolean noteBootstrapLane(BlockPos foot, Direction bearing, boolean lowerTop, BlockPos riser,
+                                          boolean refusedLane, BlockPos witnessedGround) {
             BlockPos side = foot.offset(bearing);
-            BlockPos worksite = side.offset(bearing).down(2);
-            BlockState floor = body.overlandTop(worksite, bearing, AgentProgress::dangerous);
-            boolean seenWorksite = floor != null && (naturalGround(floor) || floor.isIn(BlockTags.LOGS));
+            BlockPos worksite = witnessedGround != null ? witnessedGround : side.offset(bearing).down(2);
+            BlockState floor = witnessedGround != null ? null : body.overlandTop(worksite, bearing, AgentProgress::dangerous);
+            boolean seenWorksite = witnessedGround != null || floor != null && (naturalGround(floor) || floor.isIn(BlockTags.LOGS));
             if (seenWorksite) canopy.productive(foot, worksite);
             if ((refusedLane || seenWorksite) && !lowerTop) {
                 BlockPos leaf = side.down();
@@ -9116,7 +9341,12 @@ final class AgentProgress {
         }
 
         private boolean beginBootstrapPassage(BlockPos foot, Direction bearing, boolean recovery) {
-            if (timberChop != null || bootstrapSupport(foot) == null || !hands.stableCraftFooting() || !body.hasRecentView()) return false;
+            return beginBootstrapPassage(foot, bearing, recovery, false);
+        }
+
+        private boolean beginBootstrapPassage(BlockPos foot, Direction bearing, boolean recovery, boolean stone) {
+            if (timberChop != null || (stone ? stoneCanopySupport(foot) : bootstrapSupport(foot)) == null
+                    || !hands.stableCraftFooting() || !body.hasRecentView()) return false;
             var plan = bearing == null ? canopy.begin(foot) : canopy.begin(foot, bearing);
             if (plan == null) return false;
             if (protectedCanopyLeaf(plan.face().getBlockPos())
@@ -9130,6 +9360,7 @@ final class AgentProgress {
             }
             body.pauseWork();
             canopyRecovery = recovery;
+            canopyStone = stone;
             canopyHandoff = false;
             canopySince = tick;
             beginTimberChop(plan.face(), true);
@@ -9139,11 +9370,11 @@ final class AgentProgress {
         }
 
         private boolean workBootstrapPassage() {
+            if (canopyTread != null) return stepBootstrapDescent();
             var plan = canopy.active();
             if (plan == null) return false;
-            if (canopyTread != null) return stepBootstrapDescent();
             BlockPos leaf = plan.face().getBlockPos();
-            BlockState source = bootstrapSupport(plan.foot());
+            BlockState source = canopyStone ? stoneCanopySupport(plan.foot()) : bootstrapSupport(plan.foot());
             if (source == null || protectedCanopyLeaf(leaf)
                     || body.hazardAhead(plan.bearing().getPositiveHorizontalDegrees(), 1.5)) {
                 abandonBootstrapPassage();
@@ -9152,11 +9383,26 @@ final class AgentProgress {
             if (canopy.opened()) {
                 body.pauseWork();
                 if (tick - canopySince >= OPEN_LOOK_TICKS) {
+                    boolean reroute = canopyStone && stoneCanopyBranch != null;
+                    if (reroute)
+                        firstStone.recheckCanopyBranch(plan.foot(), stoneCanopyBranch);
                     abandonBootstrapPassage();
-                    return false;
+                    return reroute;
                 }
                 long frame = body.renderedFrame();
                 if (!hands.stableCraftFooting() || !body.hasRecentView() || !canopy.freshOpening(frame)) return true;
+                if (canopyStone) {
+                    Direction bearing = plan.bearing();
+                    if (takeStoneCanopyTread(plan.foot(), source, plan.foot().offset(bearing), bearing)) return true;
+                    if (plan.top()) {
+                        lookAtStockTread(plan.foot(), leaf, bearing);
+                        status = "checking the opened canopy for dry solid ground below";
+                        return true;
+                    }
+                    firstStone.recheckCanopyBranch(plan.foot(), bearing);
+                    abandonBootstrapPassage();
+                    return true;
+                }
                 if (plan.top()) {
                     if (!canopyRecovery && cutTimberFromTread(false)) {
                         abandonBootstrapPassage();
@@ -9212,21 +9458,33 @@ final class AgentProgress {
         private boolean stepBootstrapDescent() {
             var tread = canopyTread;
             body.pauseWork();
-            if (canopyTreadTick != tick - 1 || !bootstrapTimber || !safePickupStance() || c.player.getHealth() < 10) {
+            if (canopyTreadTick != tick - 1 || !(canopyStone ? bootstrapStone : bootstrapTimber)
+                    || !safePickupStance() || c.player.getHealth() < 10
+                    || tread.ordinaryDescent() && !tread.leftTakeoff(c)
+                        && !permitsOneWayCaveDrop(tread.from.getY() - tread.to.getY())) {
                 abandonBootstrapPassage();
                 return false;
             }
             canopyTreadTick = tick;
             switch (tread.step(c, body, tick)) {
-                case CHECKING -> status = "verifying the reversible step off the canopy";
+                case CHECKING -> status = tread.ordinaryDescent() ? "checking the bounded one-way descent off the canopy"
+                    : "verifying the reversible step off the canopy";
                 case MOVING -> {
                     rememberMotion();
                     status = "stepping down from the canopy to a witnessed dry shelf";
                 }
                 case LANDED -> {
-                    if (bootstrapSupport(tread.to) != tread.edge.lowerSupport()) {
+                    if (exactCanopyContact(tread.to) != tread.edge.lowerSupport()) {
                         abandonBootstrapPassage();
                         return false;
+                    }
+                    if (canopyStone) {
+                        separateCanopyDrop();
+                        firstStone.landedBelowCanopy(tread);
+                        bootstrapLanded(tread.from, tread.to, true);
+                        abandonBootstrapPassage();
+                        status = "reached witnessed solid ground below the canopy to seek stone";
+                        return true;
                     }
                     body.recordWalkedLeg(tread.from, tread.to);
                     overland.landedCanopyTread(tread.from, tread.to, tread.edge.down());
@@ -9251,7 +9509,11 @@ final class AgentProgress {
         }
 
         private void bootstrapLanded(BlockPos source, BlockPos landing) {
-            var floor = bootstrapSupport(landing);
+            bootstrapLanded(source, landing, false);
+        }
+
+        private void bootstrapLanded(BlockPos source, BlockPos landing, boolean stone) {
+            var floor = stone ? exactCanopyContact(landing) : bootstrapSupport(landing);
             if (floor == null) return;
             canopy.landed(source, landing);
             if (naturalGround(floor) || floor.isIn(BlockTags.LOGS))
@@ -9271,6 +9533,8 @@ final class AgentProgress {
             canopy.finish();
             canopyTread = null;
             canopyRecovery = false;
+            canopyStone = false;
+            canopyDropSeparated = false;
         }
 
         private String stallBootstrapPassage() {
@@ -9577,6 +9841,7 @@ final class AgentProgress {
         }
 
         private void broken(BlockPos position, BlockState state) {
+            if (raisedCanopy != null && position.equals(raisedCanopy.foot().down())) raisedCanopy = null;
             if (!state.isIn(BlockTags.LEAVES)) return;
             if (position.equals(cut)) {
                 cuts++;

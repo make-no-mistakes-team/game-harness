@@ -381,6 +381,10 @@ final class AgentStallGuard {
     boolean retryingDistinctWork() { return phase == Phase.RETRY && blockedReason != null; }
     boolean waitingForEvidence() { return phase == Phase.BLOCKED || phase == Phase.ASSESS
         || phase == Phase.WATER && water.blocked(); }
+    /** Only available during the confirmed placement's landing callback. */
+    BlockState confirmedStepBase(BlockPos landed) {
+        return phase == Phase.STEP && stepStage == StepStage.LAND && shaftClimb.onRaisedFoot(landed) ? stepBase : null;
+    }
     boolean triedStallRoute(BlockPos from, BlockPos cell) {
         return drivenStances.contains(cell) || !departures.newLanding(cell) || !departures.canCross(from, cell);
     }

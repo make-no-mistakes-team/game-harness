@@ -75,6 +75,9 @@ If leaves hide the route, the player
 can cut a neighboring leaf while keeping its own support. It checks
 the exposed footing before stepping down. Choosing another trunk does
 not send it back onto the same failed collection spot.
+A wooden pick is not a reason to keep walking along treetops looking
+for stone. From a confirmed canopy the player can look down for a dry
+tread before starting another overland search.
 Seeing sky or a log through the mouth of a shaft is not enough to
 finish an ascent. The player looks for ground it can walk onto, or
 timber it can cut and collect from its current tread.
@@ -120,6 +123,10 @@ worksite. The player keeps checking older connected stairs on its way
 out; it does not assume a previously walked tread is still clear or dry.
 If a retreat is blocked, the player can strike a hostile mob it can
 see and reach, including while being knocked back.
+After danger passes, a critically hurt player below the hunger needed
+for healing can take reachable food even if it was following a blocked
+mine route. It prefers safe food to rotten flesh. An empty view does
+not start a hunt.
 It need not abandon work on a dry bank to chase an unarmed drowned
 swimming below it. A visible trident or an actual hit changes that decision.
 Without a shield, the player can keep moving along a checked retreat

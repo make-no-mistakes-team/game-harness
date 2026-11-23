@@ -58,6 +58,36 @@ final class CanopyPassageTest {
     }
 
     @Test
+    void firstStoneNeedsActualNaturalLeafContactRatherThanBeingInAForest() {
+        var oak = Blocks.OAK_LEAVES.getDefaultState();
+        assertTrue(AgentProgress.firstStoneCanopyContact(FOOT, oak, null, 100));
+        assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, null, null, 100));
+        assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, Blocks.GRASS_BLOCK.getDefaultState(), null, 100));
+        assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, Blocks.STONE.getDefaultState(), null, 100));
+        assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, oak.with(LeavesBlock.PERSISTENT, true), null, 100));
+        assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, oak.with(Properties.WATERLOGGED, true), null, 100));
+    }
+
+    @Test
+    void aConfirmedCanopyStepOnlyCarriesItsExactRecentSupportIntoFirstStone() {
+        var oak = Blocks.OAK_LEAVES.getDefaultState();
+        var andesite = Blocks.ANDESITE.getDefaultState();
+        var grass = Blocks.GRASS_BLOCK.getDefaultState();
+        BlockPos raised = FOOT.up();
+        assertNull(AgentProgress.CanopyStep.confirmed(raised, null, andesite, 100), "no actor placement receipt");
+        assertNull(AgentProgress.CanopyStep.confirmed(raised, grass, andesite, 100), "a general surface step is not canopy");
+        assertNull(AgentProgress.CanopyStep.confirmed(raised, oak, null, 100), "no supporting contact");
+
+        var step = AgentProgress.CanopyStep.confirmed(raised, oak, andesite, 100);
+        assertNotNull(step);
+        assertTrue(AgentProgress.firstStoneCanopyContact(raised, andesite, step, 101));
+        assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, andesite, step, 101));
+        assertFalse(AgentProgress.firstStoneCanopyContact(raised.east(), andesite, step, 101));
+        assertFalse(AgentProgress.firstStoneCanopyContact(raised, grass, step, 101));
+        assertFalse(AgentProgress.firstStoneCanopyContact(raised, andesite, step, 341));
+    }
+
+    @Test
     void anAdjacentCanopyTopOpensOnlyOutsideTheFootprintTrailAndAttachments() {
         var leaves = Blocks.OAK_LEAVES.getDefaultState();
         BlockPos crown = FOOT.east().down();

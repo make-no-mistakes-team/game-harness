@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.BiPredicate;
+import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
 import java.util.function.ToDoubleFunction;
 import net.minecraft.block.BlockState;
@@ -337,6 +338,12 @@ final class AgentSupplyEgress {
 
     static boolean canopyContact(BlockState support, boolean bootstrap, boolean returning) {
         return bootstrap && !returning && support != null && naturalDryLeaf(support);
+    }
+
+    static boolean firstLogCanopyHandoff(AgentOrdinaryNavigator.Job owner, boolean bareHanded, boolean reachableWood,
+                                        BooleanSupplier checkedCanopy) {
+        return owner == AgentOrdinaryNavigator.Job.TIMBER && bareHanded && !reachableWood
+            && checkedCanopy.getAsBoolean();
     }
 
     static boolean canopyLeaf(BlockPos from, Direction lane, BlockHitResult hit, BlockState state, boolean protectedCell) {

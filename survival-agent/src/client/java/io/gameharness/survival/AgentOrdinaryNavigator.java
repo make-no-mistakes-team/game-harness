@@ -180,7 +180,7 @@ final class AgentOrdinaryNavigator {
     private float retraceYaw = Float.NaN;
     private boolean justWalkedReturn;
     private boolean foodScoutHandoff;
-    private boolean exhaustedFoodView;
+    private long exhaustedAt = NO_CELL;
     private AgentBody.EdgeStance edgeStance;
     private BlockPos stanceSupport;
     private int stanceSince;
@@ -208,7 +208,7 @@ final class AgentOrdinaryNavigator {
         lastScan = -100;
         unavailableSince = -1;
         foodScoutHandoff = false;
-        exhaustedFoodView = false;
+        exhaustedAt = NO_CELL;
         stage = "idle";
         lastVeto = "";
         releaseEdge();
@@ -233,7 +233,9 @@ final class AgentOrdinaryNavigator {
     }
 
     boolean foodScoutHandoff() { return foodScoutHandoff; }
-    boolean foodFrontierExhausted() { return exhaustedFoodView; }
+    Job spentFrontier(BlockPos foot) {
+        return world == client.world && player == client.player && exhaustedAt == foot.asLong() ? job : null;
+    }
 
     void resetFoodSearch() { route.resetFoodSearch(); }
 
@@ -317,7 +319,7 @@ final class AgentOrdinaryNavigator {
                         int tick, AgentMemory memory) {
         if (world != client.world || player != client.player) reset();
         foodScoutHandoff = false;
-        exhaustedFoodView = false;
+        exhaustedAt = NO_CELL;
         int action = body.actionTick();
         boolean inputs = body.ordinaryRouteInputs();
         if (!inputs) travel.forgetLanding();
@@ -649,7 +651,7 @@ final class AgentOrdinaryNavigator {
             if (!route.canLook(here)) {
                 body.pauseWork();
                 stage = "no connected dry route; directed view spent";
-                exhaustedFoodView = job == Job.FOOD && target == null;
+                if (frontierSpent(route, here, target)) exhaustedAt = here;
                 return Result.BLOCKED;
             }
             lookAt = here;
@@ -678,7 +680,7 @@ final class AgentOrdinaryNavigator {
             if (route.hop(0) == NO_CELL) {
                 body.pauseWork();
                 stage = "no connected dry route; " + frontierView.detail();
-                exhaustedFoodView = job == Job.FOOD && target == null;
+                if (frontierSpent(route, here, target)) exhaustedAt = here;
                 return Result.BLOCKED;
             }
             stage = "found a reachable route after directed look; " + frontierView.detail();
@@ -695,6 +697,10 @@ final class AgentOrdinaryNavigator {
         stage = (lookCue == NO_CELL ? "one directed terrain look" : "reconnecting to a witnessed terrain cue")
             + ": " + observation.detail;
         return Result.OBSERVING;
+    }
+
+    static boolean frontierSpent(AgentOrdinaryRoute route, long foot, Vec3d target) {
+        return target == null && route.hop(0) == NO_CELL && route.lookSpent(foot);
     }
 
     private Sight readFrontierView(long here, int tick) {

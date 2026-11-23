@@ -23,6 +23,26 @@ final class CanopyPassageTest {
     static void initializeVanilla() { VanillaTestResources.initialize(); }
 
     @Test
+    void aSpentBareHandedTimberFrontierDefersToWoodAndStillNeedsACheckedOpening() {
+        var leaves = Blocks.OAK_LEAVES.getDefaultState();
+        BlockPos lower = FOOT.east().down(2);
+        assertTrue(AgentSupplyEgress.firstLogCanopyHandoff(AgentOrdinaryNavigator.Job.TIMBER, true, false,
+            () -> AgentFoodWork.canopyEdge(FOOT, leaves, Direction.EAST, lower,
+                Blocks.GRASS_BLOCK.getDefaultState()) != null));
+        assertFalse(AgentSupplyEgress.firstLogCanopyHandoff(AgentOrdinaryNavigator.Job.TIMBER, true, true,
+            () -> { throw new AssertionError("reachable wood must win without inspecting the canopy"); }));
+        assertFalse(AgentSupplyEgress.firstLogCanopyHandoff(null, true, false,
+            () -> { throw new AssertionError("an unspent frontier has not earned a canopy action"); }));
+        assertFalse(AgentSupplyEgress.firstLogCanopyHandoff(AgentOrdinaryNavigator.Job.FOOD, true, false,
+            () -> { throw new AssertionError("FOOD has its own frontier owner"); }));
+        assertFalse(AgentSupplyEgress.firstLogCanopyHandoff(AgentOrdinaryNavigator.Job.TIMBER, false, false,
+            () -> { throw new AssertionError("an equipped hand is not first-log canopy work"); }));
+        assertFalse(AgentSupplyEgress.firstLogCanopyHandoff(AgentOrdinaryNavigator.Job.TIMBER, true, false,
+            () -> AgentFoodWork.canopyEdge(FOOT, leaves, Direction.EAST, lower, null) != null),
+            "an unseen lower top is not a descent");
+    }
+
+    @Test
     void onlyTheNaturalLeafUndersideInTheJumpColumnCanOpenTheStep() {
         var leaf = Blocks.OAK_LEAVES.getDefaultState();
         BlockPos cap = FOOT.up(2);

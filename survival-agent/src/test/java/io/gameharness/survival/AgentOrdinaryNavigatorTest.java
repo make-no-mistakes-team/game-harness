@@ -29,6 +29,8 @@ final class AgentOrdinaryNavigatorTest {
         assertEquals(AgentOrdinaryNavigator.Sight.RAY_BUDGET, view.admit(8, true, true, 12));
         assertFalse(view.complete(route, here, 2));
         assertTrue(route.canLook(here));
+        assertFalse(AgentOrdinaryNavigator.frontierSpent(route, here, null),
+            "a deferred render has not spent the first-log frontier");
 
         assertEquals(AgentOrdinaryNavigator.Sight.READY, view.admit(9, true, true, 48));
         view.pay(9, AgentOrdinaryNavigator.Sight.NO_NEIGHBOR, true);
@@ -37,6 +39,11 @@ final class AgentOrdinaryNavigatorTest {
         assertFalse(route.canLook(here));
         assertEquals(NO_CELL, route.hop(0));
         assertFalse(route.exact());
+        assertTrue(AgentOrdinaryNavigator.frontierSpent(route, here, null));
+        assertFalse(AgentOrdinaryNavigator.frontierSpent(route, cell(4, 0, 0), null),
+            "an unpaid second footing cannot borrow the first one's frontier");
+        assertFalse(AgentOrdinaryNavigator.frontierSpent(route, here, new Vec3d(2, 0, 0)),
+            "a blocked approach to a known trunk is not an exhausted frontier");
         assertEquals(AgentOrdinaryNavigator.Sight.RAY_BUDGET, view.admit(10, true, true, 0),
             "another frame cannot borrow a stale empty snapshot");
     }
@@ -62,6 +69,8 @@ final class AgentOrdinaryNavigatorTest {
         assertEquals(tread, route.hop(0));
         assertEquals(junction, route.endpoint());
         assertFalse(route.exact(), "a new viewpoint is not a destination arrival");
+        assertFalse(AgentOrdinaryNavigator.frontierSpent(route, tip, null),
+            "a connected walking alternative still belongs to the ordinary navigator");
     }
 
     @Test

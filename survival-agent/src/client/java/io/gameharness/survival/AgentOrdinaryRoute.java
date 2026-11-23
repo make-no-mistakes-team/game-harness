@@ -244,6 +244,11 @@ final class AgentOrdinaryRoute {
         return node != 0 && !looked(node);
     }
 
+    boolean lookSpent(long foot) {
+        int node = find(foot);
+        return node != 0 && looked(node);
+    }
+
     void consumeLook(long foot) {
         int node = find(foot);
         if (node != 0 && !looked(node)) {

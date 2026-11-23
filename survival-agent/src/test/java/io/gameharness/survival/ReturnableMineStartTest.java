@@ -243,6 +243,13 @@ final class ReturnableMineStartTest {
             terrain.ray(eye, Vec3d.ofCenter(side)), hull), "a standing ray to the center first hits the solid head");
         assertTrue(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
             terrain.ray(eye, footAim), hull));
+        terrain.blocks.put(side, Blocks.COPPER_ORE.getDefaultState());
+        assertTrue(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull), "an exposed copper seam is not a wall the lane must turn away from");
+        terrain.blocks.put(side, Blocks.DIAMOND_ORE.getDefaultState());
+        assertFalse(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side, EAST,
+            terrain.ray(eye, footAim), hull), "prospecting must harvest goal ore, not clear it as an incidental obstruction");
+        terrain.blocks.put(side, stone);
         assertTrue(AgentReturnableMine.stationaryDriftCut(terrain, RIM, side.up(), EAST,
             terrain.ray(eye, AgentReturnableMine.driftCutAim(side.up(), EAST, true)), hull));
         assertNull(AgentReturnableMine.witnessedTransit(RIM, side, EAST, terrain.ray(eye, floorAim),

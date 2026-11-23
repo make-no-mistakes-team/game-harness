@@ -2,6 +2,8 @@ package io.gameharness.survival;
 
 import java.util.List;
 import net.minecraft.block.Blocks;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
@@ -9,6 +11,12 @@ import net.minecraft.util.math.Vec3d;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import static io.gameharness.survival.AgentReturnableMine.Face.FLUID;
+import static io.gameharness.survival.AgentReturnableMine.Face.FOOTPRINT;
+import static io.gameharness.survival.AgentReturnableMine.Face.MATERIAL;
+import static io.gameharness.survival.AgentReturnableMine.Face.MINEABLE;
+import static io.gameharness.survival.AgentReturnableMine.Face.PROTECTED;
+import static io.gameharness.survival.AgentReturnableMine.Face.TOOL;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -27,6 +35,45 @@ final class AgentSupplyEgressTest {
     @BeforeAll
     static void initializeVanilla() {
         VanillaTestResources.initialize();
+    }
+
+    @Test
+    void payableOreCanBeClearedFromTheSideFaceAndCrownOfAnAscendingStair() {
+        var stonePick = new ItemStack(Items.STONE_PICKAXE);
+        assertEquals(MINEABLE, AgentProgress.supplyEgressCutAdmission(
+            APPROACH, APPROACH.down(), Blocks.COPPER_ORE.getDefaultState(), false, false,
+            stonePick::isSuitableFor));
+        assertEquals(MINEABLE, AgentProgress.supplyEgressCutAdmission(
+            LIP.up(2), APPROACH.down(), Blocks.DEEPSLATE_COPPER_ORE.getDefaultState(), false, false,
+            stonePick::isSuitableFor));
+
+        var woodenPick = new ItemStack(Items.WOODEN_PICKAXE);
+        assertEquals(TOOL, AgentProgress.supplyEgressCutAdmission(
+            APPROACH, APPROACH.down(), Blocks.COPPER_ORE.getDefaultState(), false, false,
+            woodenPick::isSuitableFor));
+    }
+
+    @Test
+    void ordinaryOreClearanceDoesNotRemoveTheTakeoffLandingOrProtectedTread() {
+        var copper = Blocks.COPPER_ORE.getDefaultState();
+        var stonePick = new ItemStack(Items.STONE_PICKAXE);
+        assertEquals(FOOTPRINT, AgentProgress.supplyEgressCutAdmission(
+            LIP.down(), APPROACH.down(), copper, true, false, stonePick::isSuitableFor));
+        assertEquals(PROTECTED, AgentProgress.supplyEgressCutAdmission(
+            APPROACH.down(), APPROACH.down(), copper, false, false, stonePick::isSuitableFor));
+        assertEquals(PROTECTED, AgentProgress.supplyEgressCutAdmission(
+            FIRST_DRY.down(), APPROACH.down(), copper, false, true, stonePick::isSuitableFor));
+    }
+
+    @Test
+    void gainInHeadroomDoesNotPermitFluidFallingMaterialOrWorkshopCuts() {
+        var stonePick = new ItemStack(Items.STONE_PICKAXE);
+        assertEquals(FLUID, AgentProgress.supplyEgressCutAdmission(
+            APPROACH, APPROACH.down(), Blocks.WATER.getDefaultState(), false, false, stonePick::isSuitableFor));
+        for (var block : List.of(Blocks.GRAVEL, Blocks.MAGMA_BLOCK, Blocks.FURNACE)) {
+            assertEquals(MATERIAL, AgentProgress.supplyEgressCutAdmission(
+                APPROACH, APPROACH.down(), block.getDefaultState(), false, false, stonePick::isSuitableFor));
+        }
     }
 
     @Test

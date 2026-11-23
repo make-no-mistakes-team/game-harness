@@ -229,6 +229,7 @@ final class AgentProgress {
     private int woodOfferedUntil, woodPreferenceUntil, woodCheckAfter, woodSearchTouched;
     private boolean woodOffered;
     private final AgentTools tools;
+    private final Predicate<BlockState> availableHarvestTool;
     private final AgentStallGuard stallGuard;
     private final AgentOrdinaryNavigator navigator;
     private final FirstStone firstStone;
@@ -592,6 +593,7 @@ final class AgentProgress {
         this.memory = memory;
         this.pendingFurnaceMemory = pendingFurnaceMemory;
         tools = new AgentTools(c, hands);
+        availableHarvestTool = tools::canHarvest;
         stallGuard = new AgentStallGuard(c, body, hands, tools, this::protectRecoveryBlock, this::safeSupport,
             this::recordStallFooting, this::tryStallMineHandback, expedition);
         navigator = new AgentOrdinaryNavigator(c, body);
@@ -7338,26 +7340,33 @@ final class AgentProgress {
             boolean ownBench = material.isOf(table.block) && memory.ownsWorkbench(c.world, cell);
             if (ownBench && mineDeparture) return refuse("the ascent would disturb the existing portable workshop");
             if (!material.isOf(table.block)) memory.forgetOwnedWorkbench(c.world, cell);
-            var admission = returnableFace(cell, material);
+            BlockPos support = to.down();
             if (ownBench) {
-                if (packedBench != null || proof == Proof.CROWN || cell.equals(to.down())
+                if (packedBench != null || proof == Proof.CROWN || cell.equals(support)
                         || underMineFootprint(cell) || supportsTrail(cell)
                         || cell.up().equals(furnace.position) || cell.up().equals(furnaceWitness)
                         || c.currentScreen != null || c.player.currentScreenHandler != c.player.playerScreenHandler
                         || table.placed != 0 || !fieldBench.roomForTable() || !has(AXE, 1))
                     return refuse("cannot safely pack the owned portable crafting table at " + cell.toShortString());
-            } else if (admission != AgentReturnableMine.Face.MINEABLE || cell.equals(to.down())) {
-                String reason = switch (admission) {
-                    case FOOTPRINT -> "supports the current footprint";
-                    case PROTECTED -> "protects a walked step or workshop";
-                    case FLUID, LAVA -> "contains fluid";
-                    case MATERIAL -> "is not stable natural cut material";
-                    case TOOL -> "needs a usable tool";
-                    case MINEABLE -> "is the intended landing support";
-                    default -> "could not be admitted for a safe cut";
-                };
-                return refuse(area() + " " + cell.toShortString() + " (" + Registries.BLOCK.getId(material.getBlock())
-                    + ") " + reason);
+            } else {
+                var admission = supplyEgressCutAdmission(cell, support, material, underMineFootprint(cell),
+                    protectRecoveryBlock(cell) || walked.contains(cell.up()), availableHarvestTool);
+                if (admission == AgentReturnableMine.Face.MINEABLE
+                        && AgentReturnableMine.protectedCutAttachment(c.world, cell))
+                    admission = AgentReturnableMine.Face.PROTECTED;
+                if (admission != AgentReturnableMine.Face.MINEABLE) {
+                    String reason = switch (admission) {
+                        case FOOTPRINT -> "supports the current footprint";
+                        case PROTECTED -> cell.equals(support)
+                            ? "is the intended landing support" : "protects a walked step or workshop";
+                        case FLUID, LAVA -> "contains fluid";
+                        case MATERIAL -> "is not stable natural cut material";
+                        case TOOL -> "needs a usable tool";
+                        default -> "could not be admitted for a safe cut";
+                    };
+                    return refuse(area() + " " + cell.toShortString() + " (" + Registries.BLOCK.getId(material.getBlock())
+                        + ") " + reason);
+                }
             }
             if (cuts >= MAX_CUTS || laneCuts >= MAX_LANE_CUTS)
                 return refuse("cut limit reached without a supported crossing");
@@ -7574,6 +7583,15 @@ final class AgentProgress {
                 + (packedBench == null ? "" : "; no safe pickup reached for the portable crafting table"), airborne());
             return true;
         }
+    }
+
+    /** Lit egress accepts incidental ore only in a selected clearance cell, not as expendable footing. */
+    static AgentReturnableMine.Face supplyEgressCutAdmission(BlockPos cell, BlockPos landingSupport, BlockState observed,
+                                                            boolean underFoot, boolean protectedCell,
+                                                            Predicate<BlockState> canHarvest) {
+        if (underFoot) return AgentReturnableMine.Face.FOOTPRINT;
+        if (protectedCell || cell.equals(landingSupport)) return AgentReturnableMine.Face.PROTECTED;
+        return returnableCutMaterial(observed, true, canHarvest);
     }
 
     private boolean tendTimber() {
@@ -9993,8 +10011,12 @@ final class AgentProgress {
     }
 
     AgentReturnableMine.Face returnableFace(BlockHitResult hit) {
+        return returnableFace(hit, false);
+    }
+
+    private AgentReturnableMine.Face returnableFace(BlockHitResult hit, boolean ordinaryLane) {
         BlockPos cell = hit.getBlockPos();
-        var face = returnableFace(cell, state(hit));
+        var face = returnableFace(cell, state(hit), ordinaryLane);
         return face == AgentReturnableMine.Face.MINEABLE && AgentReturnableMine.protectedCutAttachment(c.world, cell)
             ? AgentReturnableMine.Face.PROTECTED : face;
     }
@@ -10004,7 +10026,7 @@ final class AgentProgress {
         BlockPos cell = hit.getBlockPos();
         BlockState shown = state(hit);
         if (!shown.isOf(Blocks.GRAVEL)) {
-            var fact = returnableFace(hit);
+            var fact = returnableFace(hit, true);
             return drift && fact == AgentReturnableMine.Face.MINEABLE
                     && !AgentReturnableMine.stationaryDriftCut(c.world, foot, cell, bearing, hit, c.player.getBoundingBox())
                 ? AgentReturnableMine.Face.MATERIAL : fact;
@@ -10037,14 +10059,24 @@ final class AgentProgress {
     }
 
     private AgentReturnableMine.Face returnableFace(BlockPos position, BlockState observed) {
+        return returnableFace(position, observed, false);
+    }
+
+    private AgentReturnableMine.Face returnableFace(BlockPos position, BlockState observed, boolean ordinaryLane) {
         if (underMineFootprint(position)) return AgentReturnableMine.Face.FOOTPRINT;
         if (protectRecoveryBlock(position)) return AgentReturnableMine.Face.PROTECTED;
+        return returnableCutMaterial(observed, ordinaryLane, availableHarvestTool);
+    }
+
+    static AgentReturnableMine.Face returnableCutMaterial(BlockState observed, boolean ordinaryLane,
+                                                          Predicate<BlockState> canHarvest) {
         if (!observed.getFluidState().isEmpty()) return AgentReturnableMine.Face.FLUID;
         if (observed.getBlock() instanceof net.minecraft.block.FallingBlock || dangerous(observed)
                 || !(observed.isIn(BlockTags.BASE_STONE_OVERWORLD) || observed.isIn(BlockTags.DIRT) || observed.isOf(Blocks.GRASS_BLOCK)
                 || observed.isOf(Blocks.TUFF) || observed.isOf(Blocks.CALCITE) || observed.isOf(Blocks.CLAY)
-                || observed.isOf(Blocks.DRIPSTONE_BLOCK))) return AgentReturnableMine.Face.MATERIAL;
-        return tools.canHarvest(observed) ? AgentReturnableMine.Face.MINEABLE : AgentReturnableMine.Face.TOOL;
+                || observed.isOf(Blocks.DRIPSTONE_BLOCK) || ordinaryLane && AgentReturnableMine.incidentalOre(observed)))
+            return AgentReturnableMine.Face.MATERIAL;
+        return canHarvest.test(observed) ? AgentReturnableMine.Face.MINEABLE : AgentReturnableMine.Face.TOOL;
     }
 
     private boolean underMineFootprint(BlockPos position) {

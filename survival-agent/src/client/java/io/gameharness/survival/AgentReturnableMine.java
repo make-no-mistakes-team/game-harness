@@ -2016,7 +2016,14 @@ final class AgentReturnableMine {
                 || !cell.equals(hit.getBlockPos()) || hit.getSide() != bearing.getOpposite()) return false;
         BlockState shown = world.getBlockState(cell); // The exact witnessed face, never beyond it.
         return !AgentBody.dryCaveDanger(shown) && (shown.isIn(BlockTags.BASE_STONE_OVERWORLD)
-            || shown.isIn(BlockTags.DIRT)) && !protectedCutAttachment(world, cell);
+            || shown.isIn(BlockTags.DIRT) || incidentalOre(shown)) && !protectedCutAttachment(world, cell);
+    }
+
+    /** Ordinary lane clearance, not a prospecting target. Valuable goal ores have their own handoff. */
+    static boolean incidentalOre(BlockState shown) {
+        return shown.isIn(BlockTags.COPPER_ORES) || shown.isIn(BlockTags.LAPIS_ORES)
+            || shown.isIn(BlockTags.REDSTONE_ORES) || shown.isIn(BlockTags.EMERALD_ORES)
+            || shown.isOf(Blocks.GOLD_ORE) || shown.isOf(Blocks.DEEPSLATE_GOLD_ORE);
     }
 
     private static boolean insideFooting(BlockPos foot, Box hull) {

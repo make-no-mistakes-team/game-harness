@@ -644,7 +644,7 @@ final class AgentProgress {
     }
 
     void observeMemoryFooting(long observedTick) {
-        if (surfaceApproach.separateCanopyDrop()) return;
+        if (surfaceApproach.stoneFrontier.separateStoneDrop()) return;
         if (mineResite.oneWayInFlight()) {
             mineResite.discardCrossedDropSuffix();
             return;
@@ -753,6 +753,7 @@ final class AgentProgress {
         stallGuard.broken(position, state);
         surfaceApproach.broken(position, state);
         surfaceApproach.timberFrontier.ownBreak(position, state);
+        surfaceApproach.stoneFrontier.ownBreak(position, state);
         boolean aperture = false;
         if (timberCuttingLeaves && timberChop != null && position.equals(timberChop.getBlockPos())
                 && AgentSupplyEgress.naturalDryLeaf(state)) {
@@ -1038,6 +1039,7 @@ final class AgentProgress {
         if (foodWorld != c.world) {
             resetOrdinaryHealing();
             surfaceApproach.timberFrontier.reset();
+            surfaceApproach.resetStoneCanopy();
         }
         // Observe cargo before a recipe can spend it.
         if (stoneCutFoot != null && (!stoneCutFoot.equals(c.player.getBlockPos()) || has(STONE, stoneCutStock + 1)))
@@ -1047,6 +1049,8 @@ final class AgentProgress {
         boolean wooden = starterTools && has(WOOD_PICK, 1);
         bootstrapTimber = starterTools && !wooden;
         bootstrapStone = wooden && !has(STONE, 3) && !has(GOLD_PICK, 1);
+        if (!bootstrapStone && surfaceApproach.stoneFrontier.active() && !surfaceApproach.stoneFrontier.inFlight())
+            surfaceApproach.stoneFrontier.finish();
         ordinaryCaveDrops = macro == null;
         hands.allowOrdinaryLoadout(ordinaryCaveDrops);
         observeStairLight();
@@ -1066,6 +1070,7 @@ final class AgentProgress {
             }
             foodCanopy.finish();
             surfaceApproach.timberFrontier.finish();
+            surfaceApproach.stoneFrontier.finish();
             if (forage != null) finishForage(12);
         }
         observeFurnaceCook();
@@ -1117,6 +1122,7 @@ final class AgentProgress {
         if (hurt) body.interruptHorizonWade(AgentVisibleHorizon.Refusal.WADE_HEALTH_CHANGED);
         boolean escaping = escapeDanger(ears, hurt, macro == null, macroEngaged, safetySpend);
         if (hurt || escaping) surfaceApproach.timberFrontier.quietAfter = tick + 100;
+        if (hurt || escaping) surfaceApproach.stoneFrontier.quietAfter = tick + 100;
         if (hurt || escaping) nightSite.interrupt();
         if ((hurt || escaping) && dropReclaim != null) dropReclaim.cancel();
         if (escaping) {
@@ -1282,6 +1288,7 @@ final class AgentProgress {
             return;
         }
         if (surfaceApproach.timberFrontier.inFlight() && surfaceApproach.timberFrontier.step()) return;
+        if (surfaceApproach.stoneFrontier.inFlight() && surfaceApproach.stoneFrontier.step()) return;
         int hunger = c.player.getHungerManager().getFoodLevel();
         confirmMeal(hunger);
         if (healing.update(hunger, health, c.player.getMaxHealth())) {
@@ -1317,6 +1324,7 @@ final class AgentProgress {
         }
         if (hands.busy()) {
             returnableMine.waitForEquipment(hands.jobGeneration());
+            surfaceApproach.stoneFrontier.waitForCrownHand();
             return;
         }
         if (handleScreen()) return;
@@ -1381,12 +1389,12 @@ final class AgentProgress {
         // incident it is trying to leave. Danger, hands and paid work ran first.
         if (ordinaryCaveDrops && mineResite.step()) return;
         if (workshopReturn == null && !returnableMine.settling() && !caves.shallowEntry() && !stallGuard.ownsRecovery()
+                && !surfaceApproach.stoneFrontier.active()
                 && body.repairHeadroom(tools, protectedHeadroom)) {
             status = body.headroomReport().reason();
             return;
         }
         if (caveRetreat.step()) return;
-        if (surfaceApproach.seekStoneCanopy()) return;
         boolean mineRetryLease = returnableMine.hasRetryProgressLease() || firstStone.witnessedProbeWork();
         if (!returnableMine.surveyingCave() && stallGuard.caveSurveyStalled(mineRetryLease)) {
             AgentCaves.Opening opening = caves.drySurveyOpening();
@@ -1515,6 +1523,7 @@ final class AgentProgress {
         if (!stonePick && !ironPick) {
             if (has(STONE, 3)) makePick("stone_pickaxe", STONE, 3);
             else if (ordinaryCaveDrops && !firstStone.working() && fieldBench.pack()) return;
+            else if (ordinarySurfaceWork && surfaceApproach.workStoneFrontier()) return;
             else if (nextFoot == null && !firstStone.working() && ordinarySurfaceWork && needsTimberKit()
                     && fieldWood.step(LOCAL_LIGHT, false)) return;
             else if (ordinarySurfaceWork) firstStone.step();
@@ -5713,6 +5722,27 @@ final class AgentProgress {
             || step != null && step.supports(foot, support, tick));
     }
 
+    static boolean firstStoneCanopyHandoff(Job frontier, boolean needsFirstStone, boolean exposedStone,
+                                           BooleanSupplier begin) {
+        return frontier == Job.STONE && needsFirstStone && !exposedStone && begin.getAsBoolean();
+    }
+
+    static boolean stoneCanopyGround(BlockState floor) {
+        return floor != null && !(floor.getBlock() instanceof FallingBlock) && !AgentBody.dryCaveDanger(floor)
+            && (floor.isIn(BlockTags.DIRT) || floor.isIn(BlockTags.BASE_STONE_OVERWORLD)
+                || floor.isOf(Blocks.CALCITE) || floor.isOf(Blocks.DRIPSTONE_BLOCK)
+                || floor.isOf(Blocks.MOSS_BLOCK) || floor.isOf(Blocks.SNOW_BLOCK) || floor.isOf(Blocks.CLAY));
+    }
+
+    static boolean stoneCanopyMask(BlockPos foot, Direction bearing, BlockHitResult hit, BlockState leaf,
+                                   Box hull, BlockState cover, boolean protectedLeaf, boolean lowerGroundSeen) {
+        if (hit == null || protectedLeaf || AgentHeadroom.unsafeCutCover(cover)
+                || hull.expand(0.10).intersects(new Box(hit.getBlockPos())))
+            return false;
+        return AgentSupplyEgress.canopyLeaf(foot, bearing, hit, leaf, false)
+            || lowerGroundSeen && AgentSupplyEgress.canopyTopLeaf(foot, bearing, hit, leaf, false);
+    }
+
     private void seekTimber(String supplies, boolean localOnly) {
         var player = c.player;
         if (!body.hasRecentView()) {
@@ -8629,6 +8659,12 @@ final class AgentProgress {
                     return;
                 }
             }
+            if (surfaceApproach.stoneCanopySupport(standing) != null) {
+                // The crown is a viewpoint, not a quarry. Take the ordinary
+                // connected route first; a spent route may then inspect the canopy.
+                walk(standing);
+                return;
+            }
             if (fresh && beginProbe(standing, true)) return;
             if (!exhausted) {
                 exhausted = true;
@@ -8699,14 +8735,20 @@ final class AgentProgress {
                 beginPatch(arrival.to(), outward, hands.count(STONE), pickUses(WOOD_PICK), false);
                 status = "reached different witnessed ground to prospect for stone";
             }
-            if (result == Result.BLOCKED && sightBlock != null) refuseWalk(standing);
+            if (result == Result.BLOCKED) {
+                // workOre and the ordinary probe/visible-face approach have already
+                // had their turn. A spent exact frontier, not merely "blocked", can hand off.
+                if (surfaceApproach.beginStoneFrontier(standing, sightBlock != null)) return;
+                if (sightBlock != null) refuseWalk(standing);
+            }
         }
 
         private void refuseWalk(BlockPos standing) {
             BlockPos rock = sightBlock;
             if (rock != null) refusedFaces.remember(standing, rock);
             stopWalk();
-            if (rock == null || probeTo != null || !dryFieldFooting() || !body.hasRecentView()) return;
+            if (rock == null || probeTo != null || !dryFieldFooting() || !body.hasRecentView()
+                    || surfaceApproach.stoneCanopySupport(standing) != null) return;
             int dx = rock.getX() - standing.getX(), dz = rock.getZ() - standing.getZ();
             if (dx == 0 && dz == 0 || rock.getY() > standing.getY() + 2) return;
             Direction toward = Math.abs(dx) >= Math.abs(dz) ? (dx > 0 ? Direction.EAST : Direction.WEST)
@@ -8734,15 +8776,16 @@ final class AgentProgress {
             goal = null;
         }
 
-        private void landedBelowCanopy(AgentSurfaceTread crossing) {
+        private void landedBelowCanopy(BlockPos from, BlockPos to, Direction bearing, boolean oneWay, BlockState floor) {
             observeWorld();
             interrupt();
-            if (crossing.ordinaryDescent()) {
-                recordCaveFooting(crossing.to);
-                stallGuard.navigationArrival(crossing.from, crossing.to);
-            } else {
-                navigator.rememberWalked(crossing.from, crossing.to);
-                recordDryCaveFooting(crossing.from, crossing.to);
+            if (oneWay) recordCaveFooting(to);
+            else if (stoneCanopyGround(floor)) recordDryCaveFooting(from, to);
+            if (stoneCanopyGround(floor)) {
+                // A new real surface under the old crown can be horizontally close.
+                // Don't let the exhausted leaf patch stand in for this unworked soil.
+                retired.removeIf(site -> !differentStoneGround(site, to) && site.getY() != to.getY());
+                if (!retiredAt(to)) beginPatch(to, bearing, hands.count(STONE), pickUses(WOOD_PICK), false);
             }
         }
 
@@ -9557,14 +9600,16 @@ final class AgentProgress {
         private final List<BlockPos> triedLeaves = new ArrayList<>(6);
         private final AgentSupplyEgress.CanopyPassage canopy = new AgentSupplyEgress.CanopyPassage();
         private final CanopyExit timberFrontier = new CanopyExit(Job.TIMBER);
+        private final CanopyExit stoneFrontier = new CanopyExit(Job.STONE);
         private final BooleanSupplier beginTimberFrontier = this::beginTimberFrontier;
+        private final BooleanSupplier beginStoneFrontier = this::beginStoneFrontier;
         private BlockPos entrance, from, to;
         private BlockPos cut, routeCut;
         private Vec3d cutAim;
         private AgentSurfaceTread canopyTread;
         private ClientWorld stoneCanopyWorld;
         private CanopyStep raisedCanopy;
-        private boolean natural, canopyStone, canopyDropSeparated;
+        private boolean natural;
         private int canopySince, canopyTreadTick;
         private int view, since, proof, cuts, cutSince, visitedCursor, backtracks, equippedCheck;
         private float surveyYaw;
@@ -9577,6 +9622,7 @@ final class AgentProgress {
             from = to = cut = routeCut = null;
             abandonBootstrapPassage();
             timberFrontier.finish();
+            stoneFrontier.finish();
         }
 
         private boolean protectedCanopyLeaf(BlockPos leaf) {
@@ -9586,6 +9632,7 @@ final class AgentProgress {
         private void resetStoneCanopy() {
             stoneCanopyWorld = c.world;
             raisedCanopy = null;
+            stoneFrontier.reset();
         }
 
         private void raisedFromCanopy(BlockPos foot, BlockState base) {
@@ -9601,7 +9648,7 @@ final class AgentProgress {
         }
 
         private boolean stoneCanopyWorking() {
-            return bootstrapStone && canopyStone && canopyTread != null && canopyTreadTick == tick - 1;
+            return stoneFrontier.active() && stoneFrontier.continued == tick - 1;
         }
 
         private boolean workTimberFrontier(boolean reachableWood) {
@@ -9624,105 +9671,37 @@ final class AgentProgress {
                 && hands.stableCraftFooting() && bootstrapCanopy(foot) && timberFrontier.begin(foot);
         }
 
-        private boolean seekStoneCanopy() {
-            if (!bootstrapStone || returnIndex >= 0 || exitStart != null || oreProbeReturning || workshopReturn != null
-                    || returnableMine.active() || supplyEgress.active() || mineResite.active()
-                    || caves.active() || caves.routingDry() || to != null || continuingTimberTread()
-                    || portal != null && portal.locallyStopped()
-                    || stallGuard.ownsRecovery() && !stallGuard.waitingForEvidence()
-                    || firstStone.witnessedProbeWork() || finishingOreCut(Resource.STONE)) return false;
-            if (stoneCanopyWorld != c.world) resetStoneCanopy();
-            return visibleStoneCanopyWork(c.player.getBlockPos());
+        private boolean stoneFrontierAllowed() {
+            return bootstrapStone && c.interactionManager.getCurrentGameMode() == GameMode.SURVIVAL
+                    && returnIndex < 0 && exitStart == null && !oreProbeReturning && workshopReturn == null
+                    && !returnableMine.active() && !supplyEgress.active() && !mineResite.active()
+                    && !caves.active() && !caves.routingDry() && to == null && !continuingTimberTread()
+                    && (portal == null || !portal.locallyStopped())
+                    && (!stallGuard.ownsRecovery() || stallGuard.waitingForEvidence())
+                    && !firstStone.witnessedProbeWork() && !finishingOreCut(Resource.STONE);
         }
 
-        /** Only a witnessed aperture cut or an exceptional descent takes over the normal route. */
-        private boolean visibleStoneCanopyWork(BlockPos foot) {
-            BlockState source = stoneCanopySupport(foot);
-            if (source == null || !hands.stableCraftFooting() || !body.hasRecentView()) return false;
-            float yaw = body.defensiveViewYaw();
-            for (Direction bearing : Direction.Type.HORIZONTAL) {
-                float direction = bearing.getPositiveHorizontalDegrees();
-                if (bearingDistance(yaw, direction) > 37 || body.hazardAhead(direction, 1.65)) continue;
-                BlockPos side = foot.offset(bearing);
-                if (takeStoneCanopyTread(foot, source, side, bearing)) return true;
-                if (noteBootstrapLane(foot, bearing) && beginBootstrapPassage(foot, bearing, true))
-                    return true;
+        private boolean beginStoneFrontier(BlockPos foot, boolean exposedStone) {
+            return firstStoneCanopyHandoff(navigator.spentFrontier(foot), stoneFrontierAllowed(), exposedStone,
+                beginStoneFrontier);
+        }
+
+        private boolean beginStoneFrontier() {
+            BlockPos foot = c.player.getBlockPos();
+            return body.hasRecentView() && hands.stableCraftFooting() && stoneFrontier.begin(foot);
+        }
+
+        private boolean workStoneFrontier() {
+            if (!stoneFrontier.active()) return false;
+            if (!stoneFrontierAllowed() || !safePickupStance()) {
+                stoneFrontier.finish();
+                return false;
             }
-            return false;
-        }
-
-        private boolean takeStoneCanopyTread(BlockPos foot, BlockState source, BlockPos side, Direction bearing) {
-            if (body.caveLipFooting(foot) != source) return false;
-            for (int height = 2; height <= AgentDryLanding.MAX_DROP; height++) {
-                if (!permitsOneWayCaveDrop(height)) continue;
-                BlockPos landing = side.down(height);
-                if (stallGuard.refusedCrossing(foot, landing)) continue;
-                BlockState floor = body.overlandTop(landing.down(), bearing, AgentBody::dryCaveDanger);
-                if (floor == null || !naturalGround(floor) || floor.getBlock() instanceof FallingBlock) continue;
-                // Both supports are witnessed. The ordinary descent motor still
-                // proves the exact lit top, low-impact coast and stable landing.
-                var edge = new AgentSurfaceTread.Edge(foot, source, landing, floor, bearing);
-                beginCanopyTread(AgentSurfaceTread.recall(edge, false, tick, AgentSurfaceTread.RecallPolicy.ORDINARY));
-                return true;
-            }
-            return false;
-        }
-
-        private void beginCanopyTread(AgentSurfaceTread tread) {
-            canopyStone = true;
-            canopyTread = tread;
-            canopyTreadTick = tick;
-            status = "preparing the checked descent toward visibly solid ground below the canopy";
+            return stoneFrontier.step();
         }
 
         private boolean controlsCanopyFall() {
-            return timberFrontier.controlsShortFall()
-                || bootstrapStone && canopyStone && canopyTread != null && canopyTread.ordinaryDescent()
-                && canopyTread.controlsShortFall(c, body, tick);
-        }
-
-        private boolean separateCanopyDrop() {
-            var tread = canopyTread;
-            if (tread == null || !tread.ordinaryDescent() || !tread.leftTakeoff(c)) return false;
-            if (!canopyDropSeparated) {
-                detachMine(tread.from);
-                canopyDropSeparated = true;
-            }
-            return true;
-        }
-
-        private boolean noteBootstrapLane(BlockPos foot, Direction bearing) {
-            BlockPos side = foot.offset(bearing);
-            BlockPos worksite = side.offset(bearing).down(2);
-            BlockState floor = body.overlandTop(worksite, bearing, AgentProgress::dangerous);
-            boolean seenWorksite = floor != null && (naturalGround(floor) || floor.isIn(BlockTags.LOGS));
-            if (seenWorksite) {
-                canopy.productive(foot, worksite);
-                BlockPos leaf = side.down();
-                if (canopy.available(foot, leaf) && !protectedCanopyLeaf(leaf)
-                        && !stallGuard.refusedCrossing(foot, leaf)) {
-                    // Admit the top only when it actually masks the adjacent lower sightline.
-                    Vec3d point = Vec3d.ofBottomCenter(leaf)
-                        .add(0.42 * bearing.getOffsetX(), -0.025, 0.42 * bearing.getOffsetZ());
-                    var hit = terrain(point, 3.5);
-                    if (hit != null && timberInReach(hit) && AgentSupplyEgress.canopyTopLeaf(foot, bearing, hit, state(hit), false)) {
-                        canopy.offer(foot, bearing, hit, seenWorksite);
-                        return seenWorksite;
-                    }
-                }
-            }
-            for (int height = 1; height >= 0; height--) {
-                BlockPos leaf = side.up(height);
-                if (protectedCanopyLeaf(leaf) || !canopy.available(foot, leaf)) continue;
-                var hit = perceive(Vec3d.ofCenter(leaf), 2.5);
-                if (hit != null && hit.getBlockPos().equals(leaf) && timberInReach(hit)
-                        && AgentSupplyEgress.canopyLeaf(foot, bearing, hit, state(hit), false)
-                        && (height == 1 || body.overlandTop(leaf, bearing, AgentProgress::dangerous) == null)) {
-                    canopy.offer(foot, bearing, hit, seenWorksite);
-                    return seenWorksite;
-                }
-            }
-            return false;
+            return timberFrontier.controlsShortFall() || stoneFrontier.controlsShortFall();
         }
 
         private boolean cutTimberMask(Vec3d trunk) {
@@ -9735,7 +9714,7 @@ final class AgentProgress {
                 Direction bearing = AgentSurfaceTread.prospectLevelBearing(foot, leaf.up());
                 if (bearing != null && AgentSupplyEgress.canopyTopLeaf(foot, bearing, hit, state(hit), protectedCanopyLeaf(leaf))) {
                     canopy.offer(foot, bearing, hit, true);
-                    return beginBootstrapPassage(foot, bearing, false);
+                    return beginBootstrapPassage(foot, bearing);
                 }
             }
             return cutTimberMask(foot, hit);
@@ -9749,11 +9728,11 @@ final class AgentProgress {
                     || leaf.getY() == foot.getY() && body.overlandTop(leaf, bearing, AgentProgress::dangerous) != null)
                 return false;
             canopy.offer(foot, bearing, hit, false);
-            return beginBootstrapPassage(foot, bearing, false);
+            return beginBootstrapPassage(foot, bearing);
         }
 
-        private boolean beginBootstrapPassage(BlockPos foot, Direction bearing, boolean stone) {
-            if (timberChop != null || (stone ? stoneCanopySupport(foot) : bootstrapSupport(foot)) == null
+        private boolean beginBootstrapPassage(BlockPos foot, Direction bearing) {
+            if (timberChop != null || bootstrapSupport(foot) == null
                     || !hands.stableCraftFooting() || !body.hasRecentView()) return false;
             var plan = bearing == null ? canopy.begin(foot) : canopy.begin(foot, bearing);
             if (plan == null) return false;
@@ -9767,7 +9746,6 @@ final class AgentProgress {
                 ordinaryApproach = null;
             }
             body.pauseWork();
-            canopyStone = stone;
             canopySince = tick;
             beginTimberChop(plan.face(), true);
             status = plan.top() ? "lining up a witnessed leaf top from settled footing"
@@ -9780,7 +9758,7 @@ final class AgentProgress {
             var plan = canopy.active();
             if (plan == null) return false;
             BlockPos leaf = plan.face().getBlockPos();
-            BlockState source = canopyStone ? stoneCanopySupport(plan.foot()) : bootstrapSupport(plan.foot());
+            BlockState source = bootstrapSupport(plan.foot());
             if (source == null || protectedCanopyLeaf(leaf)
                     || body.hazardAhead(plan.bearing().getPositiveHorizontalDegrees(), 1.5)) {
                 abandonBootstrapPassage();
@@ -9794,17 +9772,6 @@ final class AgentProgress {
                 }
                 long frame = body.renderedFrame();
                 if (!hands.stableCraftFooting() || !body.hasRecentView() || !canopy.freshOpening(frame)) return true;
-                if (canopyStone) {
-                    Direction bearing = plan.bearing();
-                    if (takeStoneCanopyTread(plan.foot(), source, plan.foot().offset(bearing), bearing)) return true;
-                    if (plan.top()) {
-                        lookAtStockTread(plan.foot(), leaf, bearing);
-                        status = "checking the opened canopy for dry solid ground below";
-                        return true;
-                    }
-                    abandonBootstrapPassage();
-                    return true;
-                }
                 if (plan.top()) {
                     if (cutTimberFromTread(false)) {
                         abandonBootstrapPassage();
@@ -9851,17 +9818,13 @@ final class AgentProgress {
         private boolean stepBootstrapDescent() {
             var tread = canopyTread;
             body.pauseWork();
-            if (canopyTreadTick != tick - 1 || !(canopyStone ? bootstrapStone : bootstrapTimber)
-                    || !safePickupStance() || c.player.getHealth() < 10
-                    || tread.ordinaryDescent() && !tread.leftTakeoff(c)
-                        && !permitsOneWayCaveDrop(tread.from.getY() - tread.to.getY())) {
+            if (canopyTreadTick != tick - 1 || !bootstrapTimber || !safePickupStance() || c.player.getHealth() < 10) {
                 abandonBootstrapPassage();
                 return false;
             }
             canopyTreadTick = tick;
             switch (tread.step(c, body, tick)) {
-                case CHECKING -> status = tread.ordinaryDescent() ? "checking the bounded one-way descent off the canopy"
-                    : "verifying the reversible step off the canopy";
+                case CHECKING -> status = "verifying the reversible step off the canopy";
                 case MOVING -> {
                     rememberMotion();
                     status = "stepping down from the canopy to a witnessed dry shelf";
@@ -9870,14 +9833,6 @@ final class AgentProgress {
                     if (exactCanopyContact(tread.to) != tread.edge.lowerSupport()) {
                         abandonBootstrapPassage();
                         return false;
-                    }
-                    if (canopyStone) {
-                        separateCanopyDrop();
-                        firstStone.landedBelowCanopy(tread);
-                        bootstrapLanded(tread.from, tread.to, true);
-                        abandonBootstrapPassage();
-                        status = "reached witnessed solid ground below the canopy to seek stone";
-                        return true;
                     }
                     body.recordWalkedLeg(tread.from, tread.to);
                     navigator.rememberWalked(tread.from, tread.to);
@@ -9901,11 +9856,7 @@ final class AgentProgress {
         }
 
         private void bootstrapLanded(BlockPos source, BlockPos landing) {
-            bootstrapLanded(source, landing, false);
-        }
-
-        private void bootstrapLanded(BlockPos source, BlockPos landing, boolean stone) {
-            var floor = stone ? exactCanopyContact(landing) : bootstrapSupport(landing);
+            var floor = bootstrapSupport(landing);
             if (floor == null) return;
             canopy.landed(source, landing);
             if (naturalGround(floor) || floor.isIn(BlockTags.LOGS))
@@ -9924,8 +9875,6 @@ final class AgentProgress {
                     && timberChop.getBlockPos().equals(plan.face().getBlockPos())) timberChop = null;
             canopy.finish();
             canopyTread = null;
-            canopyStone = false;
-            canopyDropSeparated = false;
         }
 
         private boolean checkEquippedMine() {
@@ -13061,11 +13010,11 @@ final class AgentProgress {
         private Vec3d measuredPoint;
         private int quietAfter;
         private float restoreHealth;
-        private boolean checkingMeasured;
-        private long openedFrame;
+        private boolean checkingMeasured, stoneDropSeparated;
+        private long openedFrame, crownHandJob;
         private int since, continued, uncuedLandings, crownView, columnCuts, centerUntil, crownSettleUntil;
         private boolean seenGround, attackRequested, crownRiseSpent;
-        private int crownWood;
+        private int crownWood, crownStone;
 
         CanopyExit(Job owner) { this.owner = owner; }
 
@@ -13078,6 +13027,23 @@ final class AgentProgress {
         boolean controlsShortFall() {
             return measured != null ? measured.controlsFall(c, body, tick)
                 : tread != null && tread.controlsShortFall(c, body, tick);
+        }
+
+        boolean separateStoneDrop() {
+            if (owner != Job.STONE || from == null) return false;
+            boolean left = measured != null && measured.inFlight()
+                && (!c.player.isOnGround() || c.player.getY() < from.getY() - 0.055)
+                || tread != null && tread.ordinaryDescent() && tread.leftTakeoff(c);
+            if (!left) return false;
+            if (!stoneDropSeparated) {
+                detachMine(from);
+                stoneDropSeparated = true;
+            }
+            return true;
+        }
+
+        void waitForCrownHand() {
+            if (active() && crownHandJob != 0 && crownHandJob == hands.jobGeneration()) continued = tick;
         }
 
         void finish() {
@@ -13094,6 +13060,8 @@ final class AgentProgress {
             measuredCandidate = null;
             measuredPoint = null;
             checkingMeasured = false;
+            stoneDropSeparated = false;
+            crownHandJob = 0;
         }
 
         void reset() {
@@ -13105,7 +13073,7 @@ final class AgentProgress {
             uncuedLandings = 0;
             quietAfter = 0;
             restoreHealth = 0;
-            crownWood = 0;
+            crownWood = crownStone = 0;
         }
 
         boolean protects(BlockPos leaf) {
@@ -13124,12 +13092,20 @@ final class AgentProgress {
                     attemptedLeaves.clear();
                     crownWood = secured;
                 }
+            } else if (owner == Job.STONE) {
+                int stock = hands.count(STONE);
+                if (stock > crownStone) {
+                    // Only paid stock progress earns another look from this footprint.
+                    tried.remove(foot);
+                    crownStone = stock;
+                }
             }
-            if (tried.size() >= MAX_STANDS || tried.contains(foot) || activeTrail() > 1 || returnIndex >= 0
+            if (tried.size() >= MAX_STANDS || tried.contains(foot) || owner != Job.STONE && activeTrail() > 1 || returnIndex >= 0
                     || resumeIndex >= 0 || !body.ordinaryRouteContact(foot)) return false;
             BlockState upper = body.caveLipFooting(foot);
-            if (upper == null || !AgentSupplyEgress.naturalDryLeaf(upper) || !canDrop(1)) return false;
-            if (owner == Job.TIMBER) {
+            if (upper == null || !canDrop(1) || (owner == Job.STONE ? upper != surfaceApproach.stoneCanopySupport(foot)
+                    : !AgentSupplyEgress.naturalDryLeaf(upper))) return false;
+            if (owner != Job.FOOD) {
                 crownRiseSpent = false;
                 enterCrown(foot, upper);
                 return true;
@@ -13192,17 +13168,20 @@ final class AgentProgress {
                 (crownView & 1) == 0 ? 0.62 : -1.42, bearing.getOffsetZ() * 0.32);
             openedFrame = -1;
             since = tick;
-            status = "checking the " + bearing.getName() + " crown for a log or dry tread";
+            status = "checking the " + bearing.getName() + " crown for "
+                + (owner == Job.STONE ? "stone or lower dry ground" : "a log or dry tread");
         }
 
         private boolean nextCrownView() {
             mask = null;
             crownCutPoint = null;
             attackRequested = false;
+            crownHandJob = 0;
             if ((++crownView & 1) == 0) columnCuts = 0;
             if (crownView >= 8) {
                 if (measuredCandidate == null || !canChooseMeasured())
-                    return blocked("nearby crown bearings spent without a reachable log or dry tread");
+                    return blocked(owner == Job.STONE ? "nearby crown bearings spent without collectible stone or a dry tread"
+                        : "nearby crown bearings spent without a reachable log or dry tread");
                 checkingMeasured = true;
                 since = tick;
                 return recheckMeasured();
@@ -13213,7 +13192,7 @@ final class AgentProgress {
 
         private boolean canChooseMeasured() {
             var player = c.player;
-            return owner == Job.TIMBER && ordinaryCaveDrops && tick >= quietAfter && !healing.active()
+            return owner != Job.FOOD && ordinaryCaveDrops && tick >= quietAfter && !healing.active()
                 && player.getHealth() >= Math.max(16f, restoreHealth) && player.getHungerManager().getFoodLevel() >= 18
                 && macroFoodSafe() && !defense.recentlyThreatened(tick) && body.threatPoint() == null
                 && body.rangedThreatPoint() == null && !body.lavaEmergency() && c.currentScreen == null;
@@ -13228,6 +13207,7 @@ final class AgentProgress {
                     bearing.getOffsetX() * 0.35, -5.05, bearing.getOffsetZ() * 0.35);
                 var hit = terrain(point, 8);
                 if (hit == null || hit.getSide() != Direction.UP) continue;
+                if (owner == Job.STONE && !stoneCanopyGround(state(hit))) continue;
                 var candidate = body.measuredDrop(from, hit);
                 if (candidate != null && (measuredCandidate == null || candidate.damage() < measuredCandidate.damage())) {
                     measuredCandidate = candidate;
@@ -13267,21 +13247,26 @@ final class AgentProgress {
                 case LANDED -> {
                     var result = measured.damageTaken();
                     var landing = measuredCandidate.to();
+                    if (owner == Job.STONE) {
+                        separateStoneDrop();
+                        firstStone.landedBelowCanopy(from, landing, measuredCandidate.bearing(), true, measuredCandidate.lower());
+                    }
                     stallGuard.navigationArrival(from, landing);
                     quietAfter = tick + 100;
                     finish();
-                    status = "landed on the checked timber descent; observed health loss " + result + " HP";
+                    status = "landed on the checked " + (owner == Job.STONE ? "stone" : "timber")
+                        + " descent; observed health loss " + result + " HP";
                 }
             }
             return true;
         }
 
-        private boolean stepTimberCrown() {
+        private boolean stepCrown() {
             if (crownSettleUntil != 0) return resumeCrownContact();
             if (body.caveLipFooting(from) != source) return blocked("the dry crown support changed");
             if (tread != null) {
                 if (body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65)
-                        || tread.ordinaryDescent() && !canDrop(from.getY() - tread.to.getY())) {
+                        || tread.ordinaryDescent() && !canCrownDescend(from.getY() - tread.to.getY())) {
                     tread = null;
                     return nextCrownView();
                 }
@@ -13292,13 +13277,15 @@ final class AgentProgress {
             if (mask != null) return openCrownColumn();
             if (!body.hasRecentView()) return true;
             if (openedFrame >= 0 && body.renderedFrame() <= openedFrame) return true;
-            var log = findTimber(true, crownTrunk);
-            if (log != null) {
-                witnessTimber(log);
-                beginTimberChop(log, false);
-                finish();
-                status = "preparing to cut the exposed log from the occupied crown";
-                return true;
+            if (owner == Job.TIMBER) {
+                var log = findTimber(true, crownTrunk);
+                if (log != null) {
+                    witnessTimber(log);
+                    beginTimberChop(log, false);
+                    finish();
+                    status = "preparing to cut the exposed log from the occupied crown";
+                    return true;
+                }
             }
             if (tick < centerUntil && horizontalDistance(c.player.getPos(), Vec3d.ofBottomCenter(from)) > 0.17
                     && body.centerOnGroundedSupport(from, source)) {
@@ -13310,16 +13297,19 @@ final class AgentProgress {
             body.aim(aim);
             if (!body.renderedAim(aim, 10)) return true;
 
-            if (harvestLowerCrownLog()) return true;
-            if (selectCrownDescent()) return true;
+            if (owner == Job.TIMBER && harvestLowerCrownLog()) return true;
             BlockPos side = from.offset(bearing);
-            BlockState level = crownTreadTop(side);
+            BlockState level = owner == Job.STONE ? crownTreadTop(side) : null;
+            if (stoneCanopyGround(level)) return beginCrownCrossing(side, level);
+            if (selectCrownDescent()) return true;
+            if (owner == Job.TIMBER) level = crownTreadTop(side);
             if (level != null) return beginCrownCrossing(side, level);
             BlockPos rise = side.up();
             BlockState riseTop = crownTreadTop(rise);
             crownRiseSupport = riseTop == null ? null : side;
             noticeMeasuredTread();
-            if (columnCuts < COLUMN_CUTS && attemptedLeaves.size() < CROWN_CUTS) {
+            if (columnCuts < COLUMN_CUTS && attemptedLeaves.size() < CROWN_CUTS
+                    && (owner != Job.STONE || stoneCrownHand() >= 0)) {
                 double reach = c.player.getBlockInteractionRange() - 0.10;
                 var leaf = perceive(aim, reach);
                 if (!newCrownMask(leaf))
@@ -13333,8 +13323,7 @@ final class AgentProgress {
                     return openCrownColumn();
                 }
             }
-            // One unsolicited rise may reveal a new viewpoint; don't keep
-            // climbing the crown when that view still shows no reachable wood.
+            // A single rise can open a useful view; no repeated climbing for a search.
             if (riseTop != null && !crownRiseSpent) return beginCrownCrossing(rise, riseTop);
             return nextCrownView();
         }
@@ -13375,27 +13364,40 @@ final class AgentProgress {
 
         private boolean selectCrownDescent() {
             BlockPos side = from.offset(bearing);
+            AgentSurfaceTread.Edge shelf = null;
             for (int grade = -1; grade >= -AgentDryLanding.MAX_DROP; grade--) {
-                if (!canDrop(-grade)) continue;
+                if (!canCrownDescend(-grade)) continue;
                 BlockPos to = side.up(grade);
                 if (tried.contains(to) || stallGuard.refusedCrossing(from, to)) continue;
                 BlockState floor = body.overlandTop(to.down(), bearing, AgentBody::dryCaveDanger);
-                if (floor == null || !(AgentSupplyEgress.naturalDryLeaf(floor)
-                        || AgentFoodWork.forageGround(floor) || floor.isIn(BlockTags.LOGS))) continue;
+                if (!crownShelf(floor)) continue;
                 // A live sweep can veto a named, witnessed shelf. It never discovers the shelf.
                 if (grade == -1 && body.ordinaryRouteLane(from, to) != AgentBody.DryRouteVeto.CLEAR) continue;
-                tread = AgentSurfaceTread.recall(new AgentSurfaceTread.Edge(from, source, to, floor, bearing),
-                    false, tick, AgentSurfaceTread.RecallPolicy.ORDINARY);
-                if (tread != null) return true;
+                var edge = new AgentSurfaceTread.Edge(from, source, to, floor, bearing);
+                boolean end = owner != Job.STONE || stoneCanopyGround(floor);
+                if (shelf == null || end) shelf = edge;
+                if (end) break;
             }
-            return false;
+            if (shelf == null) return false;
+            tread = AgentSurfaceTread.recall(shelf, false, tick, AgentSurfaceTread.RecallPolicy.ORDINARY);
+            return tread != null;
+        }
+
+        private boolean crownShelf(BlockState floor) {
+            return floor != null && (AgentSupplyEgress.naturalDryLeaf(floor) || floor.isIn(BlockTags.LOGS)
+                || (owner == Job.STONE ? stoneCanopyGround(floor) : AgentFoodWork.forageGround(floor)));
+        }
+
+        private boolean canCrownDescend(int drop) {
+            return canDrop(drop) && (owner != Job.STONE || permitsOneWayCaveDrop(drop));
         }
 
         private BlockState crownTreadTop(BlockPos to) {
             if (tried.size() >= MAX_STANDS || tried.contains(to) || refusedCrown.contains(to)
                     || stallGuard.refusedCrossing(from, to)) return null;
             BlockState floor = body.overlandTop(to.down(), bearing, AgentBody::dryCaveDanger);
-            return floor != null && body.ordinaryRouteLane(from, to) == AgentBody.DryRouteVeto.CLEAR ? floor : null;
+            return floor != null && (owner != Job.STONE || crownShelf(floor))
+                && body.ordinaryRouteLane(from, to) == AgentBody.DryRouteVeto.CLEAR ? floor : null;
         }
 
         private boolean beginCrownCrossing(BlockPos to, BlockState floor) {
@@ -13414,6 +13416,7 @@ final class AgentProgress {
                         : "walking across to the witnessed crown tread";
                 }
                 case LANDED -> {
+                    if (owner == Job.STONE) return landedStoneTread(crossing.from, crossing.to, false, crossing.landing);
                     body.recordWalkedLeg(crossing.from, crossing.to);
                     navigator.rememberWalked(crossing.from, crossing.to);
                     stallGuard.navigationArrival(crossing.from, crossing.to);
@@ -13450,6 +13453,9 @@ final class AgentProgress {
             else {
                 crownRiseSpent |= foot.getY() > from.getY();
                 finish();
+                // Unexpected contact is not a crossing or a quarry receipt.
+                if (owner == Job.STONE && (!crownShelf(support) || stoneCanopyGround(support) || tried.contains(foot)))
+                    return false;
                 enterCrown(foot, support);
             }
             return true;
@@ -13460,22 +13466,58 @@ final class AgentProgress {
             BlockPos leaf = hit.getBlockPos();
             BlockPos side = from.offset(bearing);
             int rise = leaf.getY() - side.getY();
-            if (leaf.getX() != side.getX() || leaf.getZ() != side.getZ() || rise < 0 || rise > 1
+            if (leaf.getX() != side.getX() || leaf.getZ() != side.getZ() || rise < (owner == Job.STONE ? -1 : 0) || rise > 1
                     || leaf.equals(crownRiseSupport)
                     || protects(leaf) || foodCanopy.protects(leaf) || surfaceApproach.protectedCanopyLeaf(leaf)
                     || !AgentSupplyEgress.naturalDryLeaf(state(hit))) return false;
+            if (owner == Job.STONE) {
+                // Adjacent cap/attachment reads can only veto this already seen face.
+                boolean attached = AgentReturnableMine.protectedCutAttachment(c.world, leaf);
+                boolean lowerGroundSeen = rise == -1 && seenGroundBeyondLip();
+                return stoneCanopyMask(from, bearing, hit, state(hit), c.player.getBoundingBox(),
+                    c.world.getBlockState(leaf.up()), attached, lowerGroundSeen);
+            }
             return !c.player.getBoundingBox().expand(0.10).intersects(new Box(leaf));
+        }
+
+        private boolean seenGroundBeyondLip() {
+            var beyond = from.offset(bearing, 2);
+            for (int depth = 2; depth <= 3; depth++) {
+                if (stoneCanopyGround(body.overlandTop(beyond.down(depth), bearing, AgentBody::dryCaveDanger))) return true;
+            }
+            return false;
         }
 
         private boolean newCrownMask(BlockHitResult hit) {
             return hit != null && !attemptedLeaves.contains(hit.getBlockPos()) && crownMask(hit);
         }
 
-        private boolean openCrownColumn() {
-            if (!crownWorkHand(c.player.getMainHandStack())) return blocked("the held item is not a bare-hand timber supply");
-            if (tick - since >= CUT_TICKS) {
-                return nextCrownView();
+        private int stoneCrownHand() {
+            if (c.options.attackKey.isUnbound()) return -1;
+            var inventory = c.player.getInventory();
+            if (crownWorkHand(inventory.getMainHandStack())) return inventory.selectedSlot;
+            int empty = appleHand();
+            if (empty >= 0) return empty;
+            for (int slot = 0; slot < PlayerInventory.HOTBAR_SIZE; slot++) {
+                if (crownWorkHand(inventory.getStack(slot)) && hands.canEquipSlot(inventory, slot)) return slot;
             }
+            return -1;
+        }
+
+        private boolean openCrownColumn() {
+            if (tick - since >= CUT_TICKS) return nextCrownView();
+            if (!crownWorkHand(c.player.getMainHandStack())) {
+                if (owner != Job.STONE) return blocked("the held item is not a bare-hand timber supply");
+                int slot = stoneCrownHand();
+                if (slot < 0 || crownHandJob != 0) return nextCrownView();
+                body.pauseWork();
+                hands.equipSlot(slot);
+                if (!hands.busy()) return nextCrownView();
+                crownHandJob = hands.jobGeneration();
+                status = "switching to a non-consuming hand for the witnessed leaf";
+                return true;
+            }
+            crownHandJob = 0;
             if (!body.hasRecentView()) {
                 // Continue only the exact vanilla crack already started from this stance.
                 if (attackRequested) body.continueMine(mask.getBlockPos());
@@ -13492,13 +13534,14 @@ final class AgentProgress {
         }
 
         void ownBreak(BlockPos leaf, BlockState material) {
-            if (owner != Job.TIMBER || mask == null || !attackRequested || !mask.getBlockPos().equals(leaf)
+            if (owner == Job.FOOD || mask == null || !attackRequested || !mask.getBlockPos().equals(leaf)
                     || !AgentSupplyEgress.naturalDryLeaf(material)) return;
             openedFrame = body.renderedFrame();
             since = tick;
             columnCuts++;
             mask = null;
-            status = "rechecking the opened crown column for wood or a dry tread";
+            status = owner == Job.STONE ? "rechecking the opened crown column for stone or dry ground"
+                : "rechecking the opened crown column for wood or a dry tread";
         }
 
         private boolean canDrop(int height) {
@@ -13555,11 +13598,16 @@ final class AgentProgress {
                 if (crownSettleUntil == 0) return blocked("canopy inspection was interrupted");
             }
             continued = tick;
+            if (owner == Job.STONE && !inFlight() && hands.stableCraftFooting() && body.hasRecentView()
+                    && (openedFrame < 0 || body.renderedFrame() > openedFrame) && workOre(Resource.STONE, REACH - 0.35, false)) {
+                finish();
+                return true;
+            }
             if (measured != null) return stepMeasured();
             if (checkingMeasured) return recheckMeasured();
             if (crownCrossing != null) return stepCrownCrossing();
             if (tread != null && tread.inFlight()) return stepTread();
-            if (owner == Job.TIMBER) return stepTimberCrown();
+            if (owner != Job.FOOD) return stepCrown();
             var player = c.player;
             if (body.caveLipFooting(from) != source || body.hazardAhead(bearing.getPositiveHorizontalDegrees(), 1.65))
                 return blocked("canopy approach is no longer safe");
@@ -13630,9 +13678,11 @@ final class AgentProgress {
                 case MOVING -> {
                     rememberMotion();
                     report(owner == Job.FOOD ? "descending toward lower foraging ground"
+                        : owner == Job.STONE ? "descending toward a witnessed foothold to seek stone"
                         : "moving to a witnessed crown foothold to look for timber");
                 }
                 case LANDED -> {
+                    if (owner == Job.STONE) return landedStoneTread(tread.from, tread.to, true, tread.edge.lowerSupport());
                     stallGuard.navigationArrival(tread.from, tread.to);
                     if (owner == Job.FOOD) {
                         if (seenGround || AgentFoodWork.forageGround(tread.edge.lowerSupport())) uncuedLandings = 0;
@@ -13655,7 +13705,7 @@ final class AgentProgress {
                 }
                 case REFUSED -> {
                     stallGuard.refuseCrossing(tread.from, tread.to);
-                    if (owner == Job.TIMBER && body.caveLipFooting(from) == source) {
+                    if (owner != Job.FOOD && body.caveLipFooting(from) == source) {
                         String refusal = tread.refusal();
                         tread = null;
                         crownLook();
@@ -13668,10 +13718,28 @@ final class AgentProgress {
             return true;
         }
 
+        private boolean landedStoneTread(BlockPos from, BlockPos to, boolean oneWay, BlockState floor) {
+            if (exactCanopyContact(to) != floor) return blocked("the stone tread lost its exact dry support");
+            boolean ground = stoneCanopyGround(floor);
+            if (oneWay) separateStoneDrop();
+            else {
+                navigator.rememberWalked(from, to);
+                if (!ground) body.recordWalkedLeg(from, to);
+            }
+            if (oneWay || !ground) stallGuard.navigationArrival(from, to);
+            firstStone.landedBelowCanopy(from, to, bearing, oneWay, floor);
+            crownRiseSpent |= to.getY() > from.getY();
+            finish();
+            if (ground) status = "reached witnessed dry ground to expose and collect stone";
+            else if (tried.size() < MAX_STANDS) enterCrown(to, floor);
+            return true;
+        }
+
         private boolean blocked(String reason) {
             finish();
             body.pauseWork();
-            report((owner == Job.FOOD ? "food" : "timber canopy") + " route blocked (" + reason + ")");
+            report((owner == Job.FOOD ? "food" : owner == Job.STONE ? "stone canopy" : "timber canopy")
+                + " route blocked (" + reason + ")");
             return true;
         }
 

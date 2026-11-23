@@ -13,6 +13,7 @@ import net.minecraft.item.Items;
 import net.minecraft.state.property.Properties;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.Vec3d;
 import org.junit.jupiter.api.BeforeAll;
@@ -165,6 +166,63 @@ final class CanopyPassageTest {
         assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, Blocks.STONE.getDefaultState(), null, 100));
         assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, oak.with(LeavesBlock.PERSISTENT, true), null, 100));
         assertFalse(AgentProgress.firstStoneCanopyContact(FOOT, oak.with(Properties.WATERLOGGED, true), null, 100));
+    }
+
+    @Test
+    void equippedFirstStoneCanLeaveASpentForestOnlyAfterOrdinaryWorkDeclines() {
+        var crown = Blocks.BIRCH_LEAVES.getDefaultState();
+        var soil = Blocks.GRASS_BLOCK.getDefaultState();
+        assertTrue(AgentProgress.firstStoneCanopyHandoff(AgentOrdinaryNavigator.Job.STONE, true, false,
+            () -> AgentProgress.firstStoneCanopyContact(FOOT, crown, null, 100)
+                && AgentProgress.stoneCanopyGround(soil)));
+        assertFalse(AgentProgress.firstStoneCanopyHandoff(AgentOrdinaryNavigator.Job.STONE, true, true,
+            () -> { throw new AssertionError("a collectible exposed stone face gets the turn"); }));
+        assertFalse(AgentProgress.firstStoneCanopyHandoff(null, true, false,
+            () -> { throw new AssertionError("the ordinary survey must actually spend its frontier"); }));
+        assertFalse(AgentProgress.firstStoneCanopyHandoff(AgentOrdinaryNavigator.Job.TIMBER, true, false,
+            () -> { throw new AssertionError("stone is not another timber search"); }));
+        assertFalse(AgentProgress.firstStoneCanopyHandoff(AgentOrdinaryNavigator.Job.STONE, false, false,
+            () -> { throw new AssertionError("the starter pick and missing stone are required"); }));
+        assertFalse(AgentProgress.firstStoneCanopyHandoff(AgentOrdinaryNavigator.Job.STONE, true, false,
+            () -> AgentProgress.firstStoneCanopyContact(FOOT, soil, null, 100)),
+            "on real soil the local stone probe gets the turn instead");
+    }
+
+    @Test
+    void onlyNaturalStableGroundCanEndTheStoneCrownRoute() {
+        assertTrue(AgentProgress.stoneCanopyGround(Blocks.ROOTED_DIRT.getDefaultState()));
+        assertTrue(AgentProgress.stoneCanopyGround(Blocks.STONE.getDefaultState()));
+        assertFalse(AgentProgress.stoneCanopyGround(null), "no rendered support");
+        assertFalse(AgentProgress.stoneCanopyGround(Blocks.OAK_LOG.getDefaultState()), "a hollow tree is not ground");
+        assertFalse(AgentProgress.stoneCanopyGround(Blocks.OAK_LEAVES.getDefaultState()), "a crown shelf is not ground");
+        assertFalse(AgentProgress.stoneCanopyGround(Blocks.SAND.getDefaultState()), "no falling cap");
+        assertFalse(AgentProgress.stoneCanopyGround(Blocks.GRAVEL.getDefaultState()), "no falling cap");
+        assertFalse(AgentProgress.stoneCanopyGround(Blocks.CRAFTING_TABLE.getDefaultState()), "no workstation roof");
+        assertFalse(AgentProgress.stoneCanopyGround(Blocks.WATER.getDefaultState()));
+    }
+
+    @Test
+    void stoneCrownOpensOnlyTheSafeShoulderOrAKnownLowerGroundSightline() {
+        var leaf = Blocks.BIRCH_LEAVES.getDefaultState();
+        var air = Blocks.AIR.getDefaultState();
+        var shoulder = face(FOOT.east());
+        var lip = top(FOOT.east().down());
+        var body = new Box(FOOT.getX() + 0.2, FOOT.getY(), FOOT.getZ() + 0.2,
+            FOOT.getX() + 0.8, FOOT.getY() + 1.8, FOOT.getZ() + 0.8);
+        assertTrue(AgentProgress.stoneCanopyMask(FOOT, Direction.EAST, shoulder, leaf, body, air, false, false));
+        assertFalse(AgentProgress.stoneCanopyMask(FOOT, Direction.EAST, shoulder, leaf, body, air, true, false),
+            "keep a walked or attached support intact");
+        assertFalse(AgentProgress.stoneCanopyMask(FOOT, Direction.EAST, shoulder, leaf, body,
+            Blocks.GRAVEL.getDefaultState(), false, false), "a leaf cannot release a falling cap");
+        assertFalse(AgentProgress.stoneCanopyMask(FOOT, Direction.EAST, shoulder, leaf, body.offset(0.24, 0, 0), air, false, false),
+            "the body cannot be on or against the cut");
+        assertFalse(AgentProgress.stoneCanopyMask(FOOT, Direction.EAST, face(FOOT.up(2)), leaf, body, air, false, false),
+            "the roof above our footing is not a shoulder");
+        assertFalse(AgentProgress.stoneCanopyMask(FOOT, Direction.EAST, shoulder, Blocks.BIRCH_LOG.getDefaultState(),
+            body, air, false, false), "do not hollow out a trunk");
+        assertFalse(AgentProgress.stoneCanopyMask(FOOT, Direction.EAST, lip, leaf, body, air, false, false),
+            "do not cut the lip into an unseen hole");
+        assertTrue(AgentProgress.stoneCanopyMask(FOOT, Direction.EAST, lip, leaf, body, air, false, true));
     }
 
     @Test

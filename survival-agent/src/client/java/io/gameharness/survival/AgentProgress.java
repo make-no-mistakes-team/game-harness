@@ -8009,7 +8009,7 @@ final class AgentProgress {
         private int view, viewUntil, probeUntil, probeCheckAt, probeHeight, starterSteps, sideProbes, travelTick, walkUntil;
         private BlockPos cutting;
         private int lastProbeContact;
-        private boolean started, exhausted, backtracking, triedSupplyExit, canopyBranchWalk;
+        private boolean started, exhausted, backtracking, triedSupplyExit, canopyBranchWalk, directedProbe;
 
         boolean working() {
             return probeTo != null || tread != null || walkUntil != 0 || target != null && quarryingStoneStock;
@@ -8121,6 +8121,16 @@ final class AgentProgress {
                 viewUntil = tick + VIEW_TICKS;
                 refusedFaces.clear();
             }
+            boolean fresh = !exhausted && budget.canDeepen(uses, retiredAt(standing)) && starterSteps < STARTER_STEPS;
+            // A different distant face is not a pickup. Finish the already
+            // chosen opening and verify its tread before resurveying the seam.
+            if (probeTo != null) {
+                if (directedProbe || probeTo.getY() == standing.getY() || fresh) {
+                    workProbe(standing, uses);
+                    return;
+                }
+                forgetProbe();
+            }
             if (tick >= seekAfter && refusedFaces.size() < 6) {
                 var shown = body.find(Resource.STONE.block, STONE_VIEW, distantFace).orElse(null);
                 if (shown != null) {
@@ -8133,14 +8143,6 @@ final class AgentProgress {
                     walk(standing);
                     return;
                 }
-            }
-            boolean fresh = !exhausted && budget.canDeepen(uses, retiredAt(standing)) && starterSteps < STARTER_STEPS;
-            if (probeTo != null) {
-                if (probeTo.getY() == standing.getY() || fresh) {
-                    workProbe(standing, uses);
-                    return;
-                }
-                forgetProbe();
             }
             if (view < 4 && !standing.equals(stoppedAt)) {
                 Direction direction = directionAt(view);
@@ -8252,9 +8254,29 @@ final class AgentProgress {
         }
 
         private void refuseWalk(BlockPos standing) {
-            if (sightBlock != null) refusedFaces.add(sightBlock);
+            BlockPos rock = sightBlock;
+            if (rock != null) refusedFaces.add(rock);
             else refusedDeparture = standing;
             stopWalk();
+            if (rock == null || probeTo != null || !dryFieldFooting() || !body.hasRecentView()) return;
+            int dx = rock.getX() - standing.getX(), dz = rock.getZ() - standing.getZ();
+            if (dx == 0 && dz == 0 || rock.getY() > standing.getY() + 2) return;
+            Direction toward = Math.abs(dx) >= Math.abs(dz) ? (dx > 0 ? Direction.EAST : Direction.WEST)
+                : (dz > 0 ? Direction.SOUTH : Direction.NORTH);
+            boolean down = rock.getY() < standing.getY();
+            if (approachProbe(standing, rock, toward, down)) return;
+            // Don't dig the seam out from above before the drop has a
+            // collectible stance. Try beside it at the correct height.
+            if (down && !approachProbe(standing, rock, toward.rotateYClockwise(), true))
+                approachProbe(standing, rock, toward.rotateYCounterclockwise(), true);
+        }
+
+        private boolean approachProbe(BlockPos from, BlockPos rock, Direction direction, boolean down) {
+            BlockPos to = from.offset(direction).down(down ? 1 : 0);
+            if (!stoneApproachTread(from, rock, to) || !startProbe(from, to, direction)) return false;
+            directedProbe = true;
+            status = "opening a short checked approach to the exposed stone";
+            return true;
         }
 
         private void stopWalk() {
@@ -8318,20 +8340,26 @@ final class AgentProgress {
             for (int index = down ? 0 : 1; index < 4; index++) {
                 Direction direction = directionAt(index);
                 BlockPos to = from.offset(direction).down(down ? 1 : 0);
-                if (triedProbes.contains(to) || trail.contains(to) || stallGuard.refusedCrossing(from, to)) continue;
-                bearing = direction;
-                probeFrom = from;
-                probeTo = to;
-                probeUntil = tick + PROBE_TICKS;
-                probeCheckAt = tick + VIEW_TICKS;
-                lastProbeContact = 0;
-                probeHeight = down ? 2 : 1;
-                remember(triedProbes, to);
-                if (!down) sideProbes++;
+                if (!startProbe(from, to, direction)) continue;
                 status = down ? "checking a one-step stone exposure" : "checking a different level stone probe";
                 return true;
             }
             return false;
+        }
+
+        private boolean startProbe(BlockPos from, BlockPos to, Direction direction) {
+            if (triedProbes.contains(to) || trail.contains(to) || stallGuard.refusedCrossing(from, to)) return false;
+            bearing = direction;
+            probeFrom = from;
+            probeTo = to;
+            probeUntil = tick + PROBE_TICKS;
+            probeCheckAt = tick + VIEW_TICKS;
+            lastProbeContact = 0;
+            directedProbe = false;
+            probeHeight = to.getY() < from.getY() ? 2 : 1;
+            remember(triedProbes, to);
+            if (to.getY() == from.getY()) sideProbes++;
+            return true;
         }
 
         private void workProbe(BlockPos standing, int uses) {
@@ -8463,6 +8491,14 @@ final class AgentProgress {
             if (sites.size() == REMEMBERED_WORK) sites.removeFirst();
             sites.add(foot);
         }
+    }
+
+    static boolean stoneApproachTread(BlockPos from, BlockPos rock, BlockPos to) {
+        int dy = to.getY() - from.getY();
+        if (dy < -1 || dy > 0 || Math.abs(from.getX() - to.getX()) + Math.abs(from.getZ() - to.getZ()) != 1
+                || dy < 0 && (rock.getY() >= from.getY() || to.equals(rock))) return false;
+        double before = from.getSquaredDistance(rock), after = to.getSquaredDistance(rock);
+        return after < before || dy == -1 && to.getY() == rock.getY() && after == before && after <= 2;
     }
 
     private static boolean differentStoneGround(BlockPos first, BlockPos second) {

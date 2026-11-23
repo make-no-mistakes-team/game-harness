@@ -86,7 +86,9 @@ the jump still lacks clearance, the newly visible one above it. It
 rechecks the whole jump space before placing a step. It does not dig
 through rock or clear leaves above the height needed for the jump.
 When gathering cobblestone, the player chooses a face close enough to
-collect the drop. If it breaks stone but cannot pick up the drop, it
+collect the drop. If it sees stone beyond an obstructed lane, it can
+open one checked tread toward it, or beside a lower seam, instead of
+turning to inspect every exposed block again. If it cannot collect a drop, it
 changes footing before quarrying another face. Andesite and similar rock
 do not count toward a pickaxe. If a short prospect yields only those
 blocks, the miner tries different ground with uses left on its pick.

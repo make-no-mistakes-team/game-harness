@@ -30,6 +30,17 @@ final class AgentPickupTest {
     static void initializeVanilla() { VanillaTestResources.initialize(); }
 
     @Test
+    void aCheckedApproachToLowerStoneUsesTheSideInsteadOfDestroyingTheSeamForFooting() {
+        BlockPos standing = new BlockPos(0, 63, 0);
+        BlockPos low = standing.north().down();
+        assertFalse(AgentProgress.stoneApproachTread(standing, low, low));
+        assertTrue(AgentProgress.stoneApproachTread(standing, low, standing.east().down()));
+        assertTrue(AgentProgress.stoneApproachTread(standing, standing.north(3).down(), low));
+        assertFalse(AgentProgress.stoneApproachTread(standing, low, standing.south().down()));
+        assertFalse(AgentProgress.stoneApproachTread(standing, low, standing.east().down(2)));
+    }
+
+    @Test
     void nearbyDropNeedsNeitherAViewChangeNorFootInputAsItFalls() {
         for (double height : new double[] { 3.2, 2.45, 2.2, 1.4, 0.2, 0 }) {
             assertEquals(WAIT, AgentPickup.input(PLAYER, item(1.3, height, 1.3), height == 0, null, 147));

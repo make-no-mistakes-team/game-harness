@@ -28,6 +28,10 @@ final class AgentMineLightTest {
             "reserve two convertible planks or make the extra sticks before refitting");
         assertTrue(AgentMineLight.fundsHandles(0, 3, AgentMineLight.stoneRefitSticks(3)),
             "a replacement needed now can still use the scarce sticks");
+        assertTrue(AgentMineLight.fundsHandles(0, 3, AgentMineLight.stoneRefitSticks(6)),
+            "six uses cannot open a three-cut tread while keeping four in reserve; refit at the mine");
+        assertFalse(AgentMineLight.fundsHandles(0, 3, AgentMineLight.stoneRefitSticks(7)),
+            "one payable tread remains, so a speculative spare still protects the iron handles");
     }
 
     @Test void emergencyLightUsesOnlyOneReservedStickWhenThereIsNoSurplus() {

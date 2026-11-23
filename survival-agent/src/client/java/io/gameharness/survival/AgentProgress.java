@@ -2556,14 +2556,17 @@ final class AgentProgress {
                 || !workOre(Resource.STONE, REACH - 0.35, false)) seekExpeditionSupplies("a replacement pickaxe");
             return true;
         }
-        if (remaining < 3 * litLeg + MIN_PICK_USES && tick >= refitPickRetry
-                && has(STONE, 3) && affordsWood(localTableWood(), AgentMineLight.stoneRefitSticks(remaining))) {
-            refitPickCount = hands.count(STONE_PICK);
-            refitPickUntil = tick + 230;
-            return refitMinedPick();
-        }
+        if (remaining < AgentMineLight.USES_PER_TREAD * litLeg + MIN_PICK_USES && startLocalRefit(remaining)) return true;
         if (departure) departureKit = true;
         return false;
+    }
+
+    private boolean startLocalRefit(int remaining) {
+        if (tick < refitPickRetry || !has(STONE, 3)
+                || !affordsWood(localTableWood(), AgentMineLight.stoneRefitSticks(remaining))) return false;
+        refitPickCount = hands.count(STONE_PICK);
+        refitPickUntil = tick + 230;
+        return refitMinedPick();
     }
 
     private boolean refitMinedPick() {
@@ -9896,6 +9899,10 @@ final class AgentProgress {
         if (outcome == AgentReturnableMine.Outcome.SUPPLIES) {
             if (hands.count(TORCH) <= 2 && pickUses(DEEP_PICK) + pickUses(STONE_PICK) >= 7
                 && craftTorches(AgentMineLight.tripTorches(AgentMineLight.routeSteps(current.getY(), depth)))) return;
+            if (ordinaryCaveDrops && current.getY() > depth && hands.count(TORCH) > 2) {
+                int uses = returnableToolUses();
+                if (uses < MIN_PICK_USES + AgentMineLight.USES_PER_TREAD && startLocalRefit(uses)) return;
+            }
             seekExpeditionSupplies("returnable mine supplies");
         } else if (outcome == AgentReturnableMine.Outcome.EXHAUSTED) {
             if (ordinaryCaveDrops) mineResite.exhausted(sought, current);

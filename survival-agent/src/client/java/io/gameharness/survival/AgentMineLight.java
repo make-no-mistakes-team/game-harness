@@ -4,6 +4,7 @@ package io.gameharness.survival;
 final class AgentMineLight {
     static final int PICK_HANDLES = 2;
     static final int MIN_PICK_USES = 4;
+    static final int USES_PER_TREAD = 3;
     private static final int RETURN_TORCHES = 2;
     private static final int STEPS_PER_TORCH = 7;
     private static final int TORCHES_PER_CRAFT = 4;
@@ -28,8 +29,8 @@ final class AgentMineLight {
     }
 
     static int stoneRefitSticks(int pickUses) {
-        // Keep the handles for the next iron pick unless replacing the current tool is urgent.
-        return pickUses < MIN_PICK_USES ? PICK_HANDLES : 2 * PICK_HANDLES;
+        // If the next tread cannot open, this is the working pick, not a speculative spare.
+        return pickUses < MIN_PICK_USES + USES_PER_TREAD ? PICK_HANDLES : 2 * PICK_HANDLES;
     }
 
     static boolean fundsHandles(int wood, int sticks, int needed) {

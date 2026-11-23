@@ -26,7 +26,7 @@ import net.minecraft.world.BlockView;
 final class AgentReturnableMine {
     private static final int LEG_LIMIT = 3;
     private static final int TORCH_RESERVE = 2;
-    private static final int TOOL_RESERVE = 4;
+    private static final int TOOL_RESERVE = AgentMineLight.MIN_PICK_USES;
     private static final int LEG_TICKS = 520;
     private static final int PROGRESS_LEASE_TICKS = 48;
     private static final int CAVE_TURN_LIMIT = 220;
@@ -341,7 +341,8 @@ final class AgentReturnableMine {
     }
 
     private static int suppliedSteps(AgentProgress host) {
-        return Math.min(host.returnableTorches() - TORCH_RESERVE, (host.returnableToolUses() - TOOL_RESERVE) / 3);
+        return Math.min(host.returnableTorches() - TORCH_RESERVE,
+            (host.returnableToolUses() - TOOL_RESERVE) / AgentMineLight.USES_PER_TREAD);
     }
 
     boolean gravelCutAvailable() { return gravelWork.canCut(); }

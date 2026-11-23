@@ -6656,7 +6656,8 @@ final class AgentProgress {
             if (outline.active()) return true;
             if (!ordinaryCaveDrops || !body.ordinaryOutlineExitEnabled() || !actualOutlineFoot(from)
                     || body.lavaEmergency() || body.macroLavaNear()) return false;
-            outline.begin(from, tick);
+            if (foodActive()) outline.beginFoodEscape(from, tick);
+            else outline.begin(from, tick);
             since = tick;
             aim = null;
             return true;
@@ -7714,6 +7715,10 @@ final class AgentProgress {
                         && AgentReturnableMine.protectedCutAttachment(c.world, cell))
                     admission = AgentReturnableMine.Face.PROTECTED;
                 if (admission != AgentReturnableMine.Face.MINEABLE) {
+                    if (admission == AgentReturnableMine.Face.TOOL && foodActive() && !outline.active()
+                            && AgentSupplyOutline.escapeMaterial(material)
+                            && !AgentReturnableMine.protectedCutAttachment(c.world, cell)
+                            && restartCrossingUnderOutline()) return true;
                     String reason = switch (admission) {
                         case FOOTPRINT -> "supports the current footprint";
                         case PROTECTED -> cell.equals(support)

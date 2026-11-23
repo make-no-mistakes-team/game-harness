@@ -354,7 +354,8 @@ final class AgentSupplyEgress {
         private final Set<BlockPos> shiftedApexes = new HashSet<>(), handClearances = new HashSet<>();
         private BlockPos foot, pending, handReceiptCell;
         private ApexAccess apex;
-        private int until;
+        private int until, foodEscapeStartY, foodEscapeHighY;
+        private boolean foodEscape;
 
         boolean active() { return foot != null; }
         boolean withinTime(int tick) { return tick < until; }
@@ -367,6 +368,13 @@ final class AgentSupplyEgress {
             foot = from.toImmutable();
             visited.add(foot);
             until = tick + TICKS;
+        }
+
+        void beginFoodEscape(BlockPos from, int tick) {
+            if (active()) return;
+            begin(from, tick);
+            foodEscapeStartY = foodEscapeHighY = from.getY();
+            foodEscape = true;
         }
 
         boolean allowsLeg(BlockPos from, BlockPos to) {
@@ -383,7 +391,10 @@ final class AgentSupplyEgress {
         void attemptedCut(BlockPos cell) { attemptedCuts.add(cell.toImmutable()); }
 
         boolean allowsHandClearance(BlockPos cell) {
-            return handClearances.size() < HAND_CLEARANCES && !handClearances.contains(cell);
+            // Three witnessed faces can occupy the first stair. Only an actual
+            // new high tread funds the next two cuts, never a turn or a level loop.
+            int limit = foodEscape ? Math.min(CUTS, 3 + 2 * (foodEscapeHighY - foodEscapeStartY)) : HAND_CLEARANCES;
+            return handClearances.size() < limit && !handClearances.contains(cell);
         }
 
         boolean attemptHandClearance(BlockPos cell) {
@@ -435,6 +446,7 @@ final class AgentSupplyEgress {
             foot = pending;
             pending = null;
             visited.add(foot);
+            if (foodEscape) foodEscapeHighY = Math.max(foodEscapeHighY, foot.getY());
             return true;
         }
 
@@ -448,6 +460,7 @@ final class AgentSupplyEgress {
             shiftedApexes.clear();
             handClearances.clear();
             abandonHandClearance();
+            foodEscape = false;
             until = 0;
         }
     }

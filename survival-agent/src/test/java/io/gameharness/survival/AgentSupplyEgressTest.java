@@ -461,6 +461,27 @@ final class AgentSupplyEgressTest {
         assertFalse(passage.withinTime(1060), "a break after releasing the contact is not this order's receipt");
     }
 
+    @Test
+    void onlyLandingHigherFundsFurtherBareHandCutsOnAFoodExit() {
+        var passage = new AgentSupplyEgress.OutlinePassage();
+        var low = new BlockPos(0, 50, 0);
+        var high = low.north().up();
+        passage.beginFoodEscape(low, 5);
+        assertTrue(passage.attemptHandClearance(high));
+        assertTrue(passage.attemptHandClearance(high.up()));
+        assertTrue(passage.attemptHandClearance(high.up(2)));
+        assertTrue(passage.admitLanding(low, high));
+        assertFalse(passage.landed(high, false));
+        assertFalse(passage.allowsHandClearance(high.north()));
+        assertTrue(passage.landed(high, true));
+        assertFalse(passage.attemptHandClearance(high), "a paid-for obstruction cannot be bought twice");
+        assertTrue(passage.attemptHandClearance(high.north().up()));
+        assertTrue(passage.attemptHandClearance(high.north().up(2)));
+        assertTrue(passage.admitLanding(high, high.east()));
+        assertTrue(passage.landed(high.east(), true));
+        assertFalse(passage.allowsHandClearance(high.east(2)), "sideways exploration cannot renew digging");
+    }
+
     private static BlockHitResult apexFace(BlockPos foot, Direction side) {
         BlockPos apex = foot.up(3);
         return new BlockHitResult(Vec3d.ofCenter(apex), side, apex, false);

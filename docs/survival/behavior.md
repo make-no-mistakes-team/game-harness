@@ -91,6 +91,9 @@ has uses. Shaft escape checks reachable side exits and headroom; gravel is
 cleared from beside the column after falling material settles.
 An outlined face can support a short dark egress check from real dry footing;
 darkness, sound or an empty ray never proves safe ground or hidden ore.
+Clearance need not yield resources: an ordinary obstruction may be broken by
+hand when no suitable tool remains. Only actual crack progress grants extra
+mining time; it does not renew an idle movement or placement lease.
 
 The miner stocks light for return, reserves a torch when possible and checks
 placed light plus its item debit before a crossing. It preserves two sticks

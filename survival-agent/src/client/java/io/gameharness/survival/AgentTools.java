@@ -35,6 +35,23 @@ final class AgentTools {
 
     /** Returns true only when the best candidate is selected; otherwise asks Hands to equip it. */
     boolean readyFor(BlockState observedState) {
+        return readyFor(observedState, false);
+    }
+
+    /** Clearance needs a normal break, not drops; an empty hand is a legitimate candidate. */
+    boolean readyForClearance(BlockState observedState) {
+        return readyFor(observedState, true);
+    }
+
+    static boolean candidateAllowed(boolean requiresTool, boolean suitable, boolean clearance) {
+        return clearance || !requiresTool || suitable;
+    }
+
+    static float clearanceSpeed(float speed, boolean requiresTool, boolean suitable) {
+        return speed / (requiresTool && !suitable ? 100 : 30);
+    }
+
+    private boolean readyFor(BlockState observedState, boolean clearance) {
         var player = client.player;
         if (player == null || observedState.isAir() || hands.busy()) return false;
         var inventory = player.getInventory();
@@ -45,7 +62,8 @@ final class AgentTools {
 
         for (int slot = 0; slot < PlayerInventory.MAIN_SIZE; slot++) {
             ItemStack stack = inventory.getStack(slot);
-            if (requiresTool && !stack.isSuitableFor(observedState)) continue;
+            boolean suitable = stack.isSuitableFor(observedState);
+            if (!candidateAllowed(requiresTool, suitable, clearance)) continue;
 
             float speed = stack.getMiningSpeedMultiplier(observedState);
             // Vanilla adds Efficiency's main-hand bonus only when the tool already speeds up the block.
@@ -57,6 +75,7 @@ final class AgentTools {
                 int level = EnchantmentHelper.getLevel(efficiency, stack);
                 if (level > 0) speed += level * level + 1;
             }
+            if (clearance) speed = clearanceSpeed(speed, requiresTool, suitable);
             if (bestSlot >= 0) {
                 if (speed < bestSpeed) continue;
                 if (speed == bestSpeed) {

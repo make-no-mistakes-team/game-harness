@@ -6,7 +6,8 @@
     "AgentRenderMixin", "AgentSupplyOutlineRenderMixin",
     "AgentVisualHudAccess", "AgentVisualBossAccess", "AgentVisualChatAccess", "AgentVisualToastAccess",
     "AgentHandledScreenAccess", "AgentMouseAccess", "AgentKeyboardAccess", "AgentCraftScreenMixin",
-    "AgentMiningAccess", "AgentFurnaceSyncMixin", "AgentFurnaceBlockMixin", "AgentWaterUseMixin"
+    "AgentMiningAccess", "AgentFurnaceSyncMixin", "AgentFurnaceBlockMixin", "AgentWaterUseMixin",
+    "AgentSpriteContentsAccess", "AgentMultipartModelAccess", "AgentTextureFilterAccess"
   ],
   "injectors": { "defaultRequire": 1 }
 }

@@ -1,17 +1,9 @@
 # Repository instructions
 
-## Current direction
-The ordinary Survival Agent is a developer-written local player with optional
-asynchronous model strategy. It owns movement, tools, terrain clearance,
-workstations, crafting, food and immediate defense. It pursues useful work while
-the model thinks, abstains or is unavailable, adopting advice at safe transitions.
-The older model-authored general harness is a separate research system.
+## Before gameplay changes
 
-Before gameplay changes, read [the behavior contract](docs/survival/behavior.md).
-The target is a fresh-origin campaign that obtains diamonds and enters the
-Nether, ultimately progressing to beating Minecraft. Preserve local safety and
-explicit prohibitions; use ordinary Survival actions and visible inventory.
-Hidden blocks, world seeds and server-state knowledge are unavailable to actors.
+Read [the behavior contract](docs/survival/behavior.md) for product goals,
+control ownership, perception, uncertainty and gameplay acceptance.
 
 ## Evidence
 

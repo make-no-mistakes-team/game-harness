@@ -6,6 +6,11 @@ latency. The user-reported slow camera, roughly five-second pauses and awkward
 target switches are observed failures to address, not doubts to dismiss with
 passing fixtures. No retained integration result establishes this target.
 
+The local player owns ordinary movement, tools, crafting, workstations, food
+and immediate defense. The configured model makes asynchronous macro decisions.
+Useful local play continues without a reply. General model-authored GameHarness
+experiments are a separate system, not the ordinary player's policy.
+
 ## What must be visible in play
 
 - Smooth turns with useful variation in speed and effort, rather than a fixed
@@ -18,9 +23,14 @@ passing fixtures. No retained integration result establishes this target.
 - Ordinary travel and exploration use useful arbitrary bearings. The block
   grid can constrain a cut or placement, not restrict the player's gaze to
   four directions.
+- Retain a meaningful aim target rather than repeatedly switching a little
+  left and right without useful progress.
 - A healthy player can leave elevated foliage for a witnessed dry landing with
   modest survivable fall damage; searching forever for a damage-free route is
   not a safe or useful outcome.
+- Ordinary excavation and descent may rely on explicit terrain hypotheses,
+  not a proof of every future block. Wrong assumptions can cause real falls,
+  lava exposure or death; immediate response uses actual new observations.
 - Threat response that interrupts work: flee, take cover or fight a visible
   reachable hostile as conditions require. Combat cannot wait for a model.
 - Food seeking, eating and recovery when health/hunger require them.
@@ -32,10 +42,10 @@ Review the whole recording at 1× alongside movement, contact, look, pause and
 provider receipts. A turn-speed sample, neutralized cancellation, visible
 inventory action or diagnostic portal is not proof of this combined experience.
 
-## Implemented local intentions
+## Local execution contract
 
-These are source-level behaviors and safety constraints, not a successful
-fresh-campaign claim. The controllers are defined in the
+These requirements guide implementation; they are not a successful campaign
+claim. Existing controllers are defined in the
 [`survival` Java package](../../survival-agent/src/client/java/io/gameharness/survival/)
 and the [advisory host](../../src/server/survival-macro/expedition.ts).
 
@@ -54,23 +64,24 @@ and braking; urgent or precision contexts keep their protected steering.
 Face selection and actual crosshair contact govern mining. These mechanisms
 still require normal-speed footage review against the acceptance above.
 
-Each new tread needs visible support and body clearance. Ordinary exploration
-can descend one or two blocks to stable dry ground with no immediate threat,
-with a usable pick or building blocks; that does not prove a climb back.
-Unknown/unlit floors, lava and greater drops need another approach.
-A placed step or connector needs fresh placement and inventory confirmation,
-then a separate crossing check. Slips, changed terrain or a different landing
-require a fresh footing check.
+Observed routes retain their actual support/clearance evidence. A local
+hypothesis can instead permit ordinary exploratory digging or a short movement
+under uncertainty; it does not become a witnessed tread or guaranteed return.
+Known hazards take precedence. Newly exposed material, collision, falling,
+fluid contact or damage can disprove the hypothesis and change the next action.
+Placed connectors still need actual placement/stock receipts.
 
 ### Supplies, mining and workshops
 
 Timber approach chooses a collectible stance, not merely swing reach.
 Nearby low logs can supply handles and light before departure. The first pick
-takes priority over optional tools. Canopy work can clear neighboring leaves
-without removing support, inspect dry descent and avoid revisiting the same
-failed collection spot. A healthy fed player may accept a visible dry descent
-predicted to cost at most one heart only after safer wood approaches run out;
-unclear footing or a threat vetoes it.
+takes priority over optional tools. Canopy work should choose useful wood or
+descent before prolonged frontier wandering. The options include a modest fall,
+a carried water bucket, crafting/boarding a suitable boat, a predicted jump
+into visible water, and harvesting down a trunk/opening a stepped exit.
+Inferred continuation of a log column
+is a hypothesis, not knowledge of buried logs or ground. Recheck exposed
+changes and actual landing before repeating.
 
 Stone work selects collectible faces. Uncollectible drops prompt a stance
 change; andesite-like substitutes earn no cobblestone credit.

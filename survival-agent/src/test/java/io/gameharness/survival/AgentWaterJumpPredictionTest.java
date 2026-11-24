@@ -74,6 +74,43 @@ final class AgentWaterJumpPredictionTest {
     }
 
     @Test
+    void lookOnlyPlaneProjectionSharesTickMathButNeverNominatesWaterOrAuthorizesLaunch() {
+        var launch = launch(new Vec3d(0.5, 80, 0.284), new Vec3d(0, 0, 0.12), 0, 1, true, 2);
+        var distantWater = water(new Box(0, 63.8, 17, 1, 64, 18));
+        var actualPatchPrediction = predict(launch, WALK, distantWater);
+        assertEquals(AgentWaterJumpPrediction.Verdict.SHORT, actualPatchPrediction.verdict());
+        var look = AgentWaterJumpPrediction.projectToSurface(launch, WALK, 64, List.of(), NOW);
+        assertEquals(AgentWaterJumpPrediction.Verdict.SURFACE_PROJECTION, look.verdict());
+        assertFalse(look.viable(), "a look hypothesis is not an observed nearer water patch");
+        assertNotNull(look.entryFeet());
+        assertEquals(64, look.entryFeet().y, 0);
+        assertTrue(look.entryFeet().z > look.projectedTakeoffFeet().z);
+        assertTrue(look.entryFeet().z < 17);
+        assertTrue(look.entryTick() >= 2);
+        assertTrue(look.earliestEntryTick() <= look.entryTick());
+        assertTrue(look.latestEntryTick() >= look.entryTick());
+        var freshAirborne = launch(new Vec3d(7, 10, -2), new Vec3d(0.4, -1, 0.2), 3, 4, false, 0);
+        var plane = AgentWaterJumpPrediction.projectToSurface(freshAirborne, COAST, 9.5, List.of(), NOW);
+        var patch = predict(freshAirborne, COAST, water(new Box(6, 9.4, -3, 9, 9.5, 0)));
+        assertEquals(patch.entryFeet(), plane.entryFeet());
+        assertEquals(patch.entryVelocity(), plane.entryVelocity());
+        assertEquals(patch.entryTick(), plane.entryTick(), 0);
+    }
+
+    @Test
+    void lookOnlyProjectionStillRejectsVisibleObstructionsStaleMotionAndNonfiniteHeights() {
+        var launch = launch(new Vec3d(0, 10, 0), Vec3d.ZERO, 1, 0, true, 0);
+        var blocked = AgentWaterJumpPrediction.projectToSurface(launch, WALK, 6,
+            List.of(new Box(-1, 11.9, -1, 1, 12.2, 1)), NOW);
+        assertEquals(AgentWaterJumpPrediction.Verdict.VISIBLE_OBSTRUCTION, blocked.verdict());
+        assertNull(blocked.entryFeet());
+        assertEquals(AgentWaterJumpPrediction.Verdict.STALE,
+            AgentWaterJumpPrediction.projectToSurface(launch, WALK, 6, List.of(), NOW + 1).verdict());
+        assertEquals(AgentWaterJumpPrediction.Verdict.UNSUPPORTED,
+            AgentWaterJumpPrediction.projectToSurface(launch, WALK, Double.NaN, List.of(), NOW).verdict());
+    }
+
+    @Test
     void groundedJumpTickUsesGroundAccelerationThenGroundFrictionNotImmediateAirFriction() {
         var strongGravity = new AgentWaterJumpPrediction.Physics(1, (double) 0.42f, 0.098f,
             0.6f * 0.91f, 0.02f * 0.98f, 0.91f, 0.98f, true);
@@ -165,8 +202,14 @@ final class AgentWaterJumpPredictionTest {
         var fresh = predict(launch, COAST, water(box));
         var older = predict(launch, COAST, new AgentWaterJumpPrediction.WaterPatch(box, NOW - 10, true, false));
         assertTrue(older.horizontalUncertainty() > fresh.horizontalUncertainty());
+        var retainedPatch = new AgentWaterJumpPrediction.WaterPatch(box, NOW - 40, true, false);
+        var afterLineup = predict(launch, COAST, retainedPatch);
+        assertTrue(afterLineup.viable(), "bounded actual water knowledge survives a checked runway lineup");
+        assertEquals(NOW - 40, retainedPatch.observedTick(), "prediction must not renew the actual witness");
+        assertEquals(box, retainedPatch.bounds(), "prediction must not enlarge the actual water patch");
+        assertTrue(afterLineup.horizontalUncertainty() > older.horizontalUncertainty());
         var oldWater = predict(launch, COAST, new AgentWaterJumpPrediction.WaterPatch(
-            box, NOW - AgentWaterJumpPrediction.MAX_OBSERVATION_AGE - 1, true, false));
+            box, NOW - AgentWaterJumpPrediction.MAX_WATER_OBSERVATION_AGE - 1, true, false));
         assertEquals(AgentWaterJumpPrediction.Verdict.STALE, oldWater.verdict());
         var staleOwnMotion = AgentWaterJumpPrediction.predict(launch, COAST, water(box), List.of(), NOW + 1);
         assertEquals(AgentWaterJumpPrediction.Verdict.STALE, staleOwnMotion.verdict());

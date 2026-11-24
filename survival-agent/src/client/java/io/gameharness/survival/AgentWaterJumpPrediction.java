@@ -12,13 +12,15 @@ final class AgentWaterJumpPrediction {
     static final int MAX_RUNUP_TICKS = 24;
     static final int MAX_FLIGHT_TICKS = 80;
     static final int MAX_OBSERVATION_AGE = 20;
+    static final int MAX_WATER_OBSERVATION_AGE = 80;
     private static final int MAX_OBSTACLES = 32;
     private static final double LIMIT = 30_000_000;
     private static final double VELOCITY_EPSILON = 0.003;
 
     enum Verdict {
         VIABLE, RISKY, SHORT, OVERSHOOT, MISS, VISIBLE_OBSTRUCTION,
-        UNSUPPORTED, UNSUPPORTED_FLUID, KNOWN_HAZARD, MISSING_WATER, STALE, HORIZON
+        UNSUPPORTED, UNSUPPORTED_FLUID, KNOWN_HAZARD, MISSING_WATER, STALE, HORIZON,
+        SURFACE_PROJECTION
     }
 
     /**
@@ -67,13 +69,30 @@ final class AgentWaterJumpPrediction {
         if (water == null || water.bounds() == null) return rejected(Verdict.MISSING_WATER);
         if (water.knownHazard()) return rejected(Verdict.KNOWN_HAZARD);
         if (!water.stillWater()) return rejected(Verdict.UNSUPPORTED_FLUID);
-        if (launch == null || physics == null || !valid(launch, physics) || !valid(water.bounds())
+        if (!valid(water.bounds())) return rejected(Verdict.UNSUPPORTED);
+        return trace(launch, physics, water, water.bounds().maxY, visibleObstacles, nowTick);
+    }
+
+    /**
+     * LOOK-only descending plane intercept using an already observed surface height.
+     * Does not nominate water at the intercept or inflate a distant observed water patch.
+     * SURFACE_PROJECTION is deliberately not viable(); a new real rendered water witness
+     * and the ordinary runway/launch admission are required before any movement offer.
+     */
+    static Result projectToSurface(Launch launch, Physics physics, double surfaceY,
+                                   List<Box> visibleObstacles, int nowTick) {
+        return trace(launch, physics, null, surfaceY, visibleObstacles, nowTick);
+    }
+
+    private static Result trace(Launch launch, Physics physics, WaterPatch water, double surfaceY,
+                                List<Box> visibleObstacles, int nowTick) {
+        if (launch == null || physics == null || !valid(launch, physics) || !bounded(surfaceY, -LIMIT, LIMIT)
                 || visibleObstacles == null || visibleObstacles.size() > MAX_OBSTACLES)
             return rejected(Verdict.UNSUPPORTED);
         long launchAge = (long) nowTick - launch.observedTick();
-        long waterAge = (long) nowTick - water.observedTick();
+        long waterAge = water == null ? 0 : (long) nowTick - water.observedTick();
         // A runway forecast is never a substitute for this tick's own position/velocity.
-        if (launchAge != 0 || waterAge < 0 || waterAge > MAX_OBSERVATION_AGE)
+        if (launchAge != 0 || waterAge < 0 || waterAge > MAX_WATER_OBSERVATION_AGE)
             return rejected(Verdict.STALE);
         for (int i = 0; i < visibleObstacles.size(); ++i) {
             if (!valid(visibleObstacles.get(i))) return rejected(Verdict.UNSUPPORTED);
@@ -96,7 +115,7 @@ final class AgentWaterJumpPrediction {
         }
         Vec3d takeoffFeet = new Vec3d(x, y, z);
         Vec3d takeoffVelocity = new Vec3d(vx, vy, vz);
-        Box patch = water.bounds();
+        Box patch = water == null ? null : water.bounds();
         double uncertainty = 0.035 + Math.max(launchAge, waterAge) * 0.01;
         for (int tick = 0; tick < MAX_FLIGHT_TICKS; ++tick) {
             vx = snap(vx);
@@ -120,7 +139,15 @@ final class AgentWaterJumpPrediction {
                     || obstructed(visibleObstacles, x, nextY, z, nextX, nextY, nextZ, radius, launch.height()))
                 return rejected(Verdict.VISIBLE_OBSTRUCTION);
 
-            if (vy < 0 && nextY < patch.maxY && y + launch.height() > patch.minY) {
+            if (patch == null && vy < 0 && y >= surfaceY && nextY < surfaceY) {
+                double fraction = (y - surfaceY) / -vy;
+                return new Result(Verdict.SURFACE_PROJECTION,
+                    new Vec3d(x + vx * fraction, surfaceY, z + vz * fraction), new Vec3d(vx, vy, vz),
+                    launch.runupTicks() + tick + fraction, launch.runupTicks() + tick,
+                    launch.runupTicks() + tick + 2, uncertainty + (tick + 1) * 0.003,
+                    takeoffFeet, takeoffVelocity);
+            }
+            if (patch != null && vy < 0 && nextY < patch.maxY && y + launch.height() > patch.minY) {
                 // The downward surface-crossing fraction is nominal; the actual axis-ordered
                 // move/fluid-contact update can occur anywhere in this tick's swept window.
                 double fraction = y >= patch.maxY ? Math.min(1, (y - patch.maxY) / -vy) : 0;
@@ -165,7 +192,8 @@ final class AgentWaterJumpPrediction {
             vx *= drag;
             vz *= drag;
             vy = (vy - physics.gravity()) * physics.verticalDrag();
-            if (y + launch.height() < patch.minY && vy < 0) {
+            if (patch == null && y < surfaceY && vy < 0) return rejected(Verdict.MISS);
+            if (patch != null && y + launch.height() < patch.minY && vy < 0) {
                 double near = projectionMin(patch, dx, dz) - radius;
                 double far = projectionMax(patch, dx, dz) + radius;
                 double along = x * dx + z * dz;

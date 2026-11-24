@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, realpath, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { SURVIVAL_AGENT_GOALS, TERRA_MODEL_ID } from "../../shared/survival-agent-ui.ts";
+import { SURVIVAL_AGENT_GOALS } from "../../shared/survival-agent-ui.ts";
 import {
   bindFirstPlan, firstPlanScopeMatches, parseFirstPlanAdvice, PRE_SPAWN_GOAL_ONLY,
   type FirstPlanInference, type FirstPlanRequest, type FirstPlanStrategist,
@@ -120,9 +120,10 @@ type FrameCapture = MacroFrame | UnavailableFrame | { readonly cause: "basis_cha
 export interface SurvivalMacroConfig {
   readonly runDir: string;
   readonly run: string;
-  readonly strategy: "deterministic" | "terra";
+  readonly strategy: "deterministic" | "model";
+  readonly model?: string;
   readonly objective?: string;
-  /** Outcome-level jobs require explicitly admitted Terra. */
+  /** Outcome-level jobs require explicitly admitted Model. */
   readonly durableWork?: boolean;
   /** One prepared stock request, after matching rendered evidence; no other effects. */
   readonly preparedStockReady?: (observation: MacroObservation) => boolean;
@@ -170,6 +171,7 @@ interface WorkProgramCompletion {
 
 export interface MacroStatus {
   readonly strategy: SurvivalMacroConfig["strategy"];
+  readonly model: string | null;
   readonly state: MacroState;
   readonly models: readonly string[];
   readonly capabilitiesVersion: string;
@@ -1003,19 +1005,19 @@ export class SurvivalMacroController {
     this.runDir = path.resolve(config.runDir);
     validateMacroId(config.run, "run");
     if (path.basename(this.runDir) !== config.run) throw new Error("Survival macro run ID does not match its private directory.");
-    if (config.strategy !== "deterministic" && config.strategy !== "terra") throw new Error("Invalid survival strategy.");
+    if (config.strategy !== "deterministic" && config.strategy !== "model") throw new Error("Invalid survival strategy.");
     this.directory = path.join(this.runDir, "macro");
     this.limits = checkedLimits(config.limits);
     this.capabilitiesVersion = config.capabilitiesVersion ?? MACRO_CAPABILITIES_VERSION;
     if (!/^[A-Za-z0-9._:/-]{1,128}$/.test(this.capabilitiesVersion)) throw new Error("Invalid survival macro capability version.");
     if (config.objective !== undefined) {
       const objective = config.objective.trim();
-      if (config.strategy !== "terra" || !objective || objective.length > 2_048 || /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(objective)) {
+      if (config.strategy !== "model" || !objective || objective.length > 2_048 || /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(objective)) {
         throw new Error("Invalid survival macro task.");
       }
       this.objective = objective;
     }
-    if (config.durableWork && config.strategy === "terra") this.workMode = this.objective ? "constrained" : "preset";
+    if (config.durableWork && config.strategy === "model") this.workMode = this.objective ? "constrained" : "preset";
     if (config.preparedStockReady && (this.workMode !== "constrained" || this.limits.maxRequests !== 1 ||
         config.firstPlan || config.skills || config.trial || config.nativeReview))
       throw new Error("Prepared stock work requires one constrained live request and no secondary authority.");
@@ -1051,7 +1053,7 @@ export class SurvivalMacroController {
         authoring: !!(this.config.skills && this.config.trial && this.limits.maxSkillCandidates), objective: this.objective ?? null,
         admittedSkillVerbs: this.config.skills?.allowedVerbs() ?? [],
       });
-      if (this.unavailable) await this.disposition("provider_unavailable", { reason: "No admitted Terra strategist." });
+      if (this.unavailable) await this.disposition("provider_unavailable", { reason: "No admitted Model strategist." });
       this.config.signal?.throwIfAborted();
       this.markerLive = true;
       await this.ipc.write("active.json", this.marker);
@@ -1077,7 +1079,7 @@ export class SurvivalMacroController {
       this.busy?.kind === "trial" ? "testing-skill" : this.ready || this.busy || this.direct ? "awaiting-handoff" :
       this.budget ? "budget-limited" : this.unavailable ? "provider-unavailable" : "waiting";
     return {
-      strategy: this.config.strategy, state, capabilitiesVersion: this.capabilitiesVersion, limits: this.limits,
+      strategy: this.config.strategy, model: this.config.model ?? null, state, capabilitiesVersion: this.capabilitiesVersion, limits: this.limits,
       models: [...this.models], elapsedMs: this.startedAt === undefined ? 0 : Math.round((this.endedAt ?? performance.now()) - this.startedAt),
       planningIdleMs: MACRO_MAX_PLANNING_IDLE_MS, planningEpisodeId: this.planning?.notice.id ?? null,
       directContinuation: this.direct ? { requestId: this.direct.plan.requestId, issued: this.direct.issued,
@@ -1584,7 +1586,7 @@ export class SurvivalMacroController {
         requestId, stage: PRE_SPAWN_GOAL_ONLY, basis: null, providerStartedAtMs: dispatchedAt,
       }).catch(() => { /* The settled or unresolved request records the transport evidence again. */ });
     })).then(inference => {
-      const advice = inference.stage === PRE_SPAWN_GOAL_ONLY && inference.model === TERRA_MODEL_ID &&
+      const advice = inference.stage === PRE_SPAWN_GOAL_ONLY && inference.model === this.config.model &&
         inference.dispatched === true && inference.outcome === "completed" ? parseFirstPlanAdvice(inference.proposal) : null;
       work.result = { inference, advice, settledAt: performance.now() };
     }, () => { work.result = { inference: null, advice: null, settledAt: performance.now() }; });
@@ -1620,7 +1622,7 @@ export class SurvivalMacroController {
     if (!result) return;
 
     const { inference, advice } = result;
-    const modelMatches = inference?.stage === PRE_SPAWN_GOAL_ONLY && inference.model === TERRA_MODEL_ID;
+    const modelMatches = inference?.stage === PRE_SPAWN_GOAL_ONLY && inference.model === this.config.model;
     if (!work.recorded) {
       const dispatched = work.dispatchedAt !== undefined ? true : inference?.dispatched ?? null;
       await this.append(this.proposals, {
@@ -3323,7 +3325,8 @@ export class SurvivalMacroController {
     let proposal: MacroProposal | null = null;
     const inference = result.ok ? result.value : null;
     if (inference?.dispatched === true) context.providerDispatched = true;
-    const model = inference?.model && /^[A-Za-z0-9._:/-]{1,128}$/.test(inference.model) ? inference.model : null;
+    const model = inference?.model && /^[A-Za-z0-9._:/-]{1,257}$/.test(inference.model) &&
+      (!this.config.model || inference.model === this.config.model) ? inference.model : null;
     if (model) this.models.add(model);
     if (typeof inference?.dispatched === "boolean") {
       this.unreportedDispatches--;
@@ -3377,7 +3380,7 @@ export class SurvivalMacroController {
       requestId: context.requestId, disposition, reason: reason ?? (
         decision === "proposed" ? "No stock order could be published from the current physical witness." :
         decision === "stale" ? "The live stock witness or request basis changed before a job could be authorized." :
-        decision === "invalid" ? "Terra returned no valid stock decision." :
+        decision === "invalid" ? "Model returned no valid stock decision." :
         `The single request ended as ${decision}; no stock work was authorized.`),
     };
     const recovery = this.intentRecovery;
@@ -3414,7 +3417,7 @@ export class SurvivalMacroController {
         current && this.isCurrentHandoff(current) && sameTravelReacquisitionScope(original, current) &&
         original.travelHint && (!current.travelHint || sameTravelReacquisitionHint(original.travelHint, current.travelHint)) &&
         this.workQuery && this.workQuery.evidence === this.workQueryEvidence(current)) {
-      // The miss spent one request slot but did not ask Terra. Only a newer view of this exact approach can reopen it.
+      // The miss spent one request slot but did not ask Model. Only a newer view of this exact approach can reopen it.
       this.workQuery.reacquireTravel = { requestId: context.requestId, source: original, hint: original.travelHint,
         until: performance.now() + ALTERNATIVE_RECOVERY_MS };
     }

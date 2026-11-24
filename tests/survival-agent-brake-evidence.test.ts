@@ -17,7 +17,7 @@ async function readTrace(scenario: Scenario) {
   const dir = await mkdtemp(join(tmpdir(), "brake-evidence-"));
   directories.push(dir);
   const run = basename(dir);
-  const requestId = "terra-1", id = "work-1", life = 1;
+  const requestId = "model-1", id = "work-1", life = 1;
   const target = { kind: "stock", item: "minecraft:diamond", count: 1 } as const;
   const order = {
     v: 1, id, run, life, epoch: 1, basisTick: 10, expiresTick: 140, safetyRevision: 1, origin: "model",
@@ -72,7 +72,7 @@ async function readTrace(scenario: Scenario) {
       veto,
     ]),
   ]);
-  return verifyTerrain(dir, "brake-terra", last, undefined, scenario === "wall_limit" ? undefined : {
+  return verifyTerrain(dir, "brake-model", last, undefined, scenario === "wall_limit" ? undefined : {
     settlement: { vetoTick, first, last },
     status: { requests: 1, providerDispatches: 1, issuedWorkOrders: scenario === "abstained" ? 0 : 1, issued: 0,
       completedWorkOrders: 0, completedWorkPrograms: 0,
@@ -91,7 +91,7 @@ test("gap proof accepts a physical, grounded approach before a fresh support vet
 test.each([
   ["still", "did not approach two blocks"],
   ["not_issued", "did not physically issue"],
-  ["abstained", "Missing one admitted Terra request"],
+  ["abstained", "Missing one admitted Model request"],
   ["foreign", "did not match"],
   ["crossed", "crossed the runway boundary"],
   ["late", "did not approach two blocks"],

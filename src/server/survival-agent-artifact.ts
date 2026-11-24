@@ -1,24 +1,24 @@
 import actorManifest from "../../survival-agent/src/main/resources/fabric.mod.json";
 import { readNativeArtifactContract } from "./native-artifact.ts";
 
-export const TERRA_ACTOR_REBUILD =
-  "The Survival Agent mod is missing or incompatible with Terra. Run `bun run build:agent`, then try again.";
+export const MODEL_ACTOR_REBUILD =
+  "The Survival Agent mod is missing or incompatible with model strategy. Run `bun run build:agent`, then try again.";
 
-export class TerraActorCompatibilityError extends Error {
-  constructor() { super(TERRA_ACTOR_REBUILD); }
+export class ModelActorCompatibilityError extends Error {
+  constructor() { super(MODEL_ACTOR_REBUILD); }
 }
 
-const WORK_WIRE = "gameharness:terra_work_wire";
+const WORK_WIRE = "gameharness:model_work_wire";
 // The manifest is the authority for both staging and the macro capability version.
 const workWireVersion = actorManifest.custom[WORK_WIRE];
 
-export async function requireTerraActorWire(stagedJar: string): Promise<string> {
+export async function requireModelActorWire(stagedJar: string): Promise<string> {
   const { resource, artifact_sha256 } = await readNativeArtifactContract(stagedJar, "fabric.mod.json")
-    .catch(() => { throw new TerraActorCompatibilityError(); });
+    .catch(() => { throw new ModelActorCompatibilityError(); });
   if (resource && typeof resource === "object" && !Array.isArray(resource) && resource.id === actorManifest.id) {
     const { custom } = resource;
     if (custom && typeof custom === "object" && !Array.isArray(custom) && custom[WORK_WIRE] === workWireVersion)
       return artifact_sha256;
   }
-  throw new TerraActorCompatibilityError();
+  throw new ModelActorCompatibilityError();
 }

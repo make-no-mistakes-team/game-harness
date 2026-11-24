@@ -11,7 +11,7 @@ import {
   parseMacroIntent, parseMacroObservation, parseMacroProposal, parseMacroVisualProbeResult, parseMacroWorkOrder,
   parseMacroWorkPolicy, type MacroRequest, type MacroWorkDemand,
 } from "../src/server/survival-macro/protocol.ts";
-import { terraPlanContext } from "../src/server/survival-macro/terra.ts";
+import { modelPlanContext } from "../src/server/survival-macro/model-strategist.ts";
 
 const visualProposal = {
   subgoal: "See beyond a ridge", reason: "The slope obscures my view", successCondition: "A checked first-person clue",
@@ -48,7 +48,7 @@ test("Only a witnessed visual result carries a general observed surface, never a
   expect(() => parseMacroVisualProbeResult({ ...terminal, status: "witnessed", ...surface, distanceBlocks: 13 })).toThrow();
 });
 
-test("Terra exposes region nomination only for the exact native-bound image included in its message", () => {
+test("Model exposes region nomination only for the exact native-bound image included in its message", () => {
   const observation = { v: 1, run: "run", life: 1, epoch: 3, tick: 117, goal: "diamond", visualReady: true,
     health: 20, food: 20, inventory: {}, opportunities: [], recent: [], quiescent: false,
     stance: 2, safety: { clear: true, revision: 1 },
@@ -62,31 +62,31 @@ test("Terra exposes region nomination only for the exact native-bound image incl
   const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
   const request: MacroRequest = { observation, work, frame, visual: { mayNominate: true }, capabilitiesVersion: MACRO_CAPABILITIES_VERSION,
     trigger: "first", lastReceipt: null, skillGeneration: null, maxResponseBytes: 4096, maxIntentTtlTicks: 1200, maxPlanTtlTicks: 7200 };
-  const context = terraPlanContext(request, observation, image)!;
+  const context = modelPlanContext(request, observation, image)!;
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   expect(JSON.stringify(context.tools)).toContain('"nominate-visible"');
   expect(JSON.stringify(context.tools)).toContain(binding.captureId);
   expect(JSON.stringify(context.messages)).toContain(sha256);
   // The advertised deadline must respect both the image lifetime and a shorter run policy.
   for (const [maxIntentTtlTicks, expected] of [[1200, 717], [60, 177]] as const) {
-    const [msg] = terraPlanContext({ ...request, maxIntentTtlTicks }, observation, image)!.messages;
+    const [msg] = modelPlanContext({ ...request, maxIntentTtlTicks }, observation, image)!.messages;
     if (msg?.role !== "user" || !Array.isArray(msg.content) || msg.content[0]?.type !== "text")
       throw new Error("verified visual frame missing from the provider message");
     expect(JSON.parse(msg.content[0].text).frame.readExpiresTick).toBe(expected);
   }
   const postLook = { ...request, visual: { mayNominate: true, postLook: true as const } };
-  const postLookSchema = JSON.stringify(terraPlanContext(postLook, observation, image)?.tools);
+  const postLookSchema = JSON.stringify(modelPlanContext(postLook, observation, image)?.tools);
   expect(postLookSchema).toContain('"nominate-visible"');
   expect(postLookSchema).toContain('["work"]');
   for (const action of ["opportunity", "openingViewId", "work-program", "preset", "recon", "skill", "gap"])
     expect(postLookSchema).not.toContain(`"${action}"`);
-  expect(terraPlanContext(postLook, observation)).toBeUndefined();
+  expect(modelPlanContext(postLook, observation)).toBeUndefined();
   for (const candidate of [
-    terraPlanContext(request, observation),
-    terraPlanContext({ ...request, work: undefined }, observation, image),
-    terraPlanContext({ ...request, frame: { ...frame, visualBinding: undefined } }, observation, image),
-    terraPlanContext({ ...request, frame: { ...frame, tick: 116 } }, observation, image),
-    terraPlanContext(request, observation, { ...image, data: `${jpeg}AAAA` }),
+    modelPlanContext(request, observation),
+    modelPlanContext({ ...request, work: undefined }, observation, image),
+    modelPlanContext({ ...request, frame: { ...frame, visualBinding: undefined } }, observation, image),
+    modelPlanContext({ ...request, frame: { ...frame, tick: 116 } }, observation, image),
+    modelPlanContext(request, observation, { ...image, data: `${jpeg}AAAA` }),
   ]) {
     expect(JSON.stringify(candidate?.tools)).not.toContain('"nominate-visible"');
     expect(JSON.stringify(candidate?.messages)).not.toContain(binding.captureId);
@@ -110,14 +110,14 @@ test("A confirmed surface can be selected only as a separate strictly bounded re
         distanceBlocks: 4, region: { x: 0.2, y: 0.2, width: 0.3, height: 0.2 } },
     },
   };
-  const { tools } = terraPlanContext(request, observation)!;
+  const { tools } = modelPlanContext(request, observation)!;
   const schema = JSON.stringify(tools);
   expect(schema).toContain('"exact-recon"');
   expect(schema).toContain('"maxLegs"');
   expect(schema).toContain('"maxBlocks"');
   expect(schema).not.toContain('["opportunity"]');
   expect(schema).not.toContain('"nominate-visible"');
-  expect(JSON.stringify(terraPlanContext({ ...request, visual: undefined }, observation)?.tools)).not.toContain('"exact-recon"');
+  expect(JSON.stringify(modelPlanContext({ ...request, visual: undefined }, observation)?.tools)).not.toContain('"exact-recon"');
 });
 
 function liveWorkSchema(duringWaitFor?: string) {
@@ -125,12 +125,12 @@ function liveWorkSchema(duringWaitFor?: string) {
     health: 20, food: 20, inventory: {}, opportunities: [], recent: [], quiescent: true } as const;
   const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [],
     current: null, lastOutcome: null, ...(duringWaitFor ? { duringWaitFor } : {}) };
-  const context = terraPlanContext({ observation, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+  const context = modelPlanContext({ observation, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
     lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200, maxPlanTtlTicks: 7_200 }, observation);
   const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses")!;
   const model = getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id);
   const [wire] = convertOpenAICodexResponsesTools(context!.tools!, model);
-  if (wire?.type !== "function" || wire.strict !== true) throw new Error("Missing strict Terra work tool");
+  if (wire?.type !== "function" || wire.strict !== true) throw new Error("Missing strict Model work tool");
   return wire.parameters;
 }
 
@@ -141,7 +141,7 @@ test("Prepared stock exposes an exact single-order tool without the ordinary pro
       target: "ore-a", footing: "dry", bearingDegrees: 0, windowBlocks: 1.6 },
   } as const;
   const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
-  const context = terraPlanContext({ observation, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+  const context = modelPlanContext({ observation, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
     lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200, maxPlanTtlTicks: 7_200 },
     observation, undefined, "dry");
   const descriptor = getBundledModels("openai-codex").find(model => model.api === "openai-codex-responses")!;
@@ -213,7 +213,7 @@ test("Low-health food work requires a current exact source with its reserves hel
   expect(() => parseMacroWorkPolicy({ ...quote, target: { ...quote.target, item: "minecraft:beef" } })).toThrow("food forage");
   expect(() => parseMacroWorkPolicy({ ...quote, maxBreaks: 1 })).toThrow("food forage");
   const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: quote.reserves, current: null, lastOutcome: null };
-  const context = terraPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+  const context = modelPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
     lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200, maxPlanTtlTicks: 7_200 }, live);
   expect(context!.systemPrompt?.join("\n")).toContain("Emergency eating is reported separately from pickup");
   expect(JSON.stringify(context!.tools)).toContain(quote.allowedEffects[0]!);
@@ -245,7 +245,7 @@ test("A dry surface cap is read-only and an empty hand cannot spend a tool or ha
   ]) expect(() => parseMacroObservation({ ...observation, ...invalid, surfaceOpening })).toThrow("surface opening scope");
 
   const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
-  const context = terraPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+  const context = modelPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
     lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200, maxPlanTtlTicks: 7_200 }, live);
   expect(JSON.stringify(context!.messages[0]!.content)).toContain("surfaceOpening");
   expect(context!.systemPrompt?.join("\n")).toContain("no buried stone or ore");
@@ -322,7 +322,7 @@ test("Ground reconnaissance selects only an exact dry landmark and grants no sto
     evidence: "Stop on the witnessed dry ground for a new view; no harvest.", anchor } as const;
   const live = parseMacroObservation({ ...view, travelHint, opportunities: [scout] });
   const work: MacroWorkDemand = { mode: "constrained", demand: "first", protectedReserves: [], current: null, lastOutcome: null };
-  const context = terraPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
+  const context = modelPlanContext({ observation: live, work, capabilitiesVersion: MACRO_CAPABILITIES_VERSION, trigger: "first",
     lastReceipt: null, skillGeneration: null, maxResponseBytes: 4_096, maxIntentTtlTicks: 1_200,
     maxPlanTtlTicks: 7_200 }, live)!;
   expect(JSON.stringify(context.tools)).toContain('"enum":["walk-observe"]');
@@ -586,7 +586,7 @@ test("Deep diamond work is explicit, standalone, and does not imply cover or tor
 });
 
 test("The rejected descending diamond prospect cannot quote a gravel break", () => {
-  // Replay the policy the host issued and the native actor refused in an ordinary Terra run.
+  // Replay the policy the host issued and the native actor refused in an ordinary Model run.
   const policy = {
     target: { kind: "stock", item: "minecraft:diamond", count: 1 },
     allowedEffects: [

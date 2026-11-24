@@ -69,30 +69,30 @@ test("inflated resource size is bounded before JSON parsing", async () => {
 });
 
 const oldManifest = { schemaVersion: 1, id: "survival_agent", version: "1.0" };
-const terraManifest = { ...oldManifest, custom: { "gameharness:terra_work_wire": 14 } };
+const terraManifest = { ...oldManifest, custom: { "gameharness:model_work_wire": 14 } };
 const actor = (manifest: object) => jar("fabric.mod.json", Buffer.from(JSON.stringify(manifest)), true);
 
 for (const [kind, bytes] of [
   ["unmarked", actor(oldManifest)],
-  ["pre-furnace work-wire version 1", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 1 } })],
-  ["pre-prospecting work-wire version 2", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 2 } })],
-  ["pre-water-fill work-wire version 3", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 3 } })],
-  ["pre-attached-support work-wire version 4", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 4 } })],
-  ["pre-pending-production work-wire version 5", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 5 } })],
-  ["pre-ordinary-pending work-wire version 6", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 6 } })],
-  ["pre-scoped-travel work-wire version 7", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 7 } })],
-  ["pre-landmark work-wire version 8", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 8 } })],
-  ["pre-grade work-wire version 9", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 9 } })],
-  ["pre-surface-entry work-wire version 10", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 10 } })],
-  ["pre-visual-recon work-wire version 11", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 11 } })],
-  ["pre-staged-surface-entry work-wire version 12", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 12 } })],
-  ["pre-expedition-advice work-wire version 13", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 13 } })],
-  ["wrong future work-wire version", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": 15 } })],
-  ["malformed work-wire marker", actor({ ...oldManifest, custom: { "gameharness:terra_work_wire": "9" } })],
+  ["pre-furnace work-wire version 1", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 1 } })],
+  ["pre-prospecting work-wire version 2", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 2 } })],
+  ["pre-water-fill work-wire version 3", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 3 } })],
+  ["pre-attached-support work-wire version 4", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 4 } })],
+  ["pre-pending-production work-wire version 5", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 5 } })],
+  ["pre-ordinary-pending work-wire version 6", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 6 } })],
+  ["pre-scoped-travel work-wire version 7", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 7 } })],
+  ["pre-landmark work-wire version 8", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 8 } })],
+  ["pre-grade work-wire version 9", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 9 } })],
+  ["pre-surface-entry work-wire version 10", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 10 } })],
+  ["pre-visual-recon work-wire version 11", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 11 } })],
+  ["pre-staged-surface-entry work-wire version 12", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 12 } })],
+  ["pre-expedition-advice work-wire version 13", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 13 } })],
+  ["wrong future work-wire version", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": 15 } })],
+  ["malformed work-wire marker", actor({ ...oldManifest, custom: { "gameharness:model_work_wire": "9" } })],
   ["malformed JAR", Buffer.from("not a JAR")],
   ["missing", null],
 ] as const) {
-  test(`Terra staging rejects a ${kind} actor with rebuild instructions`, async () => {
+  test(`Model staging rejects a ${kind} actor with rebuild instructions`, async () => {
     const file = await artifact(bytes ?? Buffer.alloc(0));
     const root = dirname(file);
     if (bytes === null) await rm(file);
@@ -102,15 +102,15 @@ for (const [kind, bytes] of [
   });
 }
 
-for (const [kind, bytes, requireTerraWorkWire] of [
-  ["Terra", actor(terraManifest), true],
+for (const [kind, bytes, requireModelWorkWire] of [
+  ["Model", actor(terraManifest), true],
   ["deterministic or pinned trial", actor(oldManifest), false],
 ] as const) {
   test(`${kind} staging hashes exactly the installed actor bytes`, async () => {
     const file = await artifact(bytes);
     const root = dirname(file);
     const client = new MinecraftClient(root, { dataDir: root });
-    const hash = await client.stageAgentArtifact(file, requireTerraWorkWire);
+    const hash = await client.stageAgentArtifact(file, requireModelWorkWire);
     expect(await readFile(join(client.directory, "mods/survival-agent.jar"))).toEqual(bytes);
     expect(hash).toBe(createHash("sha256").update(bytes).digest("hex"));
   });

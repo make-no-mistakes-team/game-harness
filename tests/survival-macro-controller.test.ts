@@ -7,7 +7,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { createTrustedFrameCapture } from "../src/server/survival-macro/compose.ts";
 import { SurvivalMacroController, type SurvivalMacroConfig } from "../src/server/survival-macro/controller.ts";
 import { preparedStockReady } from "../src/server/survival-macro/prepared-stock.ts";
-import { hasConfirmedTerraEffect } from "../src/shared/survival-agent-ui.ts";
+import { hasConfirmedModelEffect } from "../src/shared/survival-agent-ui.ts";
 import {
   MACRO_DIAMOND_PROSPECT, MacroDirectory, MacroObservationRotating, parseMacroIntent, parseMacroPlanning, parseMacroVisualProbe,
   type MacroBasis, type MacroInference, type MacroIntent, type MacroObservation, type MacroOpportunity,
@@ -21,7 +21,7 @@ async function fixture(
   const dir = await mkdtemp(path.join(tmpdir(), "survival-macro-controller-"));
   const run = path.basename(dir);
   const actor = new SurvivalMacroController({
-    runDir: dir, run, strategy: "terra", confirmNativeExit, limits: { maxRequests, pollMs: 1_000, maxObservationAgeMs: 10_000 },
+    runDir: dir, run, strategy: "model", confirmNativeExit, limits: { maxRequests, pollMs: 1_000, maxObservationAgeMs: 10_000 },
     frame: frameFor?.(dir),
     strategist: strategist ?? (async ({ observation: { run, life, tick, epoch } }) => ({
       basis: { run, life, tick, epoch }, model: "test-strategist", outcome: "completed",
@@ -65,13 +65,16 @@ async function durableFixture(strategist: MacroStrategist, objective?: string, m
   const dir = await mkdtemp(path.join(tmpdir(), "survival-work-"));
   const run = path.basename(dir);
   const actor = new SurvivalMacroController({
-    runDir: dir, run, strategy: "terra", strategist, objective, durableWork: true, confirmNativeExit: async () => true, frame: frameFor?.(dir),
+    runDir: dir, run, strategy: "model", strategist, objective, durableWork: true, confirmNativeExit: async () => true, frame: frameFor?.(dir),
     limits: { maxRequests, pollMs: 1000, maxObservationAgeMs: 10_000, requestTimeoutMs: 3500 }, preparedStockReady: ready,
   });
   const file = (name: string) => path.join(actor.directory, name);
+  // Fixture observations are ready handoffs unless they name native work.
+  // Startup/settling scenarios must explicitly publish quiescent:false.
   const observation = (tick: number, change: Partial<MacroObservation> = {}): MacroObservation => ({
     v: 1, run, life: 1, epoch: 1, tick, goal: "wooden_pickaxe", health: 20, food: 20, inventory: {},
-    opportunities: [], recent: [], quiescent: false, safety: { clear: true, revision: 1 }, ...change,
+    opportunities: [], recent: [], quiescent: !change.working && !change.workOrder && !change.pendingWork,
+    safety: { clear: true, revision: 1 }, ...change,
   });
   async function publishObservation(tick: number, change?: Partial<MacroObservation>) {
     await writeFile(file("observation.pending"), JSON.stringify(observation(tick, change)), { mode: 0o600 });
@@ -488,9 +491,13 @@ test.each(["exact source", "only flow", "reserved bucket", "select clue"] as con
         expect(f.actor.status()).toMatchObject({ completedModelWorkOrders: 0, providerDispatches: 1 });
       } else {
         await expect(access(f.file("work.json"))).rejects.toThrow();
-        expect(await readFile(f.file("history.jsonl"), "utf8")).toContain(condition === "only flow"
-          ? "flowing water but no witnessed source" : condition === "reserved bucket"
-            ? "2 minecraft:bucket at entry" : "A water clue grants no primitive");
+        expect(f.actor.status()).toMatchObject({
+          issued: 0, issuedWorkOrders: 0, completedModelWorkOrders: 0, providerDispatches: 1,
+        });
+        const events = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        expect(events).toContainEqual(expect.objectContaining({
+          event: condition === "select clue" ? "proposal_refused" : "work_resource_shortage",
+        }));
       }
     } finally {
       await f.actor.stop();
@@ -1095,7 +1102,8 @@ test.each(["matching later witness", "camera receipt only"] as const)(
   },
 );
 
-const emptySpawn = { goal: "diamond", stance: 1, epoch: 3, safety: { clear: true, revision: 2 } } as const;
+const emptySpawn = { goal: "diamond", stance: 1, epoch: 3, quiescent: false,
+  safety: { clear: true, revision: 2 } } as const;
 const spawnGround = { id: "o-1", verb: "survey", risk: "read", summary: "Survey the nearby ground",
   evidence: "A fixed downward camera angle from the current stance." } as const;
 const spawnSide = { id: "o-2", verb: "survey", risk: "read", summary: "Survey left from this stance",
@@ -1822,7 +1830,7 @@ test.each(["same target", "different target", "never returned", "unsafe"] as con
       expect(f.actor.status()).toMatchObject({ providerDispatches: 1, issued: 0,
         issuedWorkOrders: result === "same target" ? 1 : 0, completedModelWorkOrders: 0 });
       expect(await readFile(f.file("receipts.jsonl"), "utf8")).toBe("");
-      expect(hasConfirmedTerraEffect(f.actor.status())).toBe(false);
+      expect(hasConfirmedModelEffect(f.actor.status())).toBe(false);
       const history = (await readFile(f.file("history.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
       const deferred = history.find(event => event.event === "work_start_deferred");
       expect(deferred).toMatchObject({ basis: { tick: 817 }, travelAnchor: anchor });
@@ -2595,7 +2603,7 @@ test("Rotated observation IPC defers both settlement and an uncharged correction
 });
 
 test.each(["corrected", "unchanged", "abstained"] as const)(
-  "The ordinary Terra oak approach gets one candid reserve correction (%s)",
+  "The ordinary Model oak approach gets one candid reserve correction (%s)",
   async response => {
     const log = "minecraft:oak_log";
     const objective = "Gather enough wood to carry six logs for travel and continue toward a diamond.";
@@ -2676,7 +2684,7 @@ test.each(["corrected", "unchanged", "abstained"] as const)(
       await expect(access(f.file("intent.json"))).rejects.toThrow();
       expect(requests).toHaveLength(3);
       expect(await readFile(f.file("receipts.jsonl"), "utf8")).toBe("");
-      expect(hasConfirmedTerraEffect(f.actor.status())).toBe(false);
+      expect(hasConfirmedModelEffect(f.actor.status())).toBe(false);
       expect(f.actor.status()).toMatchObject({ requests: 3, providerDispatches: 3, unreportedDispatches: 0, issued: 0,
         issuedWorkOrders: response === "corrected" ? 1 : 0, completedModelWorkOrders: 0,
         lastDisposition: response === "corrected" ? "work_order_issued" : response === "unchanged" ? "proposal_refused" : "abstained" });
@@ -2965,7 +2973,7 @@ test("Request exhaustion does not invent a successor or interrupt compatible adm
     await f.receipt(job.id, 1121, "completed");
     await f.observe(1121, { workOrder: { ...workOrder, state: "complete" } });
     expect(f.actor.status()).toMatchObject({ completedWorkOrders: 1, completedReceipts: 0, issuedWorkOrders: 1 });
-    expect(hasConfirmedTerraEffect(f.actor.status())).toBe(false);
+    expect(hasConfirmedModelEffect(f.actor.status())).toBe(false);
     await expect(access(f.file("work.json"))).rejects.toThrow();
   } finally {
     await f.actor.stop();
@@ -3058,7 +3066,7 @@ test("Approaching a live stock goal starts successor planning without publishing
     expect(next).toMatchObject({ basisTick: 110, epoch: 3, origin: "model", target: { kind: "stock", item: planks, count: 4 } });
     expect(next.id).not.toBe(first.id);
     expect(f.actor.status()).toMatchObject({ providerDispatches: 2, completedModelWorkOrders: 1, workQueuedAfter: null });
-    expect(hasConfirmedTerraEffect(f.actor.status())).toBe(true);
+    expect(hasConfirmedModelEffect(f.actor.status())).toBe(true);
   } finally {
     reply.resolve();
     await f.actor.stop();

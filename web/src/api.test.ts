@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import type { AppSnapshot, ProgramEvidenceView, RunUsage } from "../../src/shared/contracts.ts";
 import type { ObjectiveMetrics, ObjectiveMetricUpdate } from "../../src/shared/execution-evidence.ts";
 import { PREPARED_START_LIMITS, type PreparedStartRequest, type PreparedStartView } from "../../src/shared/prepared-start.ts";
+import type { SurvivalAgentSnapshot, SurvivalAgentStart } from "../../src/shared/survival-agent-ui.ts";
 import { fetchImprovementFeedback, fetchSkillEvidence, type SkillEvidencePage } from "./api.ts";
 
 test("measurement pages reject unsafe cursors, oversized records and invalid coverage", async () => {
@@ -341,5 +342,76 @@ test("preparation response failures are reported without automatic retries or in
     respond({ phase: "cancelled" });
     await expect(client.cancelPreparation(view.preparation_id)).rejects.toMatchObject({ code: "invalid_preparation" });
     expect(requests).toHaveLength(4);
+  });
+});
+
+function survivalViewFixture(patch: Partial<SurvivalAgentSnapshot> = {}): SurvivalAgentSnapshot {
+  return {
+    phase: "starting", goal: "diamond", strategy: "model", model: "openai-codex/fixture-discovered-one",
+    strategyOutcome: null, status: "Preparing agent world", won: null, run: "fixture-survival-run",
+    elapsedMs: 0, health: null, food: null, deaths: null, ...patch,
+  };
+}
+
+test("Survival start sends the exact selected provider/model and accepts generic recovered identities", async () => {
+  await withApiResponse(async (respond, requests) => {
+    const client: typeof import("./api.ts") = await import(new URL("./api.ts?survival-model-selection", import.meta.url).href);
+    respond({ csrf_token: "fixture-survival-session" });
+    await client.openSession();
+    for (const modelId of ["fixture-discovered-one", "fixture-discovered-two"]) {
+      const start: SurvivalAgentStart = { goal: "diamond", strategy: "model",
+        model: { provider: "openai-codex", modelId } };
+      const view = survivalViewFixture({ model: `openai-codex/${modelId}` });
+      respond(view, 202);
+      expect(await client.startSurvivalAgent(start)).toEqual(view);
+      expect(requests.at(-1)).toMatchObject({
+        path: "/v1/survival-agent/start", init: { method: "POST", body: JSON.stringify(start),
+          headers: { "X-CSRF-Token": "fixture-survival-session" } },
+      });
+    }
+    const recovered = survivalViewFixture({ phase: "playing", model: "openai-codex/fixture-discovered-two",
+      status: "Gathering supplies", elapsedMs: 3700, health: 20, food: 19, deaths: 0 });
+    respond(recovered);
+    expect(await client.fetchSurvivalAgent(new AbortController().signal)).toEqual(recovered);
+    expect(requests.at(-1)).toMatchObject({ path: "/v1/survival-agent", init: { method: "GET" } });
+    const ended = { ...recovered, phase: "ended" as const, strategyOutcome: "no_advice_applied" as const,
+      won: false, status: "Run ended" };
+    respond(ended);
+    expect(await client.stopSurvivalAgent()).toEqual(ended);
+    expect(requests.at(-1)).toMatchObject({ path: "/v1/survival-agent/stop", init: { method: "POST", body: "{}" } });
+    expect(requests.map(item => item.path)).toEqual([
+      "/v1/session", "/v1/survival-agent/start", "/v1/survival-agent/start",
+      "/v1/survival-agent", "/v1/survival-agent/stop",
+    ]);
+  });
+});
+
+test("model-free Survival start sends no model or extra authentication/upload request", async () => {
+  await withApiResponse(async (respond, requests) => {
+    const client: typeof import("./api.ts") = await import(new URL("./api.ts?survival-no-model", import.meta.url).href);
+    respond({ csrf_token: "fixture-model-free-session" });
+    await client.openSession();
+    const start: SurvivalAgentStart = { goal: "wooden_pickaxe", strategy: "deterministic" };
+    const view = survivalViewFixture({ goal: start.goal, strategy: "deterministic", model: null });
+    respond(view, 202);
+    expect(await client.startSurvivalAgent(start)).toEqual(view);
+    expect(requests.map(item => item.path)).toEqual(["/v1/session", "/v1/survival-agent/start"]);
+    expect(requests.at(-1)?.init?.body).toBe('{"goal":"wooden_pickaxe","strategy":"deterministic"}');
+  });
+});
+
+test("unreadable Survival states remain errors rather than invented model outcomes", async () => {
+  await withApiResponse(async respond => {
+    const client: typeof import("./api.ts") = await import(new URL("./api.ts?survival-state-validation", import.meta.url).href);
+    const valid = survivalViewFixture({ phase: "ended", strategyOutcome: "strategy_applied" });
+    for (const malformed of [
+      { ...valid, strategy: "terra" },
+      { ...valid, model: "" },
+      { ...valid, model: undefined },
+      { ...valid, strategyOutcome: "success" },
+    ]) {
+      respond(malformed);
+      await expect(client.fetchSurvivalAgent(new AbortController().signal)).rejects.toMatchObject({ code: "invalid_agent" });
+    }
   });
 });

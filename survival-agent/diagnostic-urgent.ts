@@ -7,7 +7,7 @@ import { MACRO_MAX_PLANNING_IDLE_MS, type MacroBasis, type MacroInference } from
 
 export const urgentThreatLimits = { wallSeconds: 120, maxRequests: 3 } as const;
 export const urgentCraftLimits = { wallSeconds: 120, maxRequests: 0 } as const;
-type ProbeKind = "terra" | "craft";
+type ProbeKind = "model" | "craft";
 const TAG = "gameharness_urgent_diagnostic";
 const DELAY_MS = 300;
 const SOURCE_BLOCKS = 3;
@@ -76,7 +76,7 @@ function vanillaCommand(server: ChildProcess, command: string, acknowledgement: 
 
 export function createUrgentThreatProbe(
   dir: string, signal: AbortSignal, record: (event: string, fields?: Record<string, unknown>) => Promise<void>,
-  kind: ProbeKind = "terra",
+  kind: ProbeKind = "model",
 ) {
   let endpoint: { server: ChildProcess; profile: string } | undefined;
   let dispatch: Dispatch | undefined;
@@ -168,7 +168,7 @@ export function createUrgentThreatProbe(
       row.parse(JSON.parse(line))), () => []);
   }
   async function ready() {
-    if (!issued || (kind === "terra" && !settlement)) return false;
+    if (!issued || (kind === "model" && !settlement)) return false;
     const evidence = await samples().catch(() => []);
     const fuse = evidence.find(event => event.kind === "fuse");
     return !!fuse && evidence.some(event => event.fuse_tick === fuse.tick && event.tick >= fuse.tick + 48);
@@ -213,7 +213,7 @@ export function createUrgentThreatProbe(
       ...context,
     });
     if (!issued || !fuse) return report("Missing fixture issue or perceivable vanilla fuse.");
-    if (kind === "terra") {
+    if (kind === "model") {
       if (!dispatch || !settlement) return report("Missing an authorized provider interval.");
       if (settlement.basis.run !== dispatch.basis.run || settlement.basis.tick !== dispatch.basis.tick ||
           settlement.basis.life !== dispatch.basis.life || settlement.basis.epoch !== dispatch.basis.epoch)

@@ -8,10 +8,10 @@ import {
   bindFirstPlan, firstPlanContext, parseFirstPlanToolArguments, PRE_SPAWN_GOAL_ONLY, type FirstPlanInference,
   type FirstPlanRequest, type FirstPlanStrategist,
 } from "../src/server/survival-macro/bootstrap.ts";
-import { composeTerraSurvival, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
+import { composeModelSurvival, declareModelStrategy } from "../src/server/survival-macro/compose.ts";
 import { SurvivalMacroController } from "../src/server/survival-macro/controller.ts";
 import { parseMacroWorkOrder, type MacroObservation, type MacroOpportunity, type MacroReceipt } from "../src/server/survival-macro/protocol.ts";
-import { TERRA_MODEL_ID } from "../src/shared/survival-agent-ui.ts";
+const MODEL_IDENTITY = "openai-codex/fixture-strategy-a";
 
 const GOAL = "stone_pickaxe";
 const plankBranch = {
@@ -573,7 +573,7 @@ test("a goal-only result cannot migrate to another goal, life, or safety revisio
 });
 
 const result = (proposal: FirstPlanInference["proposal"], outcome: FirstPlanInference["outcome"] = "completed") =>
-  ({ stage: PRE_SPAWN_GOAL_ONLY, model: TERRA_MODEL_ID, outcome, proposal, dispatched: true,
+  ({ stage: PRE_SPAWN_GOAL_ONLY, model: MODEL_IDENTITY, outcome, proposal, dispatched: true,
     latencyMs: 2, providerStartedAtMs: performance.now(), usage: null, costUsd: null }) satisfies FirstPlanInference;
 
 const oak = "minecraft:oak_log";
@@ -632,18 +632,18 @@ test("one feasible plank acquisition binds an exact approach, without excess spe
     live, liveScope)).toEqual({ reason: "work_resource_shortage" });
 });
 
-async function fixture(infer: FirstPlanStrategist, signal?: AbortSignal, maxRequests = 1, strategy: "terra" | "deterministic" = "terra",
+async function fixture(infer: FirstPlanStrategist, signal?: AbortSignal, maxRequests = 1, strategy: "model" | "deterministic" = "model",
   opening: FirstPlanRequest = { ...request, objective: "Mine a stone pickaxe" }) {
   const dir = await mkdtemp(path.join(tmpdir(), "survival-first-plan-"));
   const run = path.basename(dir);
   let liveCalls = 0;
-  const controller = new SurvivalMacroController({ runDir: dir, run, strategy, signal,
-    ...(strategy === "terra" ? { durableWork: true, objective: opening.objective } : {}),
+  const controller = new SurvivalMacroController({ runDir: dir, run, strategy, model: MODEL_IDENTITY, signal,
+    ...(strategy === "model" ? { durableWork: true, objective: opening.objective } : {}),
     limits: { maxRequests, pollMs: 1000 }, confirmNativeExit: async () => true,
     firstPlan: { request: opening, infer },
     strategist: async ({ observation: { run, life, epoch, tick } }) => {
       liveCalls++;
-      return { basis: { run, life, epoch, tick }, outcome: "refused", model: TERRA_MODEL_ID,
+      return { basis: { run, life, epoch, tick }, outcome: "refused", model: MODEL_IDENTITY,
         proposal: null, usage: null, costUsd: null, dispatched: true };
     },
   });
@@ -676,7 +676,7 @@ test.each([
 ] as const)("%s uses the one prepared quote on the first actual oak approach", async (_, tick, logs, opportunities) => {
   const wire = JSON.stringify({ advice: travelAdvice });
   expect(validateJsonSchemaValue(firstPlanContext(travelRequest)!.tools![0]!.parameters, JSON.parse(wire)).success).toBe(true);
-  const f = await fixture(async () => result(parseFirstPlanToolArguments(wire)), undefined, 2, "terra", travelRequest);
+  const f = await fixture(async () => result(parseFirstPlanToolArguments(wire)), undefined, 2, "model", travelRequest);
   try {
     const inventory = travelInventory(logs);
     if (opportunities) {
@@ -721,7 +721,7 @@ test.each([
   ["unsafe render", { travelHint: undefined, safety: { clear: false, revision: 2 } }, "live_scope_changed"],
 ] as const)("the first exact approach cannot be reused after %s", async (_label, next, reason) => {
   const reply = Promise.withResolvers<FirstPlanInference>();
-  const f = await fixture(async () => reply.promise, undefined, 2, "terra", travelRequest);
+  const f = await fixture(async () => reply.promise, undefined, 2, "model", travelRequest);
   try {
     const live = { goal: travelRequest.goal, tick: 7, epoch: 3, stance: 1, inventory: travelInventory(4), travelHint: oakApproach };
     await f.observe(live);
@@ -743,7 +743,7 @@ test("a future six-log floor becomes binding before the prepared spending stage,
     then: [stockStage(boundPlanks, 8, [{ item: boundSource, count: 8 }], [{ kind: "craft_bound_planks" }],
       [{ item: boundSource, count: 2 }], [{ item: boundSource, count: 6 }], 2)],
   }] });
-  const f = await fixture(async () => result(advice), undefined, 2, "terra", travelRequest);
+  const f = await fixture(async () => result(advice), undefined, 2, "model", travelRequest);
   try {
     await f.observe({ goal: travelRequest.goal, stance: 1, inventory: travelInventory(4), travelHint: oakApproach });
     const harvest = await f.order();
@@ -764,7 +764,7 @@ test("a future six-log floor becomes binding before the prepared spending stage,
 
 test("an honestly quoted but absent travel reserve rejects startup and releases ordinary planning", async () => {
   const f = await fixture(async () => result({ ...travelAdvice, reserves: [{ item: { kind: "bound_source" }, count: 6 }] }),
-    undefined, 2, "terra", travelRequest);
+    undefined, 2, "model", travelRequest);
   try {
     await f.observe({ goal: travelRequest.goal, stance: 1, inventory: travelInventory(4), travelHint: oakApproach });
     await expect(access(f.file("work.json"))).rejects.toThrow();
@@ -805,7 +805,7 @@ test("one paid startup request uses the existing quota and publishes only after 
 });
 
 test("the ordinary held-log opening publishes only stage 2 and credits just its native accepted and completed receipts", async () => {
-  const f = await fixture(async () => result(heldTimberAdvice), undefined, 2, "terra", pickRequest);
+  const f = await fixture(async () => result(heldTimberAdvice), undefined, 2, "model", pickRequest);
   try {
     const source = "minecraft:oak_log";
     // The first sample has real inventory but no rendered offers yet.
@@ -849,7 +849,7 @@ test.each([
   ["late", { tick: 16 }, "first_actionable_view_deadline"],
 ] as const)("held timber is not authority to issue the suffix after %s", async (_name, change, reason) => {
   const reply = Promise.withResolvers<FirstPlanInference>();
-  const f = await fixture(async () => reply.promise, undefined, 1, "terra", { ...pickRequest, objective: "Make a wooden pickaxe" });
+  const f = await fixture(async () => reply.promise, undefined, 1, "model", { ...pickRequest, objective: "Make a wooden pickaxe" });
   try {
     const live = heldTimber("minecraft:oak_log");
     await f.observe(live);
@@ -867,7 +867,7 @@ test.each([
 test("canceled held-stock handoff neither publishes nor creates model receipt credit", async () => {
   const abort = new AbortController();
   const reply = Promise.withResolvers<FirstPlanInference>();
-  const f = await fixture(async () => reply.promise, abort.signal, 1, "terra", pickRequest);
+  const f = await fixture(async () => reply.promise, abort.signal, 1, "model", pickRequest);
   try {
     await f.observe(heldTimber("minecraft:oak_log"));
     abort.abort();
@@ -884,7 +884,7 @@ test("canceled held-stock handoff neither publishes nor creates model receipt cr
 });
 
 test("a fully satisfied held-stock chain has no model order, receipt or completed program", async () => {
-  const f = await fixture(async () => result(heldTimberAdvice), undefined, 1, "terra", { ...pickRequest, objective: "Make a wooden pickaxe" });
+  const f = await fixture(async () => result(heldTimberAdvice), undefined, 1, "model", { ...pickRequest, objective: "Make a wooden pickaxe" });
   try {
     const source = "minecraft:oak_log";
     await f.observe({ ...heldTimber(source), inventory: { [source]: 3, [pick]: 1 } });
@@ -1210,16 +1210,16 @@ test("deterministic and prepared diagnostic never admit a paid first plan", asyn
   let called = false;
   const f = await fixture(async () => { called = true; return result(planks); }, undefined, 1, "deterministic");
   try {
-    const diagnostic = declareTerraStrategy({ maxRequests: 1, startup: "allow" }, 1_000, { preparedDiagnostic: true });
+    const diagnostic = declareModelStrategy({ model: { provider: "openai-codex", modelId: "fixture-strategy-a" }, maxRequests: 1, startup: "allow" }, 1_000, { preparedDiagnostic: true });
     expect(diagnostic.startup).toBe("off");
-    expect(() => composeTerraSurvival({ declaration: diagnostic, firstPlanGoal: GOAL, projectRoot: "/example",
+    expect(() => composeModelSurvival({ declaration: diagnostic, firstPlanGoal: GOAL, projectRoot: "/example",
       dir: "/example/local/survival-agent/diagnostic-runs/test", actorJarSha256: "unused",
       display: { display: "unused", authority: "unused", stillOwned: () => false },
       width: 1, height: 1, ffmpeg: "unused", signal: new AbortController().signal,
       authDirectory: "unused", onDisplayLoss: () => {}, confirmNativeExit: async () => true,
     })).toThrow("did not admit goal-only startup inference");
-    expect(declareTerraStrategy({ maxRequests: 1, startup: "off" }, 1_000).startup).toBe("off");
-    expect(declareTerraStrategy({ maxRequests: 1 }, 1_000).startup).toBe("allow");
+    expect(declareModelStrategy({ model: { provider: "openai-codex", modelId: "fixture-strategy-a" }, maxRequests: 1, startup: "off" }, 1_000).startup).toBe("off");
+    expect(declareModelStrategy({ model: { provider: "openai-codex", modelId: "fixture-strategy-a" }, maxRequests: 1 }, 1_000).startup).toBe("allow");
     expect(f.controller.status().requests).toBe(0);
     expect(called).toBe(false);
   } finally { await f.close(); }

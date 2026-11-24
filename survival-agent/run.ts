@@ -9,8 +9,8 @@ import { SURVIVAL_AGENT_GOALS as GOALS, type SurvivalAgentGoal as Goal } from ".
 import { JAVA, MinecraftClient, privateJson } from "../src/server/minecraft-client.ts";
 import { nativeLaunchFailure } from "../src/server/native-launch-fault.ts";
 import { osMonotonicNs } from "../src/server/os-monotonic.ts";
-import { TerraActorCompatibilityError } from "../src/server/survival-agent-artifact.ts";
-import { composeTerraSurvival, createRecoveryFrameCapture, declareTerraStrategy } from "../src/server/survival-macro/compose.ts";
+import { ModelActorCompatibilityError } from "../src/server/survival-agent-artifact.ts";
+import { composeModelSurvival, createRecoveryFrameCapture, declareModelStrategy } from "../src/server/survival-macro/compose.ts";
 import type { MacroStatus } from "../src/server/survival-macro/controller.ts";
 import { composeExpeditionAdvisor } from "../src/server/survival-macro/expedition.ts";
 import { descentFixtures, descentVariants, fixtureWorld, macroTrialWorld, provisionFixture, provisionMacroTrialWorld, terrainFixtures,
@@ -27,7 +27,7 @@ import { admitRun, diskBytes } from "./storage.ts";
 import { finalPauseEvidence, PAUSE_DIAGNOSTICS } from "./pause-evidence.ts";
 import { preparePendingFurnace, readPendingFurnaceParent, sealPendingFurnace } from "./pending-furnace.ts";
 import { finalPlanningEvidence } from "./planning-evidence.ts";
-import { readStrategy, type TerraOptions } from "./strategy-options.ts";
+import { readModelSelection, readStrategy, type StrategyOptions } from "./strategy-options.ts";
 import { monitorDescent, verifyDescent } from "./verify-descent.ts";
 import { monitorBrakeTerrain, verifyTerrain } from "./verify-terrain.ts";
 import { readSavedPlayerStats, retainsCompletedProgram, savedDeathDelta, verifySurvival, type ProgramWin } from "./verify.ts";
@@ -118,19 +118,19 @@ class Stop extends Error {
 
 const usage = `Minecraft Survival Agent
 
-Usage: bun run play:agent [--parallel-world] [--strategy terra [--control local|constrained] [--macro-requests N] [--startup allow|off] [--skill-trials allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --recover-crash-autosave | --recover-orphan-autosave | --replay-incident) RUN_BASENAME]]
+Usage: bun run play:agent [--parallel-world] [--strategy model --model PROVIDER/MODEL [--control local|constrained] [--macro-requests N] [--startup allow|off] [--skill-trials allow|off] [--task TEXT]] GOAL [SECONDS [(--continue-from | --recover-crash-autosave | --recover-orphan-autosave | --replay-incident) RUN_BASENAME]]
        bun run diagnose:pool [SECONDS]
        bun run play:agent --diagnostic-descent (${descentVariants.join(" | ")}) [SECONDS]
-       bun run play:agent --diagnostic-terrain (${terrainVariants.join(" | ")}) [SECONDS]
-       bun run play:agent --diagnostic-urgent-creeper
+       bun run play:agent --diagnostic-terrain (${terrainVariants.join(" | ")}) [SECONDS] [--model PROVIDER/MODEL]
+       bun run play:agent --diagnostic-urgent-creeper --model PROVIDER/MODEL
        bun run play:agent --diagnostic-urgent-craft
 
 GOAL: ${GOALS.join(" | ")}
---strategy terra: let gpt-6.1-terra advise the local player. The player keeps playing without advice. Omit this flag for model-free play.
+--strategy model: let the explicitly selected authenticated model advise the local player. The player keeps playing without advice. Omit this flag for model-free play.
 --macro-requests: finite call budget for this attempt (default 8).
 --task: repeat the built-in goal, or pair custom instructions with --control constrained. The vanilla goal verifier is unchanged.
 --control constrained: use the work-order controller instead of the local pilot. Requires --task TEXT.
---startup: local Terra waits for live observations. Only constrained runs and explicit skill studies can spend a request during loading.
+--startup: local Model waits for live observations. Only constrained runs and explicit skill studies can spend a request during loading.
 --skill-trials allow: opt into the work-order controller and separate skill trial worlds. The default is off.
 --parallel-world: use the second execution slot for a fresh or cleanly continued ordinary run.
   It shares capacity with diagnostics and cannot be combined with recovery, replay, or skill trials.
@@ -145,8 +145,8 @@ SECONDS: wall limit including startup, 1–${MAX_SECONDS} (default ${DEFAULT_SEC
 diagnose:pool: test casting a Nether portal in a separate, pre-provisioned diagnostic world.
 --diagnostic-descent: test a dry fall, a chosen boat descent, or connected cave shelves.
 --diagnostic-terrain: test timber reach, headroom, a shallow crossing, or a stop before a drop.
-  wade-terra and brake-terra each use one live Terra request, without Survival benchmark credit.
---diagnostic-urgent-creeper: test real Terra interruption in a prepared world, without Survival benchmark credit.
+  wade-model and brake-model require trailing --model PROVIDER/MODEL and use one live request, without Survival benchmark credit.
+--diagnostic-urgent-creeper: test real Model interruption in a prepared world, without Survival benchmark credit.
 --diagnostic-urgent-craft: test a creeper interrupting an actual crafting drag, without model or Survival benchmark credit.
 Diagnostics share one lane and cannot be continued as survival runs.
 Ordinary runs and incident replays may use vanilla Respawn within one attempt.
@@ -256,7 +256,7 @@ async function isolatedDisplay() {
   }
 }
 
-async function verifyInputs(actorJar: string, requiresTerraWorkWire: boolean) {
+async function verifyInputs(actorJar: string, requiresModelWorkWire: boolean) {
   const hasConsent = async (directory: string) => {
     const consent = await readFile(path.join(directory, "provisioning-consent.json"), "utf8")
       .then((content) => JSON.parse(content)).catch(() => null);
@@ -269,7 +269,7 @@ async function verifyInputs(actorJar: string, requiresTerraWorkWire: boolean) {
   }
   await access(SERVER_JAR, constants.R_OK);
   await access(actorJar, constants.R_OK).catch(() => {
-    if (requiresTerraWorkWire) throw new TerraActorCompatibilityError();
+    if (requiresModelWorkWire) throw new ModelActorCompatibilityError();
     throw new Error(actorJar === AGENT_JAR ? "Run `bun run build:agent` to build survival-agent-1.0.jar first." :
       "The ordinary run's pinned actor artifact is unavailable.");
   });
@@ -829,7 +829,7 @@ function goalMilestones(goal: Goal, progress: PlayingProgress, highWater: Map<st
 }
 
 async function run(goal: Goal, seconds: number, parentRun: string | undefined, diagnostic: Diagnostic | undefined,
-    strategyOptions?: TerraOptions, macroTrial?: MacroTrialLaunch,
+    strategyOptions?: StrategyOptions, macroTrial?: MacroTrialLaunch,
     { recoveryMode, orphanScope, parallelWorld = false }: {
       recoveryMode?: "previous-boot" | "same-boot"; orphanScope?: string; parallelWorld?: boolean;
     } = {}) {
@@ -837,22 +837,23 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   const actorJar = macroTrial ? macroTrialActor(macroTrial.ordinaryDir) : AGENT_JAR;
   const urgentCraft = diagnostic === "urgent-craft";
   const urgentDiagnostic = diagnostic === "urgent-creeper" || urgentCraft;
-  const wadeDiagnostic = diagnostic === "wade-terra";
-  const brakeDiagnostic = diagnostic === "brake-terra";
+  const wadeDiagnostic = diagnostic === "wade-model";
+  const brakeDiagnostic = diagnostic === "brake-model";
   const stockDiagnostic = wadeDiagnostic || brakeDiagnostic;
   const localOptions = !diagnostic && strategyOptions?.control === "local" ? strategyOptions : undefined;
   const wallMs = seconds * 1_000;
-  const terraDeclaration = stockDiagnostic ? declareTerraStrategy({
+  const modelDeclaration = stockDiagnostic ? declareModelStrategy({
+    model: strategyOptions!.model,
     maxRequests: 1,
     task: brakeDiagnostic
       ? "Test ordinary stock approach and braking: approach the visible diamond ore only while the native player can verify safe footing. Stop on supported ground before the gap; do not enter or cross it. Approaching and stopping safely, without collecting a diamond, is the test. Propose one ordinary stock order for one diamond so the native player can attempt the approach. Reserve the iron pickaxe, allow only one diamond-ore break if reachable from safe footing, and permit no other effect or item spend. If no safe near-term approach is supported, abstain."
       : "Obtain one diamond from the visible diamond ore with one ordinary stock order. Cross only where the native player verifies shallow water and a dry bank; stop if support is no longer safe. Reserve the iron pickaxe, permit only one diamond-ore break, and permit no other effect or item spend.",
   }, wallMs, brakeDiagnostic ? { preparedDiagnostic: true, brakeWork: true } : { preparedDiagnostic: true, shallowWork: true }) :
     diagnostic === "urgent-creeper"
-      ? declareTerraStrategy({ maxRequests: urgentThreatLimits.maxRequests }, wallMs, { preparedDiagnostic: true })
-      : !diagnostic && strategyOptions && !localOptions ? declareTerraStrategy(strategyOptions, wallMs) : undefined;
-  const requiresTerraActor = localOptions !== undefined || terraDeclaration !== undefined;
-  const { java, ffmpeg } = await verifyInputs(actorJar, requiresTerraActor);
+      ? declareModelStrategy({ model: strategyOptions!.model, maxRequests: urgentThreatLimits.maxRequests }, wallMs, { preparedDiagnostic: true })
+      : !diagnostic && strategyOptions && !localOptions ? declareModelStrategy(strategyOptions, wallMs) : undefined;
+  const requiresModelActor = localOptions !== undefined || modelDeclaration !== undefined;
+  const { java, ffmpeg } = await verifyInputs(actorJar, requiresModelActor);
   const executionSlot = diagnostic ? undefined : parallelWorld ? "parallel" : "primary";
   const runs = diagnostic ? DIAGNOSTIC_RUNS : RUNS;
   const liveFile = diagnostic ? DIAGNOSTIC_LIVE : parallelWorld ? PARALLEL_LIVE : LIVE;
@@ -860,6 +861,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   const descent = descentVariants.find(variant => variant === diagnostic);
   const fixture = terrain ?? descent;
   const provisioned = fixture !== undefined || diagnostic === "pool" || macroTrial !== undefined || urgentDiagnostic;
+  const artifactCampaign = process.env.SURVIVAL_AGENT_ARTIFACT_CAMPAIGN;
+  if (artifactCampaign !== undefined && artifactCampaign !== "recovery-development")
+    throw new Error("Unknown Survival artifact campaign.");
+  if (artifactCampaign && diagnostic)
+    throw new Error("The recovery-development artifact campaign is only available for ordinary Survival runs.");
   const claimScope = macroTrial ? "prepared-skill-trial" : diagnostic === "incident-replay" ? "incident-replay" :
     provisioned ? "prepared-diagnostic" : parentRun ? "continuation-chain" : "fresh-attempt";
   const descentMonitor = descent ? monitorDescent(descent) : null;
@@ -904,7 +910,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       ...orphan.reservation, sourceRun: orphan.provenance.sourceRun, signal,
       assertSource: () => { orphan.assertSource(); orphan.assertLatestPrimary(); },
       assertQuiescent: proofSignal => orphan.assertQuiescent(proofSignal),
-    } : initialRecovery?.reservation);
+    } : initialRecovery?.reservation, artifactCampaign ? { campaign: artifactCampaign } : undefined);
     signal.throwIfAborted();
     await mkdir(runs, { recursive: true, mode: 0o700 });
     // Reconfirm the source once this run owns the lane, before opening writers.
@@ -930,7 +936,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       `${JSON.stringify({ at: new Date().toISOString(), elapsedMs: Math.round(performance.now() - start), event, ...fields })}\n`,
       { mode: 0o600 },
     );
-    const urgentProbe = urgentDiagnostic ? createUrgentThreatProbe(dir, signal, record, urgentCraft ? "craft" : "terra") : undefined;
+    const urgentProbe = urgentDiagnostic ? createUrgentThreatProbe(dir, signal, record, urgentCraft ? "craft" : "model") : undefined;
     const brakeMonitor = brakeDiagnostic ? monitorBrakeTerrain(dir) : undefined;
     const progressFile = path.join(dir, "progress.json");
     const ledger = new LifeLedger(!provisioned);
@@ -949,8 +955,9 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), display: display.display, authority: display.authority };
     const benchmark = diagnostic ? undefined : { goal, verifier: "vanilla-survival", claimScope };
-    const nativeClient = terraDeclaration ? Promise.withResolvers<Owned | undefined>() : undefined;
+    const nativeClient = modelDeclaration ? Promise.withResolvers<Owned | undefined>() : undefined;
     const expeditionAdvisor = localOptions && composeExpeditionAdvisor({
+      model: localOptions.model,
       dir, goal, objective: localOptions.task ?? "", authDirectory: process.env.GAMEHARNESS_DATA_DIR ?? RUNTIME,
       signal, maxRequests: localOptions.maxRequests, maxRuntimeMs: wallMs,
       captureRecoveryFrame: createRecoveryFrameCapture({ dir, display, ...SCREEN, ffmpeg, signal }),
@@ -967,7 +974,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     };
     let mayUpdateLive = false;
     let trialJarSha256: string | undefined;
-    let macroAttempt: ReturnType<typeof composeTerraSurvival> | undefined;
+    let macroAttempt: ReturnType<typeof composeModelSurvival> | undefined;
     let stockNotExercised: ReturnType<NonNullable<typeof macroAttempt>["stockNotExercised"]>;
     let stage = "declaration";
     let server: Owned | undefined;
@@ -1024,7 +1031,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     };
     canRelease = false;
     try {
-      const agentJarSha256 = await launcher.stageAgentArtifact(actorJar, requiresTerraActor);
+      const agentJarSha256 = await launcher.stageAgentArtifact(actorJar, requiresModelActor);
       if (macroTrial) {
         if (agentJarSha256 !== macroTrial.actorJarSha256)
           throw new Stop("unverified", "The diagnostic staged a different actor from the pinned ordinary run.");
@@ -1042,11 +1049,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         world, claimScope, deathPolicy,
         ...(executionSlot ? { executionSlot } : {}),
         ...(!macroTrial ? { pauseDiagnostics: PAUSE_DIAGNOSTICS } : {}),
-        ...(benchmark ? { benchmark, strategy: expeditionAdvisor?.declaration ?? terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
+        ...(benchmark ? { benchmark, strategy: expeditionAdvisor?.declaration ?? modelDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         ...(macroTrial ? { macroTrial: { ordinaryRun: path.basename(macroTrial.ordinaryDir), maximumIntents: 1 } } : {}),
-        ...(stockDiagnostic ? { strategy: terraDeclaration } : {}),
+        ...(stockDiagnostic ? { strategy: modelDeclaration } : {}),
         ...(urgentProbe ? { urgentThreat: urgentCraft ? urgentCraftDeclaration : urgentThreatDeclaration,
-          strategy: terraDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
+          strategy: modelDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
         inactivity: { unchangedMs: STALL_MS, noGoalMilestoneMs: GOAL_STALL_MS,
           action: provisioned ? "end_diagnostic" : "record_only" },
         connection: { host: "127.0.0.1", port, auth: "host-verified-official-launcher" },
@@ -1054,6 +1061,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           wallSeconds: seconds, startupMs: STARTUP_MS, heartbeatMs: HEARTBEAT_MS,
           ...(provisioned ? { stallMs: STALL_MS, goalStallMs: GOAL_STALL_MS } : {}),
           reserveBytes, videoBytes, drainHeadroomBytes: DRAIN_HEADROOM,
+          ...(artifactCampaign ? { artifactCampaign } : {}),
           serverShutdown: SERVER_SHUTDOWN_LIMITS,
         },
         recording: { file: "screen.mp4", size: SIZE, fps: 30, codec: "h264", cursor: true, audio: false },
@@ -1121,15 +1129,15 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         // Local control is selected before launch. Authorization opens in the background.
         await expeditionAdvisor.start();
         await record("expedition_ready");
-      } else if (terraDeclaration) {
+      } else if (modelDeclaration) {
         stage = "macro_startup";
         startup.throwIfAborted();
-        macroAttempt = composeTerraSurvival({
-          declaration: terraDeclaration, dir, projectRoot: ROOT, actorJarSha256: agentJarSha256,
+        macroAttempt = composeModelSurvival({
+          declaration: modelDeclaration, dir, projectRoot: ROOT, actorJarSha256: agentJarSha256,
           authDirectory: process.env.GAMEHARNESS_DATA_DIR ?? RUNTIME, display, ...SCREEN, ffmpeg, signal,
-          ...(!diagnostic && terraDeclaration.startup === "allow" ? { firstPlanGoal: goal } : {}),
+          ...(!diagnostic && modelDeclaration.startup === "allow" ? { firstPlanGoal: goal } : {}),
           ...(urgentProbe ? { onProviderDispatch: urgentProbe.onDispatch, onProviderSettled: urgentProbe.onSettled } : {}),
-          onDisplayLoss: () => abort("failed", "The run lost its private Minecraft display; Terra uploads were stopped."),
+          onDisplayLoss: () => abort("failed", "The run lost its private Minecraft display; Model uploads were stopped."),
           confirmNativeExit: async () => {
             const owned = await nativeClient!.promise;
             await owned?.closed;
@@ -1140,7 +1148,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         catch (error) {
           signal.throwIfAborted();
           if (macroAttempt.outcome().admission === "unavailable")
-            throw new Stop("failed", `The existing GameHarness authorization could not admit ${terraDeclaration.model}.`);
+            throw new Stop("failed", `The existing GameHarness authorization could not admit ${modelDeclaration.model}.`);
           throw error;
         }
         await record("macro_ready");
@@ -1164,7 +1172,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           await copyWorldTree(copyFd === undefined ? source.world : "/proc/self/fd/3/server/world",
             destination, startup, env, copyFd);
           await checkWorldTree(destination, worldDevice, copyStopBytes - bytesBefore, startup);
-          if (pinned && !recovery) await copyAgentMemory(source, dir, pinned.read, startup, !diagnostic && !terraDeclaration);
+          if (pinned && !recovery) await copyAgentMemory(source, dir, pinned.read, startup, !diagnostic && !modelDeclaration);
           if (!diagnostic) await preparePendingFurnace(dir, live.run, { world: destination, device: worldDevice, signal: startup },
             pendingSource, pendingParent);
         } finally { await pinned?.close(); }
@@ -1371,7 +1379,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
               await record("wade_stock_goal", { workOrderId: work.id, receiptTick: work.terminal.tick, ...goalClaim });
               throw new Stop("won", "One native stock order completed and the player retained the diamond.");
             }
-          } else if (terraDeclaration?.workMode === "constrained") {
+          } else if (modelDeclaration?.workMode === "constrained") {
             const completed = macroAttempt?.outcome().status?.completedWorkProgram;
             if (completed) {
               const witness = { run: live.run, program: completed };
@@ -1381,7 +1389,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
                 goalClaim = { life: ledger.life!, tick: progress.tick, wall_ms: progress.wall_ms ?? null, deaths: ledger.deaths };
                 await record("work_program_goal", { workOrderId: completed.finalOrder.id, requestId: completed.requestId,
                   receiptTick: completed.receipt.tick, observedTick: completed.basis.tick, ...goalClaim });
-                throw new Stop("won", "The completed Terra program and live inventory confirm the Survival goal.");
+                throw new Stop("won", "The completed Model program and live inventory confirm the Survival goal.");
               }
             }
           } else if (!macroTrial && progress.won && retainsGoal(goal, progress)) {
@@ -1429,7 +1437,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       if (operatorStop) result = operatorStop;
       else if (error instanceof Stop) result = error;
       else if (signal.reason instanceof Stop) result = signal.reason;
-      else if (error instanceof TerraActorCompatibilityError) result = new Stop("failed", error.message);
+      else if (error instanceof ModelActorCompatibilityError) result = new Stop("failed", error.message);
       else if (startupDeadline.aborted && stage !== "playing") {
         result = new Stop("startup_limit", "Minecraft did not start before the startup limit.");
       } else if (orphan && stage === "world_copy" && error instanceof Error) {
@@ -1497,8 +1505,8 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         settled.every(step => step.status === "fulfilled");
       let serverDrain = settled[1].status === "fulfilled" ? settled[1].value : null;
       if (settled[4].status === "rejected") {
-        result = new Stop("failed", expeditionAdvisor ? "The Terra expedition advisor did not drain cleanly." :
-          "The Terra controller, provider, skills, or trial did not drain cleanly.");
+        result = new Stop("failed", expeditionAdvisor ? "The Model expedition advisor did not drain cleanly." :
+          "The Model controller, provider, skills, or trial did not drain cleanly.");
       } else if (!drained) {
         result = new Stop("failed", "An owned process could not be drained cleanly.");
       }
@@ -1574,13 +1582,13 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
           else if (!drained || !lifeEvidenceReadable || recordedDeaths?.attempt !== 0 || !lastProgress?.alive ||
               !ledger.currentPlaying(lastProgress) || macroClosure?.admission !== "admitted" ||
               macroClosure.drain !== "closed" || macroClosure.authLost)
-            result = new Stop("unverified", "The live player and Terra lane were not verified through shutdown.");
+            result = new Stop("unverified", "The live player and Model lane were not verified through shutdown.");
           else if (measuredBytes === null || measuredBytes > reserveBytes)
             result = new Stop("storage_limit", "The gap-stop diagnostic exceeded its reservation.");
           else if (recorder?.exit?.code !== 0 || !await stat(video).then(entry => entry.size > 0, () => false))
             result = new Stop("recorder_exit", "The gap-stop diagnostic has no completed screen recording.");
         }
-        verification = await verifyTerrain(dir, "brake-terra", lastProgress, undefined,
+        verification = await verifyTerrain(dir, "brake-model", lastProgress, undefined,
           result.status === "brake_closed" && brakeSettlement
             ? { settlement: brakeSettlement, status: macroClosure?.status ?? null } : undefined);
         if (result.status === "brake_closed") {
@@ -1602,15 +1610,15 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         else if (measuredBytes !== null && measuredBytes > reserveBytes)
           result = new Stop("storage_limit", "Final artifacts exceeded the run reservation.");
       }
-      const strategy = expeditionAdvisor ? expeditionAdvisor.outcome() : terraDeclaration
-        ? { ...(macroClosure ?? { ...terraDeclaration, admission: "not_opened", drain: "not_started",
+      const strategy = expeditionAdvisor ? expeditionAdvisor.outcome() : modelDeclaration
+        ? { ...(macroClosure ?? { ...modelDeclaration, admission: "not_opened", drain: "not_started",
           outcome: "no_completed_effect", status: null }), localFallbackTicks: lastProgress?.macro_fallback_ticks ?? null,
           planningWait: await finalPlanningEvidence(dir, lastPlanningSample) }
         : DETERMINISTIC_STRATEGY;
       const pauseEvidence = !macroTrial ? await finalPauseEvidence(dir, {
         runStartedNs, cutoffNs: clientClosedNs ?? osMonotonicNs(), recordingStartedNs, runnerStopRequestedNs,
         providerSpans: expeditionAdvisor ? expeditionAdvisor.providerTimeline() :
-          terraDeclaration ? macroAttempt?.providerTimeline() : [],
+          modelDeclaration ? macroAttempt?.providerTimeline() : [],
       }) : undefined;
       const urgentThreat = urgentProbe && await urgentProbe.verify({
         noDeath: serverSaved && lifeEvidenceReadable && recordedDeaths?.attempt === 0 && ledger.deaths === 0 &&
@@ -1626,11 +1634,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         if (urgentThreat?.status !== "proved") result = new Stop("unverified", urgentThreat?.reason ?? "Missing urgent threat proof.");
         else result = new Stop("urgent_closed", urgentCraft ?
           "Observed an actual crafting drag cancelled without release, returned cursor items, and damage-free escape." :
-          "Observed pre-deadline defense during an authorized pending Terra request.");
+          "Observed pre-deadline defense during an authorized pending Model request.");
       }
       const benchmarkConfirmed = result.status === "won";
-      if (benchmarkConfirmed && terraDeclaration && macroClosure?.outcome !== "native_effect_completed")
-        result = new Stop("failed", "The vanilla goal was verified, but no Terra-issued effect was confirmed.");
+      if (benchmarkConfirmed && modelDeclaration && macroClosure?.outcome !== "native_effect_completed")
+        result = new Stop("failed", "The vanilla goal was verified, but no Model-issued effect was confirmed.");
       const outcome = {
         schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt, world, claimScope, deathPolicy,
         ...(executionSlot ? { executionSlot } : {}),
@@ -1691,13 +1699,23 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
 
 try {
   const { args, parallelWorld } = readParallelWorld(process.argv.slice(2));
+  let diagnosticStrategy: StrategyOptions | undefined;
+  const needsDiagnosticModel = args[0] === "--diagnostic-urgent-creeper" ||
+    (args[0] === "--diagnostic-terrain" && (args[1] === "wade-model" || args[1] === "brake-model"));
+  if (needsDiagnosticModel) {
+    if (args.at(-2) !== "--model") throw new Error("This diagnostic requires trailing --model PROVIDER/MODEL.");
+    const model = readModelSelection(args.at(-1));
+    args.splice(-2);
+    diagnosticStrategy = { strategy: "model", model, control: "constrained",
+      maxRequests: 1, startup: "off", skillTrials: "off" };
+  }
   if (args[0] === "--diagnostic-macro-trial") {
     const trial = parseMacroTrialLaunch(args.slice(1), RUNS);
     process.umask(0o077);
     process.exitCode = await run(MACRO_TRIAL_GOAL, MACRO_TRIAL_SECONDS, undefined, "macro-trial", undefined, trial);
   } else if (args.length === 1 && args[0] === "--diagnostic-urgent-creeper") {
     process.umask(0o077);
-    process.exitCode = await run("diamond", urgentThreatLimits.wallSeconds, undefined, "urgent-creeper");
+    process.exitCode = await run("diamond", urgentThreatLimits.wallSeconds, undefined, "urgent-creeper", diagnosticStrategy);
   } else if (args.length === 1 && args[0] === "--diagnostic-urgent-craft") {
     process.umask(0o077);
     process.exitCode = await run("stone_pickaxe", urgentCraftLimits.wallSeconds, undefined, "urgent-craft");
@@ -1706,17 +1724,17 @@ try {
         args[0] === "--diagnostic-terrain") &&
         args[1] === "--help"))) console.log(usage);
   else {
-    const { game, terra } = readStrategy(args);
+    const { game, model } = readStrategy(args);
     const { goal, seconds, parentRun, diagnostic, recoveryMode } = parseArgs(game);
-    if (parallelWorld && (diagnostic || recoveryMode || terra?.skillTrials === "allow"))
+    if (parallelWorld && (diagnostic || recoveryMode || model?.skillTrials === "allow"))
       throw new Error(parallelWorldUsage);
-    if (recoveryMode === "same-boot" && terra?.skillTrials === "allow")
+    if (recoveryMode === "same-boot" && model?.skillTrials === "allow")
       throw new Error("--recover-orphan-autosave cannot be combined with skill trials.");
     const orphanScope = recoveryMode === "same-boot" ? process.env.SURVIVAL_AGENT_ORPHAN_SCOPE : undefined;
     if (recoveryMode === "same-boot" && !orphanAutosaveProvenance.shape.sourceScope.safeParse(orphanScope).success)
       throw new Error("Set SURVIVAL_AGENT_ORPHAN_SCOPE to the source systemd user .scope unit.");
     process.umask(0o077);
-    process.exitCode = await run(goal, seconds, parentRun, diagnostic, terra, undefined, { recoveryMode, orphanScope, parallelWorld });
+    process.exitCode = await run(goal, seconds, parentRun, diagnostic, model ?? diagnosticStrategy, undefined, { recoveryMode, orphanScope, parallelWorld });
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : "Run failed.");

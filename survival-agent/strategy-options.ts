@@ -1,7 +1,9 @@
-import { SURVIVAL_AGENT_GOALS, type SurvivalAgentGoal } from "../src/shared/survival-agent-ui.ts";
+import { SURVIVAL_AGENT_GOALS, survivalModelIdentity, type SurvivalAgentGoal,
+  type SurvivalModelSelection } from "../src/shared/survival-agent-ui.ts";
 
-export interface TerraOptions {
-  strategy: "terra";
+export interface StrategyOptions {
+  strategy: "model";
+  model: SurvivalModelSelection;
   control: "local" | "preset" | "constrained";
   maxRequests: number;
   startup: "allow" | "off";
@@ -23,17 +25,27 @@ function namedGoal(task: string): SurvivalAgentGoal | undefined {
   });
 }
 
-/** No provider call, credentials lookup, or upload unless this run explicitly selects Terra. */
-export function readStrategy(args: string[]): { game: string[]; terra?: TerraOptions } {
+export function readModelSelection(value: string | undefined): SurvivalModelSelection {
+  const slash = value?.indexOf("/") ?? -1;
+  if (!value || slash < 1) throw new Error("Select an explicit model with --model PROVIDER/MODEL.");
+  const selection = { provider: value.slice(0, slash), modelId: value.slice(slash + 1) };
+  survivalModelIdentity(selection);
+  return selection;
+}
+
+/** No provider call, credentials lookup, or upload unless this run explicitly selects Model. */
+export function readStrategy(args: string[]): { game: string[]; model?: StrategyOptions } {
   if (args[0] !== "--strategy") return { game: args };
-  if (args[1] !== "terra") throw new Error("Expected --strategy terra. Omit it for model-free play.");
-  let i = 2, maxRequests: number | undefined, task: string | undefined;
-  let startup: TerraOptions["startup"] | undefined, skillTrials: TerraOptions["skillTrials"] | undefined;
+  if (args[1] !== "model") throw new Error("Expected --strategy model. Omit it for model-free play.");
+  let i = 2, maxRequests: number | undefined, task: string | undefined, model: SurvivalModelSelection | undefined;
+  let startup: StrategyOptions["startup"] | undefined, skillTrials: StrategyOptions["skillTrials"] | undefined;
   let requestedControl: "local" | "constrained" | undefined;
   while (args[i] === "--macro-requests" || args[i] === "--task" || args[i] === "--startup" ||
-      args[i] === "--skill-trials" || args[i] === "--control") {
+      args[i] === "--skill-trials" || args[i] === "--control" || args[i] === "--model") {
     const option = args[i++], value = args[i++];
-    if (option === "--macro-requests" && maxRequests === undefined &&
+    if (option === "--model" && model === undefined) {
+      model = readModelSelection(value);
+    } else if (option === "--macro-requests" && maxRequests === undefined &&
         value !== undefined && /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value))) {
       maxRequests = Number(value);
     } else if (option === "--startup" && startup === undefined && (value === "allow" || value === "off")) {
@@ -47,6 +59,7 @@ export function readStrategy(args: string[]): { game: string[]; terra?: TerraOpt
       task = value;
     } else throw new Error(`Invalid or repeated ${option}.`);
   }
+  if (!model) throw new Error("--strategy model requires --model PROVIDER/MODEL.");
   const rawGoal = args[i];
   if (!rawGoal || rawGoal.startsWith("--")) throw new Error("Select a Survival goal after the strategy options.");
   const goal = SURVIVAL_AGENT_GOALS.find(item => item === rawGoal);
@@ -57,15 +70,15 @@ export function readStrategy(args: string[]): { game: string[]; terra?: TerraOpt
   if (taskGoal && taskGoal !== goal)
     throw new Error(`--task names ${taskGoal}, but the selected goal is ${goal}. Select the matching goal or remove --task.`);
   if (task && !taskGoal && requestedControl !== "constrained")
-    throw new Error(`Local Terra cannot enforce custom instructions. Omit --task or use --strategy terra --control constrained --task TEXT ${goal}.`);
+    throw new Error(`Local Model cannot enforce custom instructions. Omit --task or use --strategy model --control constrained --task TEXT ${goal}.`);
   if (requestedControl === "constrained" && !task)
     throw new Error("--control constrained requires --task TEXT. Omit --control constrained to play the built-in goal locally.");
   if (requestedControl === "local" && skillTrials === "allow")
     throw new Error("--control local cannot be combined with --skill-trials allow.");
   const control = requestedControl ?? (skillTrials === "allow" ? (task ? "constrained" : "preset") : "local");
   if (control === "local" && startup === "allow")
-    throw new Error("Local Terra waits for a live observation. Omit --startup allow or use an explicit constrained run or skill study.");
-  return { game, terra: { strategy: "terra", control, maxRequests: maxRequests ?? 8,
+    throw new Error("Local Model waits for a live observation. Omit --startup allow or use an explicit constrained run or skill study.");
+  return { game, model: { strategy: "model", model, control, maxRequests: maxRequests ?? 8,
     startup: startup ?? (control === "local" ? "off" : "allow"), skillTrials: skillTrials ?? "off",
     ...(task ? { task } : {}) } };
 }

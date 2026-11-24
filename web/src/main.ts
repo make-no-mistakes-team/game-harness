@@ -44,7 +44,6 @@ import {
 import type { PerformanceSnapshot, SkillEvidencePage } from "./api.ts";
 import { NativeVideo } from "./video.ts";
 import { SurvivalAgentView } from "./survival-agent-view.ts";
-import { TERRA_MODEL_ID } from "../../src/shared/survival-agent-ui.ts";
 import { EvidenceInspector, promotionEvidence } from "./evidence.ts";
 import { MAX_TASK_CHARACTERS, taskTextSchema } from "../../src/shared/tasks.ts";
 import { initialTaskDraft, editTaskPrompt, selectTaskChoice, taskSubmission } from "./task-draft.ts";
@@ -95,8 +94,9 @@ root.innerHTML = `
 </main>
 <dialog id="settings-dialog" aria-labelledby="settings-title"><div class="dialog-header"><h2 id="settings-title">Settings & task</h2><button type="button" data-close="settings-dialog" aria-label="Close settings">Close</button></div><div class="dialog-body settings-grid">
   <section aria-labelledby="survival-agent-heading"><h3 id="survival-agent-heading" tabindex="-1">Minecraft Survival Agent</h3><form id="survival-agent-form">
-    <label for="survival-agent-strategy">Agent strategy</label><div class="input-row"><select id="survival-agent-strategy" required><option value="deterministic" selected>Deterministic (no model)</option><option value="terra">Terra (${TERRA_MODEL_ID})</option></select></div>
-    <p id="survival-agent-strategy-disclosure" class="muted" hidden>Terra can send the goal, inventory, player status and available strategies to OpenAI using your connected account. Requests count toward your account usage. The player continues without a reply.</p>
+    <label for="survival-agent-strategy">Agent strategy</label><div class="input-row"><select id="survival-agent-strategy" required><option value="deterministic" selected>Deterministic (no model)</option><option value="model">Model</option></select></div>
+    <div id="survival-agent-model-field" hidden><label for="survival-agent-model-input">Strategy model</label><div class="input-row"><select id="survival-agent-model-input" disabled><option value="">Connect OpenAI first</option></select></div></div>
+    <p id="survival-agent-strategy-disclosure" class="muted" hidden>Model strategy can send your goal, inventory, player status, available strategies and game screenshots to OpenAI through your connected account. Requests count toward your account usage. The player continues without a reply.</p>
     <label for="survival-agent-goal">Agent goal</label><div class="input-row"><select id="survival-agent-goal" required></select><button id="survival-agent-start" type="submit" class="primary" disabled>Start in new world</button></div><p id="survival-agent-start-status" role="status" hidden></p><p id="survival-agent-start-error" class="error" role="alert" hidden></p><button id="survival-agent-start-check" type="button" hidden>Check status</button></form></section>
   <section><h3>Game integration</h3><p>GameHarness runs model-authored game programs. Minecraft Java 1.21.4 is the first available integration; other game adapters are not available in this build.</p></section>
   <section class="settings-task"><h3>Task and strategic model</h3><form id="task-form"><div class="form-row"><label>Automatic success check<select id="goal" required aria-describedby="goal-condition"><option value="">Waiting for checks</option></select></label><label>Strategic model<select id="model" required><option value="">Connect OpenAI first</option></select></label></div><p id="goal-condition" role="status">Custom tasks have no automatic success check.</p><div class="section-heading"><label for="task">Task</label><button id="use-goal" class="text-button" type="button">Restore preset prompt</button></div><textarea id="task" rows="3" minlength="1" maxlength="${MAX_TASK_CHARACTERS}" required placeholder="Describe what the agent should do in this world."></textarea><p id="preparation-disclosure" class="muted">Preparation uses the selected model and counts toward your account usage: up to ${PREPARED_START_LIMITS.max_requests} requests, with a ${PREPARED_START_LIMITS.duration_ms / 60000}-minute preparation limit. It starts with fresh programs; the world opens only after compilation.</p><p id="preparation-prerequisite" role="status"></p><p id="preparation-error" class="error" role="alert" hidden></p><div class="button-row"><button id="prepare-play" type="submit" class="primary" aria-describedby="preparation-disclosure preparation-prerequisite">Prepare &amp; play</button><button id="create-run" type="submit" class="primary" hidden>Create run</button><span id="create-hint" class="muted" hidden>Create saves the task; Start begins inference.</span></div></form><div id="preparation-panel" class="preparation-status" tabindex="-1" aria-labelledby="preparation-status" hidden><p id="preparation-status" role="status"></p><p id="preparation-clock" class="mono"></p><p id="preparation-requests" class="mono"></p><button id="cancel-preparation-settings" class="danger" type="button" hidden>Cancel preparation</button><details><summary>Preparation details</summary><pre id="preparation-details" tabindex="0"></pre></details></div></section>
@@ -811,6 +811,7 @@ function safeOAuth(value: string | null): string | null {
 }
 function renderAuth(state: AppSnapshot): void {
   const auth = state.auth;
+  survivalAgent.setAuth(auth);
   text(
     "account-description",
     auth.authenticated

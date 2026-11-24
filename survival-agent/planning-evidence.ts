@@ -7,7 +7,7 @@ const count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const nativeSample = z.object({
   tick: count, life: count.positive(),
   macro_planning_state: z.enum(["awaiting_plan", "planning_wait", "blocked/no_safe_action",
-    "local_in_progress", "terra_in_progress", "handoff", "urgent", "inactive", "trial_idle"]),
+    "local_in_progress", "model_in_progress", "handoff", "urgent", "inactive", "trial_idle"]),
   macro_planning_evidence: z.string().max(1024),
   macro_wait_elapsed_ms: ms, macro_wait_max_idle_ms: ms, macro_wait_max_overshoot_ms: ms, macro_wait_total_ms: ms,
   macro_wait_max_no_work_ms: ms, macro_wait_total_no_work_ms: ms.optional(), macro_planning_marker_notice_tick: count.nullable(),

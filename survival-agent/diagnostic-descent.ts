@@ -8,7 +8,7 @@ import type { SurvivalAgentGoal } from "../src/shared/survival-agent-ui.ts";
 
 export const descentVariants = ["water", "boat", "cave"] as const;
 export type DescentVariant = (typeof descentVariants)[number];
-export const terrainVariants = ["birch", "ceiling", "wade-terra", "brake-terra"] as const;
+export const terrainVariants = ["birch", "ceiling", "wade-model", "brake-model"] as const;
 export type TerrainVariant = (typeof terrainVariants)[number];
 type FixtureVariant = DescentVariant | TerrainVariant;
 type Cell = readonly [number, number, number];
@@ -78,7 +78,7 @@ export const terrainFixtures = {
     kit: [],
     terrain: { obstruction: [0, 66, 0], step: [0, 64, 1], exit: [0, 65, 3], stem: [0, 65, 8] },
   },
-  "wade-terra": {
+  "wade-model": {
     goal: "diamond",
     start: [0.5, 64, 0.60],
     pitch: 21,
@@ -89,7 +89,7 @@ export const terrainFixtures = {
       route: "Level stone bed between two dry banks; no dry route through the side walls.",
     },
   },
-  "brake-terra": {
+  "brake-model": {
     goal: "diamond",
     start: [0.5, 64, 0.60],
     pitch: 25,
@@ -226,7 +226,7 @@ function birch([x, y, z]: Cell, height: number): Command[] {
 
 async function wadeTerrain(console: (steps: Command[], allowMismatch?: boolean) => Promise<string[]>,
     signal: AbortSignal): Promise<Command[]> {
-  const { inletX, channelZ: z, bedY, centralWaterLevel, ore } = terrainFixtures["wade-terra"].terrain;
+  const { inletX, channelZ: z, bedY, centralWaterLevel, ore } = terrainFixtures["wade-model"].terrain;
   const y = bedY + 1;
   const wallSign = "oak_wall_sign[facing=east,waterlogged=false]";
   await console([
@@ -260,8 +260,8 @@ async function wadeTerrain(console: (steps: Command[], allowMismatch?: boolean) 
   throw new Error("Vanilla did not settle the shallow-water channel and both dry banks before join.");
 }
 
-function terrain(variant: Exclude<TerrainVariant, "wade-terra">): Command[] {
-  if (variant === "brake-terra") {
+function terrain(variant: Exclude<TerrainVariant, "wade-model">): Command[] {
+  if (variant === "brake-model") {
     const { start: [, y], terrain: { gap: { x: [left, right], z: [lip, last], bottomY }, ore } } =
       terrainFixtures[variant];
     return [
@@ -489,7 +489,7 @@ export async function provisionFixture(variant: FixtureVariant, server: ChildPro
   ]);
   const steps = variant === "water" ? await waterTerrain(console, signal) :
     variant === "boat" || variant === "cave" ? chamber(variant) :
-      variant === "wade-terra" ? await wadeTerrain(console, signal) : terrain(variant);
+      variant === "wade-model" ? await wadeTerrain(console, signal) : terrain(variant);
   await console([...steps, [`time set ${DAY_TICK}`, new RegExp(`^Set the time to ${DAY_TICK}$`)]]);
   await writePreparedPlayer(serverDir, profile, fixtures[variant], signal);
 }

@@ -358,6 +358,15 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
     const survivalAgentBody: z.ZodType<SurvivalAgentStart> = z.strictObject({
       goal: z.enum(SURVIVAL_AGENT_GOALS),
       strategy: z.enum(SURVIVAL_AGENT_STRATEGIES),
+      model: z.strictObject({
+        provider: z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/),
+        modelId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$/),
+      }).optional(),
+    }).superRefine((input, context) => {
+      if (input.strategy === "model" && !input.model)
+        context.addIssue({ code: "custom", path: ["model"], message: "Select a configured model for model strategy." });
+      if (input.strategy === "deterministic" && input.model)
+        context.addIssue({ code: "custom", path: ["model"], message: "Model-free play does not accept a model selection." });
     });
     const controlBody = z
       .object({
@@ -484,6 +493,13 @@ export async function createOperatorApplication(owners: OperatorApplicationOwner
                 return json(survivalAgent.snapshot());
               if (request.method === "POST" && url.pathname === "/v1/survival-agent/start") {
                 const input = await body(request, survivalAgentBody);
+                if (input.model) {
+                  const selected = input.model;
+                  const catalog = auth.snapshot();
+                  if (catalog.status !== "ready" || !catalog.authenticated ||
+                      !catalog.models.some(model => model.provider === selected.provider && model.id === selected.modelId))
+                    throw new HttpError(400, "model_unavailable", "Choose a model from the connected account’s current model catalog.");
+                }
                 assertLegacyWorldIdle();
                 return json(survivalAgent.start(input), 202);
               }

@@ -5,7 +5,7 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { SurvivalMacroConfig, UnavailableFrame } from "./controller.ts";
 import { readMacroObservation, type MacroObservation } from "./protocol.ts";
-import { frameDimensions } from "./terra.ts";
+import { frameDimensions } from "./model-strategist.ts";
 
 export const FRAME_BYTES = 2 * 1024 * 1024;
 export const FRAME_TIMEOUT_MS = 1_000;

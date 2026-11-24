@@ -17,6 +17,13 @@ test("later decisions use bounded, dated outcomes without reviving stale plans o
   const survey: MacroOpportunity = {
     id: "survey-one", verb: "survey", summary: "Survey the nearby terrain", risk: "read", evidence: "A stationary view.",
   };
+  // A completed look can expose a distinct visible target. Re-keying the same
+  // unanchored camera offer would correctly be refused as a duplicate effect.
+  const revealedSurvey: MacroOpportunity = {
+    ...survey, id: "survey-two",
+    evidence: "The completed look revealed a lit stone face at a cave entrance.",
+    anchor: { subject: "block:minecraft:stone", target: "cave-entrance-face" },
+  };
   const walk: MacroOpportunity = {
     id: "walk-one", verb: "approach", summary: "Walk toward the ridge", risk: "low", evidence: "A flat adjacent tile.",
   };
@@ -25,7 +32,7 @@ test("later decisions use bounded, dated outcomes without reviving stale plans o
   };
   const surveyDetail = "The requested camera angle rendered.";
   const controller = new SurvivalMacroController({
-    runDir, run, strategy: "terra", limits: { pollMs: 1_000 },
+    runDir, run, strategy: "model", limits: { pollMs: 1_000 },
     confirmNativeExit: async () => true,
     strategist: async request => {
       requests.push(request);
@@ -39,7 +46,7 @@ test("later decisions use bounded, dated outcomes without reviving stale plans o
       let subgoal = "Find shelter";
       switch (requests.length) {
         case 1: action = { kind: "opportunity", opportunityId: survey.id }; break;
-        case 2: if (surveyHistory) action = { kind: "opportunity", opportunityId: "survey-two" }; break;
+        case 2: if (surveyHistory) action = { kind: "opportunity", opportunityId: revealedSurvey.id }; break;
         case 3:
           await thirdDecision.promise;
           subgoal = "Scout the ridge on foot";
@@ -76,12 +83,16 @@ test("later decisions use bounded, dated outcomes without reviving stale plans o
       health: 20, food: 20, inventory: {}, recent: [], quiescent: true });
   const receive = (intent: MacroIntent, tick: number, status: MacroReceipt["status"], detail: string) =>
     publish("receipt.json", { v: 1, run, id: intent.id, life: intent.life, tick, status, detail });
-  const until = async (condition: () => boolean) => {
+  const until = async (condition: () => boolean, target: string) => {
     for (let i = 0; !condition() && i < 20; i++) await controller.poll();
-    expect(condition()).toBe(true);
+    const met = condition();
+    expect(met, met ? undefined : JSON.stringify({
+      target, requests: requests.length, status: controller.status(),
+      history: await readFile(join(controller.directory, "history.jsonl"), "utf8"),
+    })).toBe(true);
   };
   const intent = async (issued: number) => {
-    await until(() => controller.status().issued === issued);
+    await until(() => controller.status().issued === issued, `issued ${issued}`);
     return parseMacroIntent(JSON.parse(await readFile(join(controller.directory, "intent.json"), "utf8")));
   };
 
@@ -97,9 +108,10 @@ test("later decisions use bounded, dated outcomes without reviving stale plans o
     expect(requests).toHaveLength(1);
 
     await receive(first, 12, "completed", surveyDetail);
-    await observe(12, 2, 1, [{ ...survey, id: "survey-two" }]);
+    await observe(12, 2, 1, [revealedSurvey]);
     const repeat = await intent(2);
-    expect(repeat.opportunityId).toBe("survey-two");
+    expect(repeat.opportunityId).toBe(revealedSurvey.id);
+    expect(requests[1]?.observation.opportunities).toEqual([revealedSurvey]);
     expect(requests[1]?.strategicEpisodes?.[0]).toMatchObject({
       basis: { run, life: 1, tick: 10, epoch: 1 }, hypothesis: { subgoal: "Find shelter", expected: "See a sheltered entrance." },
       objectiveStatus: "not-evaluated", outcome: { source: "native", id: first.id, tick: 12, status: "completed", detail: surveyDetail },
@@ -107,7 +119,7 @@ test("later decisions use bounded, dated outcomes without reviving stale plans o
 
     await receive(repeat, 14, "completed", surveyDetail);
     await observe(14, 3, 1, [walk, inspect]);
-    await until(() => requests.length === 3);
+    await until(() => requests.length === 3, "third decision");
     expect(requests[2]?.strategicEpisodes).toHaveLength(1);
     expect(requests[2]?.strategicEpisodes?.[0]?.outcome).toMatchObject({ id: repeat.id });
     await observe(15, 3, 1, [inspect]);
@@ -127,7 +139,7 @@ test("later decisions use bounded, dated outcomes without reviving stale plans o
 
     await receive(alternate, 16, "interrupted", "The face moved out of view.");
     await observe(16, 4, 1, [inspect]);
-    await until(() => requests.length === 6);
+    await until(() => requests.length === 6, "decision after interrupted receipt");
     expect(requests[5]?.strategicEpisodes).toHaveLength(3);
     expect(requests[5]?.strategicEpisodes?.[0]?.outcome).toMatchObject({
       source: "native", status: "interrupted", id: alternate.id,
@@ -136,7 +148,7 @@ test("later decisions use bounded, dated outcomes without reviving stale plans o
       .toBe(false);
 
     await observe(17, 5, 2, [inspect]);
-    await until(() => requests.length === 7);
+    await until(() => requests.length === 7, "decision in the new life");
     expect(requests[6]?.lastReceipt).toBeNull();
     expect(requests[6]?.strategicEpisodes).toBeUndefined();
   } finally {

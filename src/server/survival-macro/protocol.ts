@@ -6,7 +6,7 @@ import actorManifest from "../../../survival-agent/src/main/resources/fabric.mod
 import { SURVIVAL_AGENT_GOALS, type SurvivalAgentGoal } from "../../shared/survival-agent-ui.ts";
 import { VANILLA_HARVEST, VANILLA_TIMBER_LEAVES } from "./vanilla-harvest.ts";
 
-export const MACRO_CAPABILITIES_VERSION = `survival-macro/v${actorManifest.custom["gameharness:terra_work_wire"]}`;
+export const MACRO_CAPABILITIES_VERSION = `survival-macro/v${actorManifest.custom["gameharness:model_work_wire"]}`;
 export const MACRO_MAX_INTENT_TTL_TICKS = 1_200;
 export const MACRO_MAX_PLAN_TTL_TICKS = 7_200;
 export const MACRO_MAX_HANDOFF_TTL_TICKS = 100;

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { SURVIVAL_AGENT_GOALS, SURVIVAL_AGENT_STRATEGIES, SURVIVAL_AGENT_STRATEGY_OUTCOMES, TERRA_MODEL_ID,
+import { SURVIVAL_AGENT_GOALS, SURVIVAL_AGENT_STRATEGIES, SURVIVAL_AGENT_STRATEGY_OUTCOMES,
   type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../../src/shared/survival-agent-ui.ts";
 import type {
   ActivityEvent,
@@ -534,7 +534,7 @@ const survivalAgentSnapshot: z.ZodType<SurvivalAgentSnapshot> = z.object({
   phase: z.enum(["idle", "starting", "playing", "stopping", "ended"]),
   goal: z.enum(SURVIVAL_AGENT_GOALS).nullable(),
   strategy: z.enum(SURVIVAL_AGENT_STRATEGIES).nullable(),
-  model: z.literal(TERRA_MODEL_ID).nullable(),
+  model: z.string().min(1).nullable(),
   strategyOutcome: z.enum(SURVIVAL_AGENT_STRATEGY_OUTCOMES).nullable(),
   status: z.string(), won: z.boolean().nullable(), run: nullableText,
   elapsedMs: z.number().nonnegative(), health: z.number().nullable(), food: z.number().nullable(),

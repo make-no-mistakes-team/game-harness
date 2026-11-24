@@ -6,7 +6,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { createMacroTrials, MACRO_TRIAL_ADAPTER_VERSION, MACRO_TRIAL_VERBS } from "../../../survival-agent/macro-trial.ts";
 import type { ProviderPendingSpan } from "../../../survival-agent/pause-evidence.ts";
-import { hasConfirmedTerraEffect, TERRA_MODEL_ID, type SurvivalAgentGoal } from "../../shared/survival-agent-ui.ts";
+import { hasConfirmedModelEffect, survivalModelIdentity, type SurvivalAgentGoal,
+  type SurvivalModelSelection } from "../../shared/survival-agent-ui.ts";
 import { PRE_SPAWN_GOAL_ONLY } from "./bootstrap.ts";
 import {
   SurvivalMacroController, type DisplayCaptureFailure, type UnavailableFrame,
@@ -19,7 +20,7 @@ import {
   type MacroBasis, type MacroInference, type MacroObservation,
 } from "./protocol.ts";
 import { MACRO_AUTOMATIC_SKILL_VERBS, SurvivalMacroSkills } from "./skills.ts";
-import { openTerraStrategist, type TerraStrategist } from "./terra.ts";
+import { openModelStrategist, type ModelStrategist } from "./model-strategist.ts";
 import { createTrustedFrameCapture, FRAME_BYTES, FRAME_TIMEOUT_MS, initializeFrameArchive } from "./visual-capture.ts";
 
 export { createTrustedFrameCapture };
@@ -36,17 +37,18 @@ export interface TrustedSurvivalDisplay {
   readonly stillOwned: () => boolean;
 }
 
-export function declareTerraStrategy(
-  options: { maxRequests: number; task?: string; startup?: "allow" | "off"; skillTrials?: "allow" | "off" }, wallMs: number,
+export function declareModelStrategy(
+  options: { model: SurvivalModelSelection; maxRequests: number; task?: string; startup?: "allow" | "off"; skillTrials?: "allow" | "off" }, wallMs: number,
   lane?: { preparedDiagnostic: true; shallowWork?: true; brakeWork?: never } |
     { preparedDiagnostic: true; brakeWork: true; shallowWork?: never },
 ) {
   const preparedDiagnostic = lane?.preparedDiagnostic === true;
   const stockFooting = lane?.brakeWork ? "dry" : lane?.shallowWork ? "shallow_water_with_bank" : undefined;
   if (stockFooting && (!options.task || options.maxRequests !== 1))
-    throw new Error("Prepared stock work requires a goal and one live Terra request.");
+    throw new Error("Prepared stock work requires a goal and one live Model request.");
   return {
-    strategy: "terra" as const, model: TERRA_MODEL_ID, task: options.task ?? null, preparedDiagnostic,
+    strategy: "model" as const, model: survivalModelIdentity(options.model), selection: { ...options.model },
+    task: options.task ?? null, preparedDiagnostic,
     startup: preparedDiagnostic ? "off" as const : options.startup ?? "allow",
     workMode: preparedDiagnostic && !stockFooting ? null : options.task ? "constrained" : "preset",
     ...(stockFooting === "dry" ? { brakeWork: true as const } : {}),
@@ -58,8 +60,8 @@ export function declareTerraStrategy(
   };
 }
 
-interface TerraAttemptOptions {
-  readonly declaration: ReturnType<typeof declareTerraStrategy>;
+interface ModelAttemptOptions {
+  readonly declaration: ReturnType<typeof declareModelStrategy>;
   readonly firstPlanGoal?: SurvivalAgentGoal;
   readonly dir: string;
   readonly projectRoot: string;
@@ -79,7 +81,7 @@ interface TerraAttemptOptions {
   }) => void;
 }
 
-type CaptureOptions = Pick<TerraAttemptOptions, "dir" | "display" | "width" | "height" | "ffmpeg" | "signal">;
+type CaptureOptions = Pick<ModelAttemptOptions, "dir" | "display" | "width" | "height" | "ffmpeg" | "signal">;
 type CaptureCommand = { readonly adapter: "scrot" | "ffmpeg"; readonly file: string; readonly args: string[] };
 type CapturedJpeg = { readonly bytes: Buffer; readonly adapter?: CaptureCommand["adapter"] };
 
@@ -213,22 +215,22 @@ export async function openTrustedFrameCapture(options: CaptureOptions & { assert
   return createTrustedFrameCapture({ ...options, readJpeg: displayJpegReader(options) });
 }
 
-/** Owns one admitted Terra lane. The deterministic runner never calls this module. */
-export function composeTerraSurvival(options: TerraAttemptOptions) {
+/** Owns one admitted Model lane. The deterministic runner never calls this module. */
+export function composeModelSurvival(options: ModelAttemptOptions) {
   const { actorJarSha256, declaration, dir, display, firstPlanGoal, projectRoot, signal, onProviderDispatch, onProviderSettled } = options;
   if (!declaration.preparedDiagnostic && (onProviderDispatch || onProviderSettled))
-    throw new Error("Only a prepared diagnostic can observe Terra provider timing.");
+    throw new Error("Only a prepared diagnostic can observe Model provider timing.");
   if (declaration.preparedDiagnostic && path.dirname(dir) !== path.join(projectRoot, "local/survival-agent/diagnostic-runs"))
-    throw new Error("Prepared Terra strategy requires a diagnostic run directory.");
+    throw new Error("Prepared Model strategy requires a diagnostic run directory.");
   if (firstPlanGoal !== undefined && (declaration.preparedDiagnostic || declaration.startup !== "allow"))
-    throw new Error("This Terra attempt did not admit goal-only startup inference.");
+    throw new Error("This Model attempt did not admit goal-only startup inference.");
   const run = path.basename(dir);
   const macroDir = path.join(dir, "macro");
   const stockFooting = declaration.preparedDiagnostic && declaration.workMode === "constrained"
     ? declaration.brakeWork ? "dry" : "shallow_water_with_bank" : undefined;
   let controller: SurvivalMacroController | undefined;
   let skills: SurvivalMacroSkills | undefined;
-  let terra: TerraStrategist | undefined;
+  let model: ModelStrategist | undefined;
   let trials: ReturnType<typeof createMacroTrials> | undefined;
   let admission: "not_opened" | "unavailable" | "admitted" = "not_opened";
   let authLost = false;
@@ -308,8 +310,8 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
       if (!path.isAbsolute(options.authDirectory) || !(await stat(options.authDirectory)).isDirectory())
         throw new Error("The explicit GameHarness data root is not an existing absolute directory.");
       let observedDispatch = false, observedSettlement = false;
-      terra = await openTerraStrategist({
-        strategy: "terra", authDirectory: options.authDirectory, runId: run, signal,
+      model = await openModelStrategist({
+        strategy: "model", model: declaration.selection, authDirectory: options.authDirectory, runId: run, signal,
         requestTimeoutMs: declaration.limits.requestTimeoutMs, assertDispatch,
         ...(stockFooting ? { preparedStock: stockFooting } : {}),
         ...(firstPlanGoal !== undefined ? {
@@ -338,12 +340,12 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
       });
       admission = "admitted";
       const observeRevocation = () => { if (!closing && !signal.aborted) authLost = true; };
-      terra.authoritySignal.addEventListener("abort", observeRevocation, { once: true });
-      if (terra.authoritySignal.aborted) observeRevocation();
+      model.authoritySignal.addEventListener("abort", observeRevocation, { once: true });
+      if (model.authoritySignal.aborted) observeRevocation();
     } catch {
       signal.throwIfAborted();
       admission = "unavailable";
-      throw new Error(`The existing GameHarness authorization could not admit ${TERRA_MODEL_ID}.`);
+      throw new Error(`The existing GameHarness authorization could not admit ${declaration.model}.`);
     }
     assertDisplay();
     const capture = await openTrustedFrameCapture({ ...options, assertDisplay, native: !declaration.preparedDiagnostic });
@@ -362,14 +364,14 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     const nativeReview = declaration.preparedDiagnostic ? undefined :
       await createNativeGapReview({ runDir: dir, projectRoot, actorJarSha256, capabilityVersion: MACRO_CAPABILITIES_VERSION });
     controller = new SurvivalMacroController({
-      runDir: dir, run, strategy: "terra", strategist: terra.infer, skills, trial: trials,
+      runDir: dir, run, strategy: "model", model: declaration.model, strategist: model.infer, skills, trial: trials,
       nativeReview, durableWork: declaration.workMode !== null,
       ...(stockFooting ? { preparedStockReady: preparedStockReady(stockFooting) } : {}),
       objective: declaration.task ?? undefined, limits: declaration.limits,
       ...(firstPlanGoal !== undefined ? {
-        firstPlan: { request: { goal: firstPlanGoal, objective: declaration.task?.trim() }, infer: terra.firstPlan },
+        firstPlan: { request: { goal: firstPlanGoal, objective: declaration.task?.trim() }, infer: model.firstPlan },
       } : {}),
-      signal: AbortSignal.any([signal, terra.authoritySignal]), frame: capture,
+      signal: AbortSignal.any([signal, model.authoritySignal]), frame: capture,
       confirmNativeExit: options.confirmNativeExit,
     });
     await controller.start();
@@ -378,10 +380,10 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
   async function close() {
     closing = true;
     try {
-      const settled = await Promise.allSettled([controller?.stop(), terra?.close()]);
+      const settled = await Promise.allSettled([controller?.stop(), model?.close()]);
       trials?.assertDrained();
       if (settled.some(step => step.status === "rejected") || controller?.status().unreportedDispatches)
-        throw new Error("The Terra controller or inference could not be drained.");
+        throw new Error("The Model controller or inference could not be drained.");
     } finally {
       await skills?.close();
     }
@@ -396,7 +398,7 @@ export function composeTerraSurvival(options: TerraAttemptOptions) {
     const providerOutcome = status?.lastProviderOutcome;
     const result = drain === "failed" ? "cleanup_failed" : displayLost ? "display_lost" :
       admission === "unavailable" || authLost ? "provider_unavailable" : status?.state === "faulted" ? "protocol_fault" :
-      hasConfirmedTerraEffect(status) ? "native_effect_completed" :
+      hasConfirmedModelEffect(status) ? "native_effect_completed" :
       providerOutcome === "refused" || providerOutcome === "provider_error" || providerOutcome === "provider_unavailable"
         ? providerOutcome : status?.budget ? "budget_limited" : "no_completed_effect";
     return { ...declaration, admission, authLost, drain, outcome: result, status };

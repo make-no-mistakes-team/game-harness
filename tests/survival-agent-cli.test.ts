@@ -23,7 +23,7 @@ test("the parallel option works before, between and after ordinary arguments", a
   for (const args of [
     ["--parallel-world", "diamond", "90"],
     ["diamond", "--parallel-world", "90", "--continue-from", runName],
-    ["--strategy", "terra", "nether_portal", "90", "--parallel-world"],
+    ["--strategy", "model", "--model", "openai-codex/fixture-strategy-a", "nether_portal", "90", "--parallel-world"],
   ]) {
     expect(await invoke(...args)).toMatchObject({
       code: 1, stdout: "", stderr: expect.stringContaining("refusing to use a desktop display"),
@@ -32,7 +32,7 @@ test("the parallel option works before, between and after ordinary arguments", a
 });
 
 test("a literal parallel-world strategy task is not interpreted as an option", async () => {
-  expect(await invoke("--strategy", "terra", "--control", "constrained", "--task", "--parallel-world",
+  expect(await invoke("--strategy", "model", "--model", "openai-codex/fixture-strategy-a", "--control", "constrained", "--task", "--parallel-world",
     "diamond", "90", "--recover-crash-autosave", runName)).toMatchObject({
     code: 1, stdout: "", stderr: expect.stringContaining("refusing to use a desktop display"),
   });
@@ -49,7 +49,7 @@ test("the parallel option refuses recovery, incident replay, diagnostics and ski
     ["--diagnostic-urgent-creeper"],
     ["--diagnostic-urgent-craft"],
     ["--diagnostic-macro-trial"],
-    ["--strategy", "terra", "--skill-trials", "allow", "diamond"],
+    ["--strategy", "model", "--model", "openai-codex/fixture-strategy-a", "--skill-trials", "allow", "diamond"],
   ]) {
     expect(await invoke(...args, "--parallel-world")).toMatchObject({
       code: 1, stdout: "", stderr: expect.stringContaining("--parallel-world is only available for ordinary"),
@@ -70,7 +70,7 @@ test("same-boot recovery requires an explicit ordinary source and rejects skill 
       code: 1, stdout: "", stderr: expect.stringContaining("Set SURVIVAL_AGENT_ORPHAN_SCOPE"),
     });
   }
-  expect(await invoke("--strategy", "terra", "--skill-trials", "allow", "diamond", "90",
+  expect(await invoke("--strategy", "model", "--model", "openai-codex/fixture-strategy-a", "--skill-trials", "allow", "diamond", "90",
     "--recover-orphan-autosave", runName)).toMatchObject({
     code: 1, stdout: "", stderr: expect.stringContaining("cannot be combined with skill trials"),
   });
@@ -81,6 +81,21 @@ test("same-boot recovery requires an explicit ordinary source and rejects skill 
   ]) {
     expect(await invoke(...args)).toMatchObject({
       code: 1, stdout: "", stderr: expect.stringContaining("Usage:"),
+    });
+  }
+});
+
+test("model diagnostics require an explicit trailing selection and reach the ordinary display guard", async () => {
+  for (const args of [
+    ["--diagnostic-terrain", "wade-model", "90"],
+    ["--diagnostic-terrain", "brake-model", "90"],
+    ["--diagnostic-urgent-creeper"],
+  ]) {
+    expect(await invoke(...args)).toMatchObject({
+      code: 1, stdout: "", stderr: expect.stringContaining("requires trailing --model PROVIDER/MODEL"),
+    });
+    expect(await invoke(...args, "--model", "openai-codex/fixture-strategy-b")).toMatchObject({
+      code: 1, stdout: "", stderr: expect.stringContaining("refusing to use a desktop display"),
     });
   }
 });

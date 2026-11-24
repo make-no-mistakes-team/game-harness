@@ -4,12 +4,12 @@ import { mkdir, open, rename, unlink, writeFile, type FileHandle } from "node:fs
 import { basename, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ProviderPendingSpan } from "../../../survival-agent/pause-evidence.ts";
-import { SURVIVAL_AGENT_GOALS, TERRA_MODEL_ID } from "../../shared/survival-agent-ui.ts";
+import { SURVIVAL_AGENT_GOALS, survivalModelIdentity, type SurvivalModelSelection } from "../../shared/survival-agent-ui.ts";
 import { validateMacroId, type MacroInference } from "./protocol.ts";
 import {
-  EXPEDITION_RECOVERY_NEED, frameDimensions, isExpeditionRecoveryText, openTerraExpeditionAdvisor,
-  TerraOwnerDrainError, type ExpeditionRecovery, type TerraExpeditionDecision,
-} from "./terra.ts";
+  EXPEDITION_RECOVERY_NEED, frameDimensions, isExpeditionRecoveryText, openModelExpeditionAdvisor,
+  ModelOwnerDrainError, type ExpeditionRecovery, type ModelExpeditionDecision,
+} from "./model-strategist.ts";
 import {
   archiveExpeditionRecoveryFrame, EXPEDITION_RECOVERY_FRAME_DIRECTORY, FRAME_BYTES, FRAME_TIMEOUT_MS,
 } from "./visual-capture.ts";
@@ -30,6 +30,7 @@ const RECOVERY_STOPPED = /^Situational recovery stopped during ([a-z][a-z0-9_-]{
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 
 interface ExpeditionOptions {
+  readonly model: SurvivalModelSelection;
   readonly dir: string;
   readonly goal: string;
   readonly objective: string;
@@ -41,8 +42,8 @@ interface ExpeditionOptions {
   readonly captureRecoveryFrame?: (signal: AbortSignal) => Promise<Buffer>;
 }
 
-type VisibleState = Omit<TerraExpeditionDecision["view"], "objective">;
-type ProviderMoment = Parameters<TerraExpeditionDecision["onProviderDispatch"]>[0];
+type VisibleState = Omit<ModelExpeditionDecision["view"], "objective">;
+type ProviderMoment = Parameters<ModelExpeditionDecision["onProviderDispatch"]>[0];
 interface Basis {
   readonly run: string;
   readonly life: number;
@@ -223,6 +224,7 @@ function timing(moment: ProviderMoment) {
 /** Ordinary native play never waits for this optional, one-request-at-a-time advisor. */
 export function composeExpeditionAdvisor(options: ExpeditionOptions) {
   const { dir, goal, authDirectory, maxRequests, maxRuntimeMs, assertDisplay, captureRecoveryFrame } = options;
+  const selection = { ...options.model };
   const run = validateMacroId(basename(dir), "Expedition run");
   const objective = options.objective.trim();
   if (!(SURVIVAL_AGENT_GOALS as readonly string[]).includes(goal) || !count(maxRequests) ||
@@ -230,7 +232,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
       /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(objective))
     throw new Error("Invalid expedition goal, objective, or advisory limits.");
   const declaration = {
-    strategy: "terra", model: TERRA_MODEL_ID, control: "local", mode: "expedition_advisory", authoring: null,
+    strategy: "model", model: survivalModelIdentity(selection), control: "local", mode: "expedition_advisory", authoring: null,
     task: objective || null, input: captureRecoveryFrame ? "visible_state_text_or_recovery_jpeg" : "visible_state_text",
     limits: { maxRequests, maxRuntimeMs, requestTimeoutMs: REQUEST_TIMEOUT_MS, cooldownMs: COOLDOWN_MS,
       ...(captureRecoveryFrame ? { recoveryCaptureTimeoutMs: FRAME_TIMEOUT_MS } : {}) },
@@ -270,7 +272,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
   function log(event: string, fields: object = {}) {
     if (!journal) return Promise.resolve(false);
     const writer = journal;
-    const line = `${JSON.stringify({ v: 1, run, event, wallMs: Date.now(), ...fields })}\n`;
+    const line = `${JSON.stringify({ v: 1, run, model: declaration.model, event, wallMs: Date.now(), ...fields })}\n`;
     journalTail = journalTail.then(async ok => {
       if (!ok) return false;
       try {
@@ -338,7 +340,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
     }
   }
 
-  type Provider = Awaited<ReturnType<typeof openTerraExpeditionAdvisor>>;
+  type Provider = Awaited<ReturnType<typeof openModelExpeditionAdvisor>>;
   async function ask(provider: Provider, state: ExpeditionState, key: string) {
     const { life, tick, need, inventory, options, health, food, activity, recovery } = state;
     const basis: Basis = { run, goal, life, tick, need, ...(recovery ? { incident: recovery.incident } : {}) };
@@ -363,7 +365,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
     let frame: {
       readonly archive: Awaited<ReturnType<typeof archiveExpeditionRecoveryFrame>>;
       readonly hashKey: string;
-      readonly image: NonNullable<TerraExpeditionDecision["image"]>;
+      readonly image: NonNullable<ModelExpeditionDecision["image"]>;
       readonly receipt: { readonly relativePath: string; readonly sha256: string; readonly width: number; readonly height: number };
     } | undefined;
     if (recovery && captureRecoveryFrame) {
@@ -468,7 +470,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
     async function closeProvider() {
       const owner = provider;
       provider = undefined;
-      if (owner) await owner.close().catch(() => { throw new TerraOwnerDrainError("The expedition provider did not drain."); });
+      if (owner) await owner.close().catch(() => { throw new ModelOwnerDrainError("The expedition provider did not drain."); });
     }
     try {
       if (maxRequests === 0) {
@@ -476,11 +478,11 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
         return;
       }
       try {
-        provider = await openTerraExpeditionAdvisor({
-          strategy: "terra", authDirectory, runId: run, signal: authority, requestTimeoutMs: REQUEST_TIMEOUT_MS,
+        provider = await openModelExpeditionAdvisor({
+          strategy: "model", model: selection, authDirectory, runId: run, signal: authority, requestTimeoutMs: REQUEST_TIMEOUT_MS,
         });
       } catch (error) {
-        if (error instanceof TerraOwnerDrainError) throw error;
+        if (error instanceof ModelOwnerDrainError) throw error;
         if (!authority.aborted) admission = "unavailable";
         await log("admission", { admission, budget });
         return;
@@ -512,7 +514,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
         await delay(POLL_MS, undefined, { signal }).catch(error => { if (!signal.aborted) throw error; });
       }
     } catch (error) {
-      if (error instanceof TerraOwnerDrainError) throw error;
+      if (error instanceof ModelOwnerDrainError) throw error;
       protocolFault = true;
       await log("protocol_fault");
     } finally {
@@ -549,7 +551,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
       finally { await journal.close(); }
       journal = undefined;
     }
-    if (cleanupFailed) throw new TerraOwnerDrainError("The expedition provider did not drain.");
+    if (cleanupFailed) throw new ModelOwnerDrainError("The expedition provider did not drain.");
   }
 
   return {
@@ -565,7 +567,7 @@ export function composeExpeditionAdvisor(options: ExpeditionOptions) {
         admission === "unavailable" || authLost ? "provider_unavailable" : budget ? "budget_limited" :
         lastProviderOutcome === "refused" || lastProviderOutcome === "provider_error" ? lastProviderOutcome : "no_advice_applied";
       return { ...declaration, admission, drain, outcome,
-        status: { requests: attempts, providerDispatches, providerSettlements, published: published.size, applied,
+        status: { model: declaration.model, requests: attempts, providerDispatches, providerSettlements, published: published.size, applied,
           budget, lastProviderOutcome } } as const;
     },
     providerTimeline: () => timingIncomplete || spans.some(({ endNs }) => endNs === null) ? undefined : spans.slice(),

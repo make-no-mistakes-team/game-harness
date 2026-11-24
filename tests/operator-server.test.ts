@@ -222,12 +222,16 @@ test("survival agent controls enforce the local session, strict input and the in
     expect((await post("/start", { goal: "diamond" })).status).toBe(400);
     expect((await post("/start", { ...start, strategy: "auto" })).status).toBe(400);
     expect((await post("/start", { ...start, display: ":0" })).status).toBe(400);
-    expect((await post("/start", { ...start, strategy: "terra", model: "gpt-6-luna" })).status).toBe(400);
+    expect((await post("/start", { ...start, strategy: "model", model: "gpt-6-luna" })).status).toBe(400);
+    expect((await post("/start", { ...start, strategy: "model" })).status).toBe(400);
+    expect((await post("/start", { ...start, model: { provider: "openai-codex", modelId: "fixture-strategy-a" } })).status).toBe(400);
+    expect((await post("/start", { ...start, strategy: "model",
+      model: { provider: "openai-codex", modelId: "not-discovered" } })).status).toBe(400);
     expect((await post("/stop", { pid: 1 })).status).toBe(400);
     expect((await get("/video?upstream=http://localhost")).status).toBe(400);
     expect((await get("/video?run=old")).status).toBe(409);
 
-    const lane = path.join(f.owners.directory, "local/survival-agent");
+    const lane = path.join(f.owners.directory, "local/survival-pilot");
     mkdirSync(lane, { recursive: true });
     const lock = path.join(lane, "owner.sqlite");
     const external = new Database(lock, { create: true });
@@ -251,26 +255,42 @@ test("survival agent controls enforce the local session, strict input and the in
     const state = f.owners.minecraft.snapshot();
     const running = spyOn(f.owners.minecraft, "snapshot").mockReturnValue({ ...state, status: "running" });
     try {
-      const refused = await post("/start", { ...start, strategy: "terra" });
+      const refused = await post("/start", start);
       expect(refused.status).toBe(409);
       expect(await refused.json()).toMatchObject({ error: { code: "busy", message: expect.stringContaining("model run") } });
     } finally { running.mockRestore(); }
 
     // This project root has no EULA consent or agent jar. Real prerequisite checks
-    // end both requests before starting Minecraft or authorizing a provider call.
-    for (const [strategy, model] of [["deterministic", null], ["terra", "gpt-6.1-terra"]] as const) {
-      const accepted = await post("/start", { ...start, strategy });
-      expect(accepted.status).toBe(202);
-      const selected = { goal: "diamond", strategy, model, strategyOutcome: null, run: null, won: null };
-      expect(await accepted.json()).toMatchObject({ ...selected, phase: "starting" });
-      const deadline = performance.now() + 1000;
-      let final: { phase?: string };
-      do {
-        final = await (await get()).json() as { phase?: string };
-        if (final.phase !== "ended") await Bun.sleep(10);
-      } while (final.phase !== "ended" && performance.now() < deadline);
-      expect(final).toMatchObject({ ...selected, phase: "ended" });
-    }
+    // end these requests before starting Minecraft or authorizing a provider call.
+    const catalog = f.owners.auth.snapshot();
+    const discovered = ["fixture-strategy-a", "fixture-strategy-b"].map(id => ({
+      id, name: id, provider: "openai-codex", context_window: 100_000,
+    }));
+    const snapshot = spyOn(f.owners.auth, "snapshot").mockReturnValue({
+      ...catalog, authenticated: true, status: "ready", provider: "openai-codex", models: discovered,
+    });
+    const inference = spyOn(f.owners.auth, "createInferenceSession");
+    try {
+      for (const modelId of [null, "fixture-strategy-a", "fixture-strategy-b"]) {
+        const strategy = modelId ? "model" : "deterministic";
+        snapshot.mockClear();
+        const model = modelId ? { provider: "openai-codex", modelId } : undefined;
+        const accepted = await post("/start", { ...start, strategy, ...(model ? { model } : {}) });
+        expect(accepted.status).toBe(202);
+        if (!modelId) expect(snapshot).not.toHaveBeenCalled();
+        const selected = { goal: "diamond", strategy, model: modelId ? `openai-codex/${modelId}` : null,
+          strategyOutcome: null, run: null, won: null };
+        expect(await accepted.json()).toMatchObject({ ...selected, phase: "starting" });
+        const deadline = performance.now() + 1000;
+        let final: { phase?: string };
+        do {
+          final = await (await get()).json() as { phase?: string };
+          if (final.phase !== "ended") await Bun.sleep(10);
+        } while (final.phase !== "ended" && performance.now() < deadline);
+        expect(final).toMatchObject({ ...selected, phase: "ended" });
+      }
+      expect(inference).not.toHaveBeenCalled();
+    } finally { snapshot.mockRestore(); inference.mockRestore(); }
   } finally {
     minecraftInitialize.mockRestore();
     try { if (app) await app.close(); else await f.closeUntransferred(); } finally { f.removeDirectory(); }

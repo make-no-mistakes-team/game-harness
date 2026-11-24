@@ -40,7 +40,7 @@ type BrakeSettlement = { vetoTick: number; first: BrakeProgress; last: BrakeProg
 type BrakeWitness = { settlement: BrakeSettlement; status: Pick<MacroStatus,
   "requests" | "providerDispatches" | "issuedWorkOrders" | "issued" |
   "completedWorkOrders" | "completedWorkPrograms" | "lastWorkOrder"> | null };
-const { start: [brakeX, brakeY, brakeZ], terrain: { gap: { z: [lip] } } } = terrainFixtures["brake-terra"];
+const { start: [brakeX, brakeY, brakeZ], terrain: { gap: { z: [lip] } } } = terrainFixtures["brake-model"];
 const MIN_APPROACH = 2;
 const NEUTRAL_TICKS = 20;
 const BODY_RADIUS = 0.30;
@@ -137,14 +137,14 @@ function parseMovement(text: string) {
 }
 
 async function proveBrake(directory: string, progress: unknown, witness: BrakeWitness | undefined) {
-  const failed = (reason: string) => ({ verified: false, reason, diagnostic: "brake-terra" as const });
+  const failed = (reason: string) => ({ verified: false, reason, diagnostic: "brake-model" as const });
   if (!witness) return failed("No pre-shutdown braking and neutral-stop witness.");
   const { settlement: { vetoTick, first, last }, status } = witness;
   const work = status?.lastWorkOrder;
   if (!status || status.requests !== 1 || status.providerDispatches !== 1 || status.issuedWorkOrders !== 1 ||
       status.issued !== 0 || status.completedWorkOrders !== 0 || status.completedWorkPrograms !== 0 ||
       !work?.requestId || !work.accepted || !work.terminal)
-    return failed("Missing one admitted Terra request and one settled native stock order without completion.");
+    return failed("Missing one admitted Model request and one settled native stock order without completion.");
   try {
     const read = (file: string) => readFile(path.join(directory, file), "utf8");
     const [saved, eventText, moves, breaks, drive, workText] = await Promise.all([
@@ -231,7 +231,7 @@ async function proveBrake(directory: string, progress: unknown, witness: BrakeWi
         !steps.every(p => p.tick < veto.tick || p.grounded && (p.tick < first.tick || sameStance(first, p))))
       return failed("The trace did not show a stable neutral stop through clean closure.");
     return { verified: true, reason: "The live stock order approached the gap, then braked and stayed on the near bank.",
-      diagnostic: "brake-terra" as const, orderId: order.id, accepted, issued, launch, edge, onset, atOnset, veto,
+      diagnostic: "brake-model" as const, orderId: order.id, accepted, issued, launch, edge, onset, atOnset, veto,
       neutral: { first, last, final }, terminal };
   } catch {
     return failed("Gap-stop artifacts were missing or unreadable.");
@@ -294,7 +294,7 @@ async function proveWade(directory: string, events: Event[], steps: Movement[], 
   const { accepted, terminal: receipt } = work ?? {};
   if (!accepted || !receipt || receipt.status !== "completed")
     return { verified: false, reason: "Missing the single completed native stock order." };
-  const { start: [sx, sy, sz], terrain: { channelZ } } = terrainFixtures["wade-terra"];
+  const { start: [sx, sy, sz], terrain: { channelZ } } = terrainFixtures["wade-model"];
   const records = (await readFile(path.join(directory, "macro/receipts.jsonl"), "utf8")).trimEnd().split("\n")
     .map(line => workEvidence.parse(JSON.parse(line)));
   const finalOrder = parseMacroWorkOrder(records[0]?.order);
@@ -348,9 +348,9 @@ async function verifyWadeStock(statsDirectory: string, progress: unknown) {
 /** Verify the incident, not just the ordinary goal. All observations stay outside the actor. */
 export async function verifyTerrain(directory: string, variant: TerrainVariant, progress: unknown, work?: WadeWork,
     brake?: BrakeWitness) {
-  if (variant === "brake-terra") return proveBrake(directory, progress, brake);
+  if (variant === "brake-model") return proveBrake(directory, progress, brake);
   const stats = path.join(directory, "server/world/stats");
-  const goal = variant === "wade-terra" ? await verifyWadeStock(stats, progress) :
+  const goal = variant === "wade-model" ? await verifyWadeStock(stats, progress) :
     await verifySurvival(stats, terrainFixtures[variant].goal, progress);
   const failed = (reason: string) => ({ verified: false, reason, diagnostic: variant, goal });
   if (!goal.verified) return failed(goal.reason);
@@ -366,7 +366,7 @@ export async function verifyTerrain(directory: string, variant: TerrainVariant, 
     if (!events.length || events.some(p => !p.alive || p.health !== 20))
       return failed("Missing damage-free event history.");
     return { diagnostic: variant, goal,
-      ...(variant === "wade-terra" ? await proveWade(directory, events, steps, breaks, work) :
+      ...(variant === "wade-model" ? await proveWade(directory, events, steps, breaks, work) :
         variant === "birch" ? proveBirch(events, steps, breaks) : proveCeiling(events, steps, breaks)) };
   } catch {
     return failed("Terrain proof artifacts were missing or unreadable.");

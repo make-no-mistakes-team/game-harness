@@ -39,11 +39,11 @@ export function preparedStockReady(footing: PreparedStockFooting) {
 
 export function filterPreparedStockProposal(action: MacroProposal["action"], view: MacroObservation) {
   if (action.kind === "abstain")
-    return { disposition: "abstained", reason: "Terra abstained; no stock order was attempted." } as const;
+    return { disposition: "abstained", reason: "Model abstained; no stock order was attempted." } as const;
   if (action.kind === "gap" && !action.reviewPatch)
-    return { disposition: "reported_gap", reason: "Terra reported a gap; no stock order was attempted." } as const;
+    return { disposition: "reported_gap", reason: "Model reported a gap; no stock order was attempted." } as const;
   if (action.kind === "opportunity" && view.opportunities.some(offer => offer.id === action.opportunityId && offer.risk === "read"))
-    return { disposition: "read_only", reason: "Terra chose a read-only observation; this diagnostic issues no read intent." } as const;
+    return { disposition: "read_only", reason: "Model chose a read-only observation; this diagnostic issues no read intent." } as const;
   const refuse = (reason: string) => ({ disposition: "prepared_stock_refused", reason } as const);
   if (action.kind !== "work" || action.openingViewId || action.afterWorkId || action.duringWaitFor || action.duringWait)
     return refuse("Choose one live stock work order, without a camera opening, successor, or contingent work.");

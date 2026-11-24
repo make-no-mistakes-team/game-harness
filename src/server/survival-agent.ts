@@ -7,10 +7,10 @@ import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { requestOperatorStop } from "../../survival-agent/operator-stop.ts";
-import { hasConfirmedTerraEffect, SURVIVAL_AGENT_STRATEGY_OUTCOMES, TERRA_MODEL_ID,
+import { hasConfirmedModelEffect, survivalModelIdentity, SURVIVAL_AGENT_STRATEGY_OUTCOMES,
   type SurvivalAgentGoal, type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../shared/survival-agent-ui.ts";
 import { prepareAgentServerArtifact } from "./minecraft-server-artifact.ts";
-import { TERRA_ACTOR_REBUILD } from "./survival-agent-artifact.ts";
+import { MODEL_ACTOR_REBUILD } from "./survival-agent-artifact.ts";
 import { AgentVideo, type AgentDisplay } from "./survival-agent-video.ts";
 
 const SYSTEM_PATH = "/usr/bin:/bin";
@@ -98,9 +98,9 @@ function agentVitals(view: SurvivalAgentSnapshot, progress: Record<string, unkno
   view.status = /^[a-zA-Z0-9_:()'.,;!? -]{1,180}$/.test(activity) ? activity : "Playing Survival.";
 }
 
-function terraOutcome(outcome: Record<string, unknown>): SurvivalAgentSnapshot["strategyOutcome"] {
+function modelOutcome(outcome: Record<string, unknown>): SurvivalAgentSnapshot["strategyOutcome"] {
   const strategy = outcome.strategy as Record<string, unknown> | null | undefined;
-  if (strategy?.strategy !== "terra" || strategy.model !== TERRA_MODEL_ID) return null;
+  if (strategy?.strategy !== "model" || (typeof strategy.model !== "string" || !strategy.model.includes("/"))) return null;
   const status = SURVIVAL_AGENT_STRATEGY_OUTCOMES.find(value => value === strategy.outcome);
   if (status === "strategy_applied" || status === "no_advice_applied") {
     if (strategy.control !== "local") return null;
@@ -111,16 +111,20 @@ function terraOutcome(outcome: Record<string, unknown>): SurvivalAgentSnapshot["
         counters.providerDispatches >= counters.applied)) return null;
   }
   if (status === "native_effect_completed" &&
-      (strategy.control === "local" || strategy.admission !== "admitted" || !hasConfirmedTerraEffect(strategy.status)))
+      (strategy.control === "local" || strategy.admission !== "admitted" || !hasConfirmedModelEffect(strategy.status)))
     return null;
   return status ?? null;
 }
 
 /** Vanilla goal proof and a model's contribution are different results. */
-export function projectSurvivalResult(outcome: Record<string, unknown>, requested: SurvivalAgentStart["strategy"], exitCode: number | null) {
-  const strategyOutcome = requested === "terra" ? terraOutcome(outcome) : null;
+export function projectSurvivalResult(outcome: Record<string, unknown>, requested: SurvivalAgentStart["strategy"],
+    exitCode: number | null, selectedModel: string | null) {
+  const recorded = outcome.strategy as { model?: unknown } | null;
+  if (requested === "model" && (!selectedModel || recorded?.model !== selectedModel))
+    return { strategyOutcome: null, won: false, local: false };
+  const strategyOutcome = requested === "model" ? modelOutcome(outcome) : null;
   const strategy = outcome.strategy as { strategy?: unknown; control?: unknown; model?: unknown } | null;
-  const local = strategy?.control === "local" && strategy.strategy === "terra" && strategy.model === TERRA_MODEL_ID;
+  const local = strategy?.control === "local" && strategy.strategy === "model" && typeof strategy.model === "string" && strategy.model.includes("/");
   const won = exitCode === 0 && outcome.status === "won" && (outcome.verification as { verified?: unknown } | null)?.verified === true &&
     (requested === "deterministic" || local || strategyOutcome === "native_effect_completed");
   return { strategyOutcome, won, local };
@@ -143,7 +147,7 @@ function outcomeStatus(outcome: Record<string, unknown>) {
     case "recorder_exit": return "The screen recorder exited unexpectedly. Check FFmpeg with x11grab and libx264.";
     case "unverified": return "The agent’s goal could not be verified.";
     default:
-      if (outcome.reason === TERRA_ACTOR_REBUILD) return TERRA_ACTOR_REBUILD;
+      if (outcome.reason === MODEL_ACTOR_REBUILD) return MODEL_ACTOR_REBUILD;
       if (outcome.reason === "The official Launcher Minecraft session is unavailable. Sign in and launch Minecraft 1.21.4 with the official Launcher.")
         return LAUNCHER_REQUIRED;
       if (outcome.finalStage === "client_session_check")
@@ -162,7 +166,7 @@ function startupFailure(line: string) {
     return "A previous agent run did not confirm cleanup. Resolve that local run before starting another.";
   if (line.startsWith("Insufficient storage:"))
     return "There is not enough disk space for a new agent run. Free space and try again.";
-  if (line === TERRA_ACTOR_REBUILD) return TERRA_ACTOR_REBUILD;
+  if (line === MODEL_ACTOR_REBUILD) return MODEL_ACTOR_REBUILD;
   if (line === "Existing explicit Minecraft 1.21.4 EULA consent is required.") return EULA_REQUIRED;
   if (line.startsWith("xvfb-run: error:") || line.startsWith("Run this command under xvfb-run"))
     return "The isolated Minecraft display could not start. Check Xvfb and xauth.";
@@ -188,13 +192,20 @@ export class SurvivalAgent {
     return { ...attempt.view, elapsedMs: Math.round(performance.now() - attempt.began) };
   }
 
-  start({ goal, strategy }: SurvivalAgentStart): SurvivalAgentSnapshot {
+  start({ goal, strategy, model }: SurvivalAgentStart): SurvivalAgentSnapshot {
     if (this.closed) throw new AgentRequestFault(503, "unavailable", "Minecraft Survival Agent is shutting down.");
     if (this.active) throw new AgentRequestFault(409, "busy", "Stop the current agent run first.");
+    let identity: string | null = null;
+    if (strategy === "model") {
+      try { identity = survivalModelIdentity(model!); }
+      catch { throw new AgentRequestFault(400, "model_required", "Select a configured model before starting model strategy."); }
+    } else if (model !== undefined) {
+      throw new AgentRequestFault(400, "unexpected_model", "Model-free play does not accept a model selection.");
+    }
     this.assertOrdinaryLaneAvailable();
     const attempt: Attempt = {
-      goal, strategy, began: performance.now(), stop: new AbortController(), done: Promise.resolve(),
-      view: { ...IDLE, goal, strategy, model: strategy === "terra" ? TERRA_MODEL_ID : null,
+      goal, strategy, ...(model ? { model: { ...model } } : {}), began: performance.now(), stop: new AbortController(), done: Promise.resolve(),
+      view: { ...IDLE, goal, strategy, model: identity,
         phase: "starting", status: "Checking Minecraft prerequisites." },
       display: null, video: new AgentVideo(),
     };
@@ -257,7 +268,7 @@ export class SurvivalAgent {
     if (!consents.some((consent) => consent?.eulaAccepted === true && consent.minecraftVersion === "1.21.4" &&
         consent.eulaUrl === "https://www.minecraft.net/en-us/eula")) throw new AgentLaunchFault(EULA_REQUIRED);
     if (!await isReadable(path.join(this.root, "survival-agent/build/libs/survival-agent-1.0.jar")))
-      throw new AgentLaunchFault(attempt.strategy === "terra" ? TERRA_ACTOR_REBUILD :
+      throw new AgentLaunchFault(attempt.strategy === "model" ? MODEL_ACTOR_REBUILD :
         "Build GameHarness with bun run build to install the Minecraft Survival Agent mod, then try again.");
     const version = path.join(homedir(), ".minecraft/versions/1.21.4/1.21.4");
     if (!await isReadable(`${version}.jar`) || !await isReadable(`${version}.json`))
@@ -302,13 +313,13 @@ export class SurvivalAgent {
 
   private async run(attempt: Attempt, tools: { wrapper: string; xvfb: string; ffmpeg: string }, authority: string) {
     const command = [process.execPath, path.join(this.root, "survival-agent/run.ts")];
-    if (attempt.strategy === "terra") command.push("--strategy", "terra");
+    if (attempt.strategy === "model") command.push("--strategy", "model", "--model", survivalModelIdentity(attempt.model!));
     command.push(attempt.goal, String(LIMIT_SECONDS[attempt.goal]));
     const env: NodeJS.ProcessEnv = { PATH: SYSTEM_PATH, GAMEHARNESS_DATA_DIR: this.dataDir };
     for (const key of ["HOME", "LANG", "JAVA_HOME", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
       "http_proxy", "https_proxy", "no_proxy", "ALL_PROXY", "all_proxy"])
       if (process.env[key] !== undefined) env[key] = process.env[key];
-    if (attempt.strategy === "terra") {
+    if (attempt.strategy === "model") {
       for (const key of ["NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"])
         if (process.env[key] !== undefined) env[key] = process.env[key];
     }
@@ -385,14 +396,14 @@ export class SurvivalAgent {
       agentVitals(attempt.view, await readJson(path.join(run, "progress.json")));
       const outcome = await readJson(path.join(run, "outcome.json"));
       if (outcome?.schemaVersion === 1 && outcome.goal === attempt.goal && typeof outcome.status === "string") {
-        const { strategyOutcome, won, local } = projectSurvivalResult(outcome, attempt.strategy, exit.code);
+        const { strategyOutcome, won, local } = projectSurvivalResult(outcome, attempt.strategy, exit.code, attempt.view.model);
         attempt.view.strategyOutcome = strategyOutcome;
         attempt.view.won = won;
         if (outcome.finalStage === "macro_startup" && strategyOutcome === "provider_unavailable")
-          return `Could not start Terra. Check OpenAI connection in Settings and make sure your account offers ${TERRA_MODEL_ID}.`;
-        if (attempt.strategy === "terra" && !local && strategyOutcome !== "native_effect_completed" &&
+          return `Could not start model strategy. Check the connected account and selected model ${attempt.view.model}.`;
+        if (attempt.strategy === "model" && !local && strategyOutcome !== "native_effect_completed" &&
             (outcome.benchmark as { confirmed?: unknown } | null)?.confirmed === true)
-          return "The vanilla goal was verified, but no Terra action was confirmed.";
+          return "The vanilla goal was verified, but no Model action was confirmed.";
         return outcome.status === "won" && !attempt.view.won ? "The agent’s goal could not be verified." : outcomeStatus(outcome);
       }
     }

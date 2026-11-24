@@ -1459,8 +1459,8 @@ final class AgentMacroControl {
         sampleClock();
         witnessStationPlacement();
         if (action != null && action.recon != null) {
-            claim("terra");
-            state("terra_in_progress", action.offer.summary);
+            claim("model");
+            state("model_in_progress", action.offer.summary);
             advanceVisualRecon(progress);
             return;
         }
@@ -1485,9 +1485,9 @@ final class AgentMacroControl {
         if (action != null) {
             observePurposefulMotion();
             boolean local = action.intent == null;
-            claim(local ? "local_motion" : "terra");
+            claim(local ? "local_motion" : "model");
             if (local) ++fallbackTicks;
-            state(local ? "local_in_progress" : "terra_in_progress", action.offer.summary);
+            state(local ? "local_in_progress" : "model_in_progress", action.offer.summary);
             int maxTicks = action.offer.scout != null ? action.offer.scout.rise != null
                 ? AgentSurfaceTread.ORDINARY_GRADE_TICKS + 6 : GROUND_SCOUT_TICKS
                 : STARTUP_OUTLOOK.equals(action.offer.key.activity) ? STARTUP_OUTLOOK_TICKS
@@ -1521,7 +1521,7 @@ final class AgentMacroControl {
             }
         }
         boolean barrier = handoffCurrent(input.handoff);
-        claim(pending || barrier ? "local_handoff" : trial ? "trial_idle" : "terra_idle");
+        claim(pending || barrier ? "local_handoff" : trial ? "trial_idle" : "model_idle");
         // No ordinary Hands job is advanced outside its action/safety authority.
         if (hands.busy()) hands.cancel();
         if (barrier && !pending) {
@@ -1546,7 +1546,7 @@ final class AgentMacroControl {
                 ? "Collection requires a fresh, direct instruction for the exact pending ticket."
             : SURFACE_CAP.equals(offer.key.activity) && intent.skillHash != null ? "A generated skill cannot cut cover."
             : (offer.route != null || offer.drySurvey != null) && intent.skillHash != null
-                ? "Only a direct Terra intent may survey or follow this dry route."
+                ? "Only a direct model intent may survey or follow this dry route."
             : !trial && intent.skillHash != null && offer.key.verb == Verb.APPROACH
                 ? "Reusable skills cannot approach while incidental pickup remains possible."
             : offer.scout == null && offer.recon == null ? validate(offer, progress) : null;
@@ -1585,7 +1585,7 @@ final class AgentMacroControl {
         }
         markConsumed(intent.id);
         firstOutlookPending = false;
-        owner = "terra";
+        owner = "model";
         if (offer.route != null || offer.drySurvey != null) routeOwner = progress;
         action = new Action(intent, offer, client, tick, now, body.renderedFrame(),
             offer.item == null ? 0 : count(offer.item), NO_ANCHORS, Float.NaN);
@@ -1633,7 +1633,7 @@ final class AgentMacroControl {
             }
         }
         receipt(intent, "accepted", "Current local evidence and controls rechecked.");
-        state("terra_in_progress", offer.summary);
+        state("model_in_progress", offer.summary);
         step(progress);
     }
 
@@ -1641,7 +1641,7 @@ final class AgentMacroControl {
         if (action.horizonTravel != null) {
             if (!action.purposefulMotion && action.horizonTravel.moved()) {
                 action.purposefulMotion = true;
-                purposeful("terra: " + action.offer.summary);
+                purposeful("model: " + action.offer.summary);
             }
             return;
         }
@@ -1655,7 +1655,7 @@ final class AgentMacroControl {
         } else return;
         if (witnessed) {
             action.purposefulMotion = true;
-            purposeful((action.intent == null ? "local_motion: " : "terra: ") + action.offer.summary);
+            purposeful((action.intent == null ? "local_motion: " : "model: ") + action.offer.summary);
         }
     }
 
@@ -1697,7 +1697,7 @@ final class AgentMacroControl {
         if (offer.key.verb == Verb.RECON) {
             if (!AgentVisualRecon.grants(intent.recon, offer.key.activity, usedReconCandidate,
                     intent.skillHash == null && !trial && ipc.workMode != null))
-                return "The witnessed candidate requires one unused, explicitly bounded Terra recon grant.";
+                return "The witnessed candidate requires one unused, explicitly bounded model recon grant.";
         } else if (intent.recon != null) return "Recon bounds do not authorize a different opportunity.";
         return null;
     }
@@ -1713,7 +1713,7 @@ final class AgentMacroControl {
         owner = actualOwner;
         owned = true;
         if (!actualOwner.equals("work_order")
-                && (action == null || action.offer.key.verb != Verb.BREAK || !actualOwner.equals("terra"))) body.pauseWork();
+                && (action == null || action.offer.key.verb != Verb.BREAK || !actualOwner.equals("model"))) body.pauseWork();
     }
 
     private static boolean sameWorkGrant(AgentWorkOrder previous, AgentWorkOrder next) {
@@ -7558,10 +7558,10 @@ final class AgentMacroControl {
         Vec3d from = client.player.getPos();
         var current = offers(progress);
         // A pinned route needs the same settled source and current view until
-        // Terra chooses it. An unrelated local walk would discard that work.
+        // the model chooses it. An unrelated local walk would discard that work.
         if (routeOffer != null && offeredOnPlanningBasis(routeOffer)
                 || drySurveyOffer != null && offeredOnPlanningBasis(drySurveyOffer)) {
-            localHoldReason = "A witnessed dry lane is awaiting Terra; no new local action can preserve its source and view.";
+            localHoldReason = "A witnessed dry lane is awaiting the model; no new local action can preserve its source and view.";
             return null;
         }
         Offer[] anchors = visibleAnchors(current);
@@ -8369,7 +8369,7 @@ final class AgentMacroControl {
             continuityWork = AgentPauseEpisodes.Work.ROUTE;
             if (!action.purposefulMotion && recon.travel() >= AgentVisualRecon.MIN_PROGRESS) {
                 action.purposefulMotion = true;
-                purposeful("terra: " + action.offer.summary);
+                purposeful("model: " + action.offer.summary);
             }
         }
         boolean posture = reconMotionCurrent() && (leg.grade()
@@ -8662,7 +8662,7 @@ final class AgentMacroControl {
                     action.scoutStoppedFrame = body.renderedFrame();
                     if (!action.purposefulMotion) {
                         action.purposefulMotion = true;
-                        purposeful("terra: " + action.offer.summary);
+                        purposeful("model: " + action.offer.summary);
                     }
                 }
             }
@@ -8688,7 +8688,7 @@ final class AgentMacroControl {
                 body.pauseWork();
                 continuityWork = AgentPauseEpisodes.Work.ROUTE;
                 action.purposefulMotion = true;
-                purposeful("terra: " + action.offer.summary);
+                purposeful("model: " + action.offer.summary);
             } else if (!player.isSneaking()) {
                 completeGroundScout("Shifted on the same dry support and rendered a fresh view from the new stance. No new route or stock was proved.");
             }
@@ -8719,7 +8719,7 @@ final class AgentMacroControl {
             continuityWork = AgentPauseEpisodes.Work.ROUTE;
             if (!action.purposefulMotion) {
                 action.purposefulMotion = true;
-                purposeful("terra: " + action.offer.summary);
+                purposeful("model: " + action.offer.summary);
             }
         }
         if (player.isOnGround() && feet.y < landing.source().getY() - 0.055) {
@@ -8931,7 +8931,7 @@ final class AgentMacroControl {
     }
 
     private float advancingCrack() {
-        if (action == null || !(action.durable || "terra".equals(owner) && action.intent != null)
+        if (action == null || !(action.durable || "model".equals(owner) && action.intent != null)
                 || action.offer.key.verb != Verb.BREAK
                 || !action.fired || action.broken || !client.options.attackKey.isPressed()
                 || !client.interactionManager.isBreakingBlock() || !hazardClear || urgent) return 0;
@@ -8986,7 +8986,7 @@ final class AgentMacroControl {
                 || action.offer.drop != null && (keys.backKey.isPressed() || keys.leftKey.isPressed() || keys.rightKey.isPressed())
                 || action.drove && (!action.durable || action.offer.key.verb == Verb.APPROACH);
         }
-        if (action != null && action.offer.key.verb == Verb.BREAK && (action.durable || owner.equals("terra")))
+        if (action != null && action.offer.key.verb == Verb.BREAK && (action.durable || owner.equals("model")))
             action.fired |= client.options.attackKey.isPressed();
         if (action != null && action.offer.scout != null && action.offer.scout.rise != null)
             action.fired |= client.options.jumpKey.isPressed() && client.options.forwardKey.isPressed();
@@ -9027,7 +9027,7 @@ final class AgentMacroControl {
             releasedSurvey = idle && body.hasRecentView() && body.renderedFrame() > surveyReleaseFrame;
             // The camera receipt is not a new view. Keep waiting while the
             // same safe owner has only a stale image; publish lost safety/ownership normally.
-            if (!releasedSurvey && (idle || "terra".equals(owner) && action == null
+            if (!releasedSurvey && (idle || "model".equals(owner) && action == null
                     && visited && hazardClear && !urgent && grounded() && stationaryWorldControls())) return;
             surveyReleaseFrame = -1;
         }
@@ -9059,7 +9059,7 @@ final class AgentMacroControl {
     }
 
     private boolean idlePublicationPremise() {
-        return owned && "terra_idle".equals(owner) && !rawWorking && neutralWorkView();
+        return owned && "model_idle".equals(owner) && !rawWorking && neutralWorkView();
     }
 
     private boolean neutralWorkView() {
@@ -10753,7 +10753,7 @@ final class AgentMacroControl {
         // An unvisited idle publication can itself explain why a survey disappeared.
         boolean trackSurvey = progress != null && !trial && surveyEvidence.enabled()
             && action == null && !hasActiveWorkOrder() && !rawWorking && !hands.busy() && !hands.holdsWorkInventory()
-            && (!visited || "terra_idle".equals(owner));
+            && (!visited || "model_idle".equals(owner));
         int publishedSurveys = 0;
         for (Offer offer : visible) {
             JsonObject entry = new JsonObject();
@@ -11064,7 +11064,7 @@ final class AgentMacroControl {
             body.pauseWork();
             if (pendingEntry() != null) requireFreshParkedView();
         }
-        if (action.offer.key.verb == Verb.BREAK && (owner.equals("terra") || action.durable)
+        if (action.offer.key.verb == Verb.BREAK && (owner.equals("model") || action.durable)
                 && !owner.equals("safety")) body.pauseWork();
         if (action.offer.key.verb == Verb.SURVEY && !owner.equals("safety")) {
             body.pauseWork();

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import type { AssistantMessage, Context, ImageContent, RawSseEvent, Tool } from "@oh-my-pi/pi-ai";
-import { SURVIVAL_AGENT_GOALS, TERRA_MODEL_ID } from "../../shared/survival-agent-ui.ts";
+import { SURVIVAL_AGENT_GOALS, survivalModelIdentity, type SurvivalModelSelection } from "../../shared/survival-agent-ui.ts";
 import type { AuthManager } from "../auth.ts";
 import type { SelectedAccountInferenceSession } from "../auth-session.ts";
 import { osMonotonicNs } from "../os-monotonic.ts";
@@ -270,48 +270,49 @@ function preparedStockTool(observation: MacroRequest["observation"]): Tool {
 
 const PREPARED_STOCK_PROMPT = `Use the supplied tool once. The live travelHint is evidence of a short checked approach toward the visible ore, not a route or proof that it is safe to reach or mine. When safe near-term progress is supported, use one ordinary stock work order; the native player rechecks support and clearance as it goes. Honor the user's stopping condition. Use the exact stock, effect and limits in the tool: costCaps is [], and reserves holds one iron pickaxe. The ore break is permitted only if ordinary native checks admit it from a safe stance; the work order does not permit excavation, bridging, jumping a gap, or any other effect. If no useful safe start is supported, abstain or state the observed gap. A read choice records your preference and does not issue input. Set expiresTick to an absolute tick after basis.tick, at most basis.tick + maxIntentTtlTicks, with enough time for a safe approach and rechecks.`;
 
-interface TerraProviderMoment {
+interface ModelProviderMoment {
   readonly monotonicMs: number;
   readonly wallMs: number;
   readonly osNs: bigint;
 }
 
-interface TerraProviderTerminal {
+interface ModelProviderTerminal {
   readonly providerTerminalMonotonicMs: number;
   readonly providerTerminalWallMs: number;
   readonly providerTerminalOsNs?: bigint;
 }
 
-interface TerraAuthority {
-  readonly strategy: "terra";
+interface ModelAuthority {
+  readonly strategy: "model";
+  readonly model: SurvivalModelSelection;
   readonly authDirectory: string;
   readonly runId: string;
   readonly signal: AbortSignal;
   readonly requestTimeoutMs: number;
 }
 
-export interface TerraOptions extends TerraAuthority {
+export interface ModelStrategistOptions extends ModelAuthority {
   readonly preparedStock?: PreparedStockFooting;
   readonly assertDispatch?: (basis: MacroBasis, lookaheadBasis?: MacroRequest["observation"],
     workBasis?: MacroRequest["observation"], correctionBasis?: MacroRequest["observation"]) => boolean | void | Promise<boolean | void>;
-  readonly onProviderDispatch?: (event: TerraProviderMoment & { readonly basis: MacroBasis }) => void;
-  readonly onProviderSettled?: (event: TerraProviderMoment & Partial<TerraProviderTerminal> & {
+  readonly onProviderDispatch?: (event: ModelProviderMoment & { readonly basis: MacroBasis }) => void;
+  readonly onProviderSettled?: (event: ModelProviderMoment & Partial<ModelProviderTerminal> & {
     readonly basis: MacroBasis;
     readonly outcome: MacroInference["outcome"];
   }) => void;
   readonly assertFirstPlanDispatch?: () => boolean | Promise<boolean>;
-  readonly onFirstPlanDispatch?: (event: TerraProviderMoment) => void;
-  readonly onFirstPlanSettled?: (event: TerraProviderMoment & Partial<TerraProviderTerminal>) => void;
+  readonly onFirstPlanDispatch?: (event: ModelProviderMoment) => void;
+  readonly onFirstPlanSettled?: (event: ModelProviderMoment & Partial<ModelProviderTerminal>) => void;
 }
 
-export interface TerraStrategist {
+export interface ModelStrategist {
   readonly infer: MacroStrategist;
   readonly firstPlan: FirstPlanStrategist;
   readonly authoritySignal: AbortSignal;
   close(): Promise<void>;
 }
 
-function providerMoment(): TerraProviderMoment {
+function providerMoment(): ModelProviderMoment {
   return { monotonicMs: performance.now(), wallMs: Date.now(), osNs: osMonotonicNs() };
 }
 
@@ -382,7 +383,7 @@ function visualTool(request: MacroRequest, basis: MacroBasis, image?: ImageConte
     { nomination: { captureId: binding.captureId, imageSha256: exact.sha256 }, reconId };
 }
 
-export function terraPlanContext(request: MacroRequest, basis: MacroBasis, image?: ImageContent,
+export function modelPlanContext(request: MacroRequest, basis: MacroBasis, image?: ImageContent,
     preparedStock?: PreparedStockFooting): Context | undefined {
   return buildPlanContext(request, basis, image, preparedStock, preparedStock ? undefined : visualTool(request, basis, image));
 }
@@ -625,7 +626,7 @@ function proposalFor(raw: string | undefined, request: MacroRequest, basis: Macr
 type Exchange<T> = Omit<FirstPlanInference, "stage" | "proposal"> & { readonly proposal: T | null };
 
 async function exchange<T extends object>(
-  session: SelectedAccountInferenceSession, options: Pick<TerraAuthority, "requestTimeoutMs">,
+  session: SelectedAccountInferenceSession, options: Pick<ModelAuthority, "requestTimeoutMs">,
   context: Context, scope: AbortSignal, started: number,
   decode: (raw: string | undefined) => T | MacroReplyRejection | null, checkDispatch?: () => boolean | void | Promise<boolean | void>,
   onDispatch?: (startedAtMs: number) => void, markTerminal?: () => void,
@@ -639,7 +640,7 @@ async function exchange<T extends object>(
   let payloadHasExactImage = false;
   let usage: MacroInference["usage"] = null;
   const finish = (outcome: MacroInference["outcome"], proposal: T | null = null, invalidReply?: MacroReplyRejection): Exchange<T> => ({
-    proposal, model: TERRA_MODEL_ID, usage, costUsd: null, outcome, dispatched,
+    proposal, model: survivalModelIdentity({ provider: session.model.provider, modelId: session.model.id }), usage, costUsd: null, outcome, dispatched,
     latencyMs: performance.now() - started, providerStartedAtMs,
     ...(invalidReply !== undefined ? { invalidReply } : {}),
     ...(observationRotating && !dispatched ? { observationRotating: true } : {}),
@@ -657,7 +658,7 @@ async function exchange<T extends object>(
       reasoning: session.thinkingLevel, hideThinkingSummary: true, toolChoice: "required", cacheRetention: "none",
       fetch: async (input, init) => {
         signal.throwIfAborted();
-        if (preflightStale) throw new Error("The Terra request is no longer eligible to dispatch.");
+        if (preflightStale) throw new Error("The Model request is no longer eligible to dispatch.");
         if (exactImage && !payloadHasExactImage) throw new Error("The request did not retain its exact admitted image.");
         let eligible;
         try {
@@ -671,7 +672,7 @@ async function exchange<T extends object>(
         }
         if (eligible === false) {
           preflightStale = true;
-          throw new Error("The Terra request is no longer eligible to dispatch.");
+          throw new Error("The Model request is no longer eligible to dispatch.");
         }
         signal.throwIfAborted();
         const pending = fetch(input, init);
@@ -689,16 +690,16 @@ async function exchange<T extends object>(
           // The SDK writes the full rejected body (including images) to its
           // default log directory for these HTTP statuses. Keep it private.
           await response.body?.cancel();
-          throw new Error("Codex rejected the admitted Terra request.");
+          throw new Error("Codex rejected the admitted Model request.");
         }
         return response;
       },
       onPayload: payload => {
         const body = record(payload);
         const tool = Array.isArray(body?.tools) && body.tools.length === 1 ? record(body.tools[0]) : undefined;
-        if (body?.model !== TERRA_MODEL_ID || body.tool_choice !== "required" ||
+        if (body?.model !== (session.model.requestModelId ?? session.model.id) || body.tool_choice !== "required" ||
             tool?.name !== toolName || tool.strict !== true)
-          throw new Error("The admitted Terra request must retain its exact model and strict proposal tool.");
+          throw new Error("The admitted Model request must retain its exact model and strict proposal tool.");
         if (exactImage) {
           let imageCount = 0;
           const expected = `data:${exactImage.mimeType};base64,${exactImage.data}`;
@@ -729,7 +730,7 @@ async function exchange<T extends object>(
     if (signal.aborted || message.stopReason === "aborted") return finish("cancelled");
     if (message.stopReason === "error") return finish(dispatched ? "provider_error" : "provider_unavailable");
     if (evidence.refused) return finish("refused");
-    if (!evidence.completed || message.provider !== PROVIDER || message.api !== API || message.model !== TERRA_MODEL_ID)
+    if (!evidence.completed || message.provider !== PROVIDER || message.api !== API || message.model !== session.model.id)
       return finish("invalid");
     const calls = message.content.filter(block => block.type === "toolCall");
     if (message.stopReason !== "toolUse" || calls.length !== 1 || calls[0]?.name !== toolName)
@@ -751,14 +752,14 @@ async function exchange<T extends object>(
 }
 
 async function infer(
-  session: SelectedAccountInferenceSession, options: TerraOptions, request: MacroRequest, caller: AbortSignal,
+  session: SelectedAccountInferenceSession, options: ModelStrategistOptions, request: MacroRequest, caller: AbortSignal,
   markTerminal?: () => void,
 ): Promise<MacroInference> {
   const started = performance.now();
   const { run, life, tick, epoch } = request.observation;
   const basis = { run, life, tick, epoch };
   const finish = (outcome: MacroInference["outcome"]): MacroInference => ({
-    proposal: null, model: TERRA_MODEL_ID, basis, usage: null, costUsd: null, outcome,
+    proposal: null, model: survivalModelIdentity({ provider: session.model.provider, modelId: session.model.id }), basis, usage: null, costUsd: null, outcome,
     dispatched: false, latencyMs: performance.now() - started,
   });
   const scope = AbortSignal.any([caller, session.signal, options.signal]);
@@ -791,19 +792,18 @@ async function infer(
     ...(result.dispatched && visual?.nomination && request.frame?.visualBinding ? { frameVisualBinding: request.frame.visualBinding } : {}) };
 }
 
-function ownTerraSession(auth: AuthManager, signal: AbortSignal) {
+function ownModelSession(auth: AuthManager, selection: SurvivalModelSelection, signal: AbortSignal) {
   let active: Promise<unknown> | undefined;
   const session = auth.createInferenceSession({
-    modelId: TERRA_MODEL_ID,
+    modelId: selection.modelId,
     consumer: {
       revoke: () => { /* AuthManager has already aborted the session signal. */ },
       drain: async () => { await active?.catch(() => {}); },
     },
   });
-  if (session.model.provider !== PROVIDER || session.model.api !== API || session.model.id !== TERRA_MODEL_ID ||
-      (session.model.requestModelId ?? TERRA_MODEL_ID) !== TERRA_MODEL_ID ||
+  if (session.model.provider !== selection.provider || session.model.api !== API || session.model.id !== selection.modelId ||
       session.model.transport === "pi-native" || !session.singleInferenceDispatch || !session.streamFn)
-    throw new Error("The selected GameHarness account did not discover the exact Terra Codex model.");
+    throw new Error("The selected GameHarness account did not discover the selected supported model.");
   const close = () => {
     signal.removeEventListener("abort", cancel);
     return auth.close();
@@ -812,10 +812,10 @@ function ownTerraSession(auth: AuthManager, signal: AbortSignal) {
   signal.addEventListener("abort", cancel, { once: true });
   function single<T extends { readonly dispatched?: boolean }>(
     start: (markTerminal?: () => void) => Promise<T>,
-    settled?: (result: T, terminal?: TerraProviderTerminal) => void,
+    settled?: (result: T, terminal?: ModelProviderTerminal) => void,
   ): Promise<T> {
-    if (active) return Promise.reject(new Error("Terra already has a request in flight for this run."));
-    let terminal: TerraProviderTerminal | undefined;
+    if (active) return Promise.reject(new Error("Model already has a request in flight for this run."));
+    let terminal: ModelProviderTerminal | undefined;
     const markTerminal = settled && (() => {
       if (terminal) return;
       let providerTerminalOsNs: bigint | undefined;
@@ -837,8 +837,8 @@ function ownTerraSession(auth: AuthManager, signal: AbortSignal) {
   return { session, single, close };
 }
 
-function ownStrategist(auth: AuthManager, options: TerraOptions): TerraStrategist {
-  const { session, single, close } = ownTerraSession(auth, options.signal);
+function ownStrategist(auth: AuthManager, options: ModelStrategistOptions): ModelStrategist {
+  const { session, single, close } = ownModelSession(auth, options.model, options.signal);
   let firstPlanAttempted = false;
   return {
     authoritySignal: session.signal,
@@ -854,7 +854,7 @@ function ownStrategist(auth: AuthManager, options: TerraOptions): TerraStrategis
       const outcome = scope.aborted ? "cancelled" : !options.assertFirstPlanDispatch || firstPlanAttempted
         ? "stale" : context ? null : "invalid";
       if (outcome || !context) return Promise.resolve({
-        stage, model: TERRA_MODEL_ID, proposal: null, dispatched: false, outcome: outcome ?? "invalid",
+        stage, model: survivalModelIdentity({ provider: session.model.provider, modelId: session.model.id }), proposal: null, dispatched: false, outcome: outcome ?? "invalid",
         usage: null, costUsd: null, latencyMs: performance.now() - started,
       });
       firstPlanAttempted = true;
@@ -870,20 +870,22 @@ function ownStrategist(auth: AuthManager, options: TerraOptions): TerraStrategis
   };
 }
 
-/** Open only for an explicitly admitted Terra run; neither import nor a deterministic run opens auth. */
-export function openTerraStrategist(options: TerraOptions): Promise<TerraStrategist> {
-  return openAuthorizedTerra(options, ownStrategist);
+/** Open only for an explicitly admitted Model run; neither import nor a deterministic run opens auth. */
+export function openModelStrategist(options: ModelStrategistOptions): Promise<ModelStrategist> {
+  return openAuthorizedModel(options, ownStrategist);
 }
 
-export class TerraOwnerDrainError extends Error {}
+export class ModelOwnerDrainError extends Error {}
 
-async function openAuthorizedTerra<Options extends TerraAuthority, T>(
+async function openAuthorizedModel<Options extends ModelAuthority, T>(
   options: Options, own: (auth: AuthManager, options: Options) => T,
 ): Promise<T> {
-  if (options.strategy !== "terra" || !isAbsolute(options.authDirectory) ||
+  survivalModelIdentity(options.model);
+  if (options.model.provider !== PROVIDER) throw new Error("The configured authentication backend does not support this provider.");
+  if (options.strategy !== "model" || !isAbsolute(options.authDirectory) ||
       !isCount(options.requestTimeoutMs) || options.requestTimeoutMs < 1 || options.requestTimeoutMs > 2_147_483_647)
-    throw new Error("Terra requires explicit run admission, an absolute GameHarness data directory and a finite request timeout.");
-  validateMacroId(options.runId, "Terra run");
+    throw new Error("Model requires explicit run admission, an absolute GameHarness data directory and a finite request timeout.");
+  validateMacroId(options.runId, "Model run");
   options.signal.throwIfAborted();
   const directory = join(options.authDirectory, "auth");
   const [folder, file] = await Promise.all([
@@ -906,17 +908,17 @@ async function openAuthorizedTerra<Options extends TerraAuthority, T>(
     changed = () => {
       const state = auth.snapshot();
       if (state.status === "ready") {
-        ready.resolve(state.authenticated && state.provider === PROVIDER &&
-          state.models.some(model => model.id === TERRA_MODEL_ID && model.provider === PROVIDER));
+        ready.resolve(state.authenticated && state.provider === options.model.provider &&
+          state.models.some(model => model.id === options.model.modelId && model.provider === options.model.provider));
       } else if (state.status !== "discovering") ready.resolve(false);
     };
     if (options.signal.aborted) onAbort();
     else changed();
     if (!(await ready.promise) || options.signal.aborted)
-      throw new Error("The existing GameHarness Codex authorization did not discover gpt-6.1-terra; no substitute is permitted.");
+      throw new Error(`The existing GameHarness authorization did not discover ${survivalModelIdentity(options.model)}; no substitute is permitted.`);
     return own(auth, options);
   } catch (error) {
-    await auth.close().catch(() => { throw new TerraOwnerDrainError("The Terra authorization could not be drained."); });
+    await auth.close().catch(() => { throw new ModelOwnerDrainError("The Model authorization could not be drained."); });
     throw error;
   } finally {
     changed = () => {};
@@ -945,7 +947,7 @@ export function isExpeditionRecoveryText(value: unknown): value is string {
     !/[\x00-\x1f\x7f\uD800-\uDFFF]/u.test(value);
 }
 
-export interface TerraExpeditionDecision {
+export interface ModelExpeditionDecision {
   readonly view: {
     readonly goal: string;
     readonly objective?: string;
@@ -959,8 +961,8 @@ export interface TerraExpeditionDecision {
   };
   readonly image?: ImageContent;
   readonly assertDispatch: () => boolean | Promise<boolean>;
-  readonly onProviderDispatch: (event: TerraProviderMoment) => void;
-  readonly onProviderSettled: (event: TerraProviderMoment & Partial<TerraProviderTerminal>) => void;
+  readonly onProviderDispatch: (event: ModelProviderMoment) => void;
+  readonly onProviderSettled: (event: ModelProviderMoment & Partial<ModelProviderTerminal>) => void;
 }
 
 interface StrategyChoice {
@@ -995,13 +997,13 @@ function decodeStrategy(raw: string | undefined, offered: readonly string[], rec
 }
 
 /** Uses the same selected-account grant as the diagnostic planner, but never its prompts or tools. */
-export function openTerraExpeditionAdvisor(options: TerraAuthority) {
-  return openAuthorizedTerra(options, (auth, authority) => {
-    const { session, single, close } = ownTerraSession(auth, authority.signal);
+export function openModelExpeditionAdvisor(options: ModelAuthority) {
+  return openAuthorizedModel(options, (auth, authority) => {
+    const { session, single, close } = ownModelSession(auth, authority.model, authority.signal);
     const scope = AbortSignal.any([authority.signal, session.signal]);
     return {
       authoritySignal: session.signal,
-      choose(decision: TerraExpeditionDecision) {
+      choose(decision: ModelExpeditionDecision) {
         const started = performance.now();
         const { view, image } = decision;
         const recovery = view.need === EXPEDITION_RECOVERY_NEED;
@@ -1009,7 +1011,7 @@ export function openTerraExpeditionAdvisor(options: TerraAuthority) {
           recovery !== !!view.recovery || (recovery ? image?.mimeType !== "image/jpeg" : !!image) ? "invalid" :
           image && !session.model.input.includes("image") ? "provider_unavailable" : undefined;
         if (unavailable) return Promise.resolve<Exchange<StrategyChoice | RecoveryChoice>>({
-          outcome: unavailable, proposal: null, model: TERRA_MODEL_ID, dispatched: false,
+          outcome: unavailable, proposal: null, model: survivalModelIdentity({ provider: session.model.provider, modelId: session.model.id }), dispatched: false,
           usage: null, costUsd: null, latencyMs: performance.now() - started,
         });
         const offered = view.options.map(({ id }) => id);

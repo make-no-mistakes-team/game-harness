@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
+import { AuthManager } from "../src/server/auth.ts";
 import { composeExpeditionAdvisor } from "../src/server/survival-macro/expedition.ts";
 import { codexLifecycleFrames } from "./helpers/acceptance-loopback-inference.ts";
 
@@ -16,9 +17,35 @@ async function until(check: () => boolean | Promise<boolean>) {
   }
 }
 
-test("ordinary Terra marks its own lane and drains without an authorized account", async () => {
+test("unsupported provider adapters remain unavailable without opening credentials or dispatching", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "expedition-unsupported-provider-"));
+  const auth = spyOn(AuthManager, "create");
+  const fetch = spyOn(globalThis, "fetch");
+  const advisor = composeExpeditionAdvisor({
+    model: { provider: "unsupported-fixture-provider", modelId: "fixture-strategy-b" },
+    dir, goal: "diamond", objective: "", authDirectory: dir, signal: new AbortController().signal,
+    maxRequests: 1, maxRuntimeMs: 3_000, assertDisplay() { throw new Error("No dispatch is admitted"); },
+  });
+  try {
+    await advisor.start();
+    await until(() => advisor.outcome().admission === "unavailable");
+    await advisor.stop();
+    expect(advisor.outcome()).toMatchObject({
+      model: "unsupported-fixture-provider/fixture-strategy-b", outcome: "provider_unavailable", drain: "closed",
+      status: { providerDispatches: 0 },
+    });
+    expect(auth).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  } finally {
+    try { await advisor.stop(); }
+    finally { auth.mockRestore(); fetch.mockRestore(); await rm(dir, { recursive: true, force: true }); }
+  }
+});
+
+test("ordinary Model marks its own lane and drains without an authorized account", async () => {
   const dir = await mkdtemp(join(tmpdir(), "expedition-no-auth-"));
   const advisor = composeExpeditionAdvisor({
+    model: { provider: "openai-codex", modelId: "fixture-strategy-a" },
     dir, goal: "iron_pickaxe", objective: "", authDirectory: join(dir, "absent"), signal: new AbortController().signal,
     maxRequests: 1, maxRuntimeMs: 3_000, assertDisplay() { throw new Error("No dispatch should reach the display"); },
   });
@@ -55,7 +82,7 @@ const token = `local.${Buffer.from(JSON.stringify({
 })).toString("base64url")}.not-a-real-signature`;
 
 async function fixture(assertDisplay: () => void = () => {}, maxRequests = 1,
-    captureRecoveryFrame?: (signal: AbortSignal) => Promise<Buffer>) {
+    captureRecoveryFrame?: (signal: AbortSignal) => Promise<Buffer>, modelId = "fixture-strategy-a") {
   const dir = await mkdtemp(join(tmpdir(), "expedition-auth-"));
   const authDir = join(dir, "auth");
   const db = join(authDir, "gameharness.sqlite");
@@ -77,9 +104,10 @@ async function fixture(assertDisplay: () => void = () => {}, maxRequests = 1,
     const path = new URL(request.url).pathname;
     if (request.method === "GET" && path.endsWith("/models")) {
       await discover.promise;
-      return Response.json({ models: [{ slug: "gpt-6.1-terra", display_name: "GPT-6.1 Terra", context_window: 500_000,
+      return Response.json({ models: ["fixture-strategy-a", "fixture-strategy-b"].map(slug => ({
+        slug, display_name: slug, context_window: 500_000,
         default_reasoning_level: "medium", supported_reasoning_levels: [{ effort: "medium" }],
-        input_modalities: ["text", "image"], prefer_websockets: false }] });
+        input_modalities: ["text", "image"], prefer_websockets: false })) });
     }
     if (request.method !== "POST" || !path.endsWith("/responses"))
       throw new Error("The offline expedition fixture rejects other requests");
@@ -102,6 +130,7 @@ async function fixture(assertDisplay: () => void = () => {}, maxRequests = 1,
   const directory = join(dir, "expedition");
   const adviceFile = join(directory, "advice.json");
   const advisor = composeExpeditionAdvisor({
+    model: { provider: "openai-codex", modelId },
     dir, goal: visible.goal, objective: "Preserve the stone pickaxe.", authDirectory: dir,
     signal: new AbortController().signal, maxRequests, maxRuntimeMs: maxRequests === 1 ? 8_000 : 20_000,
     assertDisplay, captureRecoveryFrame,
@@ -130,6 +159,44 @@ async function fixture(assertDisplay: () => void = () => {}, maxRequests = 1,
   };
 }
 
+for (const modelId of ["fixture-strategy-a", "fixture-strategy-b"]) {
+  test(`an explicitly selected discovered model retains its identity: ${modelId}`, async () => {
+    const f = await fixture(undefined, 1, undefined, modelId);
+    try {
+      expect(f.advisor.declaration.model).toBe(`openai-codex/${modelId}`);
+      await f.advisor.start();
+      await f.publish();
+      f.openDiscovery();
+      await f.received();
+      expect(f.requests[0]!.body.model).toBe(modelId);
+      f.answer(chosen);
+      await until(async () => (await f.journal()).includes('"disposition":"published"'));
+      await f.advisor.stop();
+      expect(f.advisor.outcome().model).toBe(`openai-codex/${modelId}`);
+      const journal = await f.journal();
+      expect(journal).toContain(`openai-codex/${modelId}`);
+      expect(journal).not.toContain(token);
+      expect(journal).not.toContain("not-a-real-refresh-token");
+      expect(journal).not.toContain(privateHint);
+    } finally { await f.close(); }
+  });
+}
+
+test("an undiscovered selected model is unavailable without dispatch or substitution", async () => {
+  const f = await fixture(undefined, 1, undefined, "fixture-not-discovered");
+  try {
+    await f.advisor.start();
+    await f.publish();
+    f.openDiscovery();
+    await until(() => f.advisor.outcome().admission === "unavailable");
+    expect(f.requests).toHaveLength(0);
+    await f.advisor.stop();
+    expect(f.advisor.outcome()).toMatchObject({
+      model: "openai-codex/fixture-not-discovered", outcome: "provider_unavailable", drain: "closed",
+    });
+  } finally { await f.close(); }
+});
+
 test("carrying more mined rock does not spend the request for a different strategic choice", async () => {
   const f = await fixture(undefined, 2);
   try {
@@ -149,7 +216,7 @@ test("carrying more mined rock does not spend the request for a different strate
   } finally { await f.close(); }
 }, 18_000);
 
-test("ordinary Terra sends just its visible strategy choice and counts only an exact native application", async () => {
+test("ordinary Model sends just its visible strategy choice and counts only an exact native application", async () => {
   const f = await fixture(undefined, 1, async () => { throw new Error("A text offer must not request a frame"); });
   try {
     await f.advisor.start(); // Must finish while discovery is still blocked.
@@ -160,7 +227,7 @@ test("ordinary Terra sends just its visible strategy choice and counts only an e
     expect(f.requests).toHaveLength(1);
     const { body, account: authenticatedAccount } = f.requests[0]!;
     expect(authenticatedAccount).toBe(account);
-    expect(body.model).toBe("gpt-6.1-terra");
+    expect(body.model).toBe("fixture-strategy-a");
     expect(body.tool_choice).toBe("required");
     expect(body.tools).toHaveLength(1);
     expect(body.tools[0]).toMatchObject({ name: "choose_strategy", strict: true, parameters: {
@@ -219,7 +286,7 @@ const authored = {
   steps: ["check_dry_shelf", "resupply"], reason: "The previous route failed at water.",
 };
 
-test("ordinary Terra grounds its own recovery subgoal in the exact owned JPEG and offered local methods", async () => {
+test("ordinary Model grounds its own recovery subgoal in the exact owned JPEG and offered local methods", async () => {
   let captures = 0;
   const f = await fixture(undefined, 1, async () => { captures++; return recoveryJpeg; });
   try {
@@ -460,9 +527,9 @@ for (const [label, update, answer, disposition] of [
   ["need changed", { need: "wood_supply" }, chosen, "stale"],
   ["offer disappeared", { options: [{ id: "resupply", summary: "Replace supplies" }, { id: "wait", summary: "Wait locally" }] }, chosen, "stale"],
   ["tick expired", { tick: 1_001 }, chosen, "stale"],
-  ["Terra abstained", {}, { option: "abstain", reason: "Both choices are premature." }, "abstained"],
-  ["Terra invented an option", {}, { option: "not_offered", reason: "Not offered." }, "invalid"],
-] as const) test(`ordinary Terra writes no advice when ${label}`, async () => {
+  ["Model abstained", {}, { option: "abstain", reason: "Both choices are premature." }, "abstained"],
+  ["Model invented an option", {}, { option: "not_offered", reason: "Not offered." }, "invalid"],
+] as const) test(`ordinary Model writes no advice when ${label}`, async () => {
   const f = await fixture();
   try {
     await f.advisor.start();
@@ -478,7 +545,7 @@ for (const [label, update, answer, disposition] of [
   } finally { await f.close(); }
 }, 10_000);
 
-test("ordinary Terra does not send observations when the display is no longer owned", async () => {
+test("ordinary Model does not send observations when the display is no longer owned", async () => {
   const f = await fixture(() => { throw new Error("Private display lost"); });
   try {
     await f.advisor.start();
@@ -492,7 +559,7 @@ test("ordinary Terra does not send observations when the display is no longer ow
   } finally { await f.close(); }
 }, 10_000);
 
-test("stopping ordinary Terra cancels and joins the active request without publishing advice", async () => {
+test("stopping ordinary Model cancels and joins the active request without publishing advice", async () => {
   const f = await fixture();
   try {
     await f.advisor.start();

@@ -19,7 +19,8 @@ control paths and perception profiles are not interchangeable.
 
 - [Architecture](reference/architecture.md): ownership and entry points.
 - [Lifecycle](reference/lifecycle.md): session/run/life, fences and closure.
-- [Perception](reference/perception.md): permitted information.
+- [Survival perception](survival/perception.md): optical sight and terrain hypotheses.
+- [Generic adapter perception](reference/perception.md): the separate harness profile.
 - [Security](reference/security.md): isolation, credentials and private data.
 - [Providers](reference/providers.md): authentication, request ownership and usage.
 - [Programs](reference/programs.md): the general harness's execution interface.

@@ -3,8 +3,9 @@
 Prepared trials test one mechanism under declared assistance. They do not
 establish ordinary random-world resource finding or the combined
 [Survival acceptance target](behavior.md).
-Only one diagnostic owns the second lane at a time; a parallel ordinary world
-occupies the same capacity. Diagnostic saves cannot become Survival parents.
+Only one diagnostic owns the second lane at a time. A primary ordinary run can
+continue beside it; `--parallel-world` competes for that second lane.
+Diagnostic saves cannot become Survival parents.
 
 ```sh
 bun run watch:agent --diagnostic
@@ -53,6 +54,30 @@ Both trials wait for matching safe idle approaches before spending their one
 request. If no authorized stock order can follow the answer, they close as
 `stockNotExercised`, without proof. Supplied tools, terrain and observation
 conditions must remain attached to any result.
+
+## High-water development cases
+
+| Command | Declared elevation difference |
+| --- | ---: |
+| `bun run play:agent --diagnostic-descent waterjump16 180` | 16 blocks |
+| `bun run play:agent --diagnostic-descent waterjump24 180` | 24 blocks |
+| `bun run play:agent --diagnostic-descent bucketdrop16 180` | 16 blocks |
+| `bun run play:agent --diagnostic-descent bucketdrop24 180` | 24 blocks |
+
+These zero-provider cases use controlled terrain and a named method-selection
+override while retaining the normal player tick and physical controller.
+They are labeled `mechanic-only-alternate-policy`, not ordinary campaign proof.
+Each has a maximum 180-second allocation and cannot become a Survival parent.
+
+The verifier joins native end-tick physics, actual inputs, health, water contact,
+item-use/inventory transitions and saved statistics. Controller counters or
+`LANDED` alone do not prove success. Bucket cases also require real safe reclaim.
+Retain failed attempts and close all owned processes before reusing the lane.
+
+Per-run JVM heap requests use `SURVIVAL_AGENT_{SERVER,CLIENT}_{XMS,XMX}_MIB`.
+Initial values must not exceed maxima; defaults remain unchanged. Resolved
+requests appear in `declaration.json` under `limits.jvmHeapsMiB`. Heap limits do
+not replace host-memory admission, execution-slot ownership or hard scope caps.
 
 ## Explicit constrained work orders
 

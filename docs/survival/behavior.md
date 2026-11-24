@@ -48,6 +48,7 @@ These requirements guide implementation; they are not a successful campaign
 claim. Existing controllers are defined in the
 [`survival` Java package](../../survival-agent/src/client/java/io/gameharness/survival/)
 and the [advisory host](../../src/server/survival-macro/expedition.ts).
+The [perception contract](perception.md) separates observations from hypotheses.
 
 ### Movement and camera
 

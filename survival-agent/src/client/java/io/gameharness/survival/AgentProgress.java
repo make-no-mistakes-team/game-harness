@@ -1584,7 +1584,7 @@ final class AgentProgress {
         if (portalSupplies != null) portalSupplies.interrupt();
         rejectOreProbe();
         if (target != null) {
-            forgetOreTarget();
+            forgetOre(target);
             abandonTarget();
         }
         if (pickupItem != null) abandonPickup(pickupItem, 110);
@@ -1605,17 +1605,18 @@ final class AgentProgress {
     }
 
     private boolean ordinaryRouteOwnsRecovery() {
-        if (ordinaryCaveDrops && (bootstrapTimber || bootstrapStone) && !healing.active()
-                && !surfaceApproach.timberFrontier.active() && !surfaceApproach.stoneCanopyWorking()
-                && !firstStone.witnessedProbeWork() && !hands.busy()
-                && spentSurfaceRoute.yields(bootstrapTimber ? Job.TIMBER : Job.STONE, c.player.getBlockPos(),
-                    tick, stallGuard.ownsRecovery())) return false;
+        if (!ordinarySurfaceWork || portal != null && portal.locallyStopped()) return false;
+        Job bootstrap = bootstrapTimber ? Job.TIMBER : bootstrapStone ? Job.STONE : null;
+        Job continuing = ordinaryRouteTick == tick - 1 && ordinaryRouteJob != Job.FOOD
+            && (returnIndex < 0 || ordinaryRouteJob == Job.RETURN) ? ordinaryRouteJob : null;
+        boolean protectedWork = !ordinaryCaveDrops || healing.active()
+            || surfaceApproach.timberFrontier.active() || surfaceApproach.stoneCanopyWorking()
+            || firstStone.witnessedProbeWork() || hands.busy();
         // A blocked edge is still a live route while it has another checked
-        // candidate or an unpaid view. Do not start a competing survey then.
-        return ordinarySurfaceWork && (bootstrapStone || bootstrapTimber
-            || ordinaryRouteTick == tick - 1 && ordinaryRouteJob != Job.FOOD
-                && (returnIndex < 0 || ordinaryRouteJob == Job.RETURN))
-            && (portal == null || !portal.locallyStopped());
+        // candidate or an unpaid view. A paid-empty resupply frontier is not:
+        // carrying the first stone pick must not give timber an unlimited lease.
+        return spentSurfaceRoute.ownsRecovery(bootstrap, continuing, c.player.getBlockPos(),
+            tick, protectedWork, stallGuard.ownsRecovery());
     }
 
     /** The existing stall guard owns the idle timer. Release only a repeatedly paid, empty search. */
@@ -1627,9 +1628,9 @@ final class AgentProgress {
         void clear() { foot = null; }
 
         void observe(Job next, BlockPos at, int now, boolean spent, boolean active) {
-            if (next != Job.TIMBER && next != Job.STONE || active) {
+            if (next != Job.TIMBER && next != Job.STONE || active || !spent) {
                 clear();
-            } else if (spent) {
+            } else {
                 if (next != job || !at.equals(foot) || now - last > 12) {
                     first = now;
                     job = next;
@@ -1637,6 +1638,12 @@ final class AgentProgress {
                 }
                 last = now;
             }
+        }
+
+        boolean ownsRecovery(Job bootstrap, Job continuing, BlockPos at, int now,
+                             boolean protectedWork, boolean recovering) {
+            Job owner = bootstrap != null ? bootstrap : continuing;
+            return owner != null && (protectedWork || !yields(owner, at, now, recovering));
         }
 
         boolean yields(Job need, BlockPos at, int now, boolean recovering) {

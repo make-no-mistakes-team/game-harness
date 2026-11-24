@@ -30,6 +30,30 @@ final class AgentOrdinaryNavigatorTest {
     }
 
     @Test
+    void spentTimberResupplyAfterTheStonePickReleasesTheActualRecoveryLease() {
+        var spent = new AgentProgress.SpentSurfaceRoute();
+        var foot = new BlockPos(4, 75, 8);
+        var timber = AgentOrdinaryNavigator.Job.TIMBER;
+        for (int tick = 100; tick <= 160; tick += 5) spent.observe(timber, foot, tick, true, false);
+
+        assertFalse(spent.ownsRecovery(null, timber, foot, 161, false, false),
+            "poststarter timber resupply must not suppress stall detection after paying an empty frontier");
+        assertFalse(spent.ownsRecovery(null, timber, foot, 180, false, true),
+            "the same empty route cannot reclaim control from an ongoing checked departure");
+        assertFalse(spent.ownsRecovery(null, null, foot, 161, false, false),
+            "an expired route turn owns nothing");
+        assertTrue(spent.ownsRecovery(timber, null, foot, 161, true, false),
+            "committed timber work still owns its physical turn");
+        assertTrue(spent.ownsRecovery(null, AgentOrdinaryNavigator.Job.STONE, foot, 161, false, false),
+            "a new resource objective does not inherit the old frontier's refusal");
+
+        spent.observe(timber, foot, 162, false, false);
+        assertTrue(spent.ownsRecovery(null, timber, foot, 163, false, false),
+            "an unpaid view or newly aligned edge takes control back before its first movement key");
+        assertTrue(spent.ownsRecovery(null, timber, foot, 163, false, true));
+    }
+
+    @Test
     void aPaidFrontierViewSurvivesLaterResourceScansWithoutInventingARoute() {
         var view = new AgentOrdinaryNavigator.FrontierView();
         var route = new AgentOrdinaryRoute();

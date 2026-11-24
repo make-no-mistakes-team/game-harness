@@ -9,31 +9,32 @@ and request accounting belong to each retained run declaration.
 
 ## Recovery checkpoint, 24 November 2026
 
-A fresh ordinary local-player attempt used the configurable model interface,
-with a 7,200-second wall allocation and 160-request allowance. It was stopped
-after **217.180 seconds**, not exhausted. The account was admitted, but no
-strategic offer reached inference: **zero model requests**. This is local-player
-failure evidence, not a test of model reasoning.
+The initial recovery attempt stopped after **217.180 seconds** with full health,
+no inventory or broken rock, and **zero model requests**. The user observed
+canopy refusal and repeated quarter-turn motion. Source inspection found
+cardinal route edges controlling camera heading; this required an execution
+change, not cosmetic random angles. It was local-player failure, not a test of
+model reasoning.
 
-The user observed refusal to leave the spawn canopy with modest fall damage
-and repeated quarter-turn movement. At stop the player had **20/20 health**,
-full hunger and **no inventory or broken rock**. The recording contains about
-180.767 seconds of gameplay; diagnostic witnesses attribute only 13.290 seconds
-to checked route work. Those metrics do not replace the user's visual verdict.
-The server saved all dimensions and closed without shutdown escalation.
+Later continuation footage established nonfatal descents costing one and two
+health points. All three fatal encounters in that attempt were explicitly
+attributed to zombies.
 
-Source inspection found cardinal route edges directly controlling camera
-heading and nearly cardinal alignment gating movement. Repair must change that
-execution model rather than add cosmetic random angles. Useful visible canopy
-descent is a separate unresolved policy defect. Neither is fixed by account
-admission or a passing early-tool fixture.
+The ordinary path subsequently collected wood and crafted a wooden pickaxe
+about **16 seconds after player readiness**, then also crafted a wooden shovel.
+The client crashed at the first-stone transition; the world and tools survived.
+After that crash was repaired, another continuation collected **36 dirt and no
+cobblestone**, repeatedly descending three blocks and returning uphill. Early
+tools do not establish effective progression.
 
-A later continuation descended through the canopy, with nonfatal falls costing
-one and two health points, but still obtained no tools. All three fatal
-encounters were explicitly attributed to zombies. Concurrent prepared
-16-block trials remained unverified: one produced actual sprint and Space
-takeoff but stopped before landing; the bucket trial never left its platform.
-These are failed development attempts, not a representative successful slice.
+The user reviewed a **33.2-second, 1× excerpt** of the wood/tools attempt:
+generally acceptable movement, but **00:18–00:30** still showed standing with
+slow, interrupted cursor movement. That interval remains rejected, not approved.
+
+Prepared 16-block water trials remain unverified. One produced actual sprint
+and Space takeoff but stopped before landing; a later bucket trial completed a
+fall without placement and took damage. These diagnostics are not campaign
+competence or a successful complex-task demonstration.
 
 ## Progression cohorts
 

@@ -21,6 +21,13 @@ Physical contact, collision, placement and vanilla item-use rays remain
 separate. Seeing ore through glass does not permit striking through the glass.
 Seeing ground or water does not establish a traversable route or safe arrival.
 
+A visible face point does not imply a visible block center. Keep the admitted
+point for gaze and revalidation rather than silently replacing it with the
+center. Tool work follows the actual physical first hit: a permitted natural
+leaf mask can be cleared while retaining the observed log goal. Removing
+occupied support requires an explicit descent action, not a generic mining
+exception.
+
 The implementation is in
 [`AgentOpticalSight`](../../survival-agent/src/client/java/io/gameharness/survival/AgentOpticalSight.java)
 and [`AgentBody`](../../survival-agent/src/client/java/io/gameharness/survival/AgentBody.java).
@@ -28,9 +35,10 @@ and [`AgentBody`](../../survival-agent/src/client/java/io/gameharness/survival/A
 ## What counts as inferred
 
 Ordinary excavation can assume that nearby base rock continues; trunk work can
-assume a further log below an observed column. Those are explicit, local,
-qualitative hypotheses. They do not reveal a specific hidden ore, its location,
-loot, a guaranteed floor or a return route.
+assume a further log below an observed column. An initial prospect can expect
+base rock beneath soil without claiming to have seen it. Those are explicit,
+local, qualitative hypotheses. They do not reveal a specific hidden ore, its
+location, loot, a guaranteed floor or a return route.
 
 The belief model consumes admitted observations and actual action/physics
 outcomes. It cannot query hidden terrain to check whether its guess is right.

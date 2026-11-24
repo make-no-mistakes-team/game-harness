@@ -2,6 +2,8 @@ import { Database } from "bun:sqlite";
 import { existsSync, lstatSync, mkdirSync, realpathSync, statfsSync } from "node:fs";
 import path from "node:path";
 import { evaluationPaths } from "../src/evaluation/paths.ts";
+import { campaignBytes, campaignInventory, campaignRoots, createCampaignTables,
+    developmentArtifactLimitBytes, hasCampaign } from "./storage-campaign.ts";
 
 const project = path.resolve(import.meta.dir, "..");
 const local = path.join(project, "local");
@@ -226,16 +228,35 @@ function recoveryLedgerFiles(ledgerPath: string, kind: "crash" | "orphan") {
         lastWrite: Math.max(ledger.mtimeMs, ledger.ctimeMs) };
 }
 
+function metadataAllocation(file: string) {
+    try {
+        const entry = lstatSync(file, { bigint: true });
+        return { identity: `${entry.dev}:${entry.ino}:${entry.birthtimeNs}`, bytes: Number(entry.blocks * 512n) };
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw new Error("Cannot account for development reservation metadata");
+    }
+}
+
 /** Reserve space before starting any writers; release only after all have drained. */
 export async function admitRun(reserveBytes: number, lane: Lane = "survival",
-    recovery?: CrashReservation | OrphanReservation): Promise<() => void> {
-    if (!Number.isSafeInteger(reserveBytes) || reserveBytes <= 0) throw new Error("Invalid run disk reservation");
+    recovery?: CrashReservation | OrphanReservation,
+    policy?: { campaign: "recovery-development" }): Promise<() => void> {
+    if (!Number.isSafeInteger(reserveBytes) || reserveBytes <= 0 || reserveBytes > artifactLimitBytes)
+        throw new Error("Invalid run disk reservation");
     if (lane !== "survival" && lane !== "diagnostic") throw new Error("Invalid agent lane");
+    if (policy && policy.campaign !== "recovery-development") throw new Error("Invalid development artifact campaign");
     const crash = recovery && "bootMs" in recovery ? recovery : undefined;
     const orphan = recovery && "kind" in recovery ? recovery : undefined;
     if (crash && lane !== "survival") throw new Error("Crash autosave recovery uses only the ordinary Survival lane.");
     if (orphan && lane !== "survival") throw new Error("Orphan autosave recovery uses only the primary Survival lane.");
     const ledgerPath = path.join(admissionRoot, "admission.sqlite");
+    // These entries may be created or enlarged by admission itself, before the
+    // baseline walk. Do not quietly reclassify that new reservation metadata as
+    // historical just because admission must create its lock before scanning.
+    const metadata = policy ? new Map([local, admissionRoot, ledgerPath,
+        path.join(admissionRoot, "owner.sqlite"), path.join(admissionRoot, "diagnostic-owner.sqlite")]
+        .map(file => [file, metadataAllocation(file)] as const)) : undefined;
     if (!recovery) mkdirSync(admissionRoot, { recursive: true, mode: 0o700 });
     const kind = orphan ? "orphan" : "crash";
     const original = recovery && recoveryLedgerFiles(ledgerPath, kind);
@@ -252,6 +273,13 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival",
             ) STRICT;
             INSERT INTO reservations (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
         `);
+        if (policy && !recovery) createCampaignTables(ledger);
+        const roots = evaluationPaths(project);
+        // The legacy policy intentionally retains its historical total cap.
+        // Only explicitly authorized development runs use the durable baseline.
+        const storage = [local, roots.runtimeRoot, roots.reportsRoot, roots.governanceRoot,
+            ...(process.env.GAMEHARNESS_DATA_DIR ? [path.resolve(process.env.GAMEHARNESS_DATA_DIR)] : [])];
+        const managedRoots = campaignRoots(storage);
         const read = ledger.query<Reservations, []>("SELECT generation, survival, diagnostic FROM reservations WHERE id = 1");
         const write = ledger.query(`UPDATE reservations SET ${lane} = ?, generation = generation + 1 WHERE id = 1`);
         const replaceCrash = (state: Reservations) => {
@@ -301,6 +329,8 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival",
         };
         const snapshot = ledger.transaction(() => {
             const state = read.get()!;
+            if (policy && !hasCampaign(ledger, managedRoots) && (recovery || state.survival || state.diagnostic))
+                throw new Error("Initialize the development artifact campaign only after both lanes have drained.");
             if (orphan) {
                 // Keep this lock across accounting and the asynchronous OS fence.
                 // Do not hold the aggregate transaction across either operation.
@@ -313,11 +343,7 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival",
             }
             return state.generation;
         });
-        const roots = evaluationPaths(project);
-        // Counting all of local includes both the historical and current run roots.
-        const storage = [local, roots.runtimeRoot, roots.reportsRoot, roots.governanceRoot,
-            ...(process.env.GAMEHARNESS_DATA_DIR ? [path.resolve(process.env.GAMEHARNESS_DATA_DIR)] : [])];
-        const reserve = ledger.transaction((generation: number, used: number) => {
+        const reserve = ledger.transaction((generation: number, sampled: number | Map<string, number>) => {
             const state = read.get()!;
             let replacing = true;
             if (orphan) {
@@ -328,14 +354,29 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival",
                 owner = checkOwners(state, lane, true, replacing);
             }
             if (!owner) throw new Error(`Could not acquire the ${lane} lane.`);
+            const initialMetadata = new Map<string, number>();
+            if (policy && !hasCampaign(ledger, managedRoots)) {
+                for (const [file, prior] of metadata!) {
+                    const current = metadataAllocation(file);
+                    if (current) initialMetadata.set(current.identity,
+                        current.identity === prior?.identity ? prior.bytes : 0);
+                }
+            }
+            const used = typeof sampled === "number" ? sampled :
+                campaignBytes(ledger, managedRoots, sampled, !hasCampaign(ledger, managedRoots), initialMetadata);
             // Charge full reservations on top of the scan: active payloads can
             // grow while du walks them, so the scan gives no safe per-run credit.
             const reserved = (replacing ? 0 : state.survival) + state.diagnostic;
             const fs = statfsSync(existsSync(artifactRoot) ? artifactRoot : local, { bigint: true });
-            if (used + reserved + reserveBytes + legacyHeadroom > artifactLimitBytes ||
+            const limit = policy ? developmentArtifactLimitBytes : artifactLimitBytes;
+            const headroom = policy ? 0 : legacyHeadroom;
+            if (policy && used + reserved + reserveBytes > limit)
+                console.warn(`Development artifact soft ceiling exceeded: ${used} new bytes counted, ` +
+                    `${reserved} reserved, ${reserveBytes} requested; soft limit ${limit}. Historical artifacts are preserved.`);
+            if ((!policy && used + reserved + reserveBytes + headroom > limit) ||
                 fs.bavail * fs.bsize < BigInt(reserved) + BigInt(reserveBytes) + 1024n ** 3n) {
                 throw new Error(`Insufficient storage: ${used} bytes counted, ${reserved} reserved for agent runs, ` +
-                    `${reserveBytes} requested, ${legacyHeadroom} reserved for legacy runs, limit ${artifactLimitBytes}.`);
+                    `${reserveBytes} requested, ${headroom} reserved for legacy runs, limit ${limit}.`);
             }
             if (orphan) {
                 // A death before the new live marker is published must not make
@@ -348,16 +389,29 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival",
             }
             return true;
         });
-        await accountDisk(storage, {
-            signal: orphan?.signal,
-            ledger: {
-                snapshot: () => snapshot.immediate(),
-                reserve: orphan ? async (generation, used) => {
-                    await orphan.assertQuiescent(orphan.signal);
-                    return reserve.immediate(generation, used);
-                } : (generation, used) => reserve.immediate(generation, used),
-            },
-        });
+        if (policy) {
+            for (let attempt = 1; ; attempt++) {
+                const generation = snapshot.immediate();
+                const inventory = await campaignInventory(managedRoots, orphan?.signal);
+                if (inventory !== null) {
+                    if (orphan) await orphan.assertQuiescent(orphan.signal);
+                    if (reserve.immediate(generation, inventory)) break;
+                }
+                if (attempt === maxAccountingScans)
+                    throw accountingFailure(inventory === null ? "entries vanished" : "reservations changed during scan");
+            }
+        } else {
+            await accountDisk(storage, {
+                signal: orphan?.signal,
+                ledger: {
+                    snapshot: () => snapshot.immediate(),
+                    reserve: orphan ? async (generation, used) => {
+                        await orphan.assertQuiescent(orphan.signal);
+                        return reserve.immediate(generation, used);
+                    } : (generation, used) => reserve.immediate(generation, used),
+                },
+            });
+        }
         const release = ledger.transaction(() => {
             write.run(0);
             owner!.close();

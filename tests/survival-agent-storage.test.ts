@@ -154,6 +154,52 @@ const commands = {
     console.log(JSON.stringify({ unaccounted, stranded, reservation }));
     db.close();
   `,
+  campaignActivation: `
+    const release = await storage.admitRun(11);
+    try {
+      (await admitRun(1, "diagnostic"))();
+      throw new Error("The live legacy reservation was reclassified.");
+    } catch (error) {
+      console.log(error.message);
+    } finally { release(); }
+  `,
+  campaignProcesses: `
+    const { Database } = await import("bun:sqlite");
+    const first = await admitRun(1);
+    first();
+    const children = ["survival", "diagnostic"].map(lane => Bun.spawn([
+      process.execPath, "--no-env-file", "--eval", \`
+        const { admitRun } = await import("./survival-agent/storage.ts");
+        const release = await admitRun(17, "\${lane}", undefined, { campaign: "recovery-development" });
+        console.log("held");
+        for await (const line of console) { if (line === "drain") break; }
+        release();
+      \`,
+    ], { stdin: "pipe", stdout: "pipe", stderr: "pipe", env: process.env }));
+    const ledger = new Database("local/survival-pilot/admission.sqlite", { readonly: true });
+    const state = () => ledger.query("SELECT survival, diagnostic FROM reservations").get();
+    try {
+      await Promise.all(children.map(async child => {
+        const reader = child.stdout.getReader();
+        try {
+          const result = await reader.read();
+          if (result.done || new TextDecoder().decode(result.value).trim() !== "held")
+            throw new Error("A concurrent owner did not reserve its lane.");
+        } finally { reader.releaseLock(); }
+      }));
+      const held = state();
+      children[1].stdin.write("drain\\n"); children[1].stdin.end();
+      if (await children[1].exited !== 0) throw new Error("Second process did not drain.");
+      const remaining = state();
+      children[0].stdin.write("drain\\n"); children[0].stdin.end();
+      if (await children[0].exited !== 0) throw new Error("First process did not drain.");
+      console.log(JSON.stringify({ held, remaining, drained: state() }));
+    } finally {
+      for (const child of children) { if (child.exitCode === null) child.kill(); }
+      await Promise.all(children.map(child => child.exited));
+      ledger.close();
+    }
+  `,
   measure: `console.log(await diskBytes("./runtime"));`,
   abort: `
     const controller = new AbortController();
@@ -179,14 +225,14 @@ const commands = {
   `,
 };
 
-async function withScanner(scenario: string, command: keyof typeof commands = "admission") {
+async function withScanner(scenario: string, command: keyof typeof commands = "admission", campaign = false) {
   const project = mkdtempSync(join(realpathSync(tmpdir()), "survival-admission-"));
   try {
     // Use the real entry point and ledger in a temporary checkout. Only the
     // external scanner's replies are scripted, so no timing race is required.
     for (const directory of ["survival-agent", "src/evaluation", "bin", "runtime", "reports", "governance", "data"])
       mkdirSync(join(project, directory), { recursive: true });
-    for (const source of ["survival-agent/storage.ts", "src/evaluation/paths.ts"])
+    for (const source of ["survival-agent/storage.ts", "survival-agent/storage-campaign.ts", "src/evaluation/paths.ts"])
       copyFileSync(join(import.meta.dir, "..", source), join(project, source));
     const scans = join(project, "scans");
     writeFileSync(scans, "");
@@ -232,7 +278,18 @@ case "$CASE" in
 esac
 `, { mode: 0o700 });
     const child = Bun.spawn([process.execPath, "--no-env-file", "--eval", `
-      import { admitRun, diskBytes } from "./survival-agent/storage.ts";
+      if (process.env.CASE === "campaign-soft-limit") {
+        const { mock } = await import("bun:test");
+        const original = await import("./survival-agent/storage-campaign.ts");
+        mock.module("./survival-agent/storage-campaign.ts", () => ({
+          ...original, campaignBytes: () => 400_000_000_001,
+        }));
+      }
+      const storage = await import("./survival-agent/storage.ts");
+      const { diskBytes } = storage;
+      const admitRun = ${campaign}
+        ? (bytes, lane, recovery) => storage.admitRun(bytes, lane, recovery, { campaign: "recovery-development" })
+        : storage.admitRun;
       try {
         ${commands[command]}
       } catch (error) {
@@ -374,5 +431,40 @@ test("a live measurement retries a vanished entry and returns only the complete 
 test("canceling an in-flight live measurement joins the scanner and preserves the stop reason", async () => {
   expect(await withScanner("blocked", "abort")).toEqual({
     stdout: "canceled and drained", stderr: "", code: 0, attempts: 1,
+  });
+});
+
+test("the explicit development campaign keeps the shared lane ownership and independent releases", async () => {
+  const result = await withScanner("concurrent", "concurrentAdmission", true);
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 0 });
+  expect(JSON.parse(result.stdout)).toEqual({
+    held: { survival: 11, diagnostic: 17 },
+    deniedPrimary: "The survival lane already has an active run.",
+    deniedSecond: "The diagnostic lane already has an active run.",
+    remaining: { survival: 11, diagnostic: 0 },
+    drained: { survival: 0, diagnostic: 0 },
+  });
+});
+
+test("crossing the development campaign ceiling warns without refusing a physically safe reservation", async () => {
+  const result = await withScanner("campaign-soft-limit", "admission", true);
+  expect(result).toMatchObject({ code: 0, stdout: "admitted", attempts: 0 });
+  expect(result.stderr).toContain("Development artifact soft ceiling exceeded: 400000000001 new bytes counted");
+  expect(result.stderr).toContain("soft limit 400000000000");
+});
+
+test("campaign initialization never reclassifies an active legacy reservation as historical", async () => {
+  const result = await withScanner("campaign-activation", "campaignActivation", true);
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 1 });
+  expect(result.stdout).toContain("only after both lanes have drained");
+});
+
+test("separate development processes preserve both charges until each owner drains", async () => {
+  const result = await withScanner("campaign-processes", "campaignProcesses", true);
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 0 });
+  expect(JSON.parse(result.stdout)).toEqual({
+    held: { survival: 17, diagnostic: 17 },
+    remaining: { survival: 17, diagnostic: 0 },
+    drained: { survival: 0, diagnostic: 0 },
   });
 });

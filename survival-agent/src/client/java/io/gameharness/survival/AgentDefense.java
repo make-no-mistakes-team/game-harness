@@ -225,6 +225,14 @@ final class AgentDefense {
                 && gapBelowFeet >= SHORE_MELEE_CLEARANCE;
         }
 
+        static boolean separatedDryRetreat(boolean drove, double movedSquared, boolean visible,
+                                           double distanceSquared, boolean recentView, Footing footing) {
+            // A missing hostile has no measured distance. In particular, infinity
+            // from an empty threat query cannot prove that retreat cleared it.
+            return drove && movedSquared >= 5 * 5 && visible && distanceSquared >= 6 * 6
+                && recentView && footing == Footing.DRY;
+        }
+
         boolean observe(int tick, Evidence evidence, boolean critical, boolean separated, Footing footing) {
             if (footing == Footing.VEHICLE) {
                 active = pinned = shoreNeeded = settledBank = false;
@@ -340,8 +348,8 @@ final class AgentDefense {
         double movedX = meleeStart == null ? 0 : feet.x - meleeStart.x;
         double movedZ = meleeStart == null ? 0 : feet.z - meleeStart.z;
         boolean separated = swimmerReceded && !hit && !melee.pinned
-            || meleeDrove && movedX * movedX + movedZ * movedZ >= 5 * 5
-            && distance >= 6 * 6 && body.hasRecentView() && footing == MeleeRecovery.Footing.DRY;
+            || MeleeRecovery.separatedDryRetreat(meleeDrove, movedX * movedX + movedZ * movedZ,
+                visible != null, distance, body.hasRecentView(), footing);
         boolean started = !melee.active;
         boolean wasEscaping = meleeEscapeFirst;
         var evidence = close ? MeleeRecovery.Evidence.CONTACT

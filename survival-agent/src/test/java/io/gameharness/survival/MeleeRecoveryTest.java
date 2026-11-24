@@ -46,6 +46,29 @@ final class MeleeRecoveryTest {
     }
 
     @Test
+    void aMissingSpiderFrameDoesNotProveSeparationAndHandBackTheReturnRoute() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        // Physical ore-assisted run: a hit at 775, five metres of retreat, then
+        // RETURN took back control at 807 and walked into another hit at 833.
+        assertTrue(recovery.observeImpact(775, 2, false, false, DRY));
+        boolean separated = AgentDefense.MeleeRecovery.separatedDryRetreat(
+            true, 10 * 10, false, Double.POSITIVE_INFINITY, true, DRY);
+        assertFalse(separated, "no rendered hostile is not an observed six-metre gap");
+        assertTrue(recovery.observe(807, NONE, false, separated, DRY));
+        assertTrue(recovery.observeImpact(833, 2, false, false, DRY));
+        assertTrue(recovery.observe(865, NONE, false, separated, DRY));
+        assertFalse(recovery.observe(897, NONE, false, separated, DRY),
+            "unlocated damage still expires naturally; this is not permanent defense ownership");
+
+        assertTrue(AgentDefense.MeleeRecovery.separatedDryRetreat(true, 25, true, 36, true, DRY));
+        assertFalse(AgentDefense.MeleeRecovery.separatedDryRetreat(false, 25, true, 36, true, DRY));
+        assertFalse(AgentDefense.MeleeRecovery.separatedDryRetreat(true, 24, true, 36, true, DRY));
+        assertFalse(AgentDefense.MeleeRecovery.separatedDryRetreat(true, 25, true, 35, true, DRY));
+        assertFalse(AgentDefense.MeleeRecovery.separatedDryRetreat(true, 25, true, 36, false, DRY));
+        assertFalse(AgentDefense.MeleeRecovery.separatedDryRetreat(true, 25, true, 36, true, WET));
+    }
+
+    @Test
     void aSwimmerBelowDryFootingDoesNotKeepAContactOnlyRetreatAlive() {
         var recovery = new AgentDefense.MeleeRecovery();
         assertTrue(recovery.observe(4184, CONTACT, false, false, DRY));

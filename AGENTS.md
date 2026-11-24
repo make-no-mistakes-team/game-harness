@@ -1,208 +1,51 @@
-## Documentation and GitHub issues
+# Repository instructions
 
-- Write all repository documentation in English.
-- When creating or editing GitHub issues, write their descriptions in Russian.
-- Before creating or editing Markdown documentation other than `AGENTS.md`,
-  read and apply the `sepia` skill.
-- For `README.md`, also read and apply `crafting-effective-readmes`.
-- These skill requirements are optional for Markdown files kept local and untracked.
-- Before writing or editing GitHub issue titles or descriptions, read and apply `sepia`.
-- Before editing agent instruction files, read and apply `writing-for-agents`.
-  For `AGENTS.md`, this is the only required writing skill; `sepia` is not required.
-- Keep useful instructions, requirements, and verified facts; remove repetition and material that does not help the reader.
+## Current direction
+The ordinary Survival Agent is a developer-written local player with optional
+asynchronous model strategy. It owns movement, tools, terrain clearance,
+workstations, crafting, food and immediate defense. It pursues useful work while
+the model thinks, abstains or is unavailable, adopting advice at safe transitions.
+The older model-authored general harness is a separate research system.
 
-### README scope
+Before gameplay changes, read [the behavior contract](docs/survival/behavior.md).
+The target is a fresh-origin campaign that obtains diamonds and enters the
+Nether, ultimately progressing to beating Minecraft. Preserve local safety and
+explicit prohibitions; use ordinary Survival actions and visible inventory.
+Hidden blocks, world seeds and server-state knowledge are unavailable to actors.
 
-- Keep `README.md` a concise product entry point: purpose, essential prerequisites,
-  installation and launch commands, and documentation links. Put interface
-  walkthroughs, button behavior, lifecycle explanations, feature inventories, and
-  behavior users can discover in the app in detailed guides or in-app help.
-  Retain setup and safety instructions needed before the app can be used.
-  Omit development progress, unfinished-feature lists, prototype history, and
-  passed or unpassed MVP/release milestones.
+## Evidence
 
-### Private material
+Keep a small real-model end-to-end slice on the critical path. Verify the ordinary
+default control path and its natural transitions, not an easier alternate driver,
+special prompt, fixture or evaluator-assisted substitute. Declare differences.
+Continuous input is not purposeful progress; smoothing alone is not natural aim.
+Natural waits need no substitute motion. User-reported defects are ground truth.
 
-- Keep private plans, team/course details, credentials, worlds, and run evidence
-  under locally excluded storage. Public documentation must not expose or link
-  to `local/`. A checkout-local Git exclusion does not sanitize archives or
-  already tracked files.
+Lead status with the observed gameplay outcome and what remains failed or
+unproven. Reserve time for a representative run, inspection and user feedback.
+Before model runs, continuation, review or artifact cleanup, read
+[model-run and evidence rules](docs/development/model-runs.md).
 
-## Gameplay delivery
+## Documentation and privacy
 
-The product priority is continuous, purposeful, human-like play. Terra
-chooses the strategy for a gameplay goal. The local player owns ordinary
-movement, tools, terrain clearance, workstations, crafting and immediate
-threat response. It keeps pursuing the goal while Terra thinks, abstains
-or is unavailable, and adopts useful advice at a safe transition. If model
-permissions or round trips interrupt ordinary play, reduce the model's
-authority rather than adding another per-action approval. Preserve local
-safety checks and explicit user prohibitions. Natural waits, including a
-single item cooking, need no substitute motion.
+- Repository documentation is English; GitHub issue descriptions are Russian.
+- Before Markdown edits other than this file, apply `sepia`; for `README.md`,
+  also apply `crafting-effective-readmes`. Local untracked Markdown is exempt.
+- Before agent-instruction edits, apply `writing-for-agents`; `sepia` is not
+  required for `AGENTS.md`. Before issue titles/descriptions, apply `sepia`.
+- Start at [docs/index.md](docs/index.md); load only the relevant topic.
+  Before adding, moving or expanding docs, follow the
+  [documentation maintenance rules](docs/development/documentation.md).
+  Keep each fact once; split by reader task instead of growing monoliths.
+- Keep README to purpose, prerequisites, installation, launch and guide links.
+  Put walkthroughs and lifecycle/feature details in focused guides.
+- Private plans, team/course details, credentials, worlds and raw run evidence
+  stay locally excluded. Public docs must not expose or link private storage;
+  local exclusions do not sanitize tracked files or archives.
 
-- Keep a small end-to-end gameplay slice on the critical path. Within authorized
-  budgets and working safety boundaries, exercise it with a real model early,
-  before expanding supporting work. Escalate conflicting prerequisites rather
-  than silently bypassing gates or indefinitely postponing product feedback.
-- Verify the control path the model actually uses. A smooth alternate driver,
-  synthetic fixture, special prompt or evaluator assistance does not establish
-  the ordinary default experience. Declare those differences.
-- Check natural control transitions on that actual path. A high-frequency
-  stream can still snap between targets; continuous activity can still be
-  ineffective. Neither is a substitute for the requested gameplay quality.
-- Lead status reports with the observed user-facing outcome and what remains
-  failed or unproven. Under a deadline, reserve time for a representative run,
-  inspection, user review and handoff; report a missing demonstration early
-  instead of substituting more infrastructure or an easier task.
-
-## Model-run authorization
-
-On `experiment/minecraft-survival-agent`, the user authorizes any number of Luna
-(`gpt-6-luna`) and Terra (`gpt-6.1-terra`) gameplay runs. Ask before each
-`gpt-6.2-sol` run. Choose time, request and tool budgets for the work at hand;
-larger or longer runs need no further approval. Use progress checks to catch
-loops. The standing caps and budget-increase approval rule below do not
-apply to this experiment.
-The aggregate artifact ceiling for this branch is 300,000,000,000 bytes,
-including pre-existing runs. These permissions do not change frozen study
-protocols, authorize deleting private material, or grant access to hidden
-blocks, world seeds, or server state. Use ordinary Survival actions and
-visible inventory interactions.
-
-The user grants standing permission for development and gameplay runs with
-`gpt-6-luna`, with no cumulative limit on the number of runs, including after
-unsuccessful attempts. No per-run approval or new platform-evidence revision is
-required merely because earlier Luna runs failed. Use it for early real-model
-feedback, not only for last-minute demonstrations. For more expensive SOTA
-models, normally ask first unless the current request already authorizes their
-use; Luna's standing permission does not authorize those models.
-
-Each run still needs finite request, time and evidence budgets, complete attempt
-history, and safe resource closure. Unlimited run count does not override
-safety, concurrency limits, frozen experiment protocols, explicit stop
-instructions or successful-run manual-review pauses. It does not permit
-silently substituting Luna for a different model in a declared experiment.
-
-The default resident step budget remains 25 ms. The user permits temporary
-50 ms step budgets in individually declared finite development experiments;
-record the override in each declaration. This does not authorize changing the
-default or increasing other limits.
-
-### Budget-limited outcomes
-
-Treat exhaustion of a run's time, request, token, tool, analysis or evidence
-budget as a budget-limited outcome, not proof of model incapability. Record the
-limit, its value, actual consumption, unfinished work and observed failures.
-Consider whether the budget prevented meaningful completion before attributing
-failure to the model or switching models.
-
-Propose larger limits, including substantially larger ones, when justified.
-For a recurring constraint, explicitly offer a permanent default change rather
-than only repeated temporary exceptions.
-Before increasing any model-run or experiment limit, obtain explicit user
-approval: state the old and proposed values, reason, cost or resource risks,
-and whether the change is permanent or applies only to specified runs. Use
-approved higher limits in a newly declared run.
-
-## Manual gameplay review
-
-On `experiment/minecraft-survival-agent`, request feedback on representative footage
-through `ask` when useful. Include the recording's absolute local path and
-a playback link in the request. A successful run is not a review gate: keep the
-survival progression moving unless the user asks to stop. The mandatory
-pause below applies to other branches.
-
-Request manual visual review only for gameplay runs you judge successful for
-their declared user-facing purpose. After a noticeable gameplay change produces
-such a run, show representative footage and explicitly ask for review. Pause
-development, including subagent work, until the user gives feedback.
-
-Failed runs, runtime errors and obvious gameplay defects do not require the
-user's visual review or a review pause. Capture their complete evidence,
-safely stop and drain owned resources, then diagnose and fix the cause directly.
-Later payload expiry follows the artifact-retention policy below; failed-attempt
-outcomes and accounting remain in history.
-Further runs still require finite declarations, valid admission and applicable
-authorization; this rule does not waive experiment freezes or stop rules.
-Do not relabel a failed or easier task as success to obtain review.
-
-Inspect the actual rendered behavior at original speed before presenting it.
-Playback completion and sampled screenshots are not a visual-quality verdict.
-If available tools cannot support that assessment, state the limitation rather
-than claiming a visual review.
-Identify obvious defects yourself; label failed footage honestly rather than
-presenting it as improved gameplay for the user to discover the problem.
-
-Small changes may be grouped to avoid frequent pauses. Briefly track gameplay
-changes since the last review and request another review when a successful run
-demonstrates their noticeable combined effect.
-
-Tests, metrics, code volume and your own inspection are supporting evidence,
-not proof that gameplay improved. The user's visual judgment is decisive.
-
-## Development artifact retention
-
-Use compressed live video for ordinary development recordings; retain exact
-model-visible images separately. Full lossless frame sequences require an
-explicit finite diagnostic or experiment declaration.
-
-Rotate explicitly managed, closed and confirmed-drained unpinned development
-runs, whether successful or failed: 50 GiB project budget, at most ten unpinned
-runs, and fourteen days. Preserve durable outcomes, usage and explicit payload
-expiry records. Active owners, user worlds, manual-review pins and frozen
-experiments override expiry. Refuse new admission when protected storage fills
-the budget. Existing unregistered material requires separate cleanup approval;
-credentials, governance history and the official game installation are outside
-artifact deletion ownership.
-
-## Tooling and dependencies
-
-Choose tools and programming languages based on what best serves the task, not
-on what is already installed. If a better implementation, investigation, or
-verification requires additional software, install it as part of the work
-without asking permission. This includes tools, applications, programming
-languages, runtimes, SDKs, libraries, and build or test dependencies.
-
-Prefer project-local, temporary, or virtual-environment installs when practical;
-use system-wide installation when needed. Report changes to tracked lockfiles,
-manifests, and configuration as part of the workspace changes.
-
-## Committing and integrating into main
-
-During a large implementation, make a focused local commit whenever a logical
-checkpoint or an independent feature/fix is complete and its relevant checks
-pass. Commit that result before accumulating unrelated work; do not wait for the
-entire plan. Stage only the intended repository changes and keep private local
-material excluded.
-
-These checkpoint commits are local-only, including on `main`, and need no
-separate approval. They do not authorize a push. An explicit request to commit
-changes to `main` or integrate a feature into `main` includes pushing the result
-to `origin/main`, unless I explicitly request a local-only operation. No separate
-push confirmation is needed for those explicit requests.
-
-Keep `main` linear and preserve individual commits. Prefer fast-forward to
-preserve hashes when possible. If a PR or feature branch has diverged from
-`main`, **Rebase and merge** or a local rebase on a temporary integration branch
-is allowed without separate approval; preserve authorship and commit boundaries,
-but changed hashes are acceptable. Do not create merge commits or squash unless
-I explicitly request it.
-
-Before integrating or pushing, fetch `origin/main` and check the final result
-against it. Never rewrite or force-push published `main`. Ask if local `main`
-has diverged from `origin/main` or rebase conflicts leave the intended behavior
-unclear. Check that the open PR's base and status reflect the integration.
-
-Before every push, review the exact commit tree and every outgoing commit for
-private files, secrets, and personal information, including newly added files,
-reports, machine-specific paths, and Git author/committer metadata, unless I
-explicitly ask to skip this pre-push review for that push. This publication review
-and its secret scan are required immediately before pushing, not before or after
-each local-only commit. Keep local
-plans, credentials, auth databases, worlds, raw run evidence, and generated
-artifacts out of the publication; include reports only after reviewing their
-contents as intentionally public. As part of this review, inspect the outgoing
-commit diffs and any staged diff, and run a secret scanner; `.gitignore` and a
-clean scan alone are not sufficient. Repeat the review if the publication changes. Resolve confirmed
-findings before pushing; if safe publication is uncertain, stop and report the
-blocker without exposing the sensitive data or rewriting shared history.
+## Tools and integration
+Install the tools best suited to the task without asking; prefer local or
+temporary installs. Report tracked dependency/configuration changes.
+At verified logical checkpoints, make focused local commits, preserving unrelated
+work. Before committing, integrating or pushing, read
+[publication rules](docs/development/publication.md).

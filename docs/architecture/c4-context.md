@@ -1,6 +1,6 @@
-# System context
+# Experimental GameHarness system context
 
-GameHarness connects strategic models, real fast-decision providers and game adapters through a standalone desktop. The repository contains implementation; this context view does not certify release readiness. See the [container view](c4-containers.md), [architecture](overview.md) and [integration evidence](../integration-spike.md).
+This retained diagram describes the generic generated-program experiment: strategic models, optional fast-decision providers and game adapters through a desktop. The primary ordinary Java Survival player with asynchronous provider-agnostic advice is described in [Survival play](../survival/play.md). This diagram does not certify release readiness. See the [container view](c4-containers.md), [ownership reference](../reference/architecture.md) and [runtime evidence](../reference/evidence.md).
 
 ```mermaid
 ---
@@ -28,4 +28,4 @@ One strategic agent controls one avatar in the initial runtime. A Jev-backed pol
 
 The game session outlives individual tasks/runs and player lives. The operator can stop a run without closing a healthy game connection; ordinary death leaves the model responsible for an explicit vanilla respawn decision. Game/world shutdown remains a separate owned operation. These lifetimes introduce no additional external system or playing agent.
 
-The live view and activity feed expose current behavior and actual outcomes. Model explanations do not replace game evidence. Documentation and web retrieval obey the same information restrictions as other tools; the [adapter observation contract](../runtime-contracts.md) prevents them from bypassing game permissions.
+The live view and activity feed expose current behavior and actual outcomes. Model explanations do not replace game evidence. Documentation and web retrieval obey the same information restrictions as other tools; the [perception contract](../reference/perception.md) prevents them from bypassing game permissions.

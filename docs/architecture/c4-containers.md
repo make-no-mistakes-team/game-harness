@@ -1,6 +1,6 @@
-# Container view
+# Experimental GameHarness container view
 
-This is the desktop/native reference deployment. A C4 container is a separately running application, worker or store, not necessarily a Docker container. Processes run on one supported Linux host; the integration guide records which paths have actual proof.
+This is the generic generated-program desktop/native deployment, separate from the primary [ordinary Java Survival player](../survival/play.md). A C4 container is a separately running application, worker or store, not necessarily a Docker container. Processes run on one Linux host; [scoped runtime evidence](../reference/evidence.md) records which paths have proof.
 
 ```mermaid
 ---
@@ -27,13 +27,13 @@ flowchart TB
     adapter -->|"Joins with managed session proof<br/>Minecraft protocol"| game
 ```
 
-The GameHarness boundary contains the applications and data store owned by this project. This view focuses on local process and data ownership; the backend's remote provider and reference-retrieval relationships appear in the [system context](c4-context.md). OMP and other libraries are linked into the relevant applications, not deployed as separate services.
+The GameHarness boundary contains the applications and data store owned by this experiment. This retained view summarizes local ownership, not every current process: cognition, readonly operator publication and derived-history writer are separate owned children of the trusted backend, detailed in the [architecture reference](../reference/architecture.md). Remote provider and reference-retrieval relationships appear in the [system context](c4-context.md). OMP and other libraries are linked into applications, not separate services.
 
 ## Trust and ownership
 
 The trusted backend owns model credentials, strategic conversations, policy registration, action admission, and persistence. The adapter host owns raw game-client state and the avatar connection. It returns only the observations and capabilities declared by its profile, rather than exporting its underlying client object.
 
-These are separate ownership lifetimes: a game session can span several agent runs and player lives. Pause, Stop run, goal closure and ordinary death retain a healthy native client/video; run fences await actual native neutralization and worker/planner/action drain. Only explicit model-selected vanilla respawn advances life after authoritative readiness. Stop world, world replacement and desktop close end the owned session/processes; unconfirmable control failure remains fail-closed. This changes lifecycle ownership, not the deployment containers shown above.
+These are separate ownership lifetimes: a game session can span several agent runs and player lives. Pause, Stop run, goal closure and ordinary death retain a healthy native client/video; run fences await actual native neutralization and worker/planner/action drain. Only explicit model-selected vanilla respawn requests recovery; native replacement evidence establishes the new incarnation, with full gameplay readiness checked separately. Stop world, world replacement and desktop close end the owned session/processes; unconfirmable control failure remains fail-closed. This changes lifecycle ownership, not the deployment containers shown above.
 
 Workers are untrusted. Every game effect crosses the checked broker and adapter interface. Workers cannot directly connect to the game, invoke providers, read the database or game saves, or use the live renderer's internal buffers as a data source. OS restrictions enforce isolation; IPC authorization and schema checks enforce the narrower application contract.
 
@@ -47,4 +47,4 @@ The Minecraft adapter uses the actual Fabric client and managed Java 21 server. 
 
 Another supported game must supply an adapter, view, mechanics, verifier and recovery evidence. The core carries a generic observation envelope with adapter-owned data and validates registered capability schemas against the negotiated descriptor. Minecraft supplies the current payload and mechanics; no second adapter or arbitrary trusted-plugin loading is delivered. The desktop shell, isolated program protocol and ownership rules are reusable boundaries, while rendering and saves remain game-specific.
 
-The [runtime contracts](../runtime-contracts.md) define adapter conformance and effect admission. [Operations and security](../operations-and-security.md) defines isolation and recovery checks.
+The [adapter](../reference/adapters.md) and [action](../reference/actions.md) references define conformance and effect admission. [Security](../reference/security.md), [recovery](../reference/recovery.md) and [operations](../reference/operations.md) define the corresponding boundaries.

@@ -4,8 +4,8 @@ As of **23 November 2026**, inspected ordinary campaigns establish early tools
 and partial mining, **not diamonds or Nether entry**. No evidence establishes
 both in one fresh Normal Survival campaign. Prepared portal footage is diagnostic
 evidence, not from-scratch success. The primary player uses developer-written
-Java execution with asynchronous configured-model advice; model identities below
-describe historical cohorts, not product restrictions.
+Java execution with asynchronous configured-model advice. Exact model identities
+and request accounting belong to each retained run declaration.
 
 ## Recovery checkpoint, 24 November 2026
 
@@ -28,12 +28,19 @@ execution model rather than add cosmetic random angles. Useful visible canopy
 descent is a separate unresolved policy defect. Neither is fixed by account
 admission or a passing early-tool fixture.
 
+A later continuation descended through the canopy, with nonfatal falls costing
+one and two health points, but still obtained no tools. All three fatal
+encounters were explicitly attributed to zombies. Concurrent prepared
+16-block trials remained unverified: one produced actual sprint and Space
+takeoff but stopped before landing; the bucket trial never left its platform.
+These are failed development attempts, not a representative successful slice.
+
 ## Progression cohorts
 
 | Historical cohort | Verified/intermediate evidence | Unresolved outcome |
 | --- | --- | --- |
-| Fresh diamond attempt, 23 November, local Terra advice | Logs→planks/sticks→wooden pick/table→stone pick at **214.433 seconds** after launch; later coal/four torches and descending mine. Three requests settled/one advice applied. | About 18 minutes; health **5.19/20**, hunger 17, blocked food route, **no diamond**, won false/goal unverified. |
-| Separate Nether continuation, 23 November, local Terra advice | One death/respawn; two logs acquired late. One request/no applied advice. | Two logs, **zero frame blocks**, unignited, Overworld; no Nether entry. Preceding continuation died after support-centering failed. |
+| Fresh diamond attempt, 23 November, local model advice | Logs→planks/sticks→wooden pick/table→stone pick at **214.433 seconds** after launch; later coal/four torches and descending mine. Three requests settled/one advice applied. | About 18 minutes; health **5.19/20**, hunger 17, blocked food route, **no diamond**, won false/goal unverified. |
+| Separate Nether continuation, 23 November, local model advice | One death/respawn; two logs acquired late. One request/no applied advice. | Two logs, **zero frame blocks**, unignited, Overworld; no Nether entry. Preceding continuation died after support-centering failed. |
 | Ordinary diamond continuation, 22 November | Final **four raw iron**, two stone picks, nine torches, ten coal | Ceiling/temporary-step clearance blockage; health 15/hunger 16; no carried smelted iron/diamond |
 | Older Nether-labelled continuation, 21 November | Iron pick and deepslate prospecting | Work grant held its last break for ore, preventing another cover cut; no verified reversible lower passage/goal |
 | Historical pilot, 19 November | Iron pick, one ingot, one raw iron, seven torches | Interrupted; blocked without stable dry recovery footing; no diamond |
@@ -66,7 +73,7 @@ shake and fabricated overshoot were rejected.
 Approval was narrow: **one full 34-second, 1× wood/pick continuation**, unblinded,
 with longest no-useful-work interval **2.44 seconds**. It explicitly established
 neither cave/combat nor fresh-world generalization. The disclosed reserve
-holdout failed: fallback consumed all logs making a pick and no direct Terra
+holdout failed: fallback consumed all logs making a pick and no direct model
 intent reached play. That task is regression material now, not blind evidence.
 
 ## Review and acceptance

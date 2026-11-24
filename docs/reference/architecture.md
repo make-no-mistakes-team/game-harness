@@ -2,6 +2,26 @@
 
 The primary product is an ordinary Java Survival player with an asynchronous model advisor. Model selection is provider-agnostic; authorization for a particular gameplay test does not restrict the product to that model. Local activity must remain purposeful without waiting for advice. See [Survival play](../survival/play.md) and [behavior](../survival/behavior.md). The generic generated-program GameHarness described here is a retained experimental system. Its model-authored policy boundary is not a restriction on the ordinary Java player's implementation.
 
+## Ordinary Survival control
+
+Local execution owns movement, aiming, tools, inventory and immediate threat
+response. A selected operation resumes before discovery selects another target
+or applies its stationary-start checks. Immediate danger can preempt it.
+Discovery must not alternate its old camera goal with the selected operation's
+goal.
+
+Waiting for a fresh observation is not an instruction to release every key.
+The owner retains safe protective input and continues movement only within its
+checked execution window. Takeoff acknowledgement must not silently withdraw
+the flight input. Once airborne, a forecast is advice for correction; actual
+contact or death determines the landing outcome.
+
+Macro applicability and readiness to adopt are separate. Ordinary movement or
+a temporarily missing view can defer adoption without retiring an unresolved
+strategic preference. At a safe transition, execution rechecks the selected
+method's current premises. A route tied to an old stance remains stance-bound;
+losing that route need not invalidate an unrelated relocation preference.
+
 ## Generic GameHarness
 
 The trusted core owns lifecycle, strategic scheduling, authorization, persistence and the action ledger. A trusted GameAdapter owns the raw connection, filtered observations, mechanical capabilities, authentic view and game-specific verification. Generated JavaScript requests bounded capabilities; it cannot mutate the game directly.

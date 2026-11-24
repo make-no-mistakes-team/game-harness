@@ -5,7 +5,7 @@ Read one route, not the entire tree.
 ## Run and improve Survival
 
 - [Setup](setup.md): prerequisites, game access, build and host configuration.
-- [Play](survival/play.md): ordinary local play with optional Terra strategy.
+- [Play](survival/play.md): ordinary local play with optional configured-model strategy.
 - [Behavior](survival/behavior.md): purposeful rhythm, motion, survival and goals.
 - [Recovery](survival/recovery.md): stopping, clean continuation and autosaves.
 - [Diagnostics](survival/diagnostics.md): prepared trials and their claim limits.

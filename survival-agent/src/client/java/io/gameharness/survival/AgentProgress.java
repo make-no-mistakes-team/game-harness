@@ -1011,7 +1011,10 @@ final class AgentProgress {
         navigator.reset();
         mineResite.reset();
         firstStone.afterRespawn();
-        defense.resetOrdinaryRanged();
+        defense.afterRespawn();
+        previousHealth = Float.NaN;
+        retreatUntil = 0;
+        retreatYaw = 0;
         nightSite.reset();
         surfaceApproach.abandonBootstrapPassage();
         surfaceApproach.canopy.reset();

@@ -2,6 +2,8 @@ package io.gameharness.survival;
 
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.Vec3d;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import static io.gameharness.survival.AgentDefense.MeleeRecovery.DryAction.*;
@@ -11,6 +13,11 @@ import static io.gameharness.survival.AgentDefense.MeleeRecovery.dryAction;
 import static org.junit.jupiter.api.Assertions.*;
 
 final class MeleeRecoveryTest {
+    @BeforeAll
+    static void initializeVanilla() {
+        VanillaTestResources.initialize();
+    }
+
     @Test
     void freshDamageOwnsRecoveryDespiteRepeatedMissingCombatFrames() {
         var recovery = new AgentDefense.MeleeRecovery();
@@ -178,10 +185,9 @@ final class MeleeRecoveryTest {
             "actual repeated damage can outrun a weapon without a usable shield");
         assertEquals(COUNTER, dryAction(true, false, false, true, false, true));
         assertEquals(EMERGENCY, dryAction(true, false, false, true, true, true));
-        assertTrue(recovery.tryEmergencyStrike());
-        assertFalse(recovery.tryEmergencyStrike());
         recovery.observeImpact(309, 1, true, false, UNSETTLED);
-        assertFalse(recovery.tryEmergencyStrike(), "another hit is not another punch allowance");
+        assertEquals(EMERGENCY, dryAction(true, false, false, true, true, true),
+            "a trapped visible hostile still permits charged defense after an earlier strike");
         assertEquals(WAIT, dryAction(false, true, false, false, true, true),
             "no sight-checked hostile means no strike even when trapped");
     }
@@ -196,6 +202,59 @@ final class MeleeRecoveryTest {
         assertNull(AgentBody.emergencyTreadBearing(feet, floor.south().down(), 0));
         assertNull(AgentBody.emergencyTreadBearing(feet, floor.south().east(), 0));
         assertNull(AgentBody.emergencyTreadBearing(feet, floor.south(), Float.NaN));
+    }
+
+    @Test
+    void r6RepeatedUnlocatedHitsKeepTheRollingExitInsteadOfRestartingAStationarySurvey() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        var feet = new Vec3d(-17.30, 65, 12.48);
+        recovery.observeImpact(2715, 3, false, false, UNSETTLED);
+        recovery.orientRetreat(2715, 0, 0, 32, false);
+        var walk = recovery.escapeWalk(feet);
+        assertTrue(walk.ranged(), "the real melee consumer uses the continuous, sprint-capable dry-window motor");
+        assertEquals(feet.add(Vec3d.fromPolar(0, 32).multiply(24)), walk.goal,
+            "rechecked walked footing may nominate an exit even without starter gear");
+        for (int tick : new int[] {2737, 2757, 2777, 2797, 2817, 2838}) {
+            assertTrue(recovery.observeImpact(tick, 3, tick >= 2817, false, UNSETTLED));
+            recovery.orientRetreat(tick, 170, 90, -70, false);
+            assertSame(walk, recovery.escapeWalk(feet),
+                "new recoil or a missing hostile frame must not replace the chosen retreat");
+        }
+        recovery.orientRetreat(2840, -150, 32, Float.NaN, true);
+        assertNotSame(walk, recovery.escapeWalk(feet),
+            "a newly seen hostile actually blocking that exit can change it");
+    }
+
+    @Test
+    void firstUsefulImpulseCanOrientAnExitButLaterUnconfirmedImpulsesCannotThrashIt() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        var feet = new Vec3d(3, 76, 47);
+        recovery.observeImpact(5701, 3, false, false, UNSETTLED);
+        recovery.orientRetreat(5701, Float.NaN, 12, Float.NaN, false);
+        var initial = recovery.escapeWalk(feet);
+        recovery.orientRetreat(5702, 80, 12, Float.NaN, false);
+        var oriented = recovery.escapeWalk(feet);
+        assertNotSame(initial, oriented);
+        recovery.orientRetreat(5703, -90, 12, Float.NaN, false);
+        assertSame(oriented, recovery.escapeWalk(feet));
+    }
+
+    @Test
+    void lifeResetDropsOldHitPressureEscapeRouteAndConsumedSoundIdentity() {
+        var recovery = new AgentDefense.MeleeRecovery();
+        var feet = new Vec3d(2, 76, 47);
+        var cue = new AgentEars.MeleeCue(45, 1);
+        recovery.observeImpact(5805, 3, true, false, WET);
+        recovery.orientRetreat(5805, 90, 90, Float.NaN, false);
+        var oldLife = recovery.escapeWalk(feet);
+        assertEquals(45, recovery.lookBearing(5805, cue, Float.NaN));
+        recovery.reset();
+        assertFalse(recovery.observe(5845, NONE, false, false, DRY));
+        assertFalse(recovery.needsShore());
+        recovery.observeImpact(5850, 1, false, false, DRY);
+        recovery.orientRetreat(5850, -90, -90, Float.NaN, false);
+        assertNotSame(oldLife, recovery.escapeWalk(feet));
+        assertEquals(45, recovery.lookBearing(5850, cue, Float.NaN));
     }
 
     @Test

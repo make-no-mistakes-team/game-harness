@@ -26,6 +26,21 @@ type SavedPlayerStats = z.infer<typeof statsSchema> & { file: string; netherCrit
 
 export type ProgramWin = { run: string; program: NonNullable<MacroStatus["completedWorkProgram"]> };
 
+export type MinedObsidianBaseline = {
+    diamondOre: number; deepslateDiamondOre: number; diamondsPickedUp: number;
+    obsidianMined: number; obsidianPickedUp: number; obsidianPlaced: number;
+};
+/** Host-validated material sequence: fresh-world zero, or the admitted assisted anchor's saved counters.
+ * An assisted sequence never becomes an unassisted campaign/benchmark claim. */
+export type MinedObsidianCampaign = {
+    rootRun: string; playerFile: string; scope: "fresh-world" | "assisted-sequence";
+    baseline: MinedObsidianBaseline;
+};
+export type PortalRequirements = {
+    requireMinedObsidian?: boolean;
+    campaign?: MinedObsidianCampaign;
+};
+
 /** Supplied only by the admitted host, never by the model or the progress file. */
 export function retainsCompletedProgram({ run, program }: ProgramWin, goal: string, player: {
     goal: string; alive: boolean; tick?: number; life?: number; inventory?: Record<string, number>;
@@ -117,10 +132,19 @@ function hasCompleteShoreCast(progress: z.infer<typeof progressSchema>) {
 /** Use only after the server has saved and closed the world. Never supply this
  * data to the actor. A client-predicted craft and a timed-out pickup are not wins. */
 export async function verifySurvival(statsDirectory: string, goal: string, progress: unknown, requireCast = false,
-        before: SavedPlayerStats | null = null, programWin: ProgramWin | null = null) {
+        before: SavedPlayerStats | null = null, programWin: ProgramWin | null = null,
+        { requireMinedObsidian = false, campaign }: PortalRequirements = {}) {
     let mined = 0, crafted = 0, pickedUp = 0;
     let shoreCast = false;
     const result = (verified: boolean, reason: string) => ({ verified, reason, mined, crafted, pickedUp });
+    if (requireMinedObsidian && (goal !== "nether_portal" || requireCast))
+        return result(false, "Mined obsidian requires the ordinary nether_portal goal, not a casting diagnostic");
+    if (requireMinedObsidian && (!campaign?.rootRun || !campaign.playerFile || !campaign.baseline ||
+        !["fresh-world", "assisted-sequence"].includes(campaign.scope) ||
+        !["diamondOre", "deepslateDiamondOre", "diamondsPickedUp", "obsidianMined", "obsidianPickedUp", "obsidianPlaced"]
+            .every(key => Number.isSafeInteger(campaign.baseline[key as keyof MinedObsidianBaseline]) &&
+                campaign.baseline[key as keyof MinedObsidianBaseline] >= 0)))
+        return result(false, "Missing host-validated mining-sequence baseline and own-player identity");
     const p = progressSchema.safeParse(progress);
     if (!p.success || p.data.goal !== goal ||
         (programWin ? requireCast || !retainsCompletedProgram(programWin, goal, p.data) : !p.data.won))
@@ -129,6 +153,8 @@ export async function verifySurvival(statsDirectory: string, goal: string, progr
         if (p.data.dimension !== "minecraft:the_nether" || p.data.frame_blocks !== FRAME_BLOCKS || !p.data.ignited)
             return result(false, "No observed construction, ignition and Nether arrival");
         shoreCast = hasCompleteShoreCast(p.data);
+        if (requireMinedObsidian && p.data.cast_method === "shore")
+            return result(false, "Mined-obsidian construction cannot use a shore-cast frame");
         if ((requireCast || p.data.cast_method === "shore") && !shoreCast)
             return result(false, "Missing completed shore cast with two passive feet and eight poured frame cells");
     } else if (!(p.data.inventory[`minecraft:${goal}`]! > 0))
@@ -139,6 +165,8 @@ export async function verifySurvival(statsDirectory: string, goal: string, progr
         const saved = await readSavedPlayerStats(statsDirectory);
         if (!saved) return result(false, "Expected one saved player in this world");
         if (before && saved.file !== before.file) return result(false, "Saved player changed during the continuation");
+        if (requireMinedObsidian && saved.file !== campaign!.playerFile)
+            return result(false, "Saved statistics do not belong to the campaign's authenticated player");
         const total = (key: string, item: string) => count(saved, key, item);
         const delta = (key: string, item: string) => {
             const change = total(key, item) - count(before, key, item);
@@ -159,6 +187,34 @@ export async function verifySurvival(statsDirectory: string, goal: string, progr
             const diagnosticBuild = placed === 0 && total("mined", "obsidian") === 0 &&
                 diamondPickaxeActions === 0 && supports <= MAX_DIAGNOSTIC_SUPPORTS;
             const frame = shoreCast ? cast && (!requireCast || diagnosticBuild) : placed >= FRAME_BLOCKS;
+            if (requireMinedObsidian) {
+                // The sequence baseline is NOT the current portal attempt's baseline:
+                // diamonds earned by earlier in-scope diamond runs still count after crafting.
+                const baseline = campaign!.baseline;
+                const sequenceDelta = (key: string, item: string, initial: number) => {
+                    const change = total(key, item) - initial;
+                    if (change < 0) throw new Error("Mining-sequence statistics decreased below its baseline.");
+                    return change;
+                };
+                const diamondsMined = sequenceDelta("mined", "diamond_ore", baseline.diamondOre) +
+                    sequenceDelta("mined", "deepslate_diamond_ore", baseline.deepslateDiamondOre);
+                const diamondsPickedUp = sequenceDelta("picked_up", "diamond", baseline.diamondsPickedUp);
+                const obsidianMined = sequenceDelta("mined", "obsidian", baseline.obsidianMined);
+                const obsidianPickedUp = sequenceDelta("picked_up", "obsidian", baseline.obsidianPickedUp);
+                const obsidianPlaced = sequenceDelta("used", "obsidian", baseline.obsidianPlaced);
+                for (const [key, item] of [
+                    ["mined", "diamond_ore"], ["mined", "deepslate_diamond_ore"], ["picked_up", "diamond"],
+                    ["mined", "obsidian"], ["picked_up", "obsidian"], ["used", "obsidian"],
+                ] as const) delta(key, item);
+                const materials = obsidianMined >= FRAME_BLOCKS && obsidianPickedUp >= FRAME_BLOCKS;
+                const verified = materials && obsidianPlaced >= FRAME_BLOCKS && frame &&
+                    fires > 0 && entered && (newIgnition || firstEntry);
+                return { ...result(verified, verified
+                    ? "Own-player sequence mining and pickup of ten obsidian, placed frame, ignition and Nether arrival corroborate entry"
+                    : "Missing sequence mining and pickup of ten obsidian, placed frame, or new Nether entry"),
+                    requireMinedObsidian, campaign, diamondsMined, diamondsPickedUp, obsidianMined, obsidianPickedUp, obsidianPlaced,
+                    placed, lavaBuckets, waterBuckets, cast, fires, entered, supports, newIgnition, firstEntry };
+            }
             const verified = frame && fires > 0 && entered && (newIgnition || firstEntry);
             return { ...result(verified, verified
                 ? `Vanilla ${cast ? "bucket casting" : "obsidian use"}, ignition and Nether advancement corroborate entry`

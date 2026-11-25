@@ -6,6 +6,19 @@ import { readSavedPlayerStats, savedDeathDelta, verifySurvival, type ProgramWin 
 
 const goal = "nether_portal";
 const player = "127d3ae0-4132-4aac-804e-54528afce41b.json";
+const minedPortal = {
+    requireMinedObsidian: true,
+    campaign: { rootRun: "fresh-survival-root", playerFile: player, scope: "fresh-world" as const,
+        baseline: { diamondOre: 0, deepslateDiamondOre: 0, diamondsPickedUp: 0,
+            obsidianMined: 0, obsidianPickedUp: 0, obsidianPlaced: 0 } },
+};
+const minedPortalStats = {
+    "minecraft:mined": {
+        "minecraft:diamond_ore": 1, "minecraft:deepslate_diamond_ore": 2, "minecraft:obsidian": 10,
+    },
+    "minecraft:picked_up": { "minecraft:diamond": 3, "minecraft:obsidian": 10 },
+    "minecraft:used": { "minecraft:obsidian": 10, "minecraft:flint_and_steel": 1 },
+};
 const livePortal = {
     goal, won: true, alive: true, ignited: true, dimension: "minecraft:the_nether",
     inventory: { "minecraft:water_bucket": 1 }, frame_blocks: 10,
@@ -141,6 +154,136 @@ test("saved obsidian placement remains an ordinary-only path", async () => {
     const stats = await saveWorld({ "minecraft:used": { "minecraft:obsidian": 10, "minecraft:flint_and_steel": 1 } });
     expect(await verifySurvival(stats, goal, livePortal)).toMatchObject({ verified: true, cast: false });
     expect((await verifySurvival(stats, goal, livePortal, true)).verified).toBe(false);
+});
+
+test("strict portal verification rejects casting even when campaign mining counters are sufficient", async () => {
+    const stats = await saveWorld({
+        ...minedPortalStats, "minecraft:used": { ...minedPortalStats["minecraft:used"], ...shoreUse },
+    });
+    expect((await verifySurvival(stats, goal, liveShore)).verified).toBe(true);
+    expect(await verifySurvival(stats, goal, liveShore, false, null, null, minedPortal)).toMatchObject({
+        verified: false, reason: expect.stringContaining("shore-cast"),
+    });
+    expect((await verifySurvival(stats, goal, livePortal, true, null, null, minedPortal)).verified).toBe(false);
+});
+
+test("strict portal verification rejects placed-only obsidian without changing ordinary verification", async () => {
+    const stats = await saveWorld({ "minecraft:used": minedPortalStats["minecraft:used"] });
+    expect((await verifySurvival(stats, goal, livePortal)).verified).toBe(true);
+    expect(await verifySurvival(stats, goal, livePortal, false, null, null, minedPortal)).toMatchObject({
+        verified: false, obsidianMined: 0, obsidianPickedUp: 0, diamondsMined: 0, diamondsPickedUp: 0,
+    });
+});
+
+test.each([
+    ["minecraft:mined", "minecraft:obsidian", 9],
+    ["minecraft:picked_up", "minecraft:obsidian", 9],
+    ["minecraft:used", "minecraft:obsidian", 9],
+    ["minecraft:used", "minecraft:flint_and_steel", 0],
+] as const)("strict portal requires sufficient own-player %s %s", async (category, item, count) => {
+    const stats = await saveWorld({
+        ...minedPortalStats, [category]: { ...minedPortalStats[category], [item]: count },
+    });
+    expect((await verifySurvival(stats, goal, livePortal, false, null, null, minedPortal)).verified).toBe(false);
+});
+
+test("strict portal requires obsidian pickup, not breaks or final construction alone", async () => {
+    const stats = await saveWorld({ ...minedPortalStats, "minecraft:picked_up": { "minecraft:diamond": 3 } });
+    expect((await verifySurvival(stats, goal, livePortal, false, null, null, minedPortal)).verified).toBe(false);
+});
+
+test("strict obsidian proof permits traded picks and Fortune rather than requiring three diamond-ore breaks", async () => {
+    for (const diamondOre of [0, 1]) {
+        const stats = await saveWorld({
+            "minecraft:mined": { "minecraft:diamond_ore": diamondOre, "minecraft:obsidian": 10 },
+            "minecraft:picked_up": { "minecraft:obsidian": 10 },
+            "minecraft:used": minedPortalStats["minecraft:used"],
+        });
+        expect(await verifySurvival(stats, goal, livePortal, false, null, null, minedPortal)).toMatchObject({
+            verified: true, diamondsMined: diamondOre, diamondsPickedUp: 0,
+            obsidianMined: 10, obsidianPickedUp: 10,
+        });
+    }
+});
+
+test("assisted obsidian sequence subtracts its actual anchor and never credits pre-anchor materials", async () => {
+    const requirement = { requireMinedObsidian: true, campaign: {
+        ...minedPortal.campaign, rootRun: "admitted-assisted-anchor", scope: "assisted-sequence" as const,
+        baseline: { diamondOre: 4, deepslateDiamondOre: 2, diamondsPickedUp: 8,
+            obsidianMined: 7, obsidianPickedUp: 7, obsidianPlaced: 5 },
+    } };
+    const stats = await saveWorld({
+        "minecraft:mined": { "minecraft:diamond_ore": 4, "minecraft:deepslate_diamond_ore": 2, "minecraft:obsidian": 16 },
+        "minecraft:picked_up": { "minecraft:diamond": 8, "minecraft:obsidian": 16 },
+        "minecraft:used": { "minecraft:obsidian": 15, "minecraft:flint_and_steel": 1 },
+    });
+    expect(await verifySurvival(stats, goal, livePortal, false, null, null, requirement)).toMatchObject({
+        verified: false, obsidianMined: 9, obsidianPickedUp: 9, obsidianPlaced: 10,
+    });
+    await writeFile(join(stats, player), JSON.stringify({ stats: {
+        "minecraft:mined": { "minecraft:diamond_ore": 4, "minecraft:deepslate_diamond_ore": 2, "minecraft:obsidian": 17 },
+        "minecraft:picked_up": { "minecraft:diamond": 8, "minecraft:obsidian": 17 },
+        "minecraft:used": { "minecraft:obsidian": 15, "minecraft:flint_and_steel": 1 },
+    } }));
+    expect(await verifySurvival(stats, goal, livePortal, false, null, null, requirement)).toMatchObject({
+        verified: true, diamondsMined: 0, diamondsPickedUp: 0,
+        obsidianMined: 10, obsidianPickedUp: 10, obsidianPlaced: 10,
+        campaign: { rootRun: "admitted-assisted-anchor", scope: "assisted-sequence" },
+    });
+});
+
+test("strict continuation credits prior campaign diamonds after they were spent on the pickaxe", async () => {
+    const initial = {
+        "minecraft:mined": { "minecraft:diamond_ore": 1, "minecraft:deepslate_diamond_ore": 2 },
+        "minecraft:picked_up": { "minecraft:diamond": 3 },
+        "minecraft:crafted": { "minecraft:diamond_pickaxe": 1 },
+    };
+    const stats = await saveWorld(initial, { criteria: {}, done: false });
+    const before = await readSavedPlayerStats(stats);
+    await writeFile(join(stats, player), JSON.stringify({ stats: {
+        ...minedPortalStats, "minecraft:crafted": initial["minecraft:crafted"],
+    } }));
+    await writeFile(join(stats, "..", "advancements", player), JSON.stringify({
+        "minecraft:story/enter_the_nether": netherAdvancement,
+    }));
+    expect(await verifySurvival(stats, goal, livePortal, false, before, null, minedPortal)).toMatchObject({
+        verified: true, mined: 0, diamondsMined: 3, diamondsPickedUp: 3,
+        obsidianMined: 10, obsidianPickedUp: 10, placed: 10, cast: false, firstEntry: true,
+        campaign: minedPortal.campaign,
+    });
+});
+
+test("strict proof rejects missing campaign scope and another player's statistics", async () => {
+    const stats = await saveWorld(minedPortalStats);
+    expect((await verifySurvival(stats, goal, livePortal, false, null, null,
+        { requireMinedObsidian: true })).verified).toBe(false);
+    expect((await verifySurvival(stats, goal, livePortal, false, null, null, {
+        ...minedPortal, campaign: { ...minedPortal.campaign, playerFile: "other-player.json" },
+    })).verified).toBe(false);
+});
+
+test("strict campaign proof still requires live arrival, saved advancement and a new entry or ignition", async () => {
+    const stats = await saveWorld(minedPortalStats);
+    for (const changed of [{ dimension: "minecraft:overworld" }, { frame_blocks: 9 }, { ignited: false }]) {
+        expect((await verifySurvival(stats, goal, { ...livePortal, ...changed }, false, null, null, minedPortal)).verified)
+            .toBe(false);
+    }
+    const inherited = await readSavedPlayerStats(stats);
+    expect((await verifySurvival(stats, goal, livePortal, false, inherited, null, minedPortal)).verified).toBe(false);
+    const noEntry = await saveWorld(minedPortalStats, { criteria: {}, done: false });
+    expect((await verifySurvival(noEntry, goal, livePortal, false, null, null, minedPortal)).verified).toBe(false);
+});
+
+test("strict proof rejects decreasing inherited material counters", async () => {
+    const stats = await saveWorld({
+        ...minedPortalStats, "minecraft:picked_up": { "minecraft:diamond": 4, "minecraft:obsidian": 11 },
+    }, { criteria: {}, done: false });
+    const before = await readSavedPlayerStats(stats);
+    await writeFile(join(stats, player), JSON.stringify({ stats: minedPortalStats }));
+    await writeFile(join(stats, "..", "advancements", player), JSON.stringify({
+        "minecraft:story/enter_the_nether": netherAdvancement,
+    }));
+    expect((await verifySurvival(stats, goal, livePortal, false, before, null, minedPortal)).verified).toBe(false);
 });
 
 test("continuation credits new mining and pickup, not an inherited diamond or lifetime death count", async () => {

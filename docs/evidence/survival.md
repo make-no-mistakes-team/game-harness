@@ -35,8 +35,12 @@ The temporary, explicitly assisted ore-coordinate sequence has since reached
 three raw iron, smelted three ingots and crafted an iron pick through ordinary
 Survival actions. A continuation escaped a flooded mine after restart and
 descended to level 39. It later lost its paid-charcoal worksite during stall
-recovery and stopped without diamonds. Health remained 0.4/20; no health or
-food reset was authorized. Ore assistance prevents an honest-campaign claim.
+recovery and stopped without diamonds. A later eight-block fall killed the
+0.4-health player; the next life died after surface combat. Own-gear recovery
+did not recover those tools. The current continuation has rebuilt wooden tools
+and collected stone, not retained the earlier iron-tool stock.
+No health or food reset was authorized. Ore assistance prevents an
+honest-campaign claim.
 
 A prepared 16-block bucket trial now verifies pre-landing water placement,
 an undamaged landing and safe source reclaim: placement tick 130, wet contact
@@ -46,6 +50,12 @@ failures. A separate 16-block run-up trial also verifies the full sequence:
 takeoff/Space tick 124, wet contact 153, settlement 166, minimum health 20.
 Saved statistics record one jump and 82 cm of sprinting. Neither trial
 establishes ordinary campaign competence or 1× motion quality.
+
+A prepared ordinary-controller berry trial verifies real harvesting, pickup,
+eating and natural healing: two berries picked up and eaten, health rising
+from 4 to about 5.8, hunger 19, no deaths and all owned processes exiting
+cleanly. This does not establish food finding in an unprepared world,
+animal hunting or a carried food reserve.
 
 ## Progression cohorts
 
@@ -100,5 +110,7 @@ unseen again.
 Remaining current acceptance includes diamonds **and** Nether entry in the same
 fresh campaign, purposeful execution independent of advice, variable smooth
 off-center aim, safe mining before aim fully settles, continuous local travel,
-threat flee/fight and food/healing. No hidden blocks/seeds/server truth may
-inform the player. Prior short approval does not waive these unresolved demands.
+threat flee/fight and food/healing. The
+[perception boundary](../survival/perception.md) now permits contact-bound combat
+geometry, not hidden materials, resources, entities or evaluator truth.
+Prior short approval does not waive these unresolved demands.

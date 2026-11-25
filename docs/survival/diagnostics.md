@@ -79,6 +79,26 @@ Initial values must not exceed maxima; defaults remain unchanged. Resolved
 requests appear in `declaration.json` under `limits.jvmHeapsMiB`. Heap limits do
 not replace host-memory admission, execution-slot ownership or hard scope caps.
 
+## Ordinary-controller development cases
+
+These cases prepare initial conditions before the first join, then use the
+ordinary local player with zero provider calls and no method-selection override.
+They do not establish the combined Survival target.
+
+| Command suffix after `bun run play:agent` | Prepared condition and required outcome |
+| --- | --- |
+| `--diagnostic-combat unarmed` | Hostile contact, empty hands; survive effective counters or a sustained escape. |
+| `--diagnostic-combat sword` | A carried sword, initially holding a pick; use the appropriate weapon and survive. |
+| `--diagnostic-terrain food 120` | Injury, hunger and ripe bushes; harvest, collect, eat and naturally regain health. |
+| `--diagnostic-terrain food-chicken 120` | Injury, hunger and normal chickens; hunt, collect, eat and naturally regain health. |
+| `--diagnostic-terrain excavation-void 180` | Low health, funded tools and a concealed void below a rock cap; expose it without falling through. |
+| `--diagnostic-terrain excavation-stair 180` | Low health and funded tools over rock; make two actual safe downward steps and collect the cut material. |
+
+Combat records [flow geometry](perception.md#combat-flow-geometry) separately
+from vision. Food and excavation checks join actual inputs, native physical
+outcomes and saved vanilla statistics after clean shutdown. Prepared supplies
+or a controller's acceptance counter alone are not completion evidence.
+
 ## Explicit constrained work orders
 
 This mode gives the selected model individual work-order authority instead of ordinary

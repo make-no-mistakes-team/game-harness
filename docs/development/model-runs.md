@@ -25,7 +25,9 @@ unregistered historical material. Physical disk safety remains a hard condition.
 The scoped accounting implementation lives in
 [`storage.ts`](../../survival-agent/storage.ts).
 Use `SURVIVAL_AGENT_ARTIFACT_CAMPAIGN=recovery-development` for these ordinary
-runs and the explicitly declared [high-water development diagnostics](../survival/diagnostics.md#high-water-development-cases).
+runs and the explicitly declared
+[high-water](../survival/diagnostics.md#high-water-development-cases) and
+[ordinary-controller development diagnostics](../survival/diagnostics.md#ordinary-controller-development-cases).
 First activation requires drained lanes and records the historical baseline;
 later admissions retain it. Older/frozen diagnostic allocations stay unchanged.
 

@@ -211,6 +211,31 @@ final class LocalSmeltTest {
     }
 
     @Test
+    void paidCharcoalWaitKeepsTheOriginalDeadlineThroughReopenAndCollection() {
+        var watch = new AgentLocalSmelt.Watch();
+        assertFalse(watch.mechanicalWait(18_755));
+        watch.leave(18_755, 30_391, 2, 0.03f);
+        assertFalse(watch.recheckDue(19_148));
+        assertTrue(watch.recheckDue(19_149));
+        assertTrue(watch.mechanicalWait(19_149),
+            "the first reopen must not expose the whole paid cook as idle time");
+        watch.reopen();
+        assertFalse(watch.active());
+        assertTrue(watch.mechanicalWait(19_150),
+            "synchronizing and withdrawing the original slots retains the finite lease");
+        assertTrue(watch.mechanicalWait(19_208));
+        assertFalse(watch.mechanicalWait(19_209),
+            "a failed reopen cannot turn an outstanding payment into an unlimited stall exemption");
+        watch.reopen();
+        assertFalse(watch.mechanicalWait(19_210), "reopening again does not renew the deadline");
+
+        var restored = new AgentLocalSmelt.Watch();
+        restored.reopen();
+        assertFalse(restored.mechanicalWait(1),
+            "a saved parked batch does not grant another estimated cook wait on continuation");
+    }
+
+    @Test
     void anOriginalSingletonStillWatchesInItsScreenAfterAReopen() {
         var batch = new AgentLocalSmelt.Batch(Items.BIRCH_LOG, 1, 0);
         var watch = new AgentLocalSmelt.Watch();

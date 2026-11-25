@@ -31,7 +31,7 @@ final class AgentLocalSmelt {
         private static final int SIDE_WORK_TICKS = 90;
         private static final int WALK_RESERVE = 2 * AgentSurfaceTread.ORDINARY_GRADE_TICKS + 12;
         private static final int REOPEN_TICKS = 60;
-        private int recheckAt, sideUntil, pickupStock = -1;
+        private int recheckAt, collectionUntil, sideUntil, pickupStock = -1;
         private long closedAfterFrame;
         private boolean used, pickupTried;
 
@@ -47,10 +47,12 @@ final class AgentLocalSmelt {
             used = true;
             closedAfterFrame = frame;
             recheckAt = tick + wait;
+            collectionUntil = recheckAt + REOPEN_TICKS;
             sideUntil = tick + Math.min(wait, SIDE_WORK_TICKS);
         }
 
         boolean active() { return recheckAt != 0; }
+        boolean mechanicalWait(int tick) { return collectionUntil != 0 && tick < collectionUntil; }
         boolean recheckDue(int tick) { return active() && tick >= recheckAt; }
         boolean recheckExpired(int tick) { return active() && tick - recheckAt >= REOPEN_TICKS; }
         boolean seesWorld(long frame) { return active() && frame > closedAfterFrame; }

@@ -30,6 +30,17 @@ final class NightWorksiteTest {
     }
 
     @Test
+    void spentOptionalNightDiversionYieldsMineralWorkWithoutErasingDarkOrDangerEvidence() {
+        site.observe(DARK, clearing, 20);
+        assertEquals(SEARCH, AgentNightWorksite.mineralDiversion(false));
+        assertEquals(ORDINARY, AgentNightWorksite.mineralDiversion(true),
+            "an exhausted search must not select another unlimited EXPLORE owner");
+        assertTrue(site.darkAt(clearing, 21), "yielding a diversion does not fabricate daylight or shelter");
+        assertEquals(ORDINARY, site.action(clearing, 21, false, true, CORNER, true),
+            "real safety continues to own its earlier turn");
+    }
+
+    @Test
     void partialScreenAndFirstBreakAreNotAShelteredLanding() {
         site.observe(DARK, clearing, 20);
         assertEquals(SCREEN, AgentNightWorksite.corner(true, true, true, false));

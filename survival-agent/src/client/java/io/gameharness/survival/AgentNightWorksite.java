@@ -14,6 +14,9 @@ final class AgentNightWorksite {
     enum Cover { NONE, SCREEN, CORNER, BANK, POCKET }
     enum Action { ORDINARY, SEARCH, SEEK, OPEN, WORK }
 
+    /** The optional night-site search cannot become an unlimited owner of mineral work. */
+    static Action mineralDiversion(boolean spent) { return spent ? Action.ORDINARY : Action.SEARCH; }
+
     private BlockPos exposed;
     private int seenAt;
 

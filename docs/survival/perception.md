@@ -6,8 +6,8 @@ Neither should be described as framebuffer-only play.
 
 ## What counts as observed
 
-The client admits geometry through current camera projection, range, light and
-ray visibility. Loaded world data is not a map available to the planner.
+Outside combat flow, the client admits geometry through current camera
+projection, range, light and ray visibility. Loaded world data is not a map available to the planner.
 Knowing that a chunk contains a block does not make that block observed.
 
 Optical sight uses loaded baked geometry and sprite alpha. Glass and panes can
@@ -31,6 +31,23 @@ exception.
 The implementation is in
 [`AgentOpticalSight`](../../survival-agent/src/client/java/io/gameharness/survival/AgentOpticalSight.java)
 and [`AgentBody`](../../survival-agent/src/client/java/io/gameharness/survival/AgentBody.java).
+
+## Combat flow geometry
+
+Confirmed hostile contact may enable a short-lived native geometry sensor
+within four blocks, including behind the player. It exposes nearby floor,
+steps, walls, ceiling and cliffs only up to the first solid barrier.
+Closed cavities beyond that barrier stay unknown. Block materials, resources,
+containers, items and hidden mobs are not supplied; unidentified liquid
+volumes cannot authorize a dry tread.
+
+Flow geometry is not a visual observation. Its fresh, world/player/life-bound
+receipts may support reflexive movement without turning the camera first.
+They expire with the encounter and do not populate the ordinary exploration
+map. Actually traversed contacts remain the player's own experience.
+Ambient sounds or fall damage alone cannot activate flow. Attacks, mining
+and placement still require their normal current contact, reach and effect
+checks.
 
 ## What counts as inferred
 

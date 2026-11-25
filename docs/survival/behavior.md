@@ -139,8 +139,10 @@ Pickup, eating and health recovery are separate outcomes.
 
 ## Evidence boundary
 
-The actor receives player-observable evidence, not hidden blocks, seeds,
-server state, admin commands or privileged evaluator records.
+The actor uses ordinary observations and the bounded
+[combat-flow geometry profile](perception.md#combat-flow-geometry).
+That profile does not disclose hidden block contents, resources, seeds,
+admin state or privileged evaluator records.
 Final verification reads saved vanilla statistics only after closure.
 A diamond win requires live inventory plus newly mined diamond ore and pickup.
 Nether success requires construction, ignition and actual entry, not ten

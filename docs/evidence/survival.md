@@ -1,7 +1,7 @@
 # Ordinary Survival evidence and unresolved feedback
 
-As of **23 November 2026**, inspected ordinary campaigns establish early tools
-and partial mining, **not diamonds or Nether entry**. No evidence establishes
+As of **25 November 2026**, inspected campaigns establish early tools,
+iron tools and partial mining, **not diamonds or Nether entry**. No evidence establishes
 both in one fresh Normal Survival campaign. Prepared portal footage is diagnostic
 evidence, not from-scratch success. The primary player uses developer-written
 Java execution with asynchronous configured-model advice. Exact model identities
@@ -31,10 +31,21 @@ The user reviewed a **33.2-second, 1× excerpt** of the wood/tools attempt:
 generally acceptable movement, but **00:18–00:30** still showed standing with
 slow, interrupted cursor movement. That interval remains rejected, not approved.
 
-Prepared 16-block water trials remain unverified. One produced actual sprint
-and Space takeoff but stopped before landing; a later bucket trial completed a
-fall without placement and took damage. These diagnostics are not campaign
-competence or a successful complex-task demonstration.
+The temporary, explicitly assisted ore-coordinate sequence has since reached
+three raw iron, smelted three ingots and crafted an iron pick through ordinary
+Survival actions. A continuation escaped a flooded mine after restart and
+descended to level 39. It later lost its paid-charcoal worksite during stall
+recovery and stopped without diamonds. Health remained 0.4/20; no health or
+food reset was authorized. Ore assistance prevents an honest-campaign claim.
+
+A prepared 16-block bucket trial now verifies pre-landing water placement,
+an undamaged landing and safe source reclaim: placement tick 130, wet contact
+132, reclaim 142 and settled footing 155; minimum health 20. Native physics,
+item-use receipts and saved statistics agree. Earlier failed trials remain
+failures. A separate 16-block run-up trial also verifies the full sequence:
+takeoff/Space tick 124, wet contact 153, settlement 166, minimum health 20.
+Saved statistics record one jump and 82 cm of sprinting. Neither trial
+establishes ordinary campaign competence or 1× motion quality.
 
 ## Progression cohorts
 

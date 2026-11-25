@@ -129,7 +129,10 @@ Repeated ranged hits require checked escape/cover; one dodge is not safety.
 Water escape rechecks connected older stairs rather than swimming blindly
 up under a roof. One dry step beside a breach is not a new worksite.
 After danger, hurt or hungry players suspend mining, eat suitable carried
-food, pursue visible safe food, or scout reachable new ground.
+food, pursue visible safe food, or make a bounded search of reachable ground.
+Fruitless terrain scouting cannot own play indefinitely: changing footholds
+or collecting unrelated blocks does not renew it. Keep the healing need and
+current-view food recognition active while ordinary goal work resumes.
 Apples require actual drops; an audible chicken is only a reason to look.
 Safe food takes priority over raw chicken or rotten flesh.
 Pickup, eating and health recovery are separate outcomes.

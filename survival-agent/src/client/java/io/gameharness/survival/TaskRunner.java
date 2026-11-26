@@ -1190,16 +1190,50 @@ final class TaskRunner {
         statusText = label;
         BlockPos feet = player.getBlockPos();
 
-        // 1. If in water, immediately climb out onto the nearest dry shore!
+        // 1. If in water, climb out onto a reachable low dry shore (dy 0..1), or swim along open water / carve a step out if walled in!
         if (player.isTouchingWater()) {
+            Vec3d wPos = player.getPos();
+            if (exploreLastPos == null || Math.hypot(wPos.x - exploreLastPos.x, wPos.z - exploreLastPos.z) > 1.2) {
+                exploreLastPos = wPos;
+                exploreStuckTicks = 0;
+            } else {
+                exploreStuckTicks++;
+            }
+
             BlockPos dryShore = findNearestDryShore(player, world);
+            if (exploreStuckTicks >= 32) {
+                if (dryShore != null) blacklistedTargets.add(dryShore);
+                // Steep stone/dirt wall blocking water exit: carve a step if diggable, or turn along open water!
+                BlockPos aheadWall = BlockPos.ofFloored(
+                    player.getX() + Math.cos(exploreHeadingRad) * 1.15,
+                    player.getY() + 1.0,
+                    player.getZ() + Math.sin(exploreHeadingRad) * 1.15);
+                BlockState wallSt = world.getBlockState(aheadWall);
+                if (!wallSt.isAir() && wallSt.getFluidState().isEmpty() && !Perception.isUnbreakable(wallSt)
+                        && !Perception.isHazardBlock(wallSt) && bestPickaxeTier(player) >= 1) {
+                    motor.mineBlock(aheadWall, true, true);
+                    motor.moveToward(Vec3d.ofBottomCenter(aheadWall), false, true, false, false);
+                    statusText = "carving exit out of water";
+                    if (exploreStuckTicks > 95) {
+                        exploreHeadingRad = pickOpenWaterHeading(player, world, exploreHeadingRad);
+                        exploreStuckTicks = 0;
+                        exploreLastPos = wPos;
+                    }
+                    return;
+                }
+                exploreHeadingRad = pickOpenWaterHeading(player, world, exploreHeadingRad);
+                exploreStuckTicks = 0;
+                exploreLastPos = wPos;
+                dryShore = findNearestDryShore(player, world);
+            }
+
             if (dryShore != null) {
                 exploreHeadingRad = Math.atan2(dryShore.getZ() + 0.5 - player.getZ(), dryShore.getX() + 0.5 - player.getX());
                 motor.moveToward(Vec3d.ofBottomCenter(dryShore), false, true, false, true);
                 statusText = "climbing out of water";
                 return;
             }
-            // Open water: keep ONE steady heading (never spin in circles in water!)
+            // Open water: keep ONE steady open-water heading (never splash into a vertical cliff!)
             Vec3d target = player.getPos().add(Math.cos(exploreHeadingRad) * 12.0, 0, Math.sin(exploreHeadingRad) * 12.0);
             motor.moveToward(target, false, true, false, true);
             statusText = "swimming toward land";
@@ -1380,17 +1414,58 @@ final class TaskRunner {
         return false;
     }
 
+    private double pickOpenWaterHeading(ClientPlayerEntity player, ClientWorld world, double currentRad) {
+        double bestRad = currentRad + Math.PI * 0.75;
+        double bestScore = Double.NEGATIVE_INFINITY;
+        int by = player.getBlockY();
+        for (int i = 0; i < 12; i++) {
+            double rad = currentRad + (i * Math.PI * 2.0 / 12.0);
+            double dx = Math.cos(rad);
+            double dz = Math.sin(rad);
+            // Strongly turn away from the jammed wall direction
+            double score = -Math.cos(rad - currentRad) * 5.0;
+            for (int dist = 1; dist <= 6; dist++) {
+                int bx = (int) Math.floor(player.getX() + dx * dist);
+                int bz = (int) Math.floor(player.getZ() + dz * dist);
+                BlockState atWater = world.getBlockState(new BlockPos(bx, by, bz));
+                BlockState above = world.getBlockState(new BlockPos(bx, by + 1, bz));
+                if (!Perception.isPassable(above)) {
+                    score -= 22.0; // vertical wall rising above water surface!
+                    break;
+                }
+                if (Perception.isSolidSupport(atWater) && Perception.isPassable(above)
+                        && Perception.isPassable(world.getBlockState(new BlockPos(bx, by + 2, bz)))) {
+                    score += 16.0; // low 1-block walkable dry bank!
+                    break;
+                }
+                if (atWater.getFluidState().isIn(net.minecraft.registry.tag.FluidTags.WATER)) {
+                    score += 3.5; // open swimmable water channel
+                }
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                bestRad = rad;
+            }
+        }
+        return bestRad;
+    }
+
     private BlockPos findNearestDryShore(ClientPlayerEntity player, ClientWorld world) {
         BlockPos feet = player.getBlockPos();
         BlockPos best = null;
         double bestDistSq = Double.POSITIVE_INFINITY;
         for (int dx = -12; dx <= 12; dx++) {
             for (int dz = -12; dz <= 12; dz++) {
-                for (int dy = 0; dy <= 2; dy++) {
+                // Only dy = 0..1! A player in water CANNOT jump onto a dy = +2 cliff ledge!
+                for (int dy = 0; dy <= 1; dy++) {
                     BlockPos cand = feet.add(dx, dy, dz);
+                    if (blacklistedTargets.contains(cand)) continue;
                     BlockState st = perception.getObserved(cand);
+                    BlockState head = perception.getObserved(cand.up());
                     BlockState below = perception.getObserved(cand.down());
-                    if (st != null && below != null && st.isAir() && st.getFluidState().isEmpty()
+                    if (st != null && head != null && below != null
+                            && Perception.isPassable(st) && st.getFluidState().isEmpty()
+                            && Perception.isPassable(head) && head.getFluidState().isEmpty()
                             && Perception.isSolidSupport(below)) {
                         double dSq = cand.getSquaredDistance(feet);
                         if (dSq < bestDistSq) {

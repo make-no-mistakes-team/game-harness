@@ -108,6 +108,7 @@ final class TaskRunner {
     private BlockPos branchWaypoint;
     private int branchLegSegments;
     private int descentLateralTicks;
+    private int dryInlandSeekTicks;
     private int exitCaveTicks;
     private double exploreHeadingRad = 0.7;
     private int exploreFlipCount;
@@ -658,8 +659,14 @@ final class TaskRunner {
             exploreForResources(player, world, currentTick, "scouting downhill for exposed stone");
             return;
         }
-        // Ensure we're on DRY land before digging a staircase down!
+        // Ensure we're on DRY inland ground (not a waterlogged sea-level beach!) before digging a staircase down!
+        if (dryInlandSeekTicks > 0) {
+            dryInlandSeekTicks--;
+            exploreForResources(player, world, currentTick, "moving inland to dry ground for stone");
+            return;
+        }
         if (isWetSurfaceSpot(player, world)) {
+            dryInlandSeekTicks = 60;
             route.clear();
             exploreForResources(player, world, currentTick, "moving to dry ground before digging");
             return;
@@ -669,8 +676,10 @@ final class TaskRunner {
         RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.reachY(goalY), opts, currentTick);
         statusText = "digging down to stone";
         if (st == RouteExecutor.Status.STUCK) {
-            // Try stepping forward and digging elsewhere
-            exploreForResources(player, world, currentTick, "seeking diggable ground for stone");
+            // Commit to walking inland for ~4.5s before retrying downward excavation so we leave wet/sandy shorelines cleanly!
+            dryInlandSeekTicks = 90;
+            route.clear();
+            exploreForResources(player, world, currentTick, "seeking dry inland ground for stone");
         }
     }
 
@@ -2571,13 +2580,18 @@ final class TaskRunner {
         if (feet.getY() < 60 || world.getLightLevel(net.minecraft.world.LightType.SKY, feet) < 12) {
             return false;
         }
+        boolean onBeachSand = feet.getY() <= 65 && (world.getBlockState(feet.down()).isOf(Blocks.SAND)
+            || world.getBlockState(feet.down()).isOf(Blocks.GRAVEL));
+        int radius = onBeachSand ? 3 : 2;
+        int threshold = onBeachSand ? 2 : 4;
         int wetNeighbors = 0;
-        for (int dx = -2; dx <= 2; dx++) {
-            for (int dz = -2; dz <= 2; dz++) {
+        for (int dx = -radius; dx <= radius; dx++) {
+            for (int dz = -radius; dz <= radius; dz++) {
                 if (!world.getFluidState(feet.add(dx, 0, dz)).isEmpty()
-                        || !world.getFluidState(feet.add(dx, -1, dz)).isEmpty()) {
+                        || !world.getFluidState(feet.add(dx, -1, dz)).isEmpty()
+                        || !world.getFluidState(feet.add(dx, -2, dz)).isEmpty()) {
                     wetNeighbors++;
-                    if (wetNeighbors >= 5) return true;
+                    if (wetNeighbors >= threshold) return true;
                 }
             }
         }

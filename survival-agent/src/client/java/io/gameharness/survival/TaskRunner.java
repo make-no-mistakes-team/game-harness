@@ -2463,12 +2463,13 @@ final class TaskRunner {
         if (exploreClimbingOut) {
             exploreClimbTicks++;
             boolean clearSky = feet.getY() >= exploreClimbTargetY && !isUndergroundOrRoofed(player, world);
-            if (clearSky || exploreClimbTicks > 240) {
+            if (clearSky || exploreClimbTicks > 200) {
                 exploreClimbingOut = false;
                 exploreClimbTicks = 0;
                 exploreFlipCount = 0;
                 exploreStuckTicks = 0;
                 exploreLastPos = player.getPos();
+                exploreHeadingRad = pickBestDryHeading(player, world, exploreHeadingRad + Math.PI * 0.5, true);
                 route.clear();
             } else {
                 Pathfinder.Options climbOpts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
@@ -2480,6 +2481,7 @@ final class TaskRunner {
                     exploreFlipCount = 0;
                     exploreStuckTicks = 0;
                     exploreLastPos = player.getPos();
+                    exploreHeadingRad = pickBestDryHeading(player, world, exploreHeadingRad + Math.PI * 0.75, true);
                     route.clear();
                 }
                 return;
@@ -2503,7 +2505,9 @@ final class TaskRunner {
             // If repeatedly trapped in a tight pit/overhang (3+ consecutive stuck turns), latch a full A* climb-out!
             if (exploreFlipCount >= 3) {
                 exploreClimbingOut = true;
-                exploreClimbTargetY = Math.max(feet.getY() + 4, 65);
+                exploreClimbTargetY = isUndergroundOrRoofed(player, world)
+                    ? Math.max(feet.getY() + 4, 65)
+                    : feet.getY() + 2;
                 exploreClimbTicks = 0;
                 route.clear();
                 replanCooldown = 0;

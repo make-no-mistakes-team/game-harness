@@ -116,6 +116,9 @@ final class TaskRunner {
     private int exploreFlipCount;
     private Vec3d exploreLastPos;
     private int exploreStuckTicks;
+    private boolean exploreClimbingOut;
+    private int exploreClimbTargetY;
+    private int exploreClimbTicks;
     private Vec3d canopyLastPos;
     private int canopyStuckTicks;
     private int dropChaseEntityId = -1;
@@ -1285,8 +1288,8 @@ final class TaskRunner {
             return;
         }
 
-        // 3. Explore surface to find food animals/berries (climb up first if underground!)
-        if (player.getBlockY() < 58 && world.getLightLevel(net.minecraft.world.LightType.SKY, player.getBlockPos()) < 8) {
+        // 3. Explore surface to find food animals/berries (climb up all the way into open daylight if underground/roofed!)
+        if (isUndergroundOrRoofed(player, world)) {
             if (activeTicks > 750) {
                 finishActive("partial", "still underground while looking for food", currentTick);
                 return;
@@ -1873,7 +1876,7 @@ final class TaskRunner {
                 || caves.countNearbyUnvisitedFrontiers(perception, feet, 24.0) > 0)) {
             tickCaveSearch(player, world, Perception.OreKind.IRON, 24, currentTick);
             statusText = "searching open cave for gravel";
-        } else if (feet.getY() < 58 && world.getLightLevel(net.minecraft.world.LightType.SKY, feet) < 8) {
+        } else if (isUndergroundOrRoofed(player, world)) {
             climbToSurface(player, world, currentTick, "climbing to surface to find gravel banks");
         } else {
             exploreForResources(player, world, currentTick, "scouting surface & banks for gravel");
@@ -1951,13 +1954,22 @@ final class TaskRunner {
         }
 
         waterFillAimStableTicks = 0;
-        boolean underground = world.getLightLevel(net.minecraft.world.LightType.SKY, feet) < 8;
+        boolean underground = isUndergroundOrRoofed(player, world);
         Pathfinder.Options opts = underground
             ? Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true)
             : Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
         RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(waterTarget.up(), 2.8), opts, currentTick);
         statusText = "walking to water source";
         if (st == RouteExecutor.Status.STUCK) {
+            if (!underground) {
+                replanCooldown = 0;
+                RouteExecutor.Status esc = navigateToward(player, Pathfinder.Goal.near(waterTarget.up(), 2.8),
+                    Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
+                if (esc == RouteExecutor.Status.RUNNING) {
+                    statusText = "climbing out toward water source";
+                    return;
+                }
+            }
             blacklistedTargets.add(waterTarget);
             route.clear();
         }
@@ -2279,10 +2291,16 @@ final class TaskRunner {
 
     // ===================== NAVIGATION & HELPERS =====================
 
-    private boolean isUndergroundWithoutCave(ClientPlayerEntity player, ClientWorld world) {
+    /** True whenever the player is underground OR under a dirt/stone roof (never stops short at y=59!). */
+    private boolean isUndergroundOrRoofed(ClientPlayerEntity player, ClientWorld world) {
         BlockPos feet = player.getBlockPos();
-        if (feet.getY() >= 58) return false;
-        if (world.getLightLevel(net.minecraft.world.LightType.SKY, feet) >= 8) return false;
+        if (world.getLightLevel(net.minecraft.world.LightType.SKY, feet) < 12) return true;
+        return hasRockRoofAbove(world, feet);
+    }
+
+    private boolean isUndergroundWithoutCave(ClientPlayerEntity player, ClientWorld world) {
+        if (!isUndergroundOrRoofed(player, world)) return false;
+        BlockPos feet = player.getBlockPos();
         if (caves != null && (caves.mode() == CaveExplorer.Mode.EXPLORING_CAVE
                 || caves.countNearbyUnvisitedFrontiers(perception, feet, 24.0) > 0)) {
             return false;
@@ -2292,7 +2310,7 @@ final class TaskRunner {
 
     private void climbToSurface(ClientPlayerEntity player, ClientWorld world, int currentTick, String label) {
         statusText = label;
-        int surfaceTargetY = Math.max(64, player.getBlockY() + 6);
+        int surfaceTargetY = Math.max(66, player.getBlockY() + 6);
         Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
         RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.climbToY(surfaceTargetY), opts, currentTick);
         if (st == RouteExecutor.Status.STUCK) {
@@ -2395,6 +2413,33 @@ final class TaskRunner {
             }
         }
 
+        // 2b. If latched into climbing out of a pit/overhang, finish climbing ALL the way out into open sky before resuming walking!
+        if (exploreClimbingOut) {
+            exploreClimbTicks++;
+            boolean clearSky = feet.getY() >= exploreClimbTargetY && !isUndergroundOrRoofed(player, world);
+            if (clearSky || exploreClimbTicks > 240) {
+                exploreClimbingOut = false;
+                exploreClimbTicks = 0;
+                exploreFlipCount = 0;
+                exploreStuckTicks = 0;
+                exploreLastPos = player.getPos();
+                route.clear();
+            } else {
+                Pathfinder.Options climbOpts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+                RouteExecutor.Status cst = navigateToward(player, Pathfinder.Goal.climbToY(exploreClimbTargetY), climbOpts, currentTick);
+                statusText = "climbing out of tight terrain";
+                if (cst == RouteExecutor.Status.COMPLETE || cst == RouteExecutor.Status.STUCK) {
+                    exploreClimbingOut = false;
+                    exploreClimbTicks = 0;
+                    exploreFlipCount = 0;
+                    exploreStuckTicks = 0;
+                    exploreLastPos = player.getPos();
+                    route.clear();
+                }
+                return;
+            }
+        }
+
         // 3. Track horizontal exploration progress so we NEVER jam against a 2-block hillside/corner!
         Vec3d curPos = player.getPos();
         if (exploreLastPos == null || Math.hypot(curPos.x - exploreLastPos.x, curPos.z - exploreLastPos.z) > 1.4) {
@@ -2409,17 +2454,16 @@ final class TaskRunner {
         if (stuck) {
             // Force a decisive turn away from the jammed heading and avoid re-picking the same wall!
             exploreFlipCount++;
-            // If repeatedly trapped in a tight pit/overhang (3+ consecutive stuck turns), climb cleanly out via A*!
+            // If repeatedly trapped in a tight pit/overhang (3+ consecutive stuck turns), latch a full A* climb-out!
             if (exploreFlipCount >= 3) {
+                exploreClimbingOut = true;
+                exploreClimbTargetY = Math.max(feet.getY() + 4, 65);
+                exploreClimbTicks = 0;
+                route.clear();
+                replanCooldown = 0;
                 Pathfinder.Options climbOpts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
-                RouteExecutor.Status cst = navigateToward(player, Pathfinder.Goal.climbToY(feet.getY() + 3), climbOpts, currentTick);
+                navigateToward(player, Pathfinder.Goal.climbToY(exploreClimbTargetY), climbOpts, currentTick);
                 statusText = "climbing out of tight terrain";
-                if (cst == RouteExecutor.Status.COMPLETE || cst == RouteExecutor.Status.STUCK) {
-                    exploreFlipCount = 0;
-                    exploreStuckTicks = 0;
-                    exploreLastPos = curPos;
-                    route.clear();
-                }
                 return;
             }
             double turnOffset = (exploreFlipCount % 2 == 1 ? 1.0 : -1.0) * (Math.PI * 0.62 + (exploreFlipCount % 3) * 0.25);

@@ -344,8 +344,20 @@ final class TaskRunner {
             return;
         }
 
-        // Check if standing on tree canopy leaves — if a log is right underneath or beside us, chop it!
+        // If standing on top of a tree canopy (e.g. dark oak forest roof spawn), drop safely to the forest floor first!
         BlockPos feet = player.getBlockPos();
+        if (world.getBlockState(feet.down()).getBlock() instanceof LeavesBlock) {
+            BlockPos immediateLog = findImmediateReachableLog(player, world);
+            if (immediateLog != null) {
+                motor.mineBlock(immediateLog, true, false);
+                statusText = "chopping canopy log";
+                return;
+            }
+            if (descendFromTreeCanopy(player, world)) {
+                statusText = "descending from tree canopy";
+                return;
+            }
+        }
         if (activeTargetBlock == null || !world.getBlockState(activeTargetBlock).isIn(BlockTags.LOGS)) {
             activeTargetBlock = findBestLogTarget(player, world);
             route.clear();
@@ -1894,11 +1906,10 @@ final class TaskRunner {
             return;
         }
 
-        // 2. If standing on canopy leaves, look for dry ground or water below and drop safely!
+        // 2. If standing on canopy leaves, look for dry ground/water below or punch straight through 1-2 leaf blocks!
         if (world.getBlockState(feet.down()).getBlock() instanceof LeavesBlock) {
-            BlockPos dropTarget = findSafeCanopyExit(player, world);
-            if (dropTarget != null) {
-                motor.moveToward(Vec3d.ofBottomCenter(dropTarget), false, false, false, true);
+            if (descendFromTreeCanopy(player, world)) {
+                statusText = "descending from tree canopy";
                 return;
             }
         }
@@ -2197,6 +2208,57 @@ final class TaskRunner {
             }
         }
         return best;
+    }
+
+    private BlockPos findImmediateReachableLog(ClientPlayerEntity player, ClientWorld world) {
+        BlockPos feet = player.getBlockPos();
+        for (int dy = -2; dy <= 3; dy++) {
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    BlockPos p = feet.add(dx, dy, dz);
+                    if (blacklistedTargets.contains(p)) continue;
+                    if (world.getBlockState(p).isIn(BlockTags.LOGS)
+                            && player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(p)) <= Motor.REACH_SQ
+                            && motor.findAimPoint(p) != null) {
+                        return p;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Escape a treetop canopy spawn cleanly: walk off a nearby safe edge if one exists,
+     * otherwise punch through the leaf block directly underfoot (after checking safe ground below!)
+     * so continuous dark-oak forest roofs never stall the player!
+     */
+    private boolean descendFromTreeCanopy(ClientPlayerEntity player, ClientWorld world) {
+        BlockPos feet = player.getBlockPos();
+        BlockPos edge = findSafeCanopyExit(player, world);
+        if (edge != null) {
+            motor.moveToward(Vec3d.ofBottomCenter(edge), false, false, false, true);
+            return true;
+        }
+        // Continuous canopy (e.g. dark oak roof): verify safe non-hazard landing within 12 blocks below, then break underfoot leaves!
+        boolean safeBelow = false;
+        for (int dy = 1; dy <= 12; dy++) {
+            BlockState below = world.getBlockState(feet.down(dy));
+            if (Perception.isHazardBlock(below)) return false;
+            if (below.getFluidState().isIn(net.minecraft.registry.tag.FluidTags.WATER)) {
+                safeBelow = true;
+                break;
+            }
+            if (Perception.isSolidSupport(below) && !(below.getBlock() instanceof LeavesBlock)) {
+                safeBelow = dy <= 9; // safe drop (<= 6 fall dmg, usually 0..2 after dropping through leaf layers)
+                break;
+            }
+        }
+        if (safeBelow && world.getBlockState(feet.down()).getBlock() instanceof LeavesBlock) {
+            motor.mineBlock(feet.down(), true, false);
+            return true;
+        }
+        return false;
     }
 
     private BlockPos findSafeCanopyExit(ClientPlayerEntity player, ClientWorld world) {

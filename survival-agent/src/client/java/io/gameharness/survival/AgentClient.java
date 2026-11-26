@@ -101,7 +101,7 @@ public final class AgentClient implements ClientModInitializer {
         route = new RouteExecutor(client, motor, perception);
         gui = new GuiHands(client);
         reflexes = new SurvivalReflexes(client, motor, perception, gui);
-        tasks = new TaskRunner(client, motor, perception, pathfinder, route, gui, goal);
+        tasks = new TaskRunner(client, motor, perception, pathfinder, route, gui, reflexes, goal);
         strategist = StrategistBridge.open(directory, goal);
         pauses = new AgentPauseEpisodes(directory, 0);
     }
@@ -148,6 +148,7 @@ public final class AgentClient implements ClientModInitializer {
             respawns++;
             life = respawns + 1;
             perception.resetForLife();
+            reflexes.resetForLife();
             tasks.resetForLife();
             writeLifeReceipt(true, "playing");
             appendEvent("respawn", "Respawned into life " + life);
@@ -170,8 +171,18 @@ public final class AgentClient implements ClientModInitializer {
         if (strategist != null) {
             StrategistBridge.IncomingPlan plan = strategist.pollNewPlan(tick);
             if (plan != null) {
+                if (plan.combatStance() != null && !plan.combatStance().isEmpty()) {
+                    reflexes.setCombatStance(CombatPlanner.CombatStance.parse(plan.combatStance()));
+                }
+                if (plan.replaceQueue() && !plan.tasks().isEmpty()
+                        && plan.tasks().get(0).kind() == TaskRunner.TaskKind.BUILD_SHELTER) {
+                    int holdSec = plan.tasks().get(0).count() > 0 ? Math.min(30, plan.tasks().get(0).count()) : 10;
+                    reflexes.requestManualShelter(holdSec * 20);
+                }
                 tasks.applyModelPlan(plan.tasks(), plan.replaceQueue(), plan.safeExcavation());
-                appendEvent("model_plan_applied", plan.planId() + ": " + plan.rationale());
+                appendEvent("model_plan_applied", plan.planId()
+                    + " [stance=" + (plan.combatStance().isEmpty() ? "unchanged" : plan.combatStance())
+                    + "]: " + plan.rationale());
             }
         }
 
@@ -251,7 +262,29 @@ public final class AgentClient implements ClientModInitializer {
             obj.addProperty("y", player.getY());
             obj.addProperty("z", player.getZ());
             obj.addProperty("health", player.getHealth());
+            obj.addProperty("food", player.getHungerManager().getFoodLevel());
             obj.addProperty("dimension", player.getWorld().getRegistryKey().getValue().toString());
+            if (reflexes != null) {
+                obj.addProperty("combat_stance", reflexes.combatStance().wireName());
+                obj.addProperty("combat_action", reflexes.activeActionName());
+                obj.addProperty("shield_equipped", Motor.hasShieldEquipped(player));
+                obj.addProperty("blocking", player.isBlocking());
+                obj.addProperty("shield_blocks", reflexes.shieldBlocks());
+                obj.addProperty("shield_blocking_ticks", reflexes.shieldBlockingTicks());
+                obj.addProperty("damage_taken", Math.round(reflexes.damageTaken() * 10.0) / 10.0);
+                obj.addProperty("in_shelter", reflexes.inShelter());
+                obj.addProperty("shelter_sealed", reflexes.shelterSealed());
+                obj.addProperty("shelter_roofed", reflexes.shelterRoofed());
+                obj.addProperty("shelter_ever_sealed", reflexes.shelterEverSealed());
+                obj.addProperty("shelter_ever_roofed", reflexes.shelterEverRoofed());
+                obj.addProperty("shelter_blocks_placed", reflexes.shelterBlocksPlaced());
+                obj.addProperty("trapped", reflexes.lastEscape().trapped());
+            }
+            if (perception != null) {
+                obj.addProperty("visible_hostiles", perception.visibleHostiles().size());
+                obj.addProperty("occluded_hostiles", perception.occludedHostiles().size());
+                obj.addProperty("mobs_killed", perception.observedHostileKills());
+            }
             JsonObject inv = new JsonObject();
             var pinv = player.getInventory();
             for (int i = 0; i < pinv.size(); i++) {

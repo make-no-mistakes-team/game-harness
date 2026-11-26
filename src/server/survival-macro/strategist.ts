@@ -9,13 +9,13 @@ import { osMonotonicNs } from "../os-monotonic.ts";
 
 const REQUEST_TIMEOUT_MS = 40_000;
 const POLL_MS = 350;
-const MIN_COOLDOWN_MS = 6_000;
+const MIN_COOLDOWN_MS = 3_500;
 const DISCOVERY_TIMEOUT_MS = 30_000;
 
 const SYSTEM_PROMPT = `You are the asynchronous macro strategist for an autonomous Minecraft Survival player.
-The local player handles continuous 3D A* pathfinding, smooth human-like movement and camera control, crafting/furnace GUI clicks, auto-eating, lava/drowning escape, and real-time combat reflexes. It NEVER pauses while you think.
+The local player handles continuous 3D A* pathfinding, smooth human-like movement and camera control, crafting/furnace GUI clicks, auto-eating, lava/drowning escape, shield blocking, emergency shelter construction, and real-time combat reflexes. It NEVER pauses while you think.
 
-Your job is high-level macro strategy: inspect the live JSON state (goal, vitals, position, inventory, active/queued tasks, recent outcomes, visible environment, and any available ore targets) and submit a crisp ordered queue of 1 to 5 macro tasks via submit_survival_plan.
+Your job is high-level macro strategy: inspect the live JSON state (goal, vitals, position, inventory, active/queued tasks, recent outcomes, visible environment, combat telemetry, and any available ore targets) and submit a crisp ordered queue of 1 to 5 macro tasks plus combatStance via submit_survival_plan.
 
 Available task kinds:
 - gather_wood: chop trees & pick up logs. target="logs", count=desired total logs (e.g. 4..8).
@@ -28,33 +28,46 @@ Available task kinds:
 - explore: explore terrain to find trees, stone, caves, or food animals. target="explore", count=20.
 - navigate: 3D A* navigate to x,y,z within count blocks.
 - collect_drops: pick up nearby dropped items.
+- build_shelter: dig into ground/wall or rapidly box in a fully roofed emergency shelter (spider-proof & arrow-proof), eat carried food to regenerate HP safely inside, and hold until healed/safe. target="emergency", count=hold duration in seconds (e.g. 10).
+
+Combat stance options (combatStance):
+- "auto": local reflexes dynamically choose fight, shield, kite, flee, or emergency shelter.
+- "aggressive": press melee/ranged offense aggressively while healthy and armed.
+- "defensive": prioritize shield blocking, cautious spacing, and earlier withdrawal/shelter if hurt.
+- "flee": disengage and sprint away from hostiles along safe combat-flow terrain (burrows/shelters if trapped).
+- "shelter": immediately build/burrow a roofed emergency shelter, seal inside, and eat food to recover HP.
 
 Strategic rules:
-1. Respect Minecraft's tech tree: wood -> crafting_table + wooden_pickaxe -> cobblestone -> stone_pickaxe + furnace (+ stone_sword for safety!) -> coal/torches + iron_ore -> smelt raw_iron -> iron_pickaxe -> diamond_ore (3 diamonds) -> diamond_pickaxe.
+1. Respect Minecraft's tech tree: wood -> crafting_table + wooden_pickaxe -> cobblestone -> stone_pickaxe + furnace (+ stone_sword for safety!) -> coal/torches + iron_ore -> smelt raw_iron -> iron_pickaxe (+ shield when iron & planks allow!) -> diamond_ore (3 diamonds) -> diamond_pickaxe.
 2. Keep wood/sticks in reserve AND a spare stone_pickaxe before descending deep underground (so iron_pickaxe durability is conserved for ores/diamonds instead of breaking on stone/deepslate, and diamond_pickaxe can be crafted underground!).
 3. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
-4. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.
-5. During long smelts (activeFurnace present), the local player automatically mines nearby ore/stone or chops nearby wood when safe and returns before smelting finishes — do not interrupt an active smelt unless urgent.
-6. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
-7. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
+4. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals. When healthy and well-armed, use "auto", "defensive", or "aggressive".
+5. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.
+6. During long smelts (activeFurnace present), the local player automatically mines nearby ore/stone or chops nearby wood when safe and returns before smelting finishes — do not interrupt an active smelt unless urgent.
+7. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
+8. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
 
 const TASK_KINDS = [
   "gather_wood", "mine_stone", "mine_ore", "craft", "smelt",
-  "gather_food", "dig_down", "explore", "navigate", "collect_drops",
+  "gather_food", "dig_down", "explore", "navigate", "collect_drops", "build_shelter",
 ] as const;
+
+const COMBAT_STANCES = ["auto", "aggressive", "defensive", "flee", "shelter"] as const;
+type CombatStance = (typeof COMBAT_STANCES)[number];
 
 const PLAN_TOOL: Tool = {
   name: "submit_survival_plan",
-  description: "Submit an ordered macro task queue (1-5 tasks) and excavation safety preference for the local Survival player.",
+  description: "Submit an ordered macro task queue (1-5 tasks), combat stance, and excavation safety preference for the local Survival player.",
   strict: true,
   parameters: {
     type: "object",
     additionalProperties: false,
-    required: ["rationale", "replaceQueue", "excavationMode", "tasks"],
+    required: ["rationale", "replaceQueue", "excavationMode", "combatStance", "tasks"],
     properties: {
       rationale: { type: "string", description: "Concise 1-2 sentence explanation of the macro plan." },
       replaceQueue: { type: "boolean", description: "True to replace queued tasks now; false to append smoothly." },
       excavationMode: { type: "string", enum: ["safe_staircase", "fast"] },
+      combatStance: { type: "string", enum: [...COMBAT_STANCES] },
       tasks: {
         type: "array",
         minItems: 1,
@@ -103,6 +116,19 @@ interface LiveState {
   activeTask?: { id: string; kind: string; target: string; count: number; source: string };
   queuedTasks: { id: string; kind: string; target: string; count: number; source: string }[];
   recentReceipts: { id: string; kind: string; target: string; outcome: string; detail: string; tick: number }[];
+  combat?: {
+    stance: string;
+    activeAction: string;
+    armed: boolean;
+    hasShield: boolean;
+    shieldEquipped: boolean;
+    trapped: boolean;
+    inShelter: boolean;
+    shelterSealed: boolean;
+    visibleThreatCount: number;
+    occludedThreatCount: number;
+    threats: { kind: string; dist: number; occluded: boolean }[];
+  };
   appliedPlan?: { planId: string; tick: number };
 }
 
@@ -110,6 +136,7 @@ interface ParsedPlan {
   rationale: string;
   replaceQueue: boolean;
   excavationMode: "safe_staircase" | "fast";
+  combatStance: CombatStance;
   tasks: { kind: string; target: string; count: number; x: number | null; y: number | null; z: number | null }[];
 }
 
@@ -118,6 +145,7 @@ function parsePlanArgs(raw: string): ParsedPlan | null {
     const o = JSON.parse(raw);
     if (!o || typeof o !== "object" || typeof o.rationale !== "string" || typeof o.replaceQueue !== "boolean") return null;
     if (o.excavationMode !== "safe_staircase" && o.excavationMode !== "fast") return null;
+    const combatStance: CombatStance = COMBAT_STANCES.includes(o.combatStance) ? o.combatStance : "auto";
     if (!Array.isArray(o.tasks) || o.tasks.length < 1 || o.tasks.length > 5) return null;
     const tasks = [];
     for (const t of o.tasks) {
@@ -128,7 +156,7 @@ function parsePlanArgs(raw: string): ParsedPlan | null {
       if (x === undefined || y === undefined || z === undefined) return null;
       tasks.push({ kind: t.kind, target: t.target, count: t.count, x, y, z });
     }
-    return { rationale: o.rationale.slice(0, 400), replaceQueue: o.replaceQueue, excavationMode: o.excavationMode, tasks };
+    return { rationale: o.rationale.slice(0, 400), replaceQueue: o.replaceQueue, excavationMode: o.excavationMode, combatStance, tasks };
   } catch {
     return null;
   }
@@ -249,12 +277,18 @@ export function composeMacroStrategist(options: StrategistOptions) {
     const iron = (inv.raw_iron ?? 0) + (inv.iron_ingot ?? 0);
     const diamonds = inv.diamond ?? 0;
     const lowHp = st.health < 12 ? 1 : 0;
+    const threatBucket = Math.min(3, (st.combat?.visibleThreatCount ?? 0) + (st.combat?.occludedThreatCount ?? 0));
+    const trapped = st.combat?.trapped ? 1 : 0;
+    const sheltered = st.combat?.shelterSealed ? 1 : 0;
     return JSON.stringify([
       st.life,
       tier,
       iron >= 3 ? 3 : iron,
       diamonds >= 3 ? 3 : diamonds,
       lowHp,
+      threatBucket,
+      trapped,
+      sheltered,
       st.queuedTasks.length === 0 ? "empty" : "queued",
       lastReceipt ? `${lastReceipt.id}:${lastReceipt.outcome}` : "none",
     ]);
@@ -324,6 +358,7 @@ export function composeMacroStrategist(options: StrategistOptions) {
         rationale: parsed.rationale,
         replaceQueue: parsed.replaceQueue,
         excavationMode: parsed.excavationMode,
+        combatStance: parsed.combatStance,
         tasks: parsed.tasks,
       };
       const tmp = join(stratDir, `.plan-${planId}.tmp`);
@@ -346,6 +381,7 @@ export function composeMacroStrategist(options: StrategistOptions) {
         latencyMs: Math.round(performance.now() - startedMs),
         rationale: parsed.rationale,
         excavationMode: parsed.excavationMode,
+        combatStance: parsed.combatStance,
         tasks: parsed.tasks,
       });
     } catch (err) {
@@ -388,7 +424,8 @@ export function composeMacroStrategist(options: StrategistOptions) {
         const now = Date.now();
         const queueLow = st.queuedTasks.length <= 1;
         const lastFailed = st.recentReceipts.at(-1)?.outcome === "failed";
-        const urgent = st.health < 12 || lastFailed;
+        const activeHostiles = (st.combat?.visibleThreatCount ?? 0) > 0;
+        const urgent = st.health < 12 || lastFailed || activeHostiles;
         const shouldCall = requests < options.maxRequests
           && now - lastRequestAt >= (urgent ? MIN_COOLDOWN_MS : 12_000)
           && (requests === 0 || (queueLow && key !== lastTriggerKey) || (urgent && key !== lastTriggerKey)

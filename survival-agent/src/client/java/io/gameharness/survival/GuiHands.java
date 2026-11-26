@@ -114,6 +114,8 @@ final class GuiHands {
     private boolean needOpenInventory;
     private boolean pendingHotbarSwap;
     private Predicate<ItemStack> pendingHotbarPredicate;
+    private boolean pendingEquipOffhand;
+    private Predicate<ItemStack> pendingOffhandPredicate;
     private boolean pendingFurnaceLoad;
     private Item pendingSmeltInput;
     private int pendingSmeltCount;
@@ -133,6 +135,7 @@ final class GuiHands {
         clickedActive = false;
         pendingRecipe = null;
         pendingHotbarSwap = false;
+        pendingEquipOffhand = false;
         pendingFurnaceLoad = false;
         pendingFurnaceCollect = false;
         needOpenInventory = false;
@@ -169,6 +172,18 @@ final class GuiHands {
         clearState();
         pendingHotbarSwap = true;
         pendingHotbarPredicate = pred;
+        needOpenInventory = !(client.currentScreen instanceof InventoryScreen);
+        closeWhenDone = true;
+        state = State.WORKING;
+        jobTicks = 0;
+        return true;
+    }
+
+    /** Start equipping an item matching `pred` into the vanilla offhand slot (PlayerInventory.OFF_HAND_SLOT / slot 45). */
+    boolean startEquipOffhand(Predicate<ItemStack> pred) {
+        clearState();
+        pendingEquipOffhand = true;
+        pendingOffhandPredicate = pred;
         needOpenInventory = !(client.currentScreen instanceof InventoryScreen);
         closeWhenDone = true;
         state = State.WORKING;
@@ -289,6 +304,16 @@ final class GuiHands {
                     return;
                 }
                 pendingHotbarSwap = false;
+                if (screenOpenedBeatPending) {
+                    waitUntilNs = System.nanoTime() + randMs(85, 130);
+                    screenOpenedBeatPending = false;
+                }
+            } else if (pendingEquipOffhand) {
+                if (!planEquipOffhandActions(screen, pendingOffhandPredicate)) {
+                    fail("offhand_item_missing");
+                    return;
+                }
+                pendingEquipOffhand = false;
                 if (screenOpenedBeatPending) {
                     waitUntilNs = System.nanoTime() + randMs(85, 130);
                     screenOpenedBeatPending = false;
@@ -635,11 +660,37 @@ final class GuiHands {
         return true;
     }
 
+    private boolean planEquipOffhandActions(HandledScreen<?> screen, Predicate<ItemStack> pred) {
+        ScreenHandler handler = screen.getScreenHandler();
+        var inv = client.player.getInventory();
+        Slot source = null;
+        Slot offhand = null;
+
+        for (Slot s : handler.slots) {
+            if (s.inventory != inv) continue;
+            int idx = s.getIndex();
+            if (idx == net.minecraft.entity.player.PlayerInventory.OFF_HAND_SLOT) {
+                offhand = s;
+            } else if (idx >= 0 && idx < 36 && source == null && pred.test(s.getStack())) {
+                source = s;
+            }
+        }
+        if (source == null || offhand == null) return false;
+        if (pred.test(offhand.getStack())) return true;
+        actions.add(new GuiAction(source, ClickKind.LEFT));
+        actions.add(new GuiAction(offhand, ClickKind.LEFT));
+        if (offhand.hasStack()) {
+            actions.add(new GuiAction(source, ClickKind.LEFT));
+        }
+        return true;
+    }
+
     private static int hotbarKeepPriority(ItemStack st) {
         if (st.isEmpty()) return 0;
         Item i = st.getItem();
         if (i == Items.DIAMOND_PICKAXE || i == Items.IRON_PICKAXE || i == Items.STONE_PICKAXE || i == Items.WOODEN_PICKAXE) return 100;
-        if (i == Items.IRON_SWORD || i == Items.STONE_SWORD || i == Items.IRON_AXE || i == Items.STONE_AXE) return 90;
+        if (i == Items.DIAMOND_SWORD || i == Items.IRON_SWORD || i == Items.STONE_SWORD || i == Items.IRON_AXE || i == Items.STONE_AXE) return 95;
+        if (i == Items.SHIELD) return 88;
         if (i == Items.TORCH || i == Items.WATER_BUCKET) return 80;
         if (Motor.foodScore(st, false) > 0) return 75;
         if (i == Items.COBBLESTONE || i == Items.COBBLED_DEEPSLATE || i == Items.DIRT) return 60;

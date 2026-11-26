@@ -40,7 +40,8 @@ final class TaskRunner {
         DIG_DOWN,
         EXPLORE,
         NAVIGATE,
-        COLLECT_DROPS
+        COLLECT_DROPS,
+        BUILD_SHELTER
     }
 
     record Task(
@@ -61,6 +62,7 @@ final class TaskRunner {
     private final Pathfinder pathfinder;
     private final RouteExecutor route;
     private final GuiHands gui;
+    private final SurvivalReflexes reflexes;
     private final String goal;
 
     private final ArrayDeque<Task> queue = new ArrayDeque<>();
@@ -98,13 +100,15 @@ final class TaskRunner {
     private int rockBrokenCount;
 
     TaskRunner(MinecraftClient client, Motor motor, Perception perception,
-               Pathfinder pathfinder, RouteExecutor route, GuiHands gui, String goal) {
+               Pathfinder pathfinder, RouteExecutor route, GuiHands gui,
+               SurvivalReflexes reflexes, String goal) {
         this.client = client;
         this.motor = motor;
         this.perception = perception;
         this.pathfinder = pathfinder;
         this.route = route;
         this.gui = gui;
+        this.reflexes = reflexes;
         this.goal = goal;
     }
 
@@ -261,6 +265,7 @@ final class TaskRunner {
             case EXPLORE -> tickExplore(player, world, currentTick);
             case NAVIGATE -> tickNavigate(player, world, currentTick);
             case COLLECT_DROPS -> tickCollectDrops(player, world, currentTick);
+            case BUILD_SHELTER -> tickBuildShelter(player, world, currentTick);
         }
     }
 
@@ -1005,6 +1010,25 @@ final class TaskRunner {
         ItemEntity nearest = drops.get(0);
         motor.moveToward(nearest.getPos(), player.distanceTo(nearest) > 4.0, player.horizontalCollision, false, true);
         statusText = "collecting drops";
+    }
+
+    private void tickBuildShelter(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        if (Motor.countShelterBlocks(player) <= 0) {
+            finishActive("failed", "no shelter blocks carried", currentTick);
+            return;
+        }
+        if (activeTicks <= 2) {
+            int holdSec = active.count() > 0 ? Math.min(30, active.count()) : 10;
+            reflexes.requestManualShelter(holdSec * 20);
+            statusText = "starting emergency shelter";
+            return;
+        }
+        if (!reflexes.inShelter()) {
+            finishActive(reflexes.shelterEverSealed() ? "completed" : "partial",
+                reflexes.shelterEverSealed() ? "built and exited shelter" : "shelter build ended", currentTick);
+            return;
+        }
+        statusText = "building shelter";
     }
 
     // ===================== SMART LOCAL CONTINUITY PLANNER =====================

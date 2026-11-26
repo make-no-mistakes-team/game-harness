@@ -1,14 +1,17 @@
 package io.gameharness.survival;
 
+import io.gameharness.survival.mixin.AgentKeyboardAccess;
 import io.gameharness.survival.mixin.AgentMiningAccess;
 import java.util.concurrent.ThreadLocalRandom;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.FallingBlock;
 import net.minecraft.block.LeavesBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.Window;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.entity.Entity;
@@ -33,6 +36,11 @@ import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.RaycastContext;
+
+import static org.lwjgl.glfw.GLFW.GLFW_KEY_F;
+import static org.lwjgl.glfw.GLFW.GLFW_PRESS;
+import static org.lwjgl.glfw.GLFW.GLFW_RELEASE;
+import static org.lwjgl.glfw.GLFW.glfwGetKeyScancode;
 
 /**
  * Human-like 60fps camera steering, continuous 360-degree locomotion,
@@ -82,6 +90,7 @@ final class Motor {
     private int attackCooldownTicks;
     private int useCooldownTicks;
     private int jumpCooldownTicks;
+    private int swapCooldownTicks;
     private double totalYawTravel;
     private double totalPitchTravel;
 
@@ -104,6 +113,7 @@ final class Motor {
         if (attackCooldownTicks > 0) attackCooldownTicks--;
         if (useCooldownTicks > 0) useCooldownTicks--;
         if (jumpCooldownTicks > 0) jumpCooldownTicks--;
+        if (swapCooldownTicks > 0) swapCooldownTicks--;
     }
 
     /** Called at the end of every client tick to push controls to vanilla KeyBindings. */
@@ -493,7 +503,10 @@ final class Motor {
             BlockState st = world.getBlockState(support);
             if (st.isAir() || !st.getFluidState().isEmpty() || st.isReplaceable()) continue;
             Direction clickFace = dir.getOpposite();
-            double[][] uvs = {{0.46, 0.54}, {0.5, 0.5}, {0.32, 0.62}, {0.68, 0.38}};
+            double[][] uvs = {
+                {0.46, 0.54}, {0.5, 0.5}, {0.32, 0.62}, {0.68, 0.38},
+                {0.2, 0.2}, {0.8, 0.8}, {0.5, 0.15}, {0.5, 0.85}
+            };
             for (double[] uv : uvs) {
                 Vec3d pt = pointOnFace(support, clickFace, uv[0], uv[1]);
                 if (eye.squaredDistanceTo(pt) > REACH_SQ) continue;
@@ -665,19 +678,24 @@ final class Motor {
 
     /** Smoothly aim at and attack an entity when weapon cooldown is ready. */
     boolean attackEntity(Entity target) {
+        return attackEntity(target, 0.90f);
+    }
+
+    /** Smoothly aim at and attack an entity using bounding-box-accurate aiming (tracks low hitboxes like baby zombies!). */
+    boolean attackEntity(Entity target, float minCooldown) {
         var player = client.player;
         if (player == null || target == null || !target.isAlive()) return false;
-        Vec3d aim = target.getBoundingBox().getCenter().add(0, target.getHeight() * 0.15, 0);
+        Vec3d aim = entityAimPoint(target);
         lookAtPoint(aim, LookMode.COMBAT);
 
-        double dist = player.getEyePos().distanceTo(aim);
-        if (dist > 3.4) return false;
+        double boxDist = distanceToBox(player.getEyePos(), target.getBoundingBox());
+        if (boxDist > 3.15) return false;
 
-        // Attack when cooldown >= 0.90 (full damage!) and crosshair/angle is on target
-        if (player.getAttackCooldownProgress(0.5f) >= 0.90f && attackCooldownTicks <= 0) {
+        // Attack when cooldown >= minCooldown (full damage!) and crosshair/angle is on target
+        if (!wantUse && player.getAttackCooldownProgress(0.5f) >= minCooldown && attackCooldownTicks <= 0) {
             HitResult ch = client.crosshairTarget;
             boolean directHit = ch instanceof EntityHitResult ehr && ehr.getEntity() == target;
-            if (directHit || currentAimErrorDeg() < 14.0 && dist <= 3.15) {
+            if (directHit || (currentAimErrorDeg() < 16.0 && boxDist <= 2.98)) {
                 if (client.interactionManager != null) {
                     client.interactionManager.attackEntity(player, target);
                     player.swingHand(Hand.MAIN_HAND);
@@ -687,6 +705,150 @@ final class Motor {
             }
         }
         return false;
+    }
+
+    /** Aim at exact bounding-box center for small/low mobs (baby zombies, spiders), upper center for tall mobs. */
+    static Vec3d entityAimPoint(Entity target) {
+        Box box = target.getBoundingBox();
+        Vec3d center = box.getCenter();
+        if (target.getHeight() < 1.15f) {
+            return center;
+        }
+        return center.add(0, target.getHeight() * 0.10, 0);
+    }
+
+    /** Exact Euclidean distance from point `p` to the nearest point on axis-aligned box `b`. */
+    static double distanceToBox(Vec3d p, Box b) {
+        double dx = Math.max(b.minX - p.x, Math.max(0.0, p.x - b.maxX));
+        double dy = Math.max(b.minY - p.y, Math.max(0.0, p.y - b.maxY));
+        double dz = Math.max(b.minZ - p.z, Math.max(0.0, p.z - b.maxZ));
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /** Trigger vanilla swap-hands key (F) to move a hotbar shield cleanly into the offhand. */
+    boolean swapHands() {
+        if (client.currentScreen != null || swapCooldownTicks > 0) return false;
+        Window win = client.getWindow();
+        int scan = glfwGetKeyScancode(GLFW_KEY_F);
+        ((AgentKeyboardAccess) client.keyboard).agent$onKey(win.getHandle(), GLFW_KEY_F, scan, GLFW_PRESS, 0);
+        ((AgentKeyboardAccess) client.keyboard).agent$onKey(win.getHandle(), GLFW_KEY_F, scan, GLFW_RELEASE, 0);
+        swapCooldownTicks = 12;
+        return true;
+    }
+
+    int findHotbarShield() {
+        return findHotbarItem(Items.SHIELD);
+    }
+
+    static boolean hasShieldEquipped(ClientPlayerEntity player) {
+        return player != null && (player.getOffHandStack().isOf(Items.SHIELD) || player.getMainHandStack().isOf(Items.SHIELD));
+    }
+
+    static boolean isShieldReady(ClientPlayerEntity player) {
+        if (player == null) return false;
+        ItemStack shield = player.getOffHandStack().isOf(Items.SHIELD) ? player.getOffHandStack()
+            : (player.getMainHandStack().isOf(Items.SHIELD) ? player.getMainHandStack() : ItemStack.EMPTY);
+        if (shield.isEmpty()) return false;
+        return !player.getItemCooldownManager().isCoolingDown(shield);
+    }
+
+    /**
+     * Select a main-hand slot that will NOT consume/place on right-click, so holding useKey
+     * unambiguously raises an offhand shield! Prefers best melee weapon.
+     */
+    boolean selectShieldFriendlyMainHand() {
+        var player = client.player;
+        if (player == null) return false;
+        if (player.getMainHandStack().isOf(Items.SHIELD)) return true;
+        selectBestWeapon();
+        ItemStack cur = player.getMainHandStack();
+        if (isShieldFriendlyMainHand(cur)) return true;
+        for (int i = 0; i < 9; i++) {
+            if (isShieldFriendlyMainHand(player.getInventory().getStack(i))) {
+                player.getInventory().selectedSlot = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isShieldFriendlyMainHand(ItemStack st) {
+        if (st.isEmpty()) return true;
+        Item item = st.getItem();
+        if (item instanceof SwordItem || item instanceof AxeItem || item instanceof PickaxeItem || item instanceof ShovelItem) {
+            return true;
+        }
+        if (item == Items.SHIELD) return true;
+        if (st.get(DataComponentTypes.FOOD) != null) return false;
+        if (item instanceof BlockItem) return false;
+        return item != Items.WATER_BUCKET && item != Items.LAVA_BUCKET && item != Items.BUCKET
+            && item != Items.FLINT_AND_STEEL && item != Items.BOW && item != Items.CROSSBOW;
+    }
+
+    /** Find best non-falling solid building block in hotbar for emergency shelter walls/roof. */
+    int findHotbarShelterBlock() {
+        int scaf = findHotbarScaffold();
+        if (scaf >= 0) return scaf;
+        var player = client.player;
+        if (player == null) return -1;
+        for (int i = 0; i < 9; i++) {
+            if (isShelterBlock(player.getInventory().getStack(i))) return i;
+        }
+        return -1;
+    }
+
+    static boolean isShelterBlock(ItemStack st) {
+        if (st.isEmpty() || !(st.getItem() instanceof BlockItem bi)) return false;
+        Block b = bi.getBlock();
+        if (b instanceof FallingBlock) return false; // never sand/gravel for overhead shelter caps!
+        if (b == Blocks.CRAFTING_TABLE || b == Blocks.FURNACE || b == Blocks.CHEST || b == Blocks.TNT) return false;
+        BlockState def = b.getDefaultState();
+        return def.blocksMovement() && def.isFullCube(net.minecraft.world.EmptyBlockView.INSTANCE, BlockPos.ORIGIN);
+    }
+
+    static int countShelterBlocks(ClientPlayerEntity player) {
+        if (player == null) return 0;
+        int total = 0;
+        var inv = player.getInventory();
+        for (int i = 0; i < inv.size(); i++) {
+            ItemStack st = inv.getStack(i);
+            if (isShelterBlock(st)) total += st.getCount();
+        }
+        return total;
+    }
+
+    static boolean hasDigTool(ClientPlayerEntity player) {
+        if (player == null) return false;
+        var inv = player.getInventory();
+        for (int i = 0; i < inv.size(); i++) {
+            Item item = inv.getStack(i).getItem();
+            if (item instanceof PickaxeItem || item instanceof ShovelItem) return true;
+        }
+        return false;
+    }
+
+    static double bestHotbarWeaponScore(ClientPlayerEntity player) {
+        if (player == null) return 1.0;
+        double best = 1.0;
+        for (int i = 0; i < 9; i++) {
+            best = Math.max(best, weaponScore(player.getInventory().getStack(i)));
+        }
+        return best;
+    }
+
+    static String bestHotbarWeaponName(ClientPlayerEntity player) {
+        if (player == null) return "hand";
+        int bestSlot = -1;
+        double best = 1.0;
+        for (int i = 0; i < 9; i++) {
+            double s = weaponScore(player.getInventory().getStack(i));
+            if (s > best) {
+                best = s;
+                bestSlot = i;
+            }
+        }
+        if (bestSlot < 0) return "hand";
+        return net.minecraft.registry.Registries.ITEM.getId(player.getInventory().getStack(bestSlot).getItem()).getPath();
     }
 
     /** Equip the fastest suitable tool in hotbar (0..8) for breaking `state`. */

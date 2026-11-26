@@ -33,6 +33,7 @@ final class StrategistBridge {
         String rationale,
         boolean replaceQueue,
         Boolean safeExcavation,
+        String combatStance,
         List<TaskRunner.Task> tasks
     ) {}
 
@@ -159,6 +160,56 @@ final class StrategistBridge {
         env.add("ores", ores);
         root.add("environment", env);
 
+        // Rich combat & survival shelter telemetry
+        JsonObject combat = new JsonObject();
+        combat.addProperty("stance", reflexes.combatStance().wireName());
+        combat.addProperty("activeAction", reflexes.activeActionName());
+        double weaponScore = Motor.bestHotbarWeaponScore(player);
+        combat.addProperty("armed", weaponScore >= 6.5);
+        combat.addProperty("weapon", Motor.bestHotbarWeaponName(player));
+        combat.addProperty("weaponScore", weaponScore);
+        combat.addProperty("hasShield", GuiHands.countItem(player, net.minecraft.item.Items.SHIELD) > 0 || Motor.hasShieldEquipped(player));
+        combat.addProperty("shieldEquipped", Motor.hasShieldEquipped(player));
+        combat.addProperty("blocking", player.isBlocking());
+        combat.addProperty("shieldBlocks", reflexes.shieldBlocks());
+        combat.addProperty("armor", player.getArmor());
+        int foodCount = GuiHands.countEdibleFood(player, true);
+        combat.addProperty("hasFood", foodCount > 0);
+        combat.addProperty("foodCount", foodCount);
+        combat.addProperty("scaffoldBlocks", Motor.countShelterBlocks(player));
+        combat.addProperty("trapped", reflexes.lastEscape().trapped());
+        combat.addProperty("openEscapeBearings", reflexes.lastEscape().openBearings());
+        combat.addProperty("inShelter", reflexes.inShelter());
+        combat.addProperty("shelterSealed", reflexes.shelterSealed());
+        combat.addProperty("shelterRoofed", reflexes.shelterRoofed());
+        List<CombatPlanner.ThreatInfo> threats = perception.activeThreats(player);
+        int visCount = 0;
+        int occCount = 0;
+        JsonArray threatArr = new JsonArray();
+        for (CombatPlanner.ThreatInfo t : threats) {
+            if (t.occluded()) occCount++;
+            else visCount++;
+            if (threatArr.size() < 8) {
+                JsonObject to = new JsonObject();
+                to.addProperty("kind", t.kind().wireName());
+                to.addProperty("dist", Math.round(t.dist() * 10.0) / 10.0);
+                to.addProperty("occluded", t.occluded());
+                if (t.kind() == CombatPlanner.ThreatKind.CREEPER) {
+                    to.addProperty("fuse", Math.round(t.creeperFuse() * 100.0) / 100.0);
+                    to.addProperty("swelling", t.creeperSwelling());
+                }
+                if (t.kind().isRanged()) {
+                    to.addProperty("drawing", t.rangedDrawing());
+                }
+                threatArr.add(to);
+            }
+        }
+        combat.addProperty("visibleThreatCount", visCount);
+        combat.addProperty("occludedThreatCount", occCount);
+        combat.addProperty("incomingArrow", perception.hasIncomingArrow());
+        combat.add("threats", threatArr);
+        root.add("combat", combat);
+
         if (!lastAppliedPlanId.isEmpty()) {
             JsonObject app = new JsonObject();
             app.addProperty("planId", lastAppliedPlanId);
@@ -226,6 +277,7 @@ final class StrategistBridge {
             if ("safe_staircase".equals(m)) safeMode = true;
             else if ("fast".equals(m)) safeMode = false;
         }
+        String combatStance = str(obj, "combatStance");
         List<TaskRunner.Task> tasks = new ArrayList<>();
         if (obj.has("tasks") && obj.get("tasks").isJsonArray()) {
             int idx = 0;
@@ -245,7 +297,7 @@ final class StrategistBridge {
                 tasks.add(new TaskRunner.Task(planId + "-" + (++idx), kind, target, count, pos, safe, "model"));
             }
         }
-        return new IncomingPlan(planId, rationale, replace, safeMode, tasks);
+        return new IncomingPlan(planId, rationale, replace, safeMode, combatStance, tasks);
     }
 
     private static TaskRunner.TaskKind parseKind(String raw) {

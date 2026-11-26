@@ -17,17 +17,22 @@ import net.minecraft.client.world.ClientWorld;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.ItemEntity;
 import net.minecraft.entity.LivingEntity;
+import net.minecraft.entity.mob.AbstractSkeletonEntity;
 import net.minecraft.entity.mob.CreeperEntity;
 import net.minecraft.entity.mob.EndermanEntity;
 import net.minecraft.entity.mob.HostileEntity;
 import net.minecraft.entity.mob.Monster;
+import net.minecraft.entity.mob.PillagerEntity;
 import net.minecraft.entity.mob.SpiderEntity;
+import net.minecraft.entity.mob.WitchEntity;
+import net.minecraft.entity.mob.ZombieEntity;
 import net.minecraft.entity.passive.AnimalEntity;
 import net.minecraft.entity.passive.ChickenEntity;
 import net.minecraft.entity.passive.CowEntity;
 import net.minecraft.entity.passive.PigEntity;
 import net.minecraft.entity.passive.RabbitEntity;
 import net.minecraft.entity.passive.SheepEntity;
+import net.minecraft.entity.projectile.PersistentProjectileEntity;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.registry.tag.BlockTags;
 import net.minecraft.registry.tag.FluidTags;
@@ -53,10 +58,35 @@ final class Perception {
     private static final double SIGHT_RANGE = 64.0;
     private static final int COMBAT_FLOW_TICKS = 100;
     private static final int COMBAT_FLOW_RADIUS = 4;
+    private static final int HOSTILE_MEMORY_TICKS = 90; // 4.5s short-term occlusion memory
 
     enum OreKind { COAL, IRON, DIAMOND }
 
     record ObservedBlock(BlockState state, int tick, boolean combatFlow) {}
+
+    record RememberedHostile(
+        int entityId,
+        CombatPlanner.ThreatKind kind,
+        Vec3d lastPos,
+        Vec3d lastVel,
+        int lastSeenTick,
+        float lastCreeperFuse,
+        boolean lastCreeperSwelling,
+        boolean lastRangedDrawing,
+        int clearSpotTicks
+    ) {
+        Vec3d estimatedPos(int currentTick) {
+            int dt = Math.min(12, Math.max(0, currentTick - lastSeenTick));
+            return lastPos.add(lastVel.multiply(dt * 0.55));
+        }
+
+        RememberedHostile withClearSpotTicks(int ticks) {
+            return new RememberedHostile(
+                entityId, kind, lastPos, lastVel, lastSeenTick,
+                lastCreeperFuse, lastCreeperSwelling, lastRangedDrawing, ticks
+            );
+        }
+    }
 
     private final MinecraftClient client;
     private final AgentOpticalSight opticalSight;
@@ -86,10 +116,14 @@ final class Perception {
     private final Set<Long> scannedDiagChunks = new HashSet<>();
     private final Set<Long> retiredDiagOres = new HashSet<>();
 
-    // Live entity observations (visible or recently contacted)
+    // Live entity observations (visible or recently contacted — NEVER X-ray through solid walls!)
     private final List<LivingEntity> visibleHostiles = new ArrayList<>();
+    private final Map<Integer, RememberedHostile> hostileMemory = new HashMap<>();
+    private final List<Entity> incomingProjectiles = new ArrayList<>();
     private final List<AnimalEntity> visibleFoodAnimals = new ArrayList<>();
     private final List<ItemEntity> visibleDrops = new ArrayList<>();
+    private final Set<Integer> seenHostileIds = new HashSet<>();
+    private int observedHostileKills;
 
     private int tick;
     private int combatFlowUntilTick = -1;
@@ -109,8 +143,11 @@ final class Perception {
         combatFlowMemory.clear();
         combatFlowUntilTick = -1;
         visibleHostiles.clear();
+        hostileMemory.clear();
+        incomingProjectiles.clear();
         visibleFoodAnimals.clear();
         visibleDrops.clear();
+        seenHostileIds.clear();
         lastHurtTick = -100;
     }
 
@@ -146,9 +183,11 @@ final class Perception {
         combatFlowMemory.clear();
         if (!visibleHostiles.isEmpty()) {
             double nearest = visibleHostiles.get(0).distanceTo(player);
-            if (nearest <= 14.0) {
+            if (nearest <= 16.0) {
                 combatFlowUntilTick = currentTick + COMBAT_FLOW_TICKS;
             }
+        } else if (!incomingProjectiles.isEmpty()) {
+            combatFlowUntilTick = currentTick + COMBAT_FLOW_TICKS;
         }
         if (currentTick <= combatFlowUntilTick) {
             scanCombatFlowGeometry(world, player);
@@ -264,54 +303,90 @@ final class Perception {
     /**
      * Encounter-scoped combat-flow geometry:
      * Casts short rays in all directions up to radius 4 (including behind the player),
-     * stopping at the FIRST solid obstacle so hidden rooms/ores stay completely unknown.
+     * stopping strictly at the FIRST solid obstacle so hidden rooms/ores/mobs stay completely unknown.
      */
     private void scanCombatFlowGeometry(ClientWorld world, ClientPlayerEntity player) {
         Vec3d eye = player.getEyePos();
+        float[] pitches = {-45f, -20f, 0f, 18f, 36f, 54f, 72f};
         for (int yi = 0; yi < 16; yi++) {
             float ry = yi * 22.5f;
-            for (int pi = -2; pi <= 3; pi++) {
-                float rp = pi * 20f;
+            for (float rp : pitches) {
                 Vec3d dir = Vec3d.fromPolar(rp, ry);
-                Vec3d end = eye.add(dir.multiply(COMBAT_FLOW_RADIUS + 0.5));
+                Vec3d end = eye.add(dir.multiply(COMBAT_FLOW_RADIUS + 0.35));
                 BlockHitResult hit = world.raycast(new RaycastContext(
                     eye, end, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.ANY, player));
-                double maxD = hit.getType() == HitResult.Type.BLOCK ? eye.distanceTo(hit.getPos()) : COMBAT_FLOW_RADIUS;
-                for (double d = 0.8; d < maxD; d += 0.9) {
+                double maxD = hit.getType() == HitResult.Type.BLOCK
+                    ? Math.min(COMBAT_FLOW_RADIUS + 0.35, eye.distanceTo(hit.getPos()))
+                    : COMBAT_FLOW_RADIUS;
+                for (double d = 0.45; d < maxD; d += 0.5) {
                     BlockPos bp = BlockPos.ofFloored(eye.add(dir.multiply(d)));
-                    combatFlowMemory.put(bp.asLong(), world.getBlockState(bp));
+                    if (bp.getSquaredDistance(player.getBlockPos()) <= (COMBAT_FLOW_RADIUS + 1) * (COMBAT_FLOW_RADIUS + 1)) {
+                        combatFlowMemory.put(bp.asLong(), world.getBlockState(bp));
+                    }
                 }
                 if (hit.getType() == HitResult.Type.BLOCK) {
                     BlockPos hp = hit.getBlockPos();
-                    combatFlowMemory.put(hp.asLong(), world.getBlockState(hp));
+                    if (hp.getSquaredDistance(player.getBlockPos()) <= (COMBAT_FLOW_RADIUS + 1) * (COMBAT_FLOW_RADIUS + 1)) {
+                        combatFlowMemory.put(hp.asLong(), world.getBlockState(hp));
+                    }
                 }
             }
         }
     }
 
     private void scanVisibleEntities(ClientWorld world, ClientPlayerEntity player) {
+        Set<Integer> prevVisibleIds = new HashSet<>();
+        for (LivingEntity e : visibleHostiles) prevVisibleIds.add(e.getId());
+
         visibleHostiles.clear();
+        incomingProjectiles.clear();
         visibleFoodAnimals.clear();
         visibleDrops.clear();
 
         Vec3d eye = player.getEyePos();
         Vec3d look = player.getRotationVec(1.0f);
         boolean flowActive = tick <= combatFlowUntilTick;
+        Set<Integer> currentlyVisibleIds = new HashSet<>();
 
         for (Entity entity : world.getEntities()) {
-            if (entity == player || !entity.isAlive()) continue;
+            if (entity == player) continue;
+            if (!entity.isAlive()) {
+                if (seenHostileIds.remove(entity.getId()) || prevVisibleIds.contains(entity.getId())) {
+                    observedHostileKills++;
+                }
+                hostileMemory.remove(entity.getId());
+                continue;
+            }
             double distSq = entity.squaredDistanceTo(player);
             if (distSq > 28.0 * 28.0) continue;
 
-            if (entity instanceof ItemEntity item && distSq <= 18.0 * 18.0) {
+            if (entity instanceof PersistentProjectileEntity proj && distSq <= 18.0 * 18.0) {
+                if (isIncomingProjectile(world, player, eye, proj)) {
+                    incomingProjectiles.add(proj);
+                }
+            } else if (entity instanceof ItemEntity item && distSq <= 18.0 * 18.0) {
                 if (distSq <= 25.0 || canSeeEntity(world, player, eye, look, entity, false)) {
                     visibleDrops.add(item);
                 }
-            } else if (isHostileThreat(entity)) {
+            } else if (isHostileThreat(entity, world, player)) {
                 LivingEntity mob = (LivingEntity) entity;
-                boolean withinFlow = flowActive && distSq <= 6.0 * 6.0;
-                if (withinFlow || canSeeEntity(world, player, eye, look, mob, distSq <= 25.0)) {
+                // Combat-flow allows 360-deg angle awareness at close range, but STILL strictly requires LOS (never X-ray!)
+                boolean allowPeripheral = distSq <= 25.0 || (flowActive && distSq <= 49.0);
+                if (canSeeEntity(world, player, eye, look, mob, allowPeripheral)) {
                     visibleHostiles.add(mob);
+                    currentlyVisibleIds.add(mob.getId());
+                    seenHostileIds.add(mob.getId());
+                    hostileMemory.put(mob.getId(), new RememberedHostile(
+                        mob.getId(),
+                        classifyThreat(mob),
+                        mob.getPos(),
+                        mob.getVelocity(),
+                        tick,
+                        creeperFuse(mob),
+                        isCreeperSwelling(mob),
+                        isRangedDrawing(mob),
+                        0
+                    ));
                 }
             } else if (isFoodAnimal(entity)) {
                 AnimalEntity animal = (AnimalEntity) entity;
@@ -321,9 +396,69 @@ final class Perception {
             }
         }
 
+        // Update / prune short-term occluded hostile memory (never X-ray; expire if old or if last spot is clearly empty)
+        var it = hostileMemory.entrySet().iterator();
+        while (it.hasNext()) {
+            var entry = it.next();
+            int id = entry.getKey();
+            RememberedHostile rem = entry.getValue();
+            if (currentlyVisibleIds.contains(id)) continue;
+
+            Entity live = world.getEntityById(id);
+            if (live == null) {
+                if (prevVisibleIds.contains(id)) {
+                    // Entity disappeared immediately after we saw it low/fighting (e.g. killed or despawned)
+                    if (seenHostileIds.remove(id)) observedHostileKills++;
+                }
+                it.remove();
+                continue;
+            }
+            if (!live.isAlive()) {
+                if (seenHostileIds.remove(id)) observedHostileKills++;
+                it.remove();
+                continue;
+            }
+            if (tick - rem.lastSeenTick() > HOSTILE_MEMORY_TICKS) {
+                it.remove();
+                continue;
+            }
+            // If we have direct clear LOS to the last-seen spot right now and the mob is NOT visible, count clear ticks
+            Vec3d spot = rem.lastPos().add(0, 0.85, 0);
+            Vec3d toSpot = spot.subtract(eye);
+            double d = toSpot.length();
+            if (d > 0.5 && d < 18.0 && look.dotProduct(toSpot.multiply(1.0 / d)) > 0.45) {
+                BlockHitResult hit = world.raycast(new RaycastContext(
+                    eye, spot, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, player));
+                if (hit.getType() == HitResult.Type.MISS || eye.squaredDistanceTo(hit.getPos()) >= d * d - 0.5) {
+                    int nextClear = rem.clearSpotTicks() + 1;
+                    if (nextClear >= 14) {
+                        it.remove();
+                    } else {
+                        entry.setValue(rem.withClearSpotTicks(nextClear));
+                    }
+                }
+            }
+        }
+
         visibleHostiles.sort(Comparator.comparingDouble(e -> e.squaredDistanceTo(player)));
         visibleFoodAnimals.sort(Comparator.comparingDouble(e -> e.squaredDistanceTo(player)));
         visibleDrops.sort(Comparator.comparingDouble(e -> e.squaredDistanceTo(player)));
+    }
+
+    private boolean isIncomingProjectile(ClientWorld world, ClientPlayerEntity player, Vec3d eye, PersistentProjectileEntity proj) {
+        if (proj.isOnGround() || proj.getOwner() == player) return false;
+        Vec3d vel = proj.getVelocity();
+        double speed = vel.length();
+        if (speed < 0.25) return false;
+        Vec3d toPlayer = player.getBoundingBox().getCenter().subtract(proj.getPos());
+        double dist = toPlayer.length();
+        if (dist < 0.2 || dist > 18.0) return false;
+        double approachDot = vel.multiply(1.0 / speed).dotProduct(toPlayer.multiply(1.0 / dist));
+        if (approachDot < 0.55) return false;
+        // Require unobstructed line-of-sight to the airborne projectile
+        BlockHitResult hit = world.raycast(new RaycastContext(
+            eye, proj.getPos(), RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, player));
+        return hit.getType() == HitResult.Type.MISS || eye.squaredDistanceTo(hit.getPos()) >= eye.squaredDistanceTo(proj.getPos()) - 0.6;
     }
 
     private boolean canSeeEntity(ClientWorld world, ClientPlayerEntity player, Vec3d eye, Vec3d look, Entity entity, boolean allowPeripheral) {
@@ -332,30 +467,152 @@ final class Perception {
         double dist = to.length();
         if (dist < 1e-4) return true;
         double dot = look.dotProduct(to.multiply(1.0 / dist));
-        if (!allowPeripheral && dot < 0.15) return false;
-        BlockHitResult hit = world.raycast(new RaycastContext(
-            eye, center, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, player));
-        return hit.getType() == HitResult.Type.MISS || eye.squaredDistanceTo(hit.getPos()) >= dist * dist - 0.8;
+        if (!allowPeripheral && dot < 0.12) return false;
+        if (hasClearRay(world, player, eye, center)) return true;
+        Vec3d head = new Vec3d(entity.getX(), entity.getEyeY(), entity.getZ());
+        if (hasClearRay(world, player, eye, head)) return true;
+        Vec3d low = new Vec3d(entity.getX(), entity.getY() + Math.min(0.35, entity.getHeight() * 0.45), entity.getZ());
+        return hasClearRay(world, player, eye, low);
     }
 
-    private static boolean hasNearbyHostileEntity(ClientWorld world, ClientPlayerEntity player, double radius) {
+    private static boolean hasClearRay(ClientWorld world, ClientPlayerEntity player, Vec3d eye, Vec3d target) {
+        double distSq = eye.squaredDistanceTo(target);
+        BlockHitResult hit = world.raycast(new RaycastContext(
+            eye, target, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, player));
+        return hit.getType() == HitResult.Type.MISS || eye.squaredDistanceTo(hit.getPos()) >= distSq - 0.65;
+    }
+
+    private boolean hasNearbyHostileEntity(ClientWorld world, ClientPlayerEntity player, double radius) {
         double rSq = radius * radius;
         for (Entity e : world.getEntities()) {
-            if (e != player && e.isAlive() && isHostileThreat(e) && e.squaredDistanceTo(player) <= rSq) {
+            if (e != player && e.isAlive() && isHostileThreat(e, world, player) && e.squaredDistanceTo(player) <= rSq) {
                 return true;
             }
         }
         return false;
     }
 
-    static boolean isHostileThreat(Entity e) {
+    boolean isHostileThreat(Entity e, ClientWorld world, ClientPlayerEntity player) {
         if (!(e instanceof LivingEntity)) return false;
         if (e instanceof EndermanEntity enderman) return enderman.isAngry();
         if (e instanceof SpiderEntity spider) {
-            return spider.getTarget() != null || spider.isAttacking() || spider.getBrightnessAtEyes() < 0.5f;
+            boolean night = world != null && world.getAmbientDarkness() >= 4;
+            boolean recentlyHurtNear = player != null && tick - lastHurtTick <= 100 && spider.squaredDistanceTo(player) <= 100.0;
+            return night || spider.getTarget() != null || spider.isAttacking()
+                || spider.getBrightnessAtEyes() < 0.5f || recentlyHurtNear;
         }
         return e instanceof HostileEntity || e instanceof CreeperEntity || e instanceof Monster;
     }
+
+    static CombatPlanner.ThreatKind classifyThreat(LivingEntity mob) {
+        if (mob instanceof CreeperEntity) return CombatPlanner.ThreatKind.CREEPER;
+        if (mob instanceof ZombieEntity z && z.isBaby()) return CombatPlanner.ThreatKind.BABY_ZOMBIE;
+        if (mob.isBaby() && mob instanceof HostileEntity) return CombatPlanner.ThreatKind.BABY_ZOMBIE;
+        if (mob instanceof AbstractSkeletonEntity) return CombatPlanner.ThreatKind.SKELETON;
+        if (mob instanceof PillagerEntity || mob instanceof WitchEntity) return CombatPlanner.ThreatKind.RANGED_OTHER;
+        if (mob instanceof SpiderEntity) return CombatPlanner.ThreatKind.SPIDER;
+        if (mob instanceof ZombieEntity) return CombatPlanner.ThreatKind.ZOMBIE;
+        return CombatPlanner.ThreatKind.MELEE_OTHER;
+    }
+
+    static float creeperFuse(LivingEntity mob) {
+        if (mob instanceof CreeperEntity c) {
+            return Math.max(0f, c.getClientFuseTime(1.0f));
+        }
+        return 0f;
+    }
+
+    static boolean isCreeperSwelling(LivingEntity mob) {
+        if (mob instanceof CreeperEntity c) {
+            return c.getFuseSpeed() > 0 || c.getClientFuseTime(1.0f) > 0.05f;
+        }
+        return false;
+    }
+
+    static boolean isRangedDrawing(LivingEntity mob) {
+        if (mob instanceof AbstractSkeletonEntity sk) {
+            return sk.isAttacking() || sk.isUsingItem();
+        }
+        return mob.isUsingItem();
+    }
+
+    /** Build unified ThreatInfo list (visible hostiles + fresh short-term occluded memories). */
+    List<CombatPlanner.ThreatInfo> activeThreats(ClientPlayerEntity player) {
+        List<CombatPlanner.ThreatInfo> list = new ArrayList<>();
+        Set<Integer> visIds = new HashSet<>();
+        for (LivingEntity mob : visibleHostiles) {
+            if (!mob.isAlive()) continue;
+            visIds.add(mob.getId());
+            Vec3d vel = mob.getVelocity();
+            list.add(new CombatPlanner.ThreatInfo(
+                mob.getId(),
+                classifyThreat(mob),
+                mob.getX(), mob.getY(), mob.getZ(),
+                vel.x, vel.y, vel.z,
+                mob.distanceTo(player),
+                creeperFuse(mob),
+                isCreeperSwelling(mob),
+                isRangedDrawing(mob),
+                false,
+                0
+            ));
+        }
+        for (RememberedHostile rem : hostileMemory.values()) {
+            if (visIds.contains(rem.entityId())) continue;
+            int age = Math.max(0, tick - rem.lastSeenTick());
+            if (age > HOSTILE_MEMORY_TICKS) continue;
+            Vec3d est = rem.estimatedPos(tick);
+            double dist = est.distanceTo(player.getPos());
+            if (dist > 18.0) continue;
+            list.add(new CombatPlanner.ThreatInfo(
+                rem.entityId(),
+                rem.kind(),
+                est.x, est.y, est.z,
+                rem.lastVel().x, rem.lastVel().y, rem.lastVel().z,
+                dist,
+                rem.lastCreeperFuse(),
+                rem.lastCreeperSwelling(),
+                rem.lastRangedDrawing(),
+                true,
+                age
+            ));
+        }
+        return list;
+    }
+
+    List<RememberedHostile> occludedHostiles() {
+        Set<Integer> visIds = new HashSet<>();
+        for (LivingEntity m : visibleHostiles) visIds.add(m.getId());
+        List<RememberedHostile> out = new ArrayList<>();
+        for (RememberedHostile rem : hostileMemory.values()) {
+            if (!visIds.contains(rem.entityId()) && tick - rem.lastSeenTick() <= HOSTILE_MEMORY_TICKS) {
+                out.add(rem);
+            }
+        }
+        return out;
+    }
+
+    LivingEntity findVisibleHostileById(int entityId) {
+        for (LivingEntity m : visibleHostiles) {
+            if (m.getId() == entityId && m.isAlive()) return m;
+        }
+        return null;
+    }
+
+    CombatPlanner.CellProbe combatFlowProbe() {
+        return (x, y, z) -> {
+            BlockState st = getObserved(x, y, z);
+            if (st == null) return CombatPlanner.CellKind.UNKNOWN;
+            if (isHazardBlock(st)) return CombatPlanner.CellKind.HAZARD;
+            if (isSolidSupport(st)) return CombatPlanner.CellKind.SOLID;
+            if (isPassable(st)) return CombatPlanner.CellKind.PASSABLE;
+            return CombatPlanner.CellKind.SOLID;
+        };
+    }
+
+    List<Entity> incomingProjectiles() { return incomingProjectiles; }
+    boolean hasIncomingArrow() { return !incomingProjectiles.isEmpty(); }
+    int observedHostileKills() { return observedHostileKills; }
 
     static boolean isFoodAnimal(Entity e) {
         return e instanceof PigEntity || e instanceof CowEntity || e instanceof SheepEntity

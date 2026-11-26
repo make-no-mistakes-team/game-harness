@@ -113,6 +113,8 @@ final class TaskRunner {
     private int exploreFlipCount;
     private Vec3d exploreLastPos;
     private int exploreStuckTicks;
+    private Vec3d canopyLastPos;
+    private int canopyStuckTicks;
     private int dropChaseEntityId = -1;
     private int dropChaseTicks;
     private int rockBrokenCount;
@@ -2672,12 +2674,33 @@ final class TaskRunner {
      */
     private boolean descendFromTreeCanopy(ClientPlayerEntity player, ClientWorld world) {
         BlockPos feet = player.getBlockPos();
+        Vec3d cur = player.getPos();
+        if (canopyLastPos == null || cur.squaredDistanceTo(canopyLastPos) > 0.36) {
+            canopyLastPos = cur;
+            canopyStuckTicks = 0;
+        } else {
+            canopyStuckTicks++;
+        }
+
         BlockPos edge = findSafeCanopyExit(player, world);
-        if (edge != null) {
+        if (edge != null && canopyStuckTicks < 22) {
+            if (player.horizontalCollision) {
+                int sdx = Integer.compare(edge.getX(), feet.getX());
+                int sdz = Integer.compare(edge.getZ(), feet.getZ());
+                BlockPos ahead = feet.add(sdx, 0, sdz);
+                if (world.getBlockState(ahead).getBlock() instanceof LeavesBlock) {
+                    motor.mineBlock(ahead, true, false);
+                    return true;
+                }
+                if (world.getBlockState(ahead.up()).getBlock() instanceof LeavesBlock) {
+                    motor.mineBlock(ahead.up(), true, false);
+                    return true;
+                }
+            }
             motor.moveToward(Vec3d.ofBottomCenter(edge), false, false, false, true);
             return true;
         }
-        // Continuous canopy (e.g. dark oak roof): verify safe non-hazard landing within 12 blocks below, then break underfoot leaves!
+        // Continuous canopy or obstructed canopy ledge: verify safe non-hazard landing within 12 blocks below, then break underfoot leaves!
         boolean safeBelow = false;
         for (int dy = 1; dy <= 12; dy++) {
             BlockState below = world.getBlockState(feet.down(dy));
@@ -2707,6 +2730,19 @@ final class TaskRunner {
                     BlockPos edge = feet.add(dx, 0, dz);
                     if (!Perception.isPassable(world.getBlockState(edge))
                             || !Perception.isPassable(world.getBlockState(edge.up()))) continue;
+                    // Verify the straight path across the canopy to `edge` is clear of leaf walls & tree trunks!
+                    boolean pathClear = true;
+                    for (int s = 1; s < r; s++) {
+                        int sx = (int) Math.round(dx * (s / (double) r));
+                        int sz = (int) Math.round(dz * (s / (double) r));
+                        BlockPos mid = feet.add(sx, 0, sz);
+                        if (!Perception.isPassable(world.getBlockState(mid))
+                                || !Perception.isPassable(world.getBlockState(mid.up()))) {
+                            pathClear = false;
+                            break;
+                        }
+                    }
+                    if (!pathClear) continue;
                     // Check for witnessed dry landing within 5 blocks or water within 10 blocks!
                     for (int dy = 1; dy <= 10; dy++) {
                         BlockState st = world.getBlockState(edge.down(dy));

@@ -1285,7 +1285,15 @@ final class TaskRunner {
             return;
         }
 
-        // 3. Explore surface to find food animals/berries (bounded so we don't starve wandering forever!)
+        // 3. Explore surface to find food animals/berries (climb up first if underground!)
+        if (player.getBlockY() < 58 && world.getLightLevel(net.minecraft.world.LightType.SKY, player.getBlockPos()) < 8) {
+            if (activeTicks > 750) {
+                finishActive("partial", "still underground while looking for food", currentTick);
+                return;
+            }
+            climbToSurface(player, world, currentTick, "climbing to surface to find food");
+            return;
+        }
         if (activeTicks > 500) {
             finishActive("partial", "no food animals spotted nearby", currentTick);
             return;
@@ -1861,11 +1869,11 @@ final class TaskRunner {
         //      where riverbanks, beaches, gravel hills, water sources, and surface caves/lava pools are abundant!
         //    - Otherwise scout the surface for riverbanks & gravel patches!
         BlockPos feet = player.getBlockPos();
-        if (caves != null && (caves.mode() == CaveExplorer.Mode.EXPLORING_CAVE
+        if (activeTicks < 900 && caves != null && (caves.mode() == CaveExplorer.Mode.EXPLORING_CAVE
                 || caves.countNearbyUnvisitedFrontiers(perception, feet, 24.0) > 0)) {
             tickCaveSearch(player, world, Perception.OreKind.IRON, 24, currentTick);
             statusText = "searching open cave for gravel";
-        } else if (isUndergroundWithoutCave(player, world)) {
+        } else if (feet.getY() < 58 && world.getLightLevel(net.minecraft.world.LightType.SKY, feet) < 8) {
             climbToSurface(player, world, currentTick, "climbing to surface to find gravel banks");
         } else {
             exploreForResources(player, world, currentTick, "scouting surface & banks for gravel");

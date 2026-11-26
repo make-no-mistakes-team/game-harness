@@ -820,6 +820,7 @@ final class SurvivalReflexes {
                 wallOrder.add(feet.up(dy).offset(dirs.get(i)));
             }
         }
+        int unplaceableWalls = 0;
         for (BlockPos target : wallOrder) {
             if (isSolidWall(world.getBlockState(target))) continue;
 
@@ -842,12 +843,51 @@ final class SurvivalReflexes {
                 return true;
             }
 
+            // Skip wall cells hanging over air/ravine with no adjacent placement face so we seal supported walls first!
+            if (motor.findPlacementHit(target) == null) {
+                unplaceableWalls++;
+                continue;
+            }
+
             if (motor.placeBlockAt(target, blockSlot)) {
                 shelterBlocksPlaced++;
+                shelterBlockedTicks = 0;
                 perception.recordObserved(target, world.getBlockState(target), false);
+            } else {
+                shelterBlockedTicks++;
+                if (shelterBlockedTicks > 24 && canBurrowDown(world, feet)) {
+                    shelterMode = CombatPlanner.ShelterMode.BURROW_DOWN;
+                    shelterStartY = feet.getY();
+                    shelterBlockedTicks = 0;
+                    activeStatus = "switching to emergency burrow";
+                    return true;
+                }
+                if (shelterBlockedTicks > 48) {
+                    shelterState = ShelterState.NONE;
+                    shelterBlockedTicks = 0;
+                    activeStatus = "leaving unsealable ledge";
+                    return false;
+                }
             }
             activeStatus = "sealing emergency shelter walls";
             return true;
+        }
+        // Remaining open walls hang over a drop with no placement face: burrow down into rock ledge or exit cleanly!
+        if (unplaceableWalls > 0) {
+            shelterBlockedTicks++;
+            if (canBurrowDown(world, feet)) {
+                shelterMode = CombatPlanner.ShelterMode.BURROW_DOWN;
+                shelterStartY = feet.getY();
+                shelterBlockedTicks = 0;
+                activeStatus = "burrowing into ledge for shelter";
+                return true;
+            }
+            if (shelterBlockedTicks > 30) {
+                shelterState = ShelterState.NONE;
+                shelterBlockedTicks = 0;
+                activeStatus = "leaving unsealable ledge";
+                return false;
+            }
         }
 
         // Phase 2: Spider-proof & arrow-proof ROOF at feet.up(2)!

@@ -21,13 +21,16 @@ Available task kinds:
 - gather_wood: chop trees & pick up logs. target="logs", count=desired total logs (e.g. 4..8).
 - mine_stone: mine stone/cobblestone (digs down through soil if needed). target="stone", count=desired total cobblestone (e.g. 14..20).
 - mine_ore: navigate/dig safely to mine coal, iron, or diamond ore. target="coal"|"iron"|"diamond", count=desired total drops (e.g. coal=6, iron=4, diamond=3). Optional x,y,z to pick a specific listed ore coordinate.
-- craft: craft an item (automatically crafts missing planks/sticks/crafting_table and places/uses a crafting table for 3x3 recipes!). target=recipe name ("crafting_table", "wooden_pickaxe", "stone_pickaxe", "stone_sword", "furnace", "torch", "iron_pickaxe", "iron_sword", "bucket", "shield", "diamond_pickaxe"), count=desired total count.
+- craft: craft an item (automatically crafts missing planks/sticks/crafting_table and places/uses a crafting table for 3x3 recipes!). target=recipe name ("crafting_table", "wooden_pickaxe", "stone_pickaxe", "stone_shovel", "stone_axe", "stone_sword", "furnace", "torch", "iron_pickaxe", "iron_shovel", "iron_axe", "iron_sword", "bucket", "flint_and_steel", "shield", "diamond_pickaxe"), count=desired total count.
 - smelt: place/use furnace to smelt raw_iron into iron_ingot or raw_meat into cooked meat. target="raw_iron"|"raw_meat", count=desired total cooked/smelted items.
 - gather_food: harvest visible berries or hunt visible food animals. target="food", count=desired food count (e.g. 4).
-- dig_down: dig a safe navigable staircase down to a target Y level (count=targetY, e.g. 16 for iron or -54 for diamonds).
+- gather_flint: mine observed gravel (or re-place & re-mine carried gravel blocks) until obtaining flint for flint_and_steel. target="flint", count=1.
+- fill_water: walk to observed still water and fill an empty bucket into a water_bucket. target="water", count=1.
+- clear_inventory: discard low-value clutter (seeds, flowers, rotten flesh, excess decorative stone, surplus stacks of dirt/cobble while preserving tools, ores, food, fuel, wood, and 1 stack of scaffold) to free inventory space. target="clutter", count=desired free slots (e.g. 6).
+- dig_down: dig a safe navigable staircase down to a target Y level (count=targetY, e.g. 16 for iron or -54 for diamonds). Automatically enters caves encountered along the way.
 - descend_drop: evaluate and safely descend a nearby high drop, ravine, or giant cavern overlook. target="auto"|"water_pour"|"water_clutch"|"boat_drop"|"cliff_stair"|"edge_blocks"|"avoid", count=targetFloorY (or 0 to descend to the observed cavern floor).
-- explore_cave: scout the surface for cave entrances and ravines, enter and explore deep passages for exposed ores, and exit shallow dead-end caves to search for deeper caves or ravines. target="iron"|"diamond"|"coal", count=desired target Y (e.g. 16 for iron, -54 for diamond).
-- cast_portal: cast a 10-obsidian cornerless Nether portal on the shore of an observed lava pool using a water bucket, cobblestone supports, and flint & steel, then ignite and enter the Nether. target="shore", count=1.
+- explore_cave: scout the surface for cave entrances and ravines, enter and explore deep passages for exposed ores or underground lava lakes, and exit shallow dead-end caves to search for deeper caves or ravines. target="iron"|"diamond"|"coal"|"lava", count=desired target Y (e.g. 16 for iron, -54 for diamond/lava).
+- cast_portal: approach an observed lava pool, shore-cast a 10-obsidian cornerless Nether portal using a water bucket, cobblestone supports, and flint & steel, then ignite and enter the Nether. target="shore", count=1.
 - explore: explore terrain to find trees, stone, caves, lava pools, or food animals. target="explore", count=20.
 - navigate: 3D A* navigate to x,y,z within count blocks.
 - collect_drops: pick up nearby dropped items.
@@ -41,26 +44,23 @@ Combat stance options (combatStance):
 - "shelter": immediately build/burrow a roofed emergency shelter, seal inside, and eat food to recover HP.
 
 Strategic rules:
-1. Respect Minecraft's tech tree: wood -> crafting_table + wooden_pickaxe -> cobblestone -> stone_pickaxe + furnace (+ stone_sword for safety!) -> coal/torches + iron_ore -> smelt raw_iron -> iron_pickaxe (+ shield when iron & planks allow!) -> diamond_ore (3 diamonds) -> diamond_pickaxe.
-2. Keep wood/sticks in reserve (at least 2 sticks OR >= 4 planks / 2 logs remaining AFTER crafting iron_pickaxe/spare tools!) AND a spare stone_pickaxe before descending deep underground, so iron_pickaxe durability is conserved on deepslate and diamond_pickaxe can be crafted immediately underground the instant you mine 3 diamonds!
-3. When diagnosticOreReveal is false and environment.ores has no listed coordinates for coal/iron/diamond, still queue mine_ore ("coal"|"iron"|"diamond") or explore_cave — the local player automatically scouts the surface for cave entrances and ravines, enters and explores deep caves for exposed ores, leaves shallow dead-end caves to find deeper ones, and transitions to safe staircase + cardinal branch-mining (Y=16 iron, Y=-54 diamond) once deep underground or if no surface caves are nearby. Carry torches (when coal is available) and a water bucket or boat when iron/wood allow so deep ravines and caverns can be descended safely!
-4. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
-5. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals. When healthy and well-armed, use "auto", "defensive", or "aggressive".
-6. When state.descent.nearbyDrop is true, inspect state.descent (dropDepth, floorObserved, landingSurface, landingLava, landingHostiles, hasCliffWall, hasSteppedShelf, and descent.gear) and set descentMethod (and optionally queue a descend_drop task):
-   - NEVER pick water_clutch or boat_drop if landingLava is true or floorObserved is false (use "avoid", "water_pour", or "cliff_stair" instead).
-   - Pick "water_clutch" (with waterBucket and clear dry solid floor) for fast MLG descent, or "water_pour" for a reusable waterfall column (especially when deep or floor is uncertain).
-   - Pick "boat_drop" when carrying a boat over a clear dry cavern floor for zero fall damage.
-   - Pick "cliff_stair" when lacking water/boat or when landing is dark/hostile and a cliff wall + pickaxe are available.
-   - Pick "edge_blocks" on stepped shelves/chasms when carrying scaffold blocks (cobblestone/dirt).
-   - Pick "avoid" if descending into lava or an unlit hostile swarm at low HP.
-7. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.
-8. During long smelts (activeFurnace present), the local player automatically mines nearby ore/stone or chops nearby wood when safe and returns before smelting finishes — do not interrupt an active smelt unless urgent.
-9. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
-10. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
+1. Respect Minecraft's tech tree:
+   - For pickaxe/diamond goals: wood -> crafting_table + wooden_pickaxe -> cobblestone -> stone_pickaxe + furnace (+ stone_sword) -> coal/torches + iron_ore -> smelt raw_iron -> iron_pickaxe (+ shield when iron & planks allow) -> diamond_ore (3 diamonds) -> diamond_pickaxe.
+   - For goal="nether_portal" (bucket + lava-pool shore-casting!): wood -> crafting_table + wooden_pickaxe -> cobblestone (16+) -> stone_pickaxe + furnace (+ stone_sword) -> mine >= 4 iron_ore -> smelt raw_iron -> craft bucket (3 iron) + gather_flint + craft flint_and_steel (1 iron + 1 flint) -> fill_water (water_bucket) -> find a lava pool (surface or deep cave via explore_cave target="lava" count=-54) -> cast_portal! You do NOT need diamonds or obsidian mining for shore-cast nether_portal.
+2. Craft stone_shovel when anticipating significant dirt/gravel digging (e.g. gather_flint, thick soil hills, or state.tools.soilBroken >= 5 and !hasShovel) and stone_axe when doing heavy wood gathering (or needing a strong weapon/shield breaker) if stone & sticks are available.
+3. Monitor state.inventorySpace: if cluttered (freeSlots <= 3) before mining ores, flint, or casting a portal, queue clear_inventory (target="clutter", count=6) so drops are never left behind.
+4. Keep wood/sticks in reserve (at least 2 sticks OR >= 4 planks / 2 logs) AND a spare stone_pickaxe before descending deep underground.
+5. When exploring underground or digging down: prefer explore_cave whenever caves.unvisitedFrontiers > 0 rather than rigid dig_down so caves along the way are explored for exposed ores and deeper passages! If a cave dead-ends without reaching target depth, resume digging down from the new location.
+6. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
+7. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals.
+8. When state.descent.nearbyDrop is true, inspect state.descent and set descentMethod ("water_clutch", "water_pour", "boat_drop", "cliff_stair", "edge_blocks", or "avoid" — NEVER water_clutch/boat_drop into lava or unobserved floor).
+9. Prioritize gather_food (or smelt raw_meat) when health < 12 or food <= 10, or before caving when animals/berries are visible.
+10. During long smelts (activeFurnace present), do not interrupt unless urgent. Do not repeat a failed task unchanged — adapt! Queue 2-4 coherent steps ahead so transitions stay seamless.`;
 
 const TASK_KINDS = [
   "gather_wood", "mine_stone", "mine_ore", "craft", "smelt",
-  "gather_food", "dig_down", "descend_drop", "explore_cave", "cast_portal", "explore", "navigate", "collect_drops", "build_shelter",
+  "gather_food", "gather_flint", "fill_water", "clear_inventory",
+  "dig_down", "descend_drop", "explore_cave", "cast_portal", "explore", "navigate", "collect_drops", "build_shelter",
 ] as const;
 
 const COMBAT_STANCES = ["auto", "aggressive", "defensive", "flee", "shelter"] as const;

@@ -108,6 +108,7 @@ final class Perception {
     private final Set<BlockPos> observedDiamond = new HashSet<>();
     private final Set<BlockPos> observedWater = new HashSet<>();
     private final Set<BlockPos> observedLava = new HashSet<>();
+    private final Set<BlockPos> observedGravel = new HashSet<>();
     private final Set<BlockPos> observedBerries = new HashSet<>();
     private final Set<BlockPos> observedTables = new HashSet<>();
     private final Set<BlockPos> observedFurnaces = new HashSet<>();
@@ -653,6 +654,7 @@ final class Perception {
         updateIndex(observedDiamond, imm, b == Blocks.DIAMOND_ORE || b == Blocks.DEEPSLATE_DIAMOND_ORE);
         updateIndex(observedWater, imm, state.getFluidState().isIn(FluidTags.WATER));
         updateIndex(observedLava, imm, state.getFluidState().isIn(FluidTags.LAVA));
+        updateIndex(observedGravel, imm, b == Blocks.GRAVEL);
         updateIndex(observedTables, imm, b == Blocks.CRAFTING_TABLE);
         updateIndex(observedFurnaces, imm, b == Blocks.FURNACE);
         boolean ripeBerry = b == Blocks.SWEET_BERRY_BUSH && state.contains(SweetBerryBushBlock.AGE)
@@ -743,6 +745,7 @@ final class Perception {
         observedStone.removeIf(pos -> pos.getSquaredDistance(p) > 48 * 48);
         observedWater.removeIf(pos -> pos.getSquaredDistance(p) > 64 * 64);
         observedLava.removeIf(pos -> pos.getSquaredDistance(p) > 64 * 64);
+        observedGravel.removeIf(pos -> pos.getSquaredDistance(p) > 56 * 56);
         observedBerries.removeIf(pos -> pos.getSquaredDistance(p) > 64 * 64);
         observedCaveSights.entrySet().removeIf(e ->
             e.getValue().pos().getSquaredDistance(p) > 72 * 72 || (tick - e.getValue().tick()) > 3600);
@@ -815,6 +818,7 @@ final class Perception {
     Set<BlockPos> observedDiamond() { return observedDiamond; }
     Set<BlockPos> observedWater() { return observedWater; }
     Set<BlockPos> observedLava() { return observedLava; }
+    Set<BlockPos> observedGravel() { return observedGravel; }
     Set<BlockPos> observedBerries() { return observedBerries; }
     Set<BlockPos> observedTables() { return observedTables; }
     Set<BlockPos> observedFurnaces() { return observedFurnaces; }

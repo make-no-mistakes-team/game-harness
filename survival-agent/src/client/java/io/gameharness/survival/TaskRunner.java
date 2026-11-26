@@ -37,6 +37,9 @@ final class TaskRunner {
         CRAFT,
         SMELT,
         GATHER_FOOD,
+        GATHER_FLINT,
+        FILL_WATER,
+        CLEAR_INVENTORY,
         DIG_DOWN,
         DESCEND_DROP,
         EXPLORE_CAVE,
@@ -113,6 +116,11 @@ final class TaskRunner {
     private int dropChaseEntityId = -1;
     private int dropChaseTicks;
     private int rockBrokenCount;
+    private int soilBlocksBroken;
+    private int lastAutoTriageTick = -200;
+    private int waterFillAimStableTicks;
+    private int waterFillCooldownTicks;
+    private BlockPos placedGravelPos;
 
     TaskRunner(MinecraftClient client, Motor motor, Perception perception,
                Pathfinder pathfinder, RouteExecutor route, GuiHands gui,
@@ -157,6 +165,9 @@ final class TaskRunner {
         dropChaseEntityId = -1;
         dropChaseTicks = 0;
         noMineProgressTicks = 0;
+        waterFillAimStableTicks = 0;
+        waterFillCooldownTicks = 0;
+        placedGravelPos = null;
         if (descent != null) descent.resetForLife();
         if (caves != null) caves.resetForLife();
         if (portal != null) portal.resetForLife();
@@ -169,6 +180,7 @@ final class TaskRunner {
     List<Task> queuedTasks() { return new ArrayList<>(queue); }
     List<TaskReceipt> recentReceipts() { return new ArrayList<>(recentReceipts); }
     int rockBrokenCount() { return rockBrokenCount; }
+    int soilBlocksBroken() { return soilBlocksBroken; }
     BlockPos activeSmeltFurnacePos() { return smeltLoaded ? placedFurnacePos : null; }
     int activeSmeltRemainingTicks(int currentTick) { return smeltLoaded ? Math.max(0, smeltReadyTick - currentTick) : 0; }
 
@@ -206,11 +218,40 @@ final class TaskRunner {
         if (player == null || world == null || !player.isAlive()) return;
         if (replanCooldown > 0) replanCooldown--;
 
-        // 0. If GUI hands are currently active (crafting/furnace/hotbar swap), let GUI finish smoothly!
+        // 0. If GUI hands are currently active (crafting/furnace/hotbar swap/inventory triage), let GUI finish smoothly!
         if (gui.isBusy()) {
             gui.tick();
             statusText = "using inventory/workstation";
             return;
+        }
+        if (waterFillCooldownTicks > 0) waterFillCooldownTicks--;
+
+        // Track soil/gravel breaking while mining so we anticipate crafting a shovel when digging through earth!
+        if (motor.isMining() && client.crosshairTarget instanceof net.minecraft.util.hit.BlockHitResult bhr
+                && bhr.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
+                && motor.breakingProgress() > 0.72f
+                && world.getBlockState(bhr.getBlockPos()).isIn(BlockTags.SHOVEL_MINEABLE)
+                && currentTick % 6 == 0) {
+            soilBlocksBroken++;
+        }
+
+        // 0b. Automatic inventory clutter protection: if <= 2 free slots remain during safe non-critical tasks,
+        //     discard low-value junk / excess stacks via InventoryScreen so ores, flint, and workstations can always be picked up!
+        boolean criticalBusy = active != null && (active.kind() == TaskKind.CAST_PORTAL
+            || active.kind() == TaskKind.DESCEND_DROP
+            || active.kind() == TaskKind.CRAFT
+            || active.kind() == TaskKind.SMELT
+            || active.kind() == TaskKind.CLEAR_INVENTORY);
+        if (!criticalBusy && client.currentScreen == null && currentTick - lastAutoTriageTick >= 140
+                && InventoryTriage.isCluttered(player)) {
+            List<Integer> drops = InventoryTriage.chooseSlotsToDiscard(player, goal, 5);
+            if (!drops.isEmpty()) {
+                lastAutoTriageTick = currentTick;
+                gui.startDropSlots(drops);
+                gui.tick();
+                statusText = "clearing cluttered inventory";
+                return;
+            }
         }
 
         // 1. Always pick up reachable valuable dropped items right next to us (<= 6m, cumulative cap so jumping never resets it!)
@@ -331,6 +372,9 @@ final class TaskRunner {
             case CRAFT -> tickCraft(player, world, currentTick);
             case SMELT -> tickSmelt(player, world, currentTick);
             case GATHER_FOOD -> tickGatherFood(player, world, currentTick);
+            case GATHER_FLINT -> tickGatherFlint(player, world, currentTick);
+            case FILL_WATER -> tickFillWater(player, world, currentTick);
+            case CLEAR_INVENTORY -> tickClearInventory(player, world, currentTick);
             case DIG_DOWN -> tickDigDown(player, world, currentTick);
             case DESCEND_DROP -> tickDescendDrop(player, world, currentTick);
             case EXPLORE_CAVE -> tickExploreCave(player, world, currentTick);
@@ -1213,6 +1257,25 @@ final class TaskRunner {
                 }
             }
         }
+        // If we break into an unvisited cave while digging down (horizontal or sloping!), explore it first!
+        // If it dead-ends without reaching targetY, CaveExplorer transitions right back to manual digging from the new spot!
+        if (caves != null) {
+            if (caves.mode() == CaveExplorer.Mode.EXPLORING_CAVE) {
+                tickCaveSearch(player, world, Perception.OreKind.DIAMOND, targetY, currentTick);
+                return;
+            }
+            BlockPos feet = player.getBlockPos();
+            if (caves.canBreakIntoCave(currentTick) && caves.countNearbyUnvisitedFrontiers(perception, feet, 20.0) >= 3) {
+                BlockPos caveSpot = caves.selectBestCaveFrontier(perception, feet, player.getYaw(), targetY);
+                if (caveSpot != null && caveSpot.getY() <= feet.getY() + 3) {
+                    caves.beginExploringCave(feet, currentTick, true);
+                    caves.setActiveFrontier(caveSpot);
+                    route.clear();
+                    statusText = "broke into cave while digging; exploring";
+                    return;
+                }
+            }
+        }
         if (isWetSurfaceSpot(player, world)) {
             route.clear();
             exploreForResources(player, world, currentTick, "moving to dry land before descending");
@@ -1251,6 +1314,20 @@ final class TaskRunner {
     }
 
     private void tickExploreCave(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        boolean lavaSearch = "lava".equalsIgnoreCase(active.target()) || "lava_pool".equalsIgnoreCase(active.target());
+        if (lavaSearch) {
+            if (portal != null && (portal.hasObservedLavaPoolSite(player, world) || perception.observedLava().size() >= 10)) {
+                finishActive("completed", "spotted lava pool for portal casting", currentTick);
+                return;
+            }
+            int targetY = active.count() != 0 ? active.count() : -54;
+            if (caves == null) {
+                tickDescentAndBranchMine(player, world, "lava", targetY, currentTick);
+                return;
+            }
+            tickCaveSearch(player, world, Perception.OreKind.DIAMOND, targetY, currentTick);
+            return;
+        }
         Perception.OreKind oreKind = parseOreKind(active.target());
         int targetY = active.count() != 0 ? active.count() : switch (oreKind) {
             case COAL -> 48;
@@ -1510,14 +1587,15 @@ final class TaskRunner {
             }
 
             case DEEP_BRANCH_MINE -> {
-                // If our staircase/branch mine breaks into a genuinely open downward cavern, explore that cave!
-                if (caves.countUnvisitedFrontiers(perception, feet) >= 6) {
-                    BlockPos deepCave = caves.selectBestCaveFrontier(perception, feet, player.getYaw(), targetY);
-                    if (deepCave != null && deepCave.getY() <= feet.getY() - 3) {
-                        caves.beginExploringCave(feet, currentTick);
-                        caves.setActiveFrontier(deepCave);
+                // If our staircase/branch mine breaks into ANY genuinely open cave (horizontal or descending!),
+                // explore it for exposed ores and deeper passages before resuming manual digging from our new location!
+                if (caves.canBreakIntoCave(currentTick) && caves.countNearbyUnvisitedFrontiers(perception, feet, 20.0) >= 3) {
+                    BlockPos openCave = caves.selectBestCaveFrontier(perception, feet, player.getYaw(), targetY);
+                    if (openCave != null && openCave.getY() <= feet.getY() + 3) {
+                        caves.beginExploringCave(feet, currentTick, true);
+                        caves.setActiveFrontier(openCave);
                         route.clear();
-                        statusText = "broke into deep cave; exploring";
+                        statusText = "broke into cave; exploring passages";
                         return;
                     }
                 }
@@ -1632,6 +1710,185 @@ final class TaskRunner {
         }
     }
 
+    private void tickGatherFlint(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        int want = Math.max(1, active.count());
+        if (GuiHands.countItem(player, Items.FLINT) >= want || GuiHands.countItem(player, Items.FLINT_AND_STEEL) > 0) {
+            placedGravelPos = null;
+            finishActive("completed", "obtained flint", currentTick);
+            return;
+        }
+
+        // 1. If we placed a gravel block right next to us to re-mine for flint, break it!
+        if (placedGravelPos != null) {
+            if (world.getBlockState(placedGravelPos).isOf(Blocks.GRAVEL)
+                    && player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(placedGravelPos)) <= Motor.REACH_SQ) {
+                boolean broken = motor.mineBlock(placedGravelPos, true, false);
+                statusText = "re-mining gravel for flint";
+                if (broken) {
+                    soilBlocksBroken++;
+                    placedGravelPos = null;
+                }
+                return;
+            }
+            placedGravelPos = null;
+        }
+
+        // 2. If carrying gravel blocks in inventory, place one on the ground right next to us and re-mine until flint drops!
+        if (GuiHands.countItem(player, Items.GRAVEL) > 0) {
+            if (!ensureToolInHotbar(player, st -> st.isOf(Items.GRAVEL))) {
+                statusText = "moving gravel to hotbar";
+                return;
+            }
+            int gravelSlot = motor.findHotbarItem(Items.GRAVEL);
+            BlockPos spot = findPlacementSpotNearPlayer(player, world);
+            if (gravelSlot >= 0 && spot != null) {
+                if (motor.placeBlockAt(spot, gravelSlot)) {
+                    placedGravelPos = spot;
+                }
+                statusText = "placing gravel to farm flint";
+                return;
+            }
+        }
+
+        // 3. Otherwise mine nearest observed natural gravel (riverbanks, beaches, caves, underground!)
+        if (activeTargetBlock == null || !world.getBlockState(activeTargetBlock).isOf(Blocks.GRAVEL)) {
+            activeTargetBlock = perception.nearestObserved(perception.observedGravel(), player.getBlockPos(), 44.0, blacklistedTargets);
+            route.clear();
+        }
+        if (activeTargetBlock != null) {
+            if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(activeTargetBlock)) <= Motor.REACH_SQ
+                    && motor.findAimPoint(activeTargetBlock) != null) {
+                boolean broken = motor.mineBlock(activeTargetBlock, true, false);
+                statusText = "mining gravel for flint";
+                if (broken) {
+                    soilBlocksBroken++;
+                    activeTargetBlock = null;
+                    noMineProgressTicks = 0;
+                } else if (motor.breakingProgress() > 0.01f) {
+                    noMineProgressTicks = 0;
+                } else if (++noMineProgressTicks > 45) {
+                    blacklistedTargets.add(activeTargetBlock);
+                    activeTargetBlock = null;
+                    noMineProgressTicks = 0;
+                }
+                return;
+            }
+            Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+            RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.3), opts, currentTick);
+            statusText = "approaching gravel for flint";
+            if (st == RouteExecutor.Status.STUCK) {
+                blacklistedTargets.add(activeTargetBlock);
+                activeTargetBlock = null;
+                route.clear();
+            }
+            return;
+        }
+
+        // 4. No gravel observed yet: scout caves/terrain (gravel is super common along riverbanks and inside caves!)
+        if (caves != null && (player.getBlockY() <= 54 || caves.countUnexploredEntrances() > 0)) {
+            tickCaveSearch(player, world, Perception.OreKind.IRON, 24, currentTick);
+            statusText = "searching caves & banks for gravel";
+        } else {
+            exploreForResources(player, world, currentTick, "scouting for gravel");
+        }
+    }
+
+    private void tickFillWater(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        if (GuiHands.countItem(player, Items.WATER_BUCKET) > 0) {
+            waterFillAimStableTicks = 0;
+            finishActive("completed", "filled water bucket", currentTick);
+            return;
+        }
+        if (GuiHands.countItem(player, Items.BUCKET) <= 0) {
+            finishActive("failed", "no empty bucket carried", currentTick);
+            return;
+        }
+        if (!ensureToolInHotbar(player, st -> st.isOf(Items.BUCKET))) {
+            statusText = "moving bucket to hotbar";
+            return;
+        }
+        int bucketSlot = motor.findHotbarItem(Items.BUCKET);
+
+        // Find nearest observed STILL water source
+        BlockPos waterTarget = null;
+        double bestSq = 48.0 * 48.0;
+        BlockPos feet = player.getBlockPos();
+        for (BlockPos w : perception.observedWater()) {
+            if (blacklistedTargets.contains(w)) continue;
+            var fs = world.getBlockState(w).getFluidState();
+            if (!fs.isIn(net.minecraft.registry.tag.FluidTags.WATER) || !fs.isStill()) continue;
+            double dSq = w.getSquaredDistance(feet);
+            if (dSq < bestSq) {
+                bestSq = dSq;
+                waterTarget = w;
+            }
+        }
+        if (waterTarget == null) {
+            exploreForResources(player, world, currentTick, "searching for water source");
+            return;
+        }
+
+        Vec3d aim = new Vec3d(waterTarget.getX() + 0.5, waterTarget.getY() + 0.65, waterTarget.getZ() + 0.5);
+        double eyeDistSq = player.getEyePos().squaredDistanceTo(aim);
+        if (eyeDistSq <= 4.1 * 4.1) {
+            player.getInventory().selectedSlot = bucketSlot;
+            motor.lookAtPoint(aim, Motor.LookMode.FINE);
+            statusText = "filling water bucket";
+            Vec3d eye = player.getEyePos();
+            Vec3d end = eye.add(player.getRotationVec(1.0f).multiply(4.4));
+            var hit = world.raycast(new net.minecraft.world.RaycastContext(
+                eye, end, net.minecraft.world.RaycastContext.ShapeType.OUTLINE,
+                net.minecraft.world.RaycastContext.FluidHandling.SOURCE_ONLY, player));
+            boolean ok = hit.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
+                && world.getBlockState(hit.getBlockPos()).getFluidState().isIn(net.minecraft.registry.tag.FluidTags.WATER)
+                && world.getBlockState(hit.getBlockPos()).getFluidState().isStill()
+                && motor.currentAimErrorDeg() < 2.2;
+            if (ok) {
+                waterFillAimStableTicks++;
+                if (waterFillAimStableTicks >= 2 && waterFillCooldownTicks <= 0 && client.interactionManager != null) {
+                    var res = client.interactionManager.interactItem(player, net.minecraft.util.Hand.MAIN_HAND);
+                    if (res.isAccepted()) {
+                        player.swingHand(net.minecraft.util.Hand.MAIN_HAND);
+                        waterFillCooldownTicks = 6;
+                        waterFillAimStableTicks = 0;
+                    }
+                }
+            } else {
+                waterFillAimStableTicks = 0;
+            }
+            return;
+        }
+
+        waterFillAimStableTicks = 0;
+        Pathfinder.Options opts = Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
+        RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(waterTarget.up(), 2.8), opts, currentTick);
+        statusText = "walking to water source";
+        if (st == RouteExecutor.Status.STUCK) {
+            blacklistedTargets.add(waterTarget);
+            route.clear();
+        }
+    }
+
+    private void tickClearInventory(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        int wantFree = Math.max(4, active.count() > 0 ? active.count() : 6);
+        if (gui.state() == GuiHands.State.DONE || gui.state() == GuiHands.State.FAILED) {
+            gui.abort();
+            finishActive("completed", "freed inventory space (free=" + InventoryTriage.freeSlots(player) + ")", currentTick);
+            return;
+        }
+        if (InventoryTriage.freeSlots(player) >= wantFree) {
+            finishActive("completed", "inventory already has " + InventoryTriage.freeSlots(player) + " free slots", currentTick);
+            return;
+        }
+        List<Integer> toDrop = InventoryTriage.chooseSlotsToDiscard(player, goal, wantFree);
+        if (toDrop.isEmpty()) {
+            finishActive("partial", "no discardable clutter found", currentTick);
+            return;
+        }
+        gui.startDropSlots(toDrop);
+        statusText = "discarding low-value inventory clutter";
+    }
+
     private void tickCastPortal(ClientPlayerEntity player, ClientWorld world, int currentTick) {
         if (portal == null) {
             finishActive("failed", "portal caster unavailable", currentTick);
@@ -1727,14 +1984,15 @@ final class TaskRunner {
         boolean hasFurnace = GuiHands.countItem(player, Items.FURNACE) > 0
             || findNearbyWorkstation(player, client.world, Blocks.FURNACE, 12.0) != null;
 
-        // 0a. Nether portal goal shortcut: if carrying the casting kit (water_bucket, flint_and_steel, pickaxe, >=9 blocks)
+        // 0a. Nether portal goal shortcut: if carrying the complete shore-casting kit (water_bucket, flint_and_steel, pickaxe, >=9 blocks)
         //     and a lava pool is observed (or portal cast is already underway), cast the shore portal immediately!
-        if ("nether_portal".equals(goal) && portal != null && PortalCaster.hasCastingKit(player)) {
+        if ("nether_portal".equals(goal) && portal != null && PortalCaster.hasCastingKit(player)
+                && (GuiHands.countItem(player, Items.WATER_BUCKET) > 0 || portal.isActive())) {
             if (portal.isActive() || portal.hasObservedLavaPoolSite(player, client.world) || !perception.observedLava().isEmpty()) {
                 return localTask(TaskKind.CAST_PORTAL, "shore", 1, null);
             }
-            // Carrying full casting kit on the surface, just scout for a lava pool!
-            return localTask(TaskKind.EXPLORE, "lava_pool", 24, null);
+            // Carrying full casting kit: scout surface for lava pools & ravines/caves (and descend deep caves to Y=-54 lava lakes!)
+            return localTask(TaskKind.EXPLORE_CAVE, "lava", -54, null);
         }
 
         // 0. Food acquisition & cooking:
@@ -1786,6 +2044,64 @@ final class TaskRunner {
         }
         if (torches < 4 && coal >= 2 && (logs * 4 + planks + sticks >= 2)) {
             return localTask(TaskKind.CRAFT, "torch", 8, null);
+        }
+        // Anticipate shovel / axe when digging significant dirt/gravel or gathering bulk wood!
+        boolean needFlintSoon = "nether_portal".equals(goal)
+            && GuiHands.countItem(player, Items.FLINT_AND_STEEL) == 0 && GuiHands.countItem(player, Items.FLINT) == 0;
+        if (!hasShovel(player) && stone >= 2 && (logs * 4 + planks + sticks >= 2)
+                && (soilBlocksBroken >= 6 || (needFlintSoon && (!perception.observedGravel().isEmpty() || GuiHands.countItem(player, Items.GRAVEL) > 0)))) {
+            return localTask(TaskKind.CRAFT, "stone_shovel", 1, null);
+        }
+        if (!hasAxe(player) && stone >= 3 && (logs * 4 + planks + sticks >= 2)
+                && player.getBlockY() >= 54 && logs < 3 && (logs * 4 + planks < 12) && !perception.observedLogs().isEmpty()) {
+            return localTask(TaskKind.CRAFT, "stone_axe", 1, null);
+        }
+
+        // 3b. Fresh-world Nether portal shore-casting tech tree (bucket + flint_and_steel + water_bucket + cobblestone + lava pool!)
+        if ("nether_portal".equals(goal)) {
+            boolean hasAnyBucket = GuiHands.countItem(player, Items.BUCKET) > 0
+                || GuiHands.countItem(player, Items.WATER_BUCKET) > 0
+                || GuiHands.countItem(player, Items.LAVA_BUCKET) > 0;
+            boolean hasWaterBucket = GuiHands.countItem(player, Items.WATER_BUCKET) > 0;
+            boolean hasFlintAndSteel = GuiHands.countItem(player, Items.FLINT_AND_STEEL) > 0;
+            boolean hasFlint = GuiHands.countItem(player, Items.FLINT) > 0;
+            int ironNeeded = (hasAnyBucket ? 0 : 3) + (hasFlintAndSteel ? 0 : 1);
+
+            if (ironIngots < ironNeeded) {
+                if (rawIron + ironIngots >= ironNeeded) {
+                    if (!hasFurnace) {
+                        if (stone < 8) return localTask(TaskKind.MINE_STONE, "stone", 12, null);
+                        return localTask(TaskKind.CRAFT, "furnace", 1, null);
+                    }
+                    if (GuiHands.countFuelUnits(player) < ironNeeded) {
+                        if (coal == 0 && !perception.nearestOreTargets(Perception.OreKind.COAL, player.getBlockPos(), 1, blacklistedTargets).isEmpty()) {
+                            return localTask(TaskKind.MINE_ORE, "coal", 4, null);
+                        }
+                        return localTask(TaskKind.GATHER_WOOD, "logs", 3, null);
+                    }
+                    return localTask(TaskKind.SMELT, "raw_iron", ironNeeded, null);
+                }
+                return localTask(TaskKind.MINE_ORE, "iron", ironNeeded + 1, null);
+            }
+            if (!hasAnyBucket) {
+                return localTask(TaskKind.CRAFT, "bucket", 1, null);
+            }
+            if (!hasFlintAndSteel) {
+                if (!hasFlint) {
+                    return localTask(TaskKind.GATHER_FLINT, "flint", 1, null);
+                }
+                return localTask(TaskKind.CRAFT, "flint_and_steel", 1, null);
+            }
+            if (!hasWaterBucket && GuiHands.countItem(player, Items.BUCKET) > 0) {
+                return localTask(TaskKind.FILL_WATER, "water", 1, null);
+            }
+            if (PortalCaster.countSupportBlocks(player) < 12) {
+                return localTask(TaskKind.MINE_STONE, "stone", 16, null);
+            }
+            if (portal != null && (portal.hasObservedLavaPoolSite(player, client.world) || !perception.observedLava().isEmpty())) {
+                return localTask(TaskKind.CAST_PORTAL, "shore", 1, null);
+            }
+            return localTask(TaskKind.EXPLORE_CAVE, "lava", -54, null);
         }
 
         // 4. Iron ore -> smelt -> iron pickaxe
@@ -2607,6 +2923,7 @@ final class TaskRunner {
 
     private static boolean isHighValueDrop(Item it) {
         return it == Items.DIAMOND || it == Items.RAW_IRON || it == Items.IRON_INGOT
+            || it == Items.FLINT
             || it == Items.CRAFTING_TABLE || it == Items.FURNACE;
     }
 
@@ -2615,6 +2932,7 @@ final class TaskRunner {
         ItemEntity best = null;
         double bestScore = Double.POSITIVE_INFINITY;
         boolean wantStone = (active != null && active.kind() == TaskKind.MINE_STONE) || GuiHands.countStone(player) < 14;
+        boolean wantGravel = active != null && active.kind() == TaskKind.GATHER_FLINT;
         for (ItemEntity item : perception.visibleDrops()) {
             if (ignoredDrops.contains(item.getId())) continue;
             double dSq = item.squaredDistanceTo(player);
@@ -2627,6 +2945,7 @@ final class TaskRunner {
             boolean valuable = high || it == Items.COAL
                 || item.getStack().isIn(ItemTags.LOGS)
                 || Motor.foodScore(item.getStack(), true) > 0
+                || (wantGravel && it == Items.GRAVEL)
                 || (wantStone && (it == Items.COBBLESTONE || it == Items.COBBLED_DEEPSLATE));
             if (!valuable) continue;
             double score = dSq - (high ? 100.0 : 0.0);
@@ -2659,6 +2978,24 @@ final class TaskRunner {
     }
 
     static boolean hasAnyPickaxe(ClientPlayerEntity player) { return bestPickaxeTier(player) > 0; }
+
+    static boolean hasShovel(ClientPlayerEntity player) {
+        if (player == null) return false;
+        var inv = player.getInventory();
+        for (int i = 0; i < inv.size(); i++) {
+            if (inv.getStack(i).getItem() instanceof net.minecraft.item.ShovelItem) return true;
+        }
+        return false;
+    }
+
+    static boolean hasAxe(ClientPlayerEntity player) {
+        if (player == null) return false;
+        var inv = player.getInventory();
+        for (int i = 0; i < inv.size(); i++) {
+            if (inv.getStack(i).getItem() instanceof net.minecraft.item.AxeItem) return true;
+        }
+        return false;
+    }
 
     static int pickaxeTier(Item item) {
         if (item == Items.NETHERITE_PICKAXE) return 5;

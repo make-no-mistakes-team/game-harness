@@ -147,6 +147,7 @@ final class StrategistBridge {
         env.addProperty("visibleStone", perception.observedStone().size());
         env.addProperty("visibleWater", perception.observedWater().size());
         env.addProperty("visibleLava", perception.observedLava().size());
+        env.addProperty("visibleGravel", perception.observedGravel().size());
         env.addProperty("visibleBerries", perception.observedBerries().size());
         env.addProperty("visibleHostiles", perception.visibleHostiles().size());
         env.addProperty("visibleFoodAnimals", perception.visibleFoodAnimals().size());
@@ -274,9 +275,31 @@ final class StrategistBridge {
             pObj.addProperty("frameBlocks", portal.frameBlocks());
             pObj.addProperty("ignited", portal.ignited());
             pObj.addProperty("hasKit", PortalCaster.hasCastingKit(player));
+            pObj.addProperty("hasBucket", GuiHands.countItem(player, net.minecraft.item.Items.BUCKET) > 0
+                || GuiHands.countItem(player, net.minecraft.item.Items.WATER_BUCKET) > 0
+                || GuiHands.countItem(player, net.minecraft.item.Items.LAVA_BUCKET) > 0);
+            pObj.addProperty("hasWaterBucket", GuiHands.countItem(player, net.minecraft.item.Items.WATER_BUCKET) > 0);
+            pObj.addProperty("hasFlint", GuiHands.countItem(player, net.minecraft.item.Items.FLINT) > 0);
+            pObj.addProperty("hasFlintAndSteel", GuiHands.countItem(player, net.minecraft.item.Items.FLINT_AND_STEEL) > 0);
             pObj.addProperty("lavaPoolObserved", portal.hasObservedLavaPoolSite(player, world));
             root.add("portal", pObj);
         }
+
+        // Inventory clutter & tool context so the strategist can coordinate cleanup and shovels/axes!
+        JsonObject invSpace = new JsonObject();
+        invSpace.addProperty("usedSlots", InventoryTriage.usedSlots(player));
+        invSpace.addProperty("freeSlots", InventoryTriage.freeSlots(player));
+        invSpace.addProperty("cluttered", InventoryTriage.isCluttered(player));
+        JsonArray candArr = new JsonArray();
+        for (String c : InventoryTriage.summarizeDiscardCandidates(player, goal, 6)) candArr.add(c);
+        invSpace.add("discardCandidates", candArr);
+        root.add("inventorySpace", invSpace);
+
+        JsonObject tools = new JsonObject();
+        tools.addProperty("hasShovel", TaskRunner.hasShovel(player));
+        tools.addProperty("hasAxe", TaskRunner.hasAxe(player));
+        tools.addProperty("soilBroken", runner.soilBlocksBroken());
+        root.add("tools", tools);
 
         if (!lastAppliedPlanId.isEmpty()) {
             JsonObject app = new JsonObject();

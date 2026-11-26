@@ -93,6 +93,8 @@ final class CaveExplorer {
     private int glanceTicks;
     private float glanceBaseYaw;
     private int exhaustedCaveCount;
+    private int lastCaveExhaustedTick = -1000;
+    private boolean brokenInFromDigging;
 
     void resetForLife() {
         visitedSectors.clear();
@@ -112,6 +114,8 @@ final class CaveExplorer {
         activeFrontierTicks = 0;
         glanceTicks = 0;
         exhaustedCaveCount = 0;
+        lastCaveExhaustedTick = -1000;
+        brokenInFromDigging = false;
     }
 
     static long sectorKey(int x, int y, int z) {
@@ -268,16 +272,27 @@ final class CaveExplorer {
     }
 
     void beginExploringCave(BlockPos entryPos, int currentTick) {
+        beginExploringCave(entryPos, currentTick, false);
+    }
+
+    void beginExploringCave(BlockPos entryPos, int currentTick, boolean fromUndergroundDigging) {
         this.caveEntryPos = entryPos.toImmutable();
         this.caveEntryY = entryPos.getY();
         this.caveDeepestY = entryPos.getY();
         this.caveEnterTick = currentTick;
         this.lastNewSectorTick = currentTick;
         this.lastDeeperTick = currentTick;
+        this.brokenInFromDigging = fromUndergroundDigging;
         this.mode = Mode.EXPLORING_CAVE;
         this.activeFrontier = null;
         this.activeFrontierTicks = 0;
     }
+
+    boolean canBreakIntoCave(int currentTick) {
+        return (currentTick - lastCaveExhaustedTick) >= 160;
+    }
+
+    boolean isBrokenInFromDigging() { return brokenInFromDigging; }
 
     void markActiveEntranceExhausted(int currentTick) {
         if (activeEntrance != null && !activeEntrance.exhausted) {
@@ -303,6 +318,7 @@ final class CaveExplorer {
             exhaustedCaveCount++;
         }
         activeEntrance = null;
+        lastCaveExhaustedTick = currentTick;
     }
 
     void finishExitToSurface(int currentTick) {
@@ -459,8 +475,14 @@ final class CaveExplorer {
                                     boolean hasVisibleTargetOre, int currentTick) {
         int sinceSector = lastNewSectorTick < 0 ? 0 : Math.max(0, currentTick - lastNewSectorTick);
         int sinceDeeper = lastDeeperTick < 0 ? 0 : Math.max(0, currentTick - lastDeeperTick);
-        return classifyCaveVerdict(currentY, caveDeepestY, targetOreY, hasUnvisitedFrontier,
+        CaveVerdict v = classifyCaveVerdict(currentY, caveDeepestY, targetOreY, hasUnvisitedFrontier,
             sinceSector, sinceDeeper, hasVisibleTargetOre);
+        // When we broke into an underground cave while already digging down, resume manual digging
+        // right from our new location inside the cave instead of climbing all the way back to the surface!
+        if (v == CaveVerdict.EXIT_SHALLOW_CAVE && brokenInFromDigging) {
+            return CaveVerdict.TRANSITION_DEEP_MINE;
+        }
+        return v;
     }
 
     /** True if surface scouting has gone long enough without spotting any unexhausted cave/ravine to start digging down. */
@@ -479,9 +501,14 @@ final class CaveExplorer {
     }
 
     int countUnvisitedFrontiers(Perception perception, BlockPos playerFeet) {
+        return countNearbyUnvisitedFrontiers(perception, playerFeet, MAX_FRONTIER_DIST);
+    }
+
+    int countNearbyUnvisitedFrontiers(Perception perception, BlockPos playerFeet, double maxDist) {
+        double maxSq = maxDist * maxDist;
         int c = 0;
         for (Perception.CaveSight s : perception.observedCaveSights()) {
-            if (!isVisitedOrUnreachable(s.pos()) && s.pos().getSquaredDistance(playerFeet) <= MAX_FRONTIER_DIST * MAX_FRONTIER_DIST) {
+            if (!isVisitedOrUnreachable(s.pos()) && s.pos().getSquaredDistance(playerFeet) <= maxSq) {
                 c++;
             }
         }

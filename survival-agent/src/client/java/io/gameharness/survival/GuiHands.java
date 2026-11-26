@@ -87,7 +87,7 @@ final class GuiHands {
         }
     }
 
-    private enum ClickKind { LEFT, RIGHT, SHIFT_RESULT }
+    private enum ClickKind { LEFT, RIGHT, SHIFT_RESULT, THROW_STACK }
     private record GuiAction(Slot slot, ClickKind kind) {}
 
     private final MinecraftClient client;
@@ -120,6 +120,7 @@ final class GuiHands {
     private Item pendingSmeltInput;
     private int pendingSmeltCount;
     private boolean pendingFurnaceCollect;
+    private List<Integer> pendingDropSlots;
 
     GuiHands(MinecraftClient client) {
         this.client = client;
@@ -138,6 +139,7 @@ final class GuiHands {
         pendingEquipOffhand = false;
         pendingFurnaceLoad = false;
         pendingFurnaceCollect = false;
+        pendingDropSlots = null;
         needOpenInventory = false;
         closeWhenDone = false;
         closeAfterNs = 0L;
@@ -197,6 +199,18 @@ final class GuiHands {
         pendingFurnaceLoad = true;
         pendingSmeltInput = input;
         pendingSmeltCount = count;
+        closeWhenDone = true;
+        state = State.WORKING;
+        jobTicks = 0;
+        return true;
+    }
+
+    /** Start discarding cluttered inventory stacks by hovering each slot and sending vanilla Ctrl+Q (THROW full stack). */
+    boolean startDropSlots(List<Integer> inventoryIndices) {
+        clearState();
+        if (inventoryIndices == null || inventoryIndices.isEmpty()) return false;
+        pendingDropSlots = new ArrayList<>(inventoryIndices);
+        needOpenInventory = !(client.currentScreen instanceof InventoryScreen);
         closeWhenDone = true;
         state = State.WORKING;
         jobTicks = 0;
@@ -356,6 +370,17 @@ final class GuiHands {
                     waitUntilNs = System.nanoTime() + randMs(95, 145);
                     screenOpenedBeatPending = false;
                 }
+            } else if (pendingDropSlots != null) {
+                planDropSlotsActions(screen, pendingDropSlots);
+                pendingDropSlots = null;
+                if (actions.isEmpty()) {
+                    finish();
+                    return;
+                }
+                if (screenOpenedBeatPending) {
+                    waitUntilNs = System.nanoTime() + randMs(90, 140);
+                    screenOpenedBeatPending = false;
+                }
             } else {
                 // Queue drained — short natural beat before closing GUI so item transfers stay readable!
                 long now = System.nanoTime();
@@ -439,6 +464,18 @@ final class GuiHands {
     }
 
     private void executeClick(HandledScreen<?> screen, GuiAction action, double x, double y) {
+        if (action.kind() == ClickKind.THROW_STACK) {
+            if (client.interactionManager != null && client.player != null) {
+                client.interactionManager.clickSlot(
+                    screen.getScreenHandler().syncId,
+                    action.slot().id,
+                    1,
+                    net.minecraft.screen.slot.SlotActionType.THROW,
+                    client.player
+                );
+            }
+            return;
+        }
         if (action.kind() == ClickKind.SHIFT_RESULT) {
             if (screen instanceof AgentCraftClick craftClick && screen.getScreenHandler() instanceof AbstractCraftingScreenHandler) {
                 if (craftClick.agent$shiftClickResult(action.slot(), x, y)) {
@@ -695,13 +732,27 @@ final class GuiHands {
         return true;
     }
 
+    private void planDropSlotsActions(HandledScreen<?> screen, List<Integer> invIndices) {
+        ScreenHandler handler = screen.getScreenHandler();
+        var inv = client.player.getInventory();
+        for (int idx : invIndices) {
+            for (Slot s : handler.slots) {
+                if (s.inventory == inv && s.getIndex() == idx && s.hasStack()) {
+                    actions.add(new GuiAction(s, ClickKind.THROW_STACK));
+                    break;
+                }
+            }
+        }
+    }
+
     private static int hotbarKeepPriority(ItemStack st) {
         if (st.isEmpty()) return 0;
         Item i = st.getItem();
         if (i == Items.DIAMOND_PICKAXE || i == Items.IRON_PICKAXE || i == Items.STONE_PICKAXE || i == Items.WOODEN_PICKAXE) return 100;
         if (i == Items.DIAMOND_SWORD || i == Items.IRON_SWORD || i == Items.STONE_SWORD || i == Items.IRON_AXE || i == Items.STONE_AXE) return 95;
-        if (i == Items.SHIELD) return 88;
-        if (i == Items.TORCH || i == Items.WATER_BUCKET) return 80;
+        if (i == Items.IRON_SHOVEL || i == Items.STONE_SHOVEL || i == Items.WOODEN_SHOVEL || i == Items.WOODEN_AXE) return 86;
+        if (i == Items.SHIELD || i == Items.FLINT_AND_STEEL) return 88;
+        if (i == Items.TORCH || i == Items.WATER_BUCKET || i == Items.BUCKET || i == Items.LAVA_BUCKET) return 84;
         if (Motor.foodScore(st, false) > 0) return 75;
         if (i == Items.COBBLESTONE || i == Items.COBBLED_DEEPSLATE || i == Items.DIRT) return 60;
         if (i == Items.CRAFTING_TABLE || i == Items.FURNACE) return 55;

@@ -374,23 +374,9 @@ final class PortalCaster {
                 if (up <= 2 && !probe.isPassableAir(bank2.up(up))) return false;
             }
         }
-        // 2. Step-up wings s3 (left) & s6 (right) need solid shore floor + clear space above + dry entry behind them!
-        BlockPos leftWingFloor = s.a0().offset(s.backAlong()).offset(s.shore());
-        BlockPos rightWingFloor = s.a3().offset(s.along()).offset(s.shore());
-        if (!probe.isSolid(leftWingFloor) || !probe.isPassableAir(leftWingFloor.up(1))
-                || !probe.isPassableAir(leftWingFloor.up(2))
-                || !probe.isSolid(leftWingFloor.offset(s.shore()))
-                || !probe.isPassableAir(leftWingFloor.offset(s.shore()).up(1))) {
-            return false;
-        }
-        if (!probe.isSolid(rightWingFloor) || !probe.isPassableAir(rightWingFloor.up(1))
-                || !probe.isPassableAir(rightWingFloor.up(2))
-                || !probe.isSolid(rightWingFloor.offset(s.shore()))
-                || !probe.isPassableAir(rightWingFloor.offset(s.shore()).up(1))) {
-            return false;
-        }
-        // 3. Solid stone/floor beneath the backstop cells (a1.offset(inward).down(), a2.offset(inward).down())
+        // 2. Solid stone/floor beneath the backstop cells (a1.offset(inward).down(), a2.offset(inward).down())
         //    so mining the bottom threshold trench cannot leak side lava from underneath!
+        //    (No wing step-ups are used in the 9-cobble shore-gutter geometry, so natural irregular banks match cleanly!)
         return probe.isSolid(s.a1().offset(s.inward()).down()) && probe.isSolid(s.a2().offset(s.inward()).down());
     }
 
@@ -604,12 +590,6 @@ final class PortalCaster {
         scanTicks++;
         statusText = "surveying lava pool shoreline";
 
-        // Smoothly sweep gaze downward across the lava pool so Perception observes the full pool & rim!
-        if (scanTicks < 26) {
-            float sweepYaw = player.getYaw() + (scanTicks < 13 ? 14f : -14f);
-            motor.lookAtAngles(sweepYaw, 28f, Motor.LookMode.SCAN);
-        }
-
         if (site == null && scanTicks >= 6) {
             site = findBestShoreSite(worldProbe(world), perception.observedLava(), player.getBlockPos());
         }
@@ -618,7 +598,37 @@ final class PortalCaster {
             setStage(determineResumeStage(world));
             return RunStatus.RUNNING;
         }
-        if (scanTicks > 120) {
+
+        // If we spotted a distant lava pool (> 6m away), walk safely up to its dry rim so Perception sees the full pool!
+        BlockPos nearestLava = perception.nearestObserved(perception.observedLava(), player.getBlockPos(), 48.0, null);
+        if (nearestLava != null && player.getBlockPos().getSquaredDistance(nearestLava) > 5.5 * 5.5) {
+            statusText = "approaching observed lava pool";
+            Pathfinder.Options opts = Pathfinder.Options.mining(TaskRunner.scaffoldCount(player), player.getHealth() > 10f, true);
+            if (!route.hasPlan()) {
+                Pathfinder.Plan plan = pathfinder.search(perception, player, player.getBlockPos(),
+                    Pathfinder.Goal.near(nearestLava.up(), 4.2), opts);
+                if (!plan.isEmpty()) {
+                    route.setPlan(plan);
+                } else {
+                    motor.lookAtPoint(Vec3d.ofCenter(nearestLava), Motor.LookMode.SCAN);
+                }
+            } else {
+                RouteExecutor.Status st = route.tick(totalTicks, true);
+                if (st == RouteExecutor.Status.COMPLETE || st == RouteExecutor.Status.STUCK || st == RouteExecutor.Status.INVALIDATED) {
+                    route.clear();
+                }
+            }
+            if (scanTicks > 360) {
+                clearActive();
+                return RunStatus.FAILED;
+            }
+            return RunStatus.RUNNING;
+        }
+
+        // Close to the lava pool: smoothly sweep gaze across the pool & rim so Perception maps all lava sources!
+        float sweepYaw = player.getYaw() + (scanTicks % 30 < 15 ? 16f : -16f);
+        motor.lookAtAngles(sweepYaw, 28f, Motor.LookMode.SCAN);
+        if (scanTicks > 180) {
             clearActive();
             return RunStatus.FAILED;
         }

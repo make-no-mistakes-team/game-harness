@@ -75,7 +75,8 @@ final class StrategistBridge {
     }
 
     void publishState(ClientPlayerEntity player, ClientWorld world, Perception perception,
-                      TaskRunner runner, SurvivalReflexes reflexes, SafeDescent descent, CaveExplorer caves, int life, long tick) {
+                      TaskRunner runner, SurvivalReflexes reflexes, SafeDescent descent, CaveExplorer caves,
+                      PortalCaster portal, int life, long tick) {
         if (closed || player == null || world == null) return;
         JsonObject root = new JsonObject();
         root.addProperty("v", 2);
@@ -264,6 +265,17 @@ final class StrategistBridge {
                 cObj.add("nearestEntrance", ne);
             }
             root.add("caves", cObj);
+        }
+
+        if (portal != null) {
+            JsonObject pObj = new JsonObject();
+            pObj.addProperty("active", portal.isActive());
+            pObj.addProperty("stage", portal.stage().name().toLowerCase());
+            pObj.addProperty("frameBlocks", portal.frameBlocks());
+            pObj.addProperty("ignited", portal.ignited());
+            pObj.addProperty("hasKit", PortalCaster.hasCastingKit(player));
+            pObj.addProperty("lavaPoolObserved", portal.hasObservedLavaPoolSite(player, world));
+            root.add("portal", pObj);
         }
 
         if (!lastAppliedPlanId.isEmpty()) {

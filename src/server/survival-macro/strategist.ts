@@ -27,7 +27,8 @@ Available task kinds:
 - dig_down: dig a safe navigable staircase down to a target Y level (count=targetY, e.g. 16 for iron or -54 for diamonds).
 - descend_drop: evaluate and safely descend a nearby high drop, ravine, or giant cavern overlook. target="auto"|"water_pour"|"water_clutch"|"boat_drop"|"cliff_stair"|"edge_blocks"|"avoid", count=targetFloorY (or 0 to descend to the observed cavern floor).
 - explore_cave: scout the surface for cave entrances and ravines, enter and explore deep passages for exposed ores, and exit shallow dead-end caves to search for deeper caves or ravines. target="iron"|"diamond"|"coal", count=desired target Y (e.g. 16 for iron, -54 for diamond).
-- explore: explore terrain to find trees, stone, caves, or food animals. target="explore", count=20.
+- cast_portal: cast a 10-obsidian cornerless Nether portal on the shore of an observed lava pool using a water bucket, cobblestone supports, and flint & steel, then ignite and enter the Nether. target="shore", count=1.
+- explore: explore terrain to find trees, stone, caves, lava pools, or food animals. target="explore", count=20.
 - navigate: 3D A* navigate to x,y,z within count blocks.
 - collect_drops: pick up nearby dropped items.
 - build_shelter: dig into ground/wall or rapidly box in a fully roofed emergency shelter (spider-proof & arrow-proof), eat carried food to regenerate HP safely inside, and hold until healed/safe. target="emergency", count=hold duration in seconds (e.g. 10).
@@ -59,7 +60,7 @@ Strategic rules:
 
 const TASK_KINDS = [
   "gather_wood", "mine_stone", "mine_ore", "craft", "smelt",
-  "gather_food", "dig_down", "descend_drop", "explore_cave", "explore", "navigate", "collect_drops", "build_shelter",
+  "gather_food", "dig_down", "descend_drop", "explore_cave", "cast_portal", "explore", "navigate", "collect_drops", "build_shelter",
 ] as const;
 
 const COMBAT_STANCES = ["auto", "aggressive", "defensive", "flee", "shelter"] as const;

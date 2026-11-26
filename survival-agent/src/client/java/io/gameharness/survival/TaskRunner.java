@@ -40,6 +40,7 @@ final class TaskRunner {
         DIG_DOWN,
         DESCEND_DROP,
         EXPLORE_CAVE,
+        CAST_PORTAL,
         EXPLORE,
         NAVIGATE,
         COLLECT_DROPS,
@@ -67,6 +68,7 @@ final class TaskRunner {
     private final SurvivalReflexes reflexes;
     private final SafeDescent descent;
     private final CaveExplorer caves;
+    private final PortalCaster portal;
     private final String goal;
 
     private final ArrayDeque<Task> queue = new ArrayDeque<>();
@@ -114,7 +116,7 @@ final class TaskRunner {
 
     TaskRunner(MinecraftClient client, Motor motor, Perception perception,
                Pathfinder pathfinder, RouteExecutor route, GuiHands gui,
-               SurvivalReflexes reflexes, SafeDescent descent, CaveExplorer caves, String goal) {
+               SurvivalReflexes reflexes, SafeDescent descent, CaveExplorer caves, PortalCaster portal, String goal) {
         this.client = client;
         this.motor = motor;
         this.perception = perception;
@@ -124,6 +126,7 @@ final class TaskRunner {
         this.reflexes = reflexes;
         this.descent = descent;
         this.caves = caves;
+        this.portal = portal;
         this.goal = goal;
     }
 
@@ -156,6 +159,7 @@ final class TaskRunner {
         noMineProgressTicks = 0;
         if (descent != null) descent.resetForLife();
         if (caves != null) caves.resetForLife();
+        if (portal != null) portal.resetForLife();
     }
 
     void setSafeExcavationMode(boolean safe) { this.safeExcavationMode = safe; }
@@ -180,7 +184,8 @@ final class TaskRunner {
             // Interrupt active task cleanly when strategist explicitly replaces the queue
             // (never abort mid-GUI click, loaded furnace, or mid-air/mid-descent maneuver!)
             boolean descentBusy = descent != null && descent.isActivelyDescending();
-            if (active != null && !gui.isBusy() && !smeltLoaded && !descentBusy) {
+            boolean portalBusy = portal != null && portal.isActive();
+            if (active != null && !gui.isBusy() && !smeltLoaded && !descentBusy && !portalBusy) {
                 Task firstNew = tasks.get(0);
                 boolean sameActive = active.kind() == firstNew.kind()
                     && java.util.Objects.equals(active.target(), firstNew.target())
@@ -210,7 +215,8 @@ final class TaskRunner {
 
         // 1. Always pick up reachable valuable dropped items right next to us (<= 6m, cumulative cap so jumping never resets it!)
         if (active != null) activeTicks++;
-        if (active == null || (active.kind() != TaskKind.CRAFT && active.kind() != TaskKind.SMELT && active.kind() != TaskKind.DESCEND_DROP)) {
+        if (active == null || (active.kind() != TaskKind.CRAFT && active.kind() != TaskKind.SMELT
+                && active.kind() != TaskKind.DESCEND_DROP && active.kind() != TaskKind.CAST_PORTAL)) {
             ItemEntity nearbyValuable = findNearbyValuableDrop(player, 6.0);
             if (nearbyValuable != null) {
                 int eid = nearbyValuable.getId();
@@ -307,10 +313,12 @@ final class TaskRunner {
         int maxTicks = (active.kind() == TaskKind.MINE_ORE && !perception.isDiagnosticRevealOres())
             ? 9000
             : ((active.kind() == TaskKind.MINE_ORE || active.kind() == TaskKind.DIG_DOWN
-                || active.kind() == TaskKind.DESCEND_DROP || active.kind() == TaskKind.EXPLORE_CAVE) ? 6000
+                || active.kind() == TaskKind.DESCEND_DROP || active.kind() == TaskKind.EXPLORE_CAVE
+                || active.kind() == TaskKind.CAST_PORTAL) ? 6000
                 : (active.kind() == TaskKind.MINE_STONE ? 3600 : 2400));
         if (activeTicks > maxTicks) {
             if (descent != null && descent.isActivelyDescending()) descent.clearActive();
+            if (portal != null && portal.isActive()) portal.clearActive();
             finishActive("timeout", "task exceeded time limit", currentTick);
             return;
         }
@@ -326,6 +334,7 @@ final class TaskRunner {
             case DIG_DOWN -> tickDigDown(player, world, currentTick);
             case DESCEND_DROP -> tickDescendDrop(player, world, currentTick);
             case EXPLORE_CAVE -> tickExploreCave(player, world, currentTick);
+            case CAST_PORTAL -> tickCastPortal(player, world, currentTick);
             case EXPLORE -> tickExplore(player, world, currentTick);
             case NAVIGATE -> tickNavigate(player, world, currentTick);
             case COLLECT_DROPS -> tickCollectDrops(player, world, currentTick);
@@ -1623,6 +1632,23 @@ final class TaskRunner {
         }
     }
 
+    private void tickCastPortal(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        if (portal == null) {
+            finishActive("failed", "portal caster unavailable", currentTick);
+            return;
+        }
+        if (!portal.isActive()) {
+            portal.start(player, world);
+        }
+        PortalCaster.RunStatus st = portal.tick(player, world, currentTick);
+        statusText = portal.statusText();
+        if (st == PortalCaster.RunStatus.COMPLETED) {
+            finishActive("completed", "cast, ignited, and entered nether portal", currentTick);
+        } else if (st == PortalCaster.RunStatus.FAILED) {
+            finishActive("failed", "portal casting failed at " + portal.stage().name().toLowerCase(), currentTick);
+        }
+    }
+
     private void tickExplore(ClientPlayerEntity player, ClientWorld world, int currentTick) {
         if (activeTicks > 300) {
             finishActive("completed", "explored terrain", currentTick);
@@ -1700,6 +1726,16 @@ final class TaskRunner {
             || findNearbyWorkstation(player, client.world, Blocks.CRAFTING_TABLE, 10.0) != null;
         boolean hasFurnace = GuiHands.countItem(player, Items.FURNACE) > 0
             || findNearbyWorkstation(player, client.world, Blocks.FURNACE, 12.0) != null;
+
+        // 0a. Nether portal goal shortcut: if carrying the casting kit (water_bucket, flint_and_steel, pickaxe, >=9 blocks)
+        //     and a lava pool is observed (or portal cast is already underway), cast the shore portal immediately!
+        if ("nether_portal".equals(goal) && portal != null && PortalCaster.hasCastingKit(player)) {
+            if (portal.isActive() || portal.hasObservedLavaPoolSite(player, client.world) || !perception.observedLava().isEmpty()) {
+                return localTask(TaskKind.CAST_PORTAL, "shore", 1, null);
+            }
+            // Carrying full casting kit on the surface, just scout for a lava pool!
+            return localTask(TaskKind.EXPLORE, "lava_pool", 24, null);
+        }
 
         // 0. Food acquisition & cooking:
         //    - If injured/hungry with no food, grab visible food immediately

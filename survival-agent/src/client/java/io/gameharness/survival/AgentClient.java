@@ -1,5 +1,6 @@
 package io.gameharness.survival;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -45,6 +46,7 @@ public final class AgentClient implements ClientModInitializer {
     private GuiHands gui;
     private SafeDescent descent;
     private CaveExplorer caves;
+    private PortalCaster portal;
     private SurvivalReflexes reflexes;
     private TaskRunner tasks;
     private StrategistBridge strategist;
@@ -104,8 +106,9 @@ public final class AgentClient implements ClientModInitializer {
         gui = new GuiHands(client);
         descent = new SafeDescent(client, motor, perception, gui);
         caves = new CaveExplorer();
+        portal = new PortalCaster(client, motor, perception, pathfinder, route, gui);
         reflexes = new SurvivalReflexes(client, motor, perception, gui, descent);
-        tasks = new TaskRunner(client, motor, perception, pathfinder, route, gui, reflexes, descent, caves, goal);
+        tasks = new TaskRunner(client, motor, perception, pathfinder, route, gui, reflexes, descent, caves, portal, goal);
         strategist = StrategistBridge.open(directory, goal);
         pauses = new AgentPauseEpisodes(directory, 0);
     }
@@ -171,6 +174,7 @@ public final class AgentClient implements ClientModInitializer {
         // 3. Tick perception (sight rays + optical sight + combat flow + optional diagnostic ore scan)
         perception.tick((int) tick);
         descent.tickTelemetry(player, client.world, (int) tick);
+        if (portal != null) portal.tickTelemetry(client.world);
         int skyLight = client.world.getLightLevel(net.minecraft.world.LightType.SKY, player.getBlockPos());
         caves.recordPlayerPosition(player.getBlockPos(), skyLight, (int) tick);
         if (tick % 4 == 0) {
@@ -210,7 +214,7 @@ public final class AgentClient implements ClientModInitializer {
 
         // 7. Periodically publish state to LLM strategist & progress.json to run.ts!
         if (strategist != null && (tick % 15 == 0 || tick <= 2)) {
-            strategist.publishState(player, client.world, perception, tasks, reflexes, descent, caves, life, tick);
+            strategist.publishState(player, client.world, perception, tasks, reflexes, descent, caves, portal, life, tick);
         }
         long nowMs = System.currentTimeMillis();
         if (tick % 5 == 0 || nowMs - lastProgressWriteMs >= 250) {
@@ -287,6 +291,34 @@ public final class AgentClient implements ClientModInitializer {
             obj.addProperty("damage_taken", Math.round(descent.totalDamageTaken() * 100.0) / 100.0);
             obj.addProperty("min_y", Math.round(descent.minY() * 100.0) / 100.0);
             obj.addProperty("max_y", Math.round(descent.maxY() * 100.0) / 100.0);
+        }
+        if (portal != null && (portal.usedShoreCast() || "nether_portal".equals(goal))) {
+            obj.addProperty("frame_blocks", portal.frameBlocks());
+            obj.addProperty("ignited", portal.ignited());
+            if (portal.usedShoreCast()) {
+                obj.addProperty("cast_method", "shore");
+                obj.addProperty("cast_frame_blocks", portal.castFrameBlocks());
+                obj.addProperty("cast_passive_blocks", portal.castPassiveBlocks());
+                obj.addProperty("cast_lava_deposits", portal.castLavaDeposits());
+                JsonArray passiveArr = new JsonArray();
+                for (net.minecraft.util.math.BlockPos p : portal.castPassiveCells()) {
+                    JsonArray c = new JsonArray(3);
+                    c.add(p.getX());
+                    c.add(p.getY());
+                    c.add(p.getZ());
+                    passiveArr.add(c);
+                }
+                obj.add("cast_passive_cells", passiveArr);
+                JsonArray pouredArr = new JsonArray();
+                for (net.minecraft.util.math.BlockPos p : portal.castPouredCells()) {
+                    JsonArray c = new JsonArray(3);
+                    c.add(p.getX());
+                    c.add(p.getY());
+                    c.add(p.getZ());
+                    pouredArr.add(c);
+                }
+                obj.add("cast_poured_cells", pouredArr);
+            }
         }
         if (alive) {
             obj.addProperty("x", player.getX());

@@ -183,6 +183,19 @@ final class RouteExecutor {
 
         // 5. Continuous human-like locomotion with multi-step lookahead!
         Vec3d steerTarget = computeLookaheadTarget(stepIndex);
+        // If brushing low leaves overhead while stepping up onto raised terrain, clear the leaf block cleanly!
+        if (step.kind() == Pathfinder.MoveKind.STEP_UP && player.horizontalCollision) {
+            BlockPos headLeaf = step.to().up();
+            BlockPos aboveSelf = player.getBlockPos().up(2);
+            if (world.getBlockState(headLeaf).getBlock() instanceof net.minecraft.block.LeavesBlock) {
+                motor.mineBlock(headLeaf, true, false);
+                return Status.RUNNING;
+            }
+            if (world.getBlockState(aboveSelf).getBlock() instanceof net.minecraft.block.LeavesBlock) {
+                motor.mineBlock(aboveSelf, true, false);
+                return Status.RUNNING;
+            }
+        }
         boolean needJump = shouldJump(player, world, step);
         boolean canSprint = canSprintSegment(player, stepIndex);
         boolean sneak = step.kind() == Pathfinder.MoveKind.BRIDGE;
@@ -242,14 +255,30 @@ final class RouteExecutor {
 
     private boolean shouldJump(ClientPlayerEntity player, ClientWorld world, Pathfinder.Step step) {
         if (player.isTouchingWater()) {
-            return player.getY() < step.to().getY() + 0.25 || player.horizontalCollision;
+            return step.kind() == Pathfinder.MoveKind.STEP_UP
+                || !player.isOnGround()
+                || player.getY() < step.to().getY() + 0.25
+                || player.horizontalCollision;
         }
         if (step.kind() == Pathfinder.MoveKind.STEP_UP) {
             double dist = Math.hypot(player.getX() - (step.to().getX() + 0.5), player.getZ() - (step.to().getZ() + 0.5));
-            return player.getY() < step.to().getY() - 0.15 && dist < 1.35;
+            boolean belowLedge = player.getY() < step.to().getY() - 0.08;
+            // Jump crisply right as we reach the ledge edge (0.30..1.15m) or on contact — never prematurely!
+            return belowLedge && ((dist < 1.15 && dist > 0.30) || player.horizontalCollision);
+        }
+        // Proactive seamless jump when the NEXT step is a STEP_UP and we're closing in smoothly
+        if (plan != null && stepIndex + 1 < plan.steps().size()) {
+            Pathfinder.Step next = plan.steps().get(stepIndex + 1);
+            if (next.kind() == Pathfinder.MoveKind.STEP_UP && next.toBreak().isEmpty()) {
+                double nextDist = Math.hypot(player.getX() - (next.to().getX() + 0.5), player.getZ() - (next.to().getZ() + 0.5));
+                if (player.getY() < next.to().getY() - 0.08 && nextDist < 1.10 && player.isOnGround()) {
+                    return true;
+                }
+            }
         }
         if (player.horizontalCollision && player.isOnGround() && step.toBreak().isEmpty()) {
-            return true;
+            // Only jump on collision if there's headroom above us so we don't head-bonk a low ceiling
+            return Perception.isPassable(world.getBlockState(player.getBlockPos().up(2)));
         }
         return false;
     }

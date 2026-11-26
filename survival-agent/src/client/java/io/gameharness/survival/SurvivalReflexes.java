@@ -176,7 +176,7 @@ final class SurvivalReflexes {
         }
 
         // 2. Drowning / underwater breath emergency!
-        if (player.isSubmergedInWater() && player.getAir() < 160) {
+        if (player.isSubmergedInWater() && player.getAir() < 210) {
             shelterState = ShelterState.NONE;
             closeScreenIfOpen();
             handleDrownEscape(player, world);
@@ -253,7 +253,7 @@ final class SurvivalReflexes {
         if (eating) {
             eatingTicks++;
             int slot = motor.findHotbarFood(emergencyFood);
-            if (slot < 0 || !needFood || eatingTicks > 48) {
+            if (slot < 0 || !needFood || eatingTicks > 60) {
                 eating = false;
                 eatingTicks = 0;
             } else {
@@ -270,6 +270,14 @@ final class SurvivalReflexes {
                 eating = true;
                 eatingTicks = 1;
                 activeStatus = "eating food";
+                return true;
+            }
+            // If edible food is in backpack (slots 9..35), swap it smoothly into hotbar so we can eat!
+            if (GuiHands.countEdibleFood(player, emergencyFood) > 0 && !gui.isBusy()) {
+                boolean allowRaw = emergencyFood;
+                gui.startHotbarSwap(st -> Motor.foodScore(st, allowRaw) > 0);
+                gui.tick();
+                activeStatus = "moving food to hotbar";
                 return true;
             }
         }
@@ -1183,12 +1191,14 @@ final class SurvivalReflexes {
         double bestDist = Double.POSITIVE_INFINITY;
         for (int dx = -4; dx <= 4; dx++) {
             for (int dz = -4; dz <= 4; dz++) {
-                for (int dy = 0; dy <= 2; dy++) {
+                // Only dy = 0..1! A player in water cannot jump onto a dy = +2 cliff ledge!
+                for (int dy = 0; dy <= 1; dy++) {
                     BlockPos cand = p.add(dx, dy, dz);
                     BlockState f = world.getBlockState(cand);
                     BlockState h = world.getBlockState(cand.up());
                     BlockState b = world.getBlockState(cand.down());
-                    if (f.isAir() && h.isAir() && Perception.isSolidSupport(b)) {
+                    if (f.isAir() && f.getFluidState().isEmpty() && h.isAir() && h.getFluidState().isEmpty()
+                            && Perception.isSolidSupport(b)) {
                         if (avoidLava && perception.isNearKnownLava(cand.getX(), cand.getY(), cand.getZ())) continue;
                         double d = cand.getSquaredDistance(p);
                         if (d < bestDist) {

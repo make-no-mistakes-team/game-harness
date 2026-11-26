@@ -376,13 +376,18 @@ final class Motor {
         if (wantLeft && wantRight) { wantLeft = false; wantRight = false; }
 
         wantSneak = sneak;
-        wantSprint = sprint && wantForward && !sneak && !wantBack && player.getHungerManager().getFoodLevel() > 6 && !player.horizontalCollision;
+        wantSprint = sprint && wantForward && !sneak && !wantBack
+            && player.getHungerManager().getFoodLevel() > 6
+            && (!player.horizontalCollision || jump);
 
-        if (jump && canJumpNow(player)) {
+        if (player.isTouchingWater()) {
+            // Stay buoyant at the water surface & climb cleanly onto banks (never sink passively underwater!)
+            if (jump || !player.isOnGround() || player.getY() < target.y + 0.20 || player.horizontalCollision) {
+                wantJump = true;
+            }
+        } else if (jump && canJumpNow(player)) {
             wantJump = true;
-            if (player.isOnGround()) jumpCooldownTicks = 2;
-        } else if (player.isTouchingWater() && (jump || player.getY() < target.y + 0.1)) {
-            wantJump = true; // swim upward
+            if (player.isOnGround()) jumpCooldownTicks = 1;
         }
     }
 

@@ -91,6 +91,8 @@ final class TaskRunner {
     private int smeltBatchSize;
     private boolean smeltLoaded;
     private boolean smeltCollecting;
+    private Item smeltInputItem;
+    private Item smeltOutputItem;
     private BlockPos smeltChoreTarget;
     private int smeltChoreNoProgressTicks;
     private boolean recoveringWorkstation;
@@ -133,6 +135,8 @@ final class TaskRunner {
         smeltLoaded = false;
         smeltCollecting = false;
         smeltReadyTick = -1;
+        smeltInputItem = null;
+        smeltOutputItem = null;
         recoveringWorkstation = false;
         workstationToRecover = null;
         workstationRecoverTicks = 0;
@@ -284,6 +288,8 @@ final class TaskRunner {
             activeTargetBlock = null;
             smeltLoaded = false;
             smeltCollecting = false;
+            smeltInputItem = null;
+            smeltOutputItem = null;
             workstationOpenStuckTicks = 0;
             branchWaypoint = null;
             branchLegSegments = 0;
@@ -364,6 +370,14 @@ final class TaskRunner {
             return;
         }
 
+        // Never float or submerge in water to chop riverbank wood when dry land is nearby — climb onto dry land first!
+        if (player.isSubmergedInWater()
+                || (player.isTouchingWater() && (!player.isOnGround() || findNearestDryShore(player, world) != null))) {
+            route.clear();
+            exploreForResources(player, world, currentTick, "getting onto dry land before chopping wood");
+            return;
+        }
+
         // Check if log is directly within reach!
         if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(activeTargetBlock)) <= Motor.REACH_SQ) {
             boolean broken = motor.mineBlock(activeTargetBlock, true, false);
@@ -408,13 +422,17 @@ final class TaskRunner {
             int dy = pos.getY() - feet.getY();
             if (dy > 4) continue;
             double waterPenalty = 0.0;
-            for (int d = 1; d <= 3; d++) {
-                BlockState below = perception.getObserved(pos.getX(), pos.getY() - d, pos.getZ());
-                if (below != null && !below.getFluidState().isEmpty()) {
-                    waterPenalty = 14.0;
-                    break;
+            outerWater:
+            for (int wx = -1; wx <= 1; wx++) {
+                for (int wz = -1; wz <= 1; wz++) {
+                    for (int d = 0; d <= 3; d++) {
+                        BlockState below = perception.getObserved(pos.getX() + wx, pos.getY() - d, pos.getZ() + wz);
+                        if (below != null && !below.getFluidState().isEmpty()) {
+                            waterPenalty = 26.0;
+                            break outerWater;
+                        }
+                    }
                 }
-                if (below != null && Perception.isSolidSupport(below)) break;
             }
             double score = Math.sqrt(pos.getSquaredDistance(feet)) + Math.abs(dy) * 1.1 + waterPenalty;
             if (score < bestScore) {
@@ -450,6 +468,11 @@ final class TaskRunner {
         }
 
         if (activeTargetBlock != null) {
+            if (player.isSubmergedInWater() || (player.isTouchingWater() && !player.isOnGround())) {
+                route.clear();
+                exploreForResources(player, world, currentTick, "getting onto dry land before mining stone");
+                return;
+            }
             if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(activeTargetBlock)) <= Motor.REACH_SQ
                     && motor.findAimPoint(activeTargetBlock) != null) {
                 BlockPos headroomFirst = findHeadroomBlockerForLowTarget(player, world, activeTargetBlock);
@@ -931,17 +954,25 @@ final class TaskRunner {
     }
 
     private void tickSmelt(ClientPlayerEntity player, ClientWorld world, int currentTick) {
-        Item inputItem = "raw_meat".equals(active.target()) ? findBestRawMeat(player) : Items.RAW_IRON;
-        Item outputItem = inputItem == Items.RAW_IRON ? Items.IRON_INGOT : cookedOf(inputItem);
+        boolean meatTarget = isMeatSmeltTarget(active.target());
+        if (smeltInputItem == null || (!smeltLoaded && GuiHands.countItem(player, smeltInputItem) <= 0)) {
+            smeltInputItem = resolveSmeltInput(active.target(), player);
+            smeltOutputItem = smeltInputItem == Items.RAW_IRON ? Items.IRON_INGOT : cookedOf(smeltInputItem);
+        }
+        Item inputItem = smeltInputItem;
+        Item outputItem = smeltOutputItem;
         int targetOut = Math.max(1, active.count());
+        int haveOut = meatTarget
+            ? countCookedMeat(player)
+            : (outputItem == null ? 0 : GuiHands.countItem(player, outputItem));
 
-        if (outputItem != null && GuiHands.countItem(player, outputItem) >= targetOut && !smeltLoaded) {
+        if (haveOut >= targetOut && !smeltLoaded) {
             if (placedFurnacePos != null && world.getBlockState(placedFurnacePos).isOf(Blocks.FURNACE)) {
                 workstationToRecover = placedFurnacePos;
                 recoveringWorkstation = true;
                 placedFurnacePos = null;
             }
-            finishActive("completed", "smelted " + outputItem.getName().getString(), currentTick);
+            finishActive("completed", "smelted " + (outputItem != null ? outputItem.getName().getString() : active.target()), currentTick);
             return;
         }
 
@@ -950,8 +981,14 @@ final class TaskRunner {
             if (smeltCollecting) {
                 smeltCollecting = false;
                 smeltLoaded = false;
-                int nowOut = outputItem == null ? 0 : GuiHands.countItem(player, outputItem);
-                int remIn = inputItem == null ? 0 : GuiHands.countItem(player, inputItem);
+                int nowOut = meatTarget
+                    ? countCookedMeat(player)
+                    : (outputItem == null ? 0 : GuiHands.countItem(player, outputItem));
+                int remIn = meatTarget
+                    ? countRawMeat(player)
+                    : (inputItem == null ? 0 : GuiHands.countItem(player, inputItem));
+                smeltInputItem = null;
+                smeltOutputItem = null;
                 if (nowOut >= targetOut || remIn <= 0) {
                     if (placedFurnacePos != null && world.getBlockState(placedFurnacePos).isOf(Blocks.FURNACE)) {
                         workstationToRecover = placedFurnacePos;
@@ -1049,10 +1086,10 @@ final class TaskRunner {
                 return;
             }
             int toSmelt = Math.min(GuiHands.countItem(player, inputItem),
-                Math.max(1, targetOut - (outputItem == null ? 0 : GuiHands.countItem(player, outputItem))));
+                Math.max(1, targetOut - haveOut));
             smeltBatchSize = toSmelt;
             gui.startFurnaceLoad(inputItem, toSmelt);
-            statusText = "loading furnace";
+            statusText = meatTarget ? "cooking food in furnace" : "loading furnace";
         }
     }
 
@@ -1083,11 +1120,13 @@ final class TaskRunner {
         if (!animals.isEmpty()) {
             AnimalEntity quarry = animals.get(0);
             motor.selectBestWeapon();
+            double hRad = Math.atan2(quarry.getZ() - player.getZ(), quarry.getX() - player.getX());
+            boolean needHop = shouldStepUpAlongHeading(player, world, hRad) || player.horizontalCollision || player.isTouchingWater();
             if (player.distanceTo(quarry) <= 3.3) {
                 motor.attackEntity(quarry);
-                motor.moveToward(quarry.getPos(), false, player.horizontalCollision, false, false);
+                motor.moveToward(quarry.getPos(), false, needHop, false, false);
             } else {
-                motor.moveToward(quarry.getPos(), true, player.horizontalCollision, false, true);
+                motor.moveToward(quarry.getPos(), !player.isTouchingWater(), needHop, false, true);
             }
             statusText = "hunting " + quarry.getType().getName().getString();
             return;
@@ -1591,9 +1630,23 @@ final class TaskRunner {
         boolean hasFurnace = GuiHands.countItem(player, Items.FURNACE) > 0
             || findNearbyWorkstation(player, client.world, Blocks.FURNACE, 12.0) != null;
 
-        // 0. If injured or hungry with no food on surface, grab quick visible food!
-        if ((player.getHealth() < 12f || player.getHungerManager().getFoodLevel() <= 10)
-                && GuiHands.countEdibleFood(player, true) == 0
+        // 0. Food acquisition & cooking:
+        //    - If injured/hungry with no food, grab visible food immediately
+        //    - When armed on the surface with < 4 edible food and animals/berries right in sight, stock up before caving!
+        //    - When carrying raw meat + furnace + fuel (and low on cooked food), cook it into high-saturation cooked meat!
+        int edibleFood = GuiHands.countEdibleFood(player, true);
+        int rawMeat = countRawMeat(player);
+        int cookedMeat = countCookedMeat(player);
+        boolean hungryOrHurt = player.getHealth() < 12f || player.getHungerManager().getFoodLevel() <= 10;
+        if (hungryOrHurt && edibleFood == 0
+                && (!perception.visibleFoodAnimals().isEmpty() || !perception.observedBerries().isEmpty())) {
+            return localTask(TaskKind.GATHER_FOOD, "food", 4, null);
+        }
+        if (hasFurnace && rawMeat > 0 && (rawMeat >= 2 || hungryOrHurt) && cookedMeat < 6
+                && GuiHands.countFuelUnits(player) >= 2) {
+            return localTask(TaskKind.SMELT, "raw_meat", cookedMeat + Math.min(rawMeat, 6), null);
+        }
+        if (pickTier >= 2 && player.getBlockY() >= 54 && edibleFood < 4
                 && (!perception.visibleFoodAnimals().isEmpty() || !perception.observedBerries().isEmpty())) {
             return localTask(TaskKind.GATHER_FOOD, "food", 4, null);
         }
@@ -1829,18 +1882,70 @@ final class TaskRunner {
         double dz = Math.sin(headingRad);
         Vec3d target = player.getPos().add(dx * 10.0, 0, dz * 10.0);
 
-        // Proactive jump over 1-block solid ledges right ahead so sprinting over hills is fluid!
-        BlockPos aheadFeet = BlockPos.ofFloored(player.getX() + dx * 0.95, player.getY(), player.getZ() + dz * 0.95);
-        boolean stepUpAhead = Perception.isSolidSupport(world.getBlockState(aheadFeet))
-            && Perception.isPassable(world.getBlockState(aheadFeet.up()))
-            && Perception.isPassable(world.getBlockState(aheadFeet.up(2)));
-        boolean jump = stepUpAhead || player.horizontalCollision || player.isTouchingWater();
+        // If a low tree leaf block right over a 1-block grass step is blocking headroom, clear it cleanly in 1 swing!
+        BlockPos obstructingLeaf = findLowStepLeafBlocker(player, world, dx, dz);
+        if (obstructingLeaf != null) {
+            motor.mineBlock(obstructingLeaf, true, false);
+            motor.moveToward(target, false, false, false, false);
+            return;
+        }
+
+        // Crisp 3-point shoulder-width proactive jump over 1-block ledges (never bonk solid low ceilings!)
+        boolean stepUpAhead = shouldStepUpAlongHeading(player, world, headingRad);
+        boolean headroomClear = Perception.isPassable(world.getBlockState(player.getBlockPos().up(2)));
+        boolean jump = stepUpAhead || (player.horizontalCollision && headroomClear) || player.isTouchingWater();
 
         // Gently pan gaze left/right (+/- 28 deg) while sprinting forward to scan horizon for forests/caves
         float moveYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
         float scanOffset = (float) (Math.sin(currentTick * 0.055) * 28.0);
         motor.lookAtAngles(moveYaw + scanOffset, 3.0f, Motor.LookMode.NORMAL);
         motor.moveToward(target, !player.isTouchingWater(), jump, false, false);
+    }
+
+    /** 3-point shoulder-width check for a clean climbable 1-block step-up directly along headingRad. */
+    private boolean shouldStepUpAlongHeading(ClientPlayerEntity player, ClientWorld world, double headingRad) {
+        double dx = Math.cos(headingRad);
+        double dz = Math.sin(headingRad);
+        double px = -dz;
+        double pz = dx;
+        double[] dists = {0.68, 1.05};
+        double[] offsets = {0.0, 0.26, -0.26};
+        int by = player.getBlockY();
+        if (!Perception.isPassable(world.getBlockState(player.getBlockPos().up(2)))) {
+            return false;
+        }
+        for (double dist : dists) {
+            for (double off : offsets) {
+                BlockPos ahead = BlockPos.ofFloored(
+                    player.getX() + dx * dist + px * off,
+                    by,
+                    player.getZ() + dz * dist + pz * off);
+                if (Perception.isSolidSupport(world.getBlockState(ahead))
+                        && Perception.isPassable(world.getBlockState(ahead.up()))
+                        && Perception.isPassable(world.getBlockState(ahead.up(2)))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Detects low tree leaves directly above a 1-block step-up that would cause head-bonking under a canopy. */
+    private BlockPos findLowStepLeafBlocker(ClientPlayerEntity player, ClientWorld world, double dx, double dz) {
+        int by = player.getBlockY();
+        BlockPos selfTop = player.getBlockPos().up(2);
+        if (player.horizontalCollision && world.getBlockState(selfTop).getBlock() instanceof LeavesBlock) {
+            return selfTop;
+        }
+        BlockPos ahead = BlockPos.ofFloored(player.getX() + dx * 0.95, by, player.getZ() + dz * 0.95);
+        if (Perception.isSolidSupport(world.getBlockState(ahead)) && Perception.isPassable(world.getBlockState(ahead.up()))) {
+            BlockPos leaf = ahead.up(2);
+            if (world.getBlockState(leaf).getBlock() instanceof LeavesBlock
+                    && player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(leaf)) <= Motor.REACH_SQ) {
+                return leaf;
+            }
+        }
+        return null;
     }
 
     private boolean isHeadingIntoWaterOrWall(ClientPlayerEntity player, ClientWorld world, double rad) {
@@ -1949,7 +2054,7 @@ final class TaskRunner {
                 if (!world.getFluidState(feet.add(dx, 0, dz)).isEmpty()
                         || !world.getFluidState(feet.add(dx, -1, dz)).isEmpty()) {
                     wetNeighbors++;
-                    if (wetNeighbors >= 3) return true;
+                    if (wetNeighbors >= 5) return true;
                 }
             }
         }
@@ -2448,10 +2553,41 @@ final class TaskRunner {
         return need > 0 && GuiHands.countItem(p, Items.STICK) < need;
     }
 
+    static boolean isMeatSmeltTarget(String target) {
+        if (target == null) return false;
+        String clean = target.toLowerCase().replace("minecraft:", "").trim();
+        return clean.equals("raw_meat") || clean.equals("meat") || clean.equals("food")
+            || clean.contains("beef") || clean.contains("pork") || clean.contains("mutton")
+            || clean.contains("chicken") || clean.contains("rabbit");
+    }
+
+    private static Item resolveSmeltInput(String target, ClientPlayerEntity p) {
+        if (!isMeatSmeltTarget(target)) return Items.RAW_IRON;
+        String clean = target.toLowerCase().replace("minecraft:", "").trim();
+        if (clean.contains("beef") && GuiHands.countItem(p, Items.BEEF) > 0) return Items.BEEF;
+        if (clean.contains("pork") && GuiHands.countItem(p, Items.PORKCHOP) > 0) return Items.PORKCHOP;
+        if (clean.contains("mutton") && GuiHands.countItem(p, Items.MUTTON) > 0) return Items.MUTTON;
+        if (clean.contains("chicken") && GuiHands.countItem(p, Items.CHICKEN) > 0) return Items.CHICKEN;
+        if (clean.contains("rabbit") && GuiHands.countItem(p, Items.RABBIT) > 0) return Items.RABBIT;
+        return findBestRawMeat(p);
+    }
+
     private static Item findBestRawMeat(ClientPlayerEntity p) {
         Item[] raw = {Items.BEEF, Items.PORKCHOP, Items.MUTTON, Items.CHICKEN, Items.RABBIT};
         for (Item item : raw) if (GuiHands.countItem(p, item) > 0) return item;
         return null;
+    }
+
+    private static int countRawMeat(ClientPlayerEntity p) {
+        return GuiHands.countItem(p, Items.BEEF) + GuiHands.countItem(p, Items.PORKCHOP)
+            + GuiHands.countItem(p, Items.MUTTON) + GuiHands.countItem(p, Items.CHICKEN)
+            + GuiHands.countItem(p, Items.RABBIT);
+    }
+
+    private static int countCookedMeat(ClientPlayerEntity p) {
+        return GuiHands.countItem(p, Items.COOKED_BEEF) + GuiHands.countItem(p, Items.COOKED_PORKCHOP)
+            + GuiHands.countItem(p, Items.COOKED_MUTTON) + GuiHands.countItem(p, Items.COOKED_CHICKEN)
+            + GuiHands.countItem(p, Items.COOKED_RABBIT);
     }
 
     private static Item cookedOf(Item raw) {

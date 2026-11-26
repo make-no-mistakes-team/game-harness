@@ -72,4 +72,14 @@ final class CaveExplorerTest {
         assertFalse(second.ravineLike, "After exhausting ravine, should pick remaining unexhausted cave mouth");
         assertEquals(1, explorer.exhaustedCaveCount());
     }
+
+    @Test
+    void meatSmeltTargetsRecognizeGenericAndSpecificMeats() {
+        assertTrue(TaskRunner.isMeatSmeltTarget("raw_meat"));
+        assertTrue(TaskRunner.isMeatSmeltTarget("raw_beef"));
+        assertTrue(TaskRunner.isMeatSmeltTarget("minecraft:porkchop"));
+        assertTrue(TaskRunner.isMeatSmeltTarget("mutton"));
+        assertTrue(TaskRunner.isMeatSmeltTarget("chicken"));
+        assertFalse(TaskRunner.isMeatSmeltTarget("raw_iron"));
+    }
 }

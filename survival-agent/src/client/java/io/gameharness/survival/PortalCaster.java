@@ -213,6 +213,7 @@ final class PortalCaster {
     private int scanTicks;
     private BlockPos activeWaterPos;
     private BlockPos activeLavaScoopTarget;
+    private BlockPos activeRouteDest;
     private int lavaScoopStuckTicks;
     private final Set<BlockPos> skippedLavaCells = new HashSet<>();
     private String statusText = "";
@@ -245,6 +246,7 @@ final class PortalCaster {
         scanTicks = 0;
         activeWaterPos = null;
         activeLavaScoopTarget = null;
+        activeRouteDest = null;
         lavaScoopStuckTicks = 0;
         skippedLavaCells.clear();
         statusText = "";
@@ -305,6 +307,7 @@ final class PortalCaster {
     void clearActive() {
         stage = Stage.IDLE;
         statusText = "";
+        activeRouteDest = null;
         route.clear();
     }
 
@@ -590,6 +593,7 @@ final class PortalCaster {
         aimStableTicks = 0;
         pourConfirmTicks = 0;
         activeLavaScoopTarget = null;
+        activeRouteDest = null;
         lavaScoopStuckTicks = 0;
         route.clear();
     }
@@ -953,7 +957,9 @@ final class PortalCaster {
             motor.requestSneak();
             if (tryScoopLiquid(player, world, activeLavaScoopTarget, false)) {
                 activeLavaScoopTarget = null;
+                activeRouteDest = null;
                 lavaScoopStuckTicks = 0;
+                route.clear();
             }
             return RunStatus.RUNNING;
         }
@@ -969,7 +975,12 @@ final class PortalCaster {
         // Use safe surface A* (avoids lava automatically!) or direct dry walk when clear
         if (player.getBlockPos().getSquaredDistance(stand) <= 1.2 * 1.2) {
             motor.requestSneak();
-            tryScoopLiquid(player, world, activeLavaScoopTarget, false);
+            if (tryScoopLiquid(player, world, activeLavaScoopTarget, false)) {
+                activeLavaScoopTarget = null;
+                activeRouteDest = null;
+                lavaScoopStuckTicks = 0;
+                route.clear();
+            }
         } else {
             navigateDryAroundPool(player, world, stand);
         }
@@ -1152,6 +1163,10 @@ final class PortalCaster {
     }
 
     private void navigateDryAroundPool(ClientPlayerEntity player, ClientWorld world, BlockPos dest) {
+        if (dest != null && !dest.equals(activeRouteDest)) {
+            route.clear();
+            activeRouteDest = dest.toImmutable();
+        }
         // Use Pathfinder.Options.surface (respects observed lava as HAZARD and stays on solid dry stone!)
         if (!route.hasPlan()) {
             Pathfinder.Options opts = Pathfinder.Options.surface(0, true);
@@ -1169,6 +1184,7 @@ final class PortalCaster {
         RouteExecutor.Status st = route.tick(totalTicks, true);
         if (st == RouteExecutor.Status.COMPLETE || st == RouteExecutor.Status.STUCK || st == RouteExecutor.Status.INVALIDATED) {
             route.clear();
+            activeRouteDest = null;
         }
     }
 

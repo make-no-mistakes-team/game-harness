@@ -287,7 +287,16 @@ final class TaskRunner {
             route.clear();
         }
 
+        boolean underground = world.getLightLevel(net.minecraft.world.LightType.SKY, feet) == 0;
         if (activeTargetBlock == null) {
+            // If underground inside a cave/tunnel, climb/staircase back up to the surface instead of walking into stone walls!
+            if (underground) {
+                Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+                int surfaceY = Math.max(feet.getY() + 8, 66);
+                navigateToward(player, Pathfinder.Goal.reachY(surfaceY), opts, currentTick);
+                statusText = "climbing to surface for wood";
+                return;
+            }
             // If we spotted distant tree leaves (canopy up to 64m away), head toward those trees!
             BlockPos leaves = perception.nearestObserved(perception.observedLeaves(), feet, 64.0, blacklistedTargets);
             if (leaves != null && leaves.getSquaredDistance(feet) > 16.0) {
@@ -319,8 +328,10 @@ final class TaskRunner {
         }
         noMineProgressTicks = 0;
 
-        // Navigate toward log (allowing leaf clearance and safe canopy drops!)
-        Pathfinder.Options opts = Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
+        // Navigate toward log (use mining pathfinder if underground so we can dig/staircase out to surface trees!)
+        Pathfinder.Options opts = underground
+            ? Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true)
+            : Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
         RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.6), opts, currentTick);
         statusText = "approaching tree";
         if (st == RouteExecutor.Status.STUCK) {
@@ -752,7 +763,10 @@ final class TaskRunner {
                 int slot = motor.findHotbarItem(Items.CRAFTING_TABLE);
                 BlockPos spot = findPlacementSpotNearPlayer(player, world);
                 if (spot == null) {
-                    // Step slightly to find a clear flat spot
+                    if (clearAlcoveForWorkstation(player, world)) {
+                        statusText = "clearing space for crafting table";
+                        return;
+                    }
                     exploreForResources(player, world, currentTick, "finding space to place crafting table");
                     return;
                 }
@@ -842,6 +856,10 @@ final class TaskRunner {
             int slot = motor.findHotbarItem(Items.FURNACE);
             BlockPos spot = findPlacementSpotNearPlayer(player, world);
             if (spot == null) {
+                if (clearAlcoveForWorkstation(player, world)) {
+                    statusText = "clearing space for furnace";
+                    return;
+                }
                 exploreForResources(player, world, currentTick, "finding space for furnace");
                 return;
             }
@@ -1643,7 +1661,24 @@ final class TaskRunner {
 
     private BlockPos findPlacementSpotNearPlayer(ClientPlayerEntity player, ClientWorld world) {
         BlockPos feet = player.getBlockPos();
-        // Check 1..2 blocks around feet for an air cell on solid support that doesn't intersect player hitbox
+        // Pass 1: air/replaceable cell on solid support (dy 0, -1, 1) that doesn't intersect player hitbox
+        int[] dyOrder = {0, -1, 1};
+        for (int r = 1; r <= 2; r++) {
+            for (int dx = -r; dx <= r; dx++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    if (dx == 0 && dz == 0) continue;
+                    for (int dy : dyOrder) {
+                        BlockPos cand = feet.add(dx, dy, dz);
+                        BlockState st = world.getBlockState(cand);
+                        if (!st.isAir() && !st.isReplaceable()) continue;
+                        if (!st.getFluidState().isEmpty()) continue;
+                        if (!Perception.isSolidSupport(world.getBlockState(cand.down()))) continue;
+                        if (motor.findPlacementHit(cand) != null) return cand;
+                    }
+                }
+            }
+        }
+        // Pass 2: tight tunnel fallback — crafting tables & furnaces can attach to any adjacent solid face!
         for (int r = 1; r <= 2; r++) {
             for (int dx = -r; dx <= r; dx++) {
                 for (int dz = -r; dz <= r; dz++) {
@@ -1652,13 +1687,33 @@ final class TaskRunner {
                         BlockPos cand = feet.add(dx, dy, dz);
                         BlockState st = world.getBlockState(cand);
                         if (!st.isAir() && !st.isReplaceable()) continue;
-                        if (!Perception.isSolidSupport(world.getBlockState(cand.down()))) continue;
+                        if (!st.getFluidState().isEmpty()) continue;
                         if (motor.findPlacementHit(cand) != null) return cand;
                     }
                 }
             }
         }
         return null;
+    }
+
+    /** When in a tight 1x2 tunnel with no free placement cell, carve a 1-block wall alcove for our workstation! */
+    private boolean clearAlcoveForWorkstation(ClientPlayerEntity player, ClientWorld world) {
+        BlockPos feet = player.getBlockPos();
+        int[][] dirs = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int[] d : dirs) {
+                BlockPos wall = feet.add(d[0], dy, d[1]);
+                BlockState st = world.getBlockState(wall);
+                if (st.isAir() || !st.getFluidState().isEmpty()) continue;
+                if (Perception.isUnbreakable(st) || Perception.isHazardBlock(st)) continue;
+                if (st.isOf(Blocks.CRAFTING_TABLE) || st.isOf(Blocks.FURNACE)) continue;
+                if (perception.isNearKnownLava(wall.getX(), wall.getY(), wall.getZ())) continue;
+                if (perception.isNearKnownFluidAboveOrSide(wall.getX(), wall.getY(), wall.getZ())) continue;
+                motor.mineBlock(wall, true, true);
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isHighValueDrop(Item it) {

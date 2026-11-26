@@ -1779,6 +1779,15 @@ final class TaskRunner {
                 branchWaypoint = null;
                 route.clear();
             }
+        } else if (player.getBlockY() < targetY - 4 && descentLateralTicks <= 0) {
+            RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.climbToY(targetY), opts, currentTick);
+            statusText = "climbing to y=" + targetY + " for " + oreLabel;
+            if (st == RouteExecutor.Status.STUCK) {
+                branchDirIndex = (branchDirIndex + 1) & 3;
+                descentLateralTicks = 90;
+                branchWaypoint = null;
+                route.clear();
+            }
         } else {
             if (descentLateralTicks > 0) descentLateralTicks--;
             // Cardinal 1x2 branch-mining gallery (2x faster & half the pickaxe wear of diagonal tunnels!)
@@ -1795,7 +1804,8 @@ final class TaskRunner {
                     branchDirIndex = (branchDirIndex + 1) & 3;
                 } else {
                     int[] d = dirs[branchDirIndex];
-                    int desiredY = Math.max(targetY, Math.min(feet.getY(), targetY + 3));
+                    // Always keep branchWaypoint within +/-3 blocks of feet.getY() so it never triggers an immediate next-tick reset!
+                    int desiredY = Math.max(feet.getY() - 3, Math.min(feet.getY() + 3, targetY));
                     branchWaypoint = new BlockPos(feet.getX() + d[0] * 16, desiredY, feet.getZ() + d[1] * 16);
                 }
                 route.clear();

@@ -160,6 +160,11 @@ final class RouteExecutor {
             }
             for (BlockPos placePos : step.toPlace()) {
                 BlockState st = world.getBlockState(placePos);
+                if (!Perception.isSolidSupport(st) && !st.isAir() && !st.isReplaceable() && st.getFluidState().isEmpty()) {
+                    // Clear non-solid obstructions (e.g. floor torch) before placing scaffold block!
+                    motor.mineBlock(placePos, true, false);
+                    return Status.RUNNING;
+                }
                 if (st.isAir() || st.isReplaceable()) {
                     if (step.kind() == Pathfinder.MoveKind.PILLAR) {
                         // Center tightly (<0.15) over block so hitbox (0.30) never clips adjacent ceiling corners!
@@ -167,10 +172,18 @@ final class RouteExecutor {
                         if (Math.hypot(player.getX() - center.x, player.getZ() - center.z) > 0.15) {
                             motor.moveToward(center, false, false, true, false);
                         } else {
-                            motor.requestJump();
-                            motor.lookAtPoint(Vec3d.ofBottomCenter(placePos).add(0, -0.05, 0), Motor.LookMode.FINE);
-                            if (player.getY() >= placePos.getY() + 0.85) {
-                                motor.placeBlockAt(placePos, scaffoldSlot);
+                            // Select scaffold and aim cleanly straight down at placePos.down() BEFORE jumping
+                            // so crosshair is locked on the top face by the time feet clear placePos (y >= +1.00)!
+                            player.getInventory().selectedSlot = scaffoldSlot;
+                            Vec3d downPoint = new Vec3d(placePos.getX() + 0.5, placePos.getY() - 0.01, placePos.getZ() + 0.5);
+                            motor.lookAtPoint(downPoint, Motor.LookMode.FINE);
+                            if (player.getPitch() >= 76.0f) {
+                                if (player.isOnGround()) {
+                                    motor.requestJump();
+                                }
+                                if (player.getY() >= placePos.getY() + 1.00) {
+                                    motor.placeBlockAgainst(placePos.down(), net.minecraft.util.math.Direction.UP, downPoint, scaffoldSlot);
+                                }
                             }
                         }
                     } else {

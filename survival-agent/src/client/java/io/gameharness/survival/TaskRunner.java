@@ -4,6 +4,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
@@ -457,8 +458,11 @@ final class TaskRunner {
             }
         }
         if (activeTargetBlock == null || !world.getBlockState(activeTargetBlock).isIn(BlockTags.LOGS)) {
+            BlockPos prev = activeTargetBlock;
             activeTargetBlock = findBestLogTarget(player, world);
-            route.clear();
+            if (!Objects.equals(prev, activeTargetBlock)) {
+                route.clear();
+            }
         }
 
         boolean underground = isUndergroundOrRoofed(player, world);
@@ -600,9 +604,12 @@ final class TaskRunner {
 
         // 1. Prefer any directly aimable stone within reach first, then nearest observed stone within 24 blocks!
         if (activeTargetBlock == null || !isStoneBlock(world.getBlockState(activeTargetBlock))) {
+            BlockPos prev = activeTargetBlock;
             activeTargetBlock = findBestStoneTarget(player, world);
             noMineProgressTicks = 0;
-            route.clear();
+            if (!Objects.equals(prev, activeTargetBlock)) {
+                route.clear();
+            }
         }
 
         if (activeTargetBlock != null) {
@@ -1868,8 +1875,11 @@ final class TaskRunner {
 
         // 3. Otherwise mine nearest observed natural gravel (riverbanks, beaches, caves, underground!)
         if (activeTargetBlock == null || !world.getBlockState(activeTargetBlock).isOf(Blocks.GRAVEL)) {
+            BlockPos prev = activeTargetBlock;
             activeTargetBlock = perception.nearestObserved(perception.observedGravel(), player.getBlockPos(), 44.0, blacklistedTargets);
-            route.clear();
+            if (!Objects.equals(prev, activeTargetBlock)) {
+                route.clear();
+            }
         }
         if (activeTargetBlock != null) {
             if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(activeTargetBlock)) <= Motor.REACH_SQ
@@ -3088,7 +3098,9 @@ final class TaskRunner {
         if (smeltChoreTarget == null) {
             smeltChoreTarget = pickProductiveSmeltChoreTarget(player, world, furnace);
             smeltChoreNoProgressTicks = 0;
-            route.clear();
+            if (smeltChoreTarget != null) {
+                route.clear();
+            }
         }
         if (smeltChoreTarget == null) return false;
 

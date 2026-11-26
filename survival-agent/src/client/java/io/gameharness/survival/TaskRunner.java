@@ -264,11 +264,11 @@ final class TaskRunner {
             }
         }
 
-        // 0c. Automatic 2x2 torch crafting when entering pitch-dark underground with coal + wood:
+        // 0c. Automatic 2x2 torch crafting when entering pitch-dark underground/mountain caves with coal + wood:
         //     needs NO crafting table, takes ~2 seconds, and lights up staircases & caves for both navigation & visibility!
         if (!criticalBusy && client.currentScreen == null && currentTick - lastAutoTorchTick >= 120
-                && player.getBlockY() <= 56
                 && world.getLightLevel(net.minecraft.world.LightType.SKY, player.getBlockPos()) == 0
+                && world.getLightLevel(net.minecraft.world.LightType.BLOCK, player.getBlockPos()) <= 3
                 && GuiHands.countItem(player, Items.TORCH) == 0
                 && (GuiHands.countItem(player, Items.COAL) + GuiHands.countItem(player, Items.CHARCOAL)) >= 1) {
             int sticks = GuiHands.countItem(player, Items.STICK);
@@ -1370,7 +1370,7 @@ final class TaskRunner {
                 return;
             }
             BlockPos feet = player.getBlockPos();
-            if (caves.canBreakIntoCave(currentTick) && caves.countNearbyUnvisitedFrontiers(perception, feet, 20.0) >= 3) {
+            if (caves.canBreakIntoCave(currentTick) && caves.countNearbyUnvisitedFrontiers(perception, feet, 20.0) >= 6) {
                 BlockPos caveSpot = caves.selectBestCaveFrontier(perception, feet, player.getYaw(), targetY);
                 if (caveSpot != null && caveSpot.getY() <= feet.getY() + 3) {
                     caves.beginExploringCave(feet, currentTick, true);
@@ -1593,9 +1593,9 @@ final class TaskRunner {
                     return;
                 }
                 if (verdict == CaveExplorer.CaveVerdict.TRANSITION_DEEP_MINE) {
-                    caves.setMode(CaveExplorer.Mode.DEEP_BRANCH_MINE, currentTick);
+                    caves.finishCaveIntoDeepMine(perception, feet, currentTick);
                     route.clear();
-                    statusText = "deep cave ended; starting branch mine";
+                    statusText = "cave pocket ended; digging staircase";
                     return;
                 }
 
@@ -1694,9 +1694,9 @@ final class TaskRunner {
             }
 
             case DEEP_BRANCH_MINE -> {
-                // If our staircase/branch mine breaks into ANY genuinely open cave (horizontal or descending!),
+                // If our staircase/branch mine breaks into a genuinely open cave (>= 6 unvisited frontiers!),
                 // explore it for exposed ores and deeper passages before resuming manual digging from our new location!
-                if (caves.canBreakIntoCave(currentTick) && caves.countNearbyUnvisitedFrontiers(perception, feet, 20.0) >= 3) {
+                if (caves.canBreakIntoCave(currentTick) && caves.countNearbyUnvisitedFrontiers(perception, feet, 20.0) >= 6) {
                     BlockPos openCave = caves.selectBestCaveFrontier(perception, feet, player.getYaw(), targetY);
                     if (openCave != null && openCave.getY() <= feet.getY() + 3) {
                         caves.beginExploringCave(feet, currentTick, true);

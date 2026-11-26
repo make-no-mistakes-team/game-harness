@@ -289,7 +289,23 @@ final class CaveExplorer {
     }
 
     boolean canBreakIntoCave(int currentTick) {
-        return (currentTick - lastCaveExhaustedTick) >= 160;
+        return (currentTick - lastCaveExhaustedTick) >= 400;
+    }
+
+    /** Transition cleanly from an exhausted/dead-end cave into deep manual digging without immediately re-entering the same pocket. */
+    void finishCaveIntoDeepMine(Perception perception, BlockPos feet, int currentTick) {
+        this.lastCaveExhaustedTick = currentTick;
+        this.brokenInFromDigging = false;
+        this.activeFrontier = null;
+        this.activeFrontierTicks = 0;
+        this.mode = Mode.DEEP_BRANCH_MINE;
+        if (perception != null && feet != null) {
+            for (Perception.CaveSight s : perception.observedCaveSights()) {
+                if (s.pos().getSquaredDistance(feet) <= 14.0 * 14.0) {
+                    visitedSectors.add(sectorKey(s.pos()));
+                }
+            }
+        }
     }
 
     boolean isBrokenInFromDigging() { return brokenInFromDigging; }

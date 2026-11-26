@@ -545,7 +545,9 @@ final class Pathfinder {
         if (headCost < 0) return;
         List<BlockPos> breaks = headCost > 0 ? List.of(new BlockPos(x, y + 2, z)) : List.of();
         if (!breaks.isEmpty() && !opts.allowDigging) return;
-        out.add(new Step(from, new BlockPos(x, y + 1, z), MoveKind.PILLAR, breaks, List.of(from), 18.0 + headCost));
+        // Prefer walking up an existing walkable staircase over tunneling a new vertical pillar shaft through solid rock!
+        double baseCost = breaks.isEmpty() ? 18.0 : 30.0;
+        out.add(new Step(from, new BlockPos(x, y + 1, z), MoveKind.PILLAR, breaks, List.of(from), baseCost + headCost));
     }
 
     private void tryDigStraightDown(Perception p, ClientPlayerEntity player, BlockPos from, Options opts, List<Step> out) {

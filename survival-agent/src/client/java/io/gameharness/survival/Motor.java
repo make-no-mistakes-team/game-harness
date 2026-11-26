@@ -185,7 +185,8 @@ final class Motor {
         double dy = point.y - eye.y;
         double dz = point.z - eye.z;
         double horiz = Math.hypot(dx, dz);
-        float yaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+        // Avoid gimbal-lock yaw flips when aiming straight up or straight down (e.g. pillaring)!
+        float yaw = horiz < 0.08 ? player.getYaw() : (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
         float pitch = (float) -Math.toDegrees(Math.atan2(dy, Math.max(1e-6, horiz)));
         lookAtAngles(yaw, pitch, mode);
     }

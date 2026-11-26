@@ -172,12 +172,17 @@ final class RouteExecutor {
                         if (Math.hypot(player.getX() - center.x, player.getZ() - center.z) > 0.15) {
                             motor.moveToward(center, false, false, true, false);
                         } else {
-                            // Select scaffold and aim cleanly straight down at placePos.down() BEFORE jumping
-                            // so crosshair is locked on the top face by the time feet clear placePos (y >= +1.00)!
+                            // Select scaffold and lock crosshair cleanly onto placePos.down() TOP face BEFORE jumping
+                            // so placement succeeds on the very first jump apex (y >= placePos.y + 1.00)!
                             player.getInventory().selectedSlot = scaffoldSlot;
                             Vec3d downPoint = new Vec3d(placePos.getX() + 0.5, placePos.getY() - 0.01, placePos.getZ() + 0.5);
                             motor.lookAtPoint(downPoint, Motor.LookMode.FINE);
-                            if (player.getPitch() >= 76.0f) {
+                            boolean aimedAtFloor = player.getPitch() >= 84.0f
+                                && client.crosshairTarget instanceof net.minecraft.util.hit.BlockHitResult bhr
+                                && bhr.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
+                                && bhr.getBlockPos().equals(placePos.down())
+                                && bhr.getSide() == net.minecraft.util.math.Direction.UP;
+                            if (aimedAtFloor) {
                                 if (player.isOnGround()) {
                                     motor.requestJump();
                                 }

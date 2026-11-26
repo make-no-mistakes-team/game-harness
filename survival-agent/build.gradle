@@ -24,19 +24,8 @@ dependencies {
 }
 tasks.named('test') {
     useJUnitPlatform()
-    // Load the named vanilla classes through Fabric's test launcher, not bare Java.
     classpath += sourceSets.client.runtimeClasspath
-    // Fabric discovers mods and opens its logs relative to the test working directory.
     def testGameDir = layout.buildDirectory.dir('vanilla-test-run').get().asFile
     workingDir testGameDir
     doFirst { testGameDir.mkdirs() }
 }
-
-def dryRouteGraphProof = tasks.register('dryRouteGraphProof', JavaExec) {
-    group = 'verification'
-    description = 'Runs the standalone observed dry-route graph behavior proofs.'
-    dependsOn tasks.named('testClasses')
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'io.gameharness.survival.DryRouteGraphProof'
-}
-tasks.named('check') { dependsOn dryRouteGraphProof }

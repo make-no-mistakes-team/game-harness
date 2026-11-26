@@ -88,9 +88,8 @@ final class AgentPauseEpisodes {
             long now = System.nanoTime();
             if (now - lastNs > MAX_WITNESS_INTERVAL_NS) {
                 line("state", lastNs, lastTick, "unsampled");
-                lastNs = now;
             }
-            line("end", lastNs, lastTick, reason);
+            line("end", Math.max(now, lastNs), lastTick, reason);
         } catch (IOException ignored) {
             // An absent terminal record leaves the report explicitly censored.
         } finally {

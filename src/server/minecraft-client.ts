@@ -477,6 +477,7 @@ export class MinecraftClient {
       display: string;
       authority: string;
       stillOwned: () => boolean;
+      revealOresDiagnostic?: boolean;
       onSetup?: (phase: "client_session_check" | "client_dependencies" | "client_startup") => void;
       beforeConnect?: (profileName: string) => Promise<void>;
     },
@@ -515,6 +516,7 @@ export class MinecraftClient {
       `-Djava.io.tmpdir=${tmp}`,
       `-Dgh.agent.dir=${config.evidenceDir}`,
       `-Dgh.agent.goal=${config.goal}`,
+      ...(config.revealOresDiagnostic ? ["-Dgh.agent.reveal_ores=true"] : []),
       // launchAgent's sole caller starts this exact loopback server with max-players=1.
       `-Dgh.agent.ownedSinglePlayerPort=${config.port}`,
       "-cp",

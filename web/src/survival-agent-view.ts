@@ -5,7 +5,7 @@ import { ApiError, fetchSurvivalAgent, startSurvivalAgent, stopSurvivalAgent } f
 
 const goalNames: Record<SurvivalAgentGoal, string> = {
   wooden_pickaxe: "Wooden pickaxe", stone_pickaxe: "Stone pickaxe", iron_pickaxe: "Iron pickaxe",
-  diamond: "Diamond", nether_portal: "Nether portal",
+  diamond: "Diamond", diamond_pickaxe: "Diamond pickaxe", nether_portal: "Nether portal",
 };
 
 const strategyOutcomeLabels: Record<NonNullable<SurvivalAgentSnapshot["strategyOutcome"]>, string> = {

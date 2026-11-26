@@ -1,5 +1,5 @@
 export const SURVIVAL_AGENT_GOALS = [
-  "wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond", "nether_portal",
+  "wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond", "diamond_pickaxe", "nether_portal",
 ] as const;
 
 export type SurvivalAgentGoal = (typeof SURVIVAL_AGENT_GOALS)[number];

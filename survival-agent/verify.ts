@@ -159,7 +159,7 @@ export async function verifySurvival(statsDirectory: string, goal: string, progr
             return result(false, "Missing completed shore cast with two passive feet and eight poured frame cells");
     } else if (!(p.data.inventory[`minecraft:${goal}`]! > 0))
         return result(false, "Live player did not retain the declared item");
-    if (!["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond", "nether_portal"].includes(goal))
+    if (!["wooden_pickaxe", "stone_pickaxe", "iron_pickaxe", "diamond", "diamond_pickaxe", "nether_portal"].includes(goal))
         return result(false, "Unsupported proof");
     try {
         const saved = await readSavedPlayerStats(statsDirectory);
@@ -223,7 +223,10 @@ export async function verifySurvival(statsDirectory: string, goal: string, progr
         }
         crafted = delta("crafted", goal);
         pickedUp = delta("picked_up", goal);
-        const verified = goal === "diamond" ? mined > 0 && pickedUp > 0 : crafted > 0;
+        const diamondsPicked = delta("picked_up", "diamond");
+        const verified = goal === "diamond" ? mined > 0 && pickedUp > 0
+            : goal === "diamond_pickaxe" ? crafted > 0 && mined >= 3 && diamondsPicked >= 3
+            : crafted > 0;
         return result(verified, verified ? "This attempt's vanilla player statistics corroborate the live inventory" :
             "Saved player statistics do not corroborate a newly achieved goal");
     } catch { return result(false, "Saved player statistics unavailable or unreadable"); }

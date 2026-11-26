@@ -15,7 +15,7 @@ import { AgentVideo, type AgentDisplay } from "./survival-agent-video.ts";
 
 const SYSTEM_PATH = "/usr/bin:/bin";
 const LIMIT_SECONDS: Record<SurvivalAgentGoal, number> = {
-  wooden_pickaxe: 900, stone_pickaxe: 900, iron_pickaxe: 900, diamond: 1800, nether_portal: 3600,
+  wooden_pickaxe: 900, stone_pickaxe: 900, iron_pickaxe: 900, diamond: 1800, diamond_pickaxe: 2400, nether_portal: 3600,
 };
 const IDLE: SurvivalAgentSnapshot = {
   phase: "idle", goal: null, strategy: null, model: null, strategyOutcome: null,

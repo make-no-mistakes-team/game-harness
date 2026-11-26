@@ -12,7 +12,7 @@ import { osMonotonicNs } from "../src/server/os-monotonic.ts";
 import { ModelActorCompatibilityError } from "../src/server/survival-agent-artifact.ts";
 import { composeModelSurvival, createRecoveryFrameCapture, declareModelStrategy } from "../src/server/survival-macro/compose.ts";
 import type { MacroStatus } from "../src/server/survival-macro/controller.ts";
-import { composeExpeditionAdvisor } from "../src/server/survival-macro/expedition.ts";
+import { composeMacroStrategist } from "../src/server/survival-macro/strategist.ts";
 import { descentFixtures, descentVariants, fixtureWorld, macroTrialWorld, provisionFixture, provisionMacroTrialWorld, terrainFixtures,
   terrainVariants, provisionUrgentThreatWorld, urgentThreatWorld, provisionUrgentCraftWorld, urgentCraftWorld,
   type DescentVariant, type TerrainVariant } from "./diagnostic-descent.ts";
@@ -164,12 +164,16 @@ const parallelWorldUsage = "--parallel-world is only available for ordinary fres
 
 function readParallelWorld(rawArgs: string[]) {
   let parallelWorld = false;
+  let revealOres = false;
   const args: string[] = [];
   for (let i = 0; i < rawArgs.length; i++) {
     const arg = rawArgs[i]!;
     if (arg === "--parallel-world") {
       if (parallelWorld) throw new Error("Repeated --parallel-world.");
       parallelWorld = true;
+    } else if (arg === "--diagnostic-reveal-ores") {
+      if (revealOres) throw new Error("Repeated --diagnostic-reveal-ores.");
+      revealOres = true;
     } else {
       args.push(arg);
       // A free-form strategy task may literally be "--parallel-world".
@@ -177,7 +181,7 @@ function readParallelWorld(rawArgs: string[]) {
     }
   }
   if (parallelWorld && args[0]?.startsWith("--diagnostic-")) throw new Error(parallelWorldUsage);
-  return { args, parallelWorld };
+  return { args, parallelWorld, revealOres };
 }
 
 function parseArgs(args: string[]) {
@@ -803,6 +807,9 @@ function goalMilestones(goal: Goal, progress: PlayingProgress, highWater: Map<st
     capped("ironIngots", count("iron_ingot"), 3);
     capped("ironPickaxe", count("iron_pickaxe"), 1);
     if (tier >= 3) capped("diamond", count("diamond"), tier === 3 ? 1 : 3);
+    if (goal === "diamond_pickaxe") {
+      capped("diamondPickaxe", count("diamond_pickaxe"), 1);
+    }
     if (progress.y <= 20 && progress.rock_broken && progress.status.startsWith("branch mining ")) {
       // A horizontal prospecting tunnel can legitimately run longer than the stall
       // window. Count rock actually broken, not requested digs or repeated rotations.
@@ -830,8 +837,8 @@ function goalMilestones(goal: Goal, progress: PlayingProgress, highWater: Map<st
 
 async function run(goal: Goal, seconds: number, parentRun: string | undefined, diagnostic: Diagnostic | undefined,
     strategyOptions?: StrategyOptions, macroTrial?: MacroTrialLaunch,
-    { recoveryMode, orphanScope, parallelWorld = false }: {
-      recoveryMode?: "previous-boot" | "same-boot"; orphanScope?: string; parallelWorld?: boolean;
+    { recoveryMode, orphanScope, parallelWorld = false, revealOres = false }: {
+      recoveryMode?: "previous-boot" | "same-boot"; orphanScope?: string; parallelWorld?: boolean; revealOres?: boolean;
     } = {}) {
   const display = await isolatedDisplay();
   const actorJar = macroTrial ? macroTrialActor(macroTrial.ordinaryDir) : AGENT_JAR;
@@ -866,8 +873,11 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     throw new Error("Unknown Survival artifact campaign.");
   if (artifactCampaign && diagnostic)
     throw new Error("The recovery-development artifact campaign is only available for ordinary Survival runs.");
-  const claimScope = macroTrial ? "prepared-skill-trial" : diagnostic === "incident-replay" ? "incident-replay" :
+  const claimScope = revealOres ? "ore-assisted-diagnostic" : macroTrial ? "prepared-skill-trial" : diagnostic === "incident-replay" ? "incident-replay" :
     provisioned ? "prepared-diagnostic" : parentRun ? "continuation-chain" : "fresh-attempt";
+  const oreAssistance = revealOres
+    ? { kind: "diagnostic-loaded-ore-coordinates" as const, ores: ["coal", "iron", "diamond"] as const, campaignProof: false as const }
+    : undefined;
   const descentMonitor = descent ? monitorDescent(descent) : null;
   const videoBytes = 32_000_000 + seconds * 600_000;
   const reserveBytes = videoBytes + 1_000_000_000;
@@ -954,13 +964,13 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
     };
     const video = path.join(dir, "screen.mp4");
     const live = { run: path.basename(dir), display: display.display, authority: display.authority };
-    const benchmark = diagnostic ? undefined : { goal, verifier: "vanilla-survival", claimScope };
+    const benchmark = diagnostic ? undefined : { goal, verifier: "vanilla-survival", claimScope,
+      ...(oreAssistance ? { campaignProof: false, assistance: oreAssistance.kind } : {}) };
     const nativeClient = modelDeclaration ? Promise.withResolvers<Owned | undefined>() : undefined;
-    const expeditionAdvisor = localOptions && composeExpeditionAdvisor({
+    const expeditionAdvisor = localOptions && composeMacroStrategist({
       model: localOptions.model,
       dir, goal, objective: localOptions.task ?? "", authDirectory: process.env.GAMEHARNESS_DATA_DIR ?? RUNTIME,
       signal, maxRequests: localOptions.maxRequests, maxRuntimeMs: wallMs,
-      captureRecoveryFrame: createRecoveryFrameCapture({ dir, display, ...SCREEN, ffmpeg, signal }),
       assertDisplay: () => {
         if (!display.stillOwned()) throw new Error("The run no longer owns its private Minecraft display.");
       },
@@ -1047,6 +1057,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       await privateJson(path.join(dir, "declaration.json"), {
         schemaVersion: 1, startedAt, goal, minecraftVersion: "1.21.4", agentJarSha256,
         world, claimScope, deathPolicy,
+        ...(oreAssistance ? { assistance: oreAssistance, campaignProof: false } : {}),
         ...(executionSlot ? { executionSlot } : {}),
         ...(!macroTrial ? { pauseDiagnostics: PAUSE_DIAGNOSTICS } : {}),
         ...(benchmark ? { benchmark, strategy: expeditionAdvisor?.declaration ?? modelDeclaration ?? DETERMINISTIC_STRATEGY } : {}),
@@ -1263,6 +1274,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
       const parentDeath = source?.parentDeath;
       const launched = await launcher.launchAgent({
         runtimeCache: RUNTIME, port, goal, evidenceDir: dir, ...display,
+        revealOresDiagnostic: revealOres,
         onSetup: (phase) => { stage = phase; },
         beforeConnect: provisioned ? async (profileName) => {
           stage = "diagnostic_provisioning";
@@ -1641,6 +1653,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
         result = new Stop("failed", "The vanilla goal was verified, but no Model-issued effect was confirmed.");
       const outcome = {
         schemaVersion: 1, status: result.status, reason: result.message, goal, startedAt, world, claimScope, deathPolicy,
+        ...(oreAssistance ? { assistance: oreAssistance, campaignProof: false } : {}),
         ...(executionSlot ? { executionSlot } : {}),
         finishedAt: new Date().toISOString(), durationMs: Math.round(performance.now() - start),
         finalStage: stage, reservedBytes: reserveBytes, measuredBytes, progress: lastProgress,
@@ -1698,7 +1711,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
 }
 
 try {
-  const { args, parallelWorld } = readParallelWorld(process.argv.slice(2));
+  const { args, parallelWorld, revealOres } = readParallelWorld(process.argv.slice(2));
   let diagnosticStrategy: StrategyOptions | undefined;
   const needsDiagnosticModel = args[0] === "--diagnostic-urgent-creeper" ||
     (args[0] === "--diagnostic-terrain" && (args[1] === "wade-model" || args[1] === "brake-model"));
@@ -1734,7 +1747,7 @@ try {
     if (recoveryMode === "same-boot" && !orphanAutosaveProvenance.shape.sourceScope.safeParse(orphanScope).success)
       throw new Error("Set SURVIVAL_AGENT_ORPHAN_SCOPE to the source systemd user .scope unit.");
     process.umask(0o077);
-    process.exitCode = await run(goal, seconds, parentRun, diagnostic, model ?? diagnosticStrategy, undefined, { recoveryMode, orphanScope, parallelWorld });
+    process.exitCode = await run(goal, seconds, parentRun, diagnostic, model ?? diagnosticStrategy, undefined, { recoveryMode, orphanScope, parallelWorld, revealOres });
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : "Run failed.");

@@ -84,6 +84,8 @@ final class TaskRunner {
     private int activeTicks;
     private int replanCooldown;
     private int noMineProgressTicks;
+    private int occludedTargetTicks;
+    private BlockPos lastOccludedTarget;
     private String statusText = "starting";
     private boolean safeExcavationMode = true;
     private int localSeq;
@@ -511,7 +513,11 @@ final class TaskRunner {
             : Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
         RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.6), opts, currentTick);
         statusText = "approaching tree";
-        if (st == RouteExecutor.Status.STUCK) {
+        if (st == RouteExecutor.Status.COMPLETE) {
+            if (!handleOccludedTargetComplete(player, world, activeTargetBlock, true, "clearing view to tree")) {
+                activeTargetBlock = null;
+            }
+        } else if (st == RouteExecutor.Status.STUCK) {
             if (!underground) {
                 // Might be standing in a sunlit 2-deep pit: try climbing out with mining-capable A* before giving up on the tree!
                 RouteExecutor.Status esc = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.6),
@@ -879,7 +885,11 @@ final class TaskRunner {
         int dy = activeTargetBlock.getY() - player.getBlockY();
         int dist = (int) Math.round(Math.sqrt(activeTargetBlock.getSquaredDistance(player.getBlockPos())));
         statusText = "mining route to " + active.target() + " (" + dist + "m, dy=" + dy + ")";
-        if (st == RouteExecutor.Status.STUCK) {
+        if (st == RouteExecutor.Status.COMPLETE) {
+            if (!handleOccludedTargetComplete(player, world, activeTargetBlock, true, "clearing view to " + active.target() + " ore")) {
+                activeTargetBlock = null;
+            }
+        } else if (st == RouteExecutor.Status.STUCK) {
             // If stuck on one target, defer it and try the next nearest ore!
             blacklistedTargets.add(activeTargetBlock);
             activeTargetBlock = null;
@@ -1244,9 +1254,15 @@ final class TaskRunner {
                 statusText = "harvesting sweet berries";
                 return;
             }
-            navigateToward(player, Pathfinder.Goal.interactReach(berry, 3.2),
+            RouteExecutor.Status bst = navigateToward(player, Pathfinder.Goal.interactReach(berry, 3.2),
                 Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f), currentTick);
             statusText = "walking to berry bush";
+            if (bst == RouteExecutor.Status.STUCK || bst == RouteExecutor.Status.COMPLETE) {
+                if (bst == RouteExecutor.Status.STUCK || !handleOccludedTargetComplete(player, world, berry, false, "clearing view to berry bush")) {
+                    blacklistedTargets.add(berry);
+                    route.clear();
+                }
+            }
             return;
         }
 
@@ -1447,7 +1463,9 @@ final class TaskRunner {
                 RouteExecutor.Status bst = navigateToward(player, Pathfinder.Goal.interactReach(bonusOre, 3.3),
                     Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
                 statusText = "approaching exposed cave ore";
-                if (bst == RouteExecutor.Status.STUCK) {
+                if (bst == RouteExecutor.Status.COMPLETE) {
+                    handleOccludedTargetComplete(player, world, bonusOre, true, "clearing view to cave ore");
+                } else if (bst == RouteExecutor.Status.STUCK) {
                     blacklistedTargets.add(bonusOre);
                     route.clear();
                 }
@@ -1823,7 +1841,11 @@ final class TaskRunner {
             Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
             RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.3), opts, currentTick);
             statusText = "approaching gravel for flint";
-            if (st == RouteExecutor.Status.STUCK) {
+            if (st == RouteExecutor.Status.COMPLETE) {
+                if (!handleOccludedTargetComplete(player, world, activeTargetBlock, true, "clearing view to gravel")) {
+                    activeTargetBlock = null;
+                }
+            } else if (st == RouteExecutor.Status.STUCK) {
                 blacklistedTargets.add(activeTargetBlock);
                 activeTargetBlock = null;
                 route.clear();
@@ -2837,6 +2859,10 @@ final class TaskRunner {
 
     /** Raycast from eye to target workstation center to find a single safe diggable corner block blocking sight. */
     private BlockPos findSafeOccludingBlock(ClientPlayerEntity player, ClientWorld world, BlockPos target) {
+        return findSafeOccludingBlock(player, world, target, false);
+    }
+
+    private BlockPos findSafeOccludingBlock(ClientPlayerEntity player, ClientWorld world, BlockPos target, boolean allowBelowTarget) {
         Vec3d eye = player.getEyePos();
         Vec3d center = Vec3d.ofCenter(target);
         net.minecraft.util.hit.BlockHitResult hit = world.raycast(new net.minecraft.world.RaycastContext(
@@ -2844,7 +2870,7 @@ final class TaskRunner {
             net.minecraft.world.RaycastContext.FluidHandling.NONE, player));
         if (hit.getType() != net.minecraft.util.hit.HitResult.Type.BLOCK) return null;
         BlockPos hp = hit.getBlockPos();
-        if (hp.equals(target) || hp.equals(target.down())) return null;
+        if (hp.equals(target) || (!allowBelowTarget && hp.equals(target.down()))) return null;
         if (eye.squaredDistanceTo(Vec3d.ofCenter(hp)) > Motor.REACH_SQ) return null;
         BlockState st = world.getBlockState(hp);
         if (st.isAir() || !st.getFluidState().isEmpty()) return null;
@@ -2855,6 +2881,39 @@ final class TaskRunner {
         if (perception.isNearKnownLava(hp.getX(), hp.getY(), hp.getZ())) return null;
         if (perception.isNearKnownFluidAboveOrSide(hp.getX(), hp.getY(), hp.getZ())) return null;
         return hp;
+    }
+
+    /**
+     * Handles the case where Goal.interactReach(target) returns COMPLETE (already inside reach radius)
+     * yet motor.findAimPoint(target) is null because an adjacent corner block occludes line of sight.
+     * Clears one safe occluding block or blacklists target so we never stall forever on an occluded target!
+     * Returns true if still actively clearing occlusion, false if target was blacklisted & abandoned.
+     */
+    private boolean handleOccludedTargetComplete(ClientPlayerEntity player, ClientWorld world,
+                                                 BlockPos target, boolean allowDigBlocker, String label) {
+        if (lastOccludedTarget == null || !lastOccludedTarget.equals(target)) {
+            lastOccludedTarget = target;
+            occludedTargetTicks = 0;
+        }
+        if (allowDigBlocker) {
+            BlockPos blocker = findSafeOccludingBlock(player, world, target, true);
+            if (blocker != null) {
+                boolean broken = motor.mineBlock(blocker, true, false);
+                statusText = label;
+                if (broken || motor.breakingProgress() > 0.01f) {
+                    occludedTargetTicks = 0;
+                    return true;
+                }
+            }
+        }
+        if (++occludedTargetTicks > 35) {
+            blacklistedTargets.add(target);
+            occludedTargetTicks = 0;
+            lastOccludedTarget = null;
+            route.clear();
+            return false;
+        }
+        return true;
     }
 
     private static int remainingIronPickDurability(ClientPlayerEntity player) {
@@ -2944,7 +3003,11 @@ final class TaskRunner {
         Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
         RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.interactReach(smeltChoreTarget, 3.2), opts, currentTick);
         statusText = "gathering nearby while smelting (" + remSec + "s)";
-        if (st == RouteExecutor.Status.STUCK) {
+        if (st == RouteExecutor.Status.COMPLETE) {
+            if (!handleOccludedTargetComplete(player, world, smeltChoreTarget, true, "clearing view for smelt chore")) {
+                smeltChoreTarget = null;
+            }
+        } else if (st == RouteExecutor.Status.STUCK) {
             blacklistedTargets.add(smeltChoreTarget);
             smeltChoreTarget = null;
             route.clear();

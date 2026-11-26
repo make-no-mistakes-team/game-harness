@@ -74,6 +74,7 @@ final class SurvivalReflexes {
     private int shelterBlockedTicks;
     private int shelterSealedTicks;
     private int shelterUnsealTicks;
+    private int shelterCooldownTicks;
     private int manualShelterTicks;
     private int shelterBlocksPlaced;
     private boolean shelterEverSealed;
@@ -107,6 +108,7 @@ final class SurvivalReflexes {
         shelterBlockedTicks = 0;
         shelterSealedTicks = 0;
         shelterUnsealTicks = 0;
+        shelterCooldownTicks = 0;
         manualShelterTicks = 0;
     }
 
@@ -156,6 +158,7 @@ final class SurvivalReflexes {
         trackVitalsAndShield(player);
         if (creeperRetreatTicks > 0) creeperRetreatTicks--;
         if (recentBlockTicks > 0) recentBlockTicks--;
+        if (shelterCooldownTicks > 0) shelterCooldownTicks--;
         if (manualShelterTicks > 0) manualShelterTicks--;
         strafeFlipTicks++;
         if (strafeFlipTicks >= 28) {
@@ -719,8 +722,18 @@ final class SurvivalReflexes {
 
     // ===================== EMERGENCY SHELTER / BURROW-IN =====================
 
+    private void abortShelter(int cooldownTicks) {
+        shelterState = ShelterState.NONE;
+        shelterBuildTicks = 0;
+        shelterBlockedTicks = 0;
+        shelterCooldownTicks = Math.max(shelterCooldownTicks, cooldownTicks);
+        if (combatStance == CombatPlanner.CombatStance.SHELTER) {
+            combatStance = CombatPlanner.CombatStance.AUTO;
+        }
+    }
+
     private void beginShelter(ClientPlayerEntity player, ClientWorld world) {
-        if (player == null || world == null) return;
+        if (player == null || world == null || shelterCooldownTicks > 0) return;
         BlockPos feet = player.getBlockPos();
         int blocks = Motor.countShelterBlocks(player);
         boolean hasDig = Motor.hasDigTool(player);
@@ -771,8 +784,8 @@ final class SurvivalReflexes {
             case BUILDING -> {
                 shelterBuildTicks++;
                 if (shelterBuildTicks > 180) {
-                    // Timed out trying to build — abort back to combat/flee
-                    shelterState = ShelterState.NONE;
+                    // Timed out trying to build — reset SHELTER stance & add cooldown so we don't loop on an unsealable tile!
+                    abortShelter(100);
                     return false;
                 }
                 return tickShelterBuild(player, world);
@@ -900,8 +913,7 @@ final class SurvivalReflexes {
                     return true;
                 }
                 if (shelterBlockedTicks > 48) {
-                    shelterState = ShelterState.NONE;
-                    shelterBlockedTicks = 0;
+                    abortShelter(100);
                     activeStatus = "leaving unsealable ledge";
                     return false;
                 }
@@ -920,8 +932,7 @@ final class SurvivalReflexes {
                 return true;
             }
             if (shelterBlockedTicks > 30) {
-                shelterState = ShelterState.NONE;
-                shelterBlockedTicks = 0;
+                abortShelter(100);
                 activeStatus = "leaving unsealable ledge";
                 return false;
             }

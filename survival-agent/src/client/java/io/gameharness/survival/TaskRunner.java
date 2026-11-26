@@ -130,6 +130,7 @@ final class TaskRunner {
     private int lastAutoTorchTick = -300;
     private int waterFillAimStableTicks;
     private int waterFillCooldownTicks;
+    private int waterFillStuckTicks;
     private BlockPos placedGravelPos;
     private int oreTargetTicks;
 
@@ -178,6 +179,7 @@ final class TaskRunner {
         noMineProgressTicks = 0;
         waterFillAimStableTicks = 0;
         waterFillCooldownTicks = 0;
+        waterFillStuckTicks = 0;
         placedGravelPos = null;
         if (descent != null) descent.resetForLife();
         if (caves != null) caves.resetForLife();
@@ -1934,6 +1936,7 @@ final class TaskRunner {
     private void tickFillWater(ClientPlayerEntity player, ClientWorld world, int currentTick) {
         if (GuiHands.countItem(player, Items.WATER_BUCKET) > 0) {
             waterFillAimStableTicks = 0;
+            waterFillStuckTicks = 0;
             finishActive("completed", "filled water bucket", currentTick);
             return;
         }
@@ -1947,36 +1950,43 @@ final class TaskRunner {
         }
         int bucketSlot = motor.findHotbarItem(Items.BUCKET);
 
-        // Find nearest observed STILL water source
+        // Prefer any directly visible, unobstructed STILL water source within reach first
+        // (avoids staring at a bank-occluded water block right under the grass edge!).
+        BlockPos directWater = null;
+        double bestDirectSq = 4.2 * 4.2;
         BlockPos waterTarget = null;
         double bestSq = 48.0 * 48.0;
         BlockPos feet = player.getBlockPos();
+        Vec3d eye = player.getEyePos();
         for (BlockPos w : perception.observedWater()) {
             if (blacklistedTargets.contains(w)) continue;
             var fs = world.getBlockState(w).getFluidState();
             if (!fs.isIn(net.minecraft.registry.tag.FluidTags.WATER) || !fs.isStill()) continue;
+            Vec3d surfaceAim = new Vec3d(w.getX() + 0.5, w.getY() + 0.85, w.getZ() + 0.5);
+            double eyeSq = eye.squaredDistanceTo(surfaceAim);
+            if (eyeSq <= bestDirectSq) {
+                var losHit = world.raycast(new net.minecraft.world.RaycastContext(
+                    eye, surfaceAim, net.minecraft.world.RaycastContext.ShapeType.OUTLINE,
+                    net.minecraft.world.RaycastContext.FluidHandling.SOURCE_ONLY, player));
+                if (losHit.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK) {
+                    var hitFs = world.getBlockState(losHit.getBlockPos()).getFluidState();
+                    if (hitFs.isIn(net.minecraft.registry.tag.FluidTags.WATER) && hitFs.isStill()) {
+                        bestDirectSq = eyeSq;
+                        directWater = losHit.getBlockPos().toImmutable();
+                    }
+                }
+            }
             double dSq = w.getSquaredDistance(feet);
             if (dSq < bestSq) {
                 bestSq = dSq;
                 waterTarget = w;
             }
         }
-        if (waterTarget == null) {
-            if (isUndergroundWithoutCave(player, world)) {
-                climbToSurface(player, world, currentTick, "climbing to surface to find water");
-            } else {
-                exploreForResources(player, world, currentTick, "searching for water source");
-            }
-            return;
-        }
-
-        Vec3d aim = new Vec3d(waterTarget.getX() + 0.5, waterTarget.getY() + 0.65, waterTarget.getZ() + 0.5);
-        double eyeDistSq = player.getEyePos().squaredDistanceTo(aim);
-        if (eyeDistSq <= 4.1 * 4.1) {
+        if (directWater != null) {
+            Vec3d aim = new Vec3d(directWater.getX() + 0.5, directWater.getY() + 0.85, directWater.getZ() + 0.5);
             player.getInventory().selectedSlot = bucketSlot;
             motor.lookAtPoint(aim, Motor.LookMode.FINE);
             statusText = "filling water bucket";
-            Vec3d eye = player.getEyePos();
             Vec3d end = eye.add(player.getRotationVec(1.0f).multiply(4.4));
             var hit = world.raycast(new net.minecraft.world.RaycastContext(
                 eye, end, net.minecraft.world.RaycastContext.ShapeType.OUTLINE,
@@ -1993,25 +2003,43 @@ final class TaskRunner {
                         player.swingHand(net.minecraft.util.Hand.MAIN_HAND);
                         waterFillCooldownTicks = 6;
                         waterFillAimStableTicks = 0;
+                        waterFillStuckTicks = 0;
                     }
                 }
             } else {
                 waterFillAimStableTicks = 0;
+                if (++waterFillStuckTicks > 40) {
+                    blacklistedTargets.add(directWater);
+                    waterFillStuckTicks = 0;
+                }
+            }
+            return;
+        }
+        if (waterTarget == null) {
+            if (isUndergroundWithoutCave(player, world)) {
+                climbToSurface(player, world, currentTick, "climbing to surface to find water");
+            } else {
+                exploreForResources(player, world, currentTick, "searching for water source");
             }
             return;
         }
 
         waterFillAimStableTicks = 0;
+        waterFillStuckTicks = 0;
         boolean underground = isUndergroundOrRoofed(player, world);
         Pathfinder.Options opts = underground
             ? Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true)
             : Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
-        RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(waterTarget.up(), 2.8), opts, currentTick);
+        RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(waterTarget.up(), 1.8), opts, currentTick);
         statusText = "walking to water source";
-        if (st == RouteExecutor.Status.STUCK) {
+        if (st == RouteExecutor.Status.COMPLETE) {
+            // Arrived right next to waterTarget yet still no unobstructed SOURCE_ONLY raycast — blacklist & try next water block!
+            blacklistedTargets.add(waterTarget);
+            route.clear();
+        } else if (st == RouteExecutor.Status.STUCK) {
             if (!underground) {
                 replanCooldown = 0;
-                RouteExecutor.Status esc = navigateToward(player, Pathfinder.Goal.near(waterTarget.up(), 2.8),
+                RouteExecutor.Status esc = navigateToward(player, Pathfinder.Goal.near(waterTarget.up(), 1.8),
                     Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
                 if (esc == RouteExecutor.Status.RUNNING) {
                     statusText = "climbing out toward water source";

@@ -519,16 +519,18 @@ final class TaskRunner {
             }
         } else if (st == RouteExecutor.Status.STUCK) {
             if (!underground) {
-                // Might be standing in a sunlit 2-deep pit: try climbing out with mining-capable A* before giving up on the tree!
+                // Clear replanCooldown so the mining fallback actually runs instead of returning RUNNING!
+                replanCooldown = 0;
                 RouteExecutor.Status esc = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.6),
                     Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
-                if (esc != RouteExecutor.Status.STUCK) {
+                if (esc == RouteExecutor.Status.RUNNING) {
                     statusText = "climbing out toward tree";
                     return;
                 }
             }
             blacklistedTargets.add(activeTargetBlock);
             activeTargetBlock = null;
+            route.clear();
         }
     }
 
@@ -2288,6 +2290,7 @@ final class TaskRunner {
         if (st == RouteExecutor.Status.STUCK) {
             // Try a slightly nearer upward step if a rock lip blocked the full surface climb
             route.clear();
+            replanCooldown = 0;
             navigateToward(player, Pathfinder.Goal.climbToY(player.getBlockY() + 4), opts, currentTick);
         }
     }

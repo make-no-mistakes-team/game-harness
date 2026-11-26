@@ -610,9 +610,9 @@ final class Pathfinder {
         if (st.isIn(BlockTags.LOGS)) return 18.0;
         if (st.isOf(Blocks.OBSIDIAN)) return -1.0; // never casually tunnel through obsidian!
 
-        // Hard rock / ore: require a suitable pickaxe (so we don't try punching stone/deepslate by hand)
+        // Hard rock / sandstone / terracotta / ore: require a suitable pickaxe (never punch tool-required blocks bare-handed!)
         double hardness = Math.max(0.2, st.getHardness(null, BlockPos.ORIGIN));
-        if (st.isToolRequired() && hardness >= 1.0 && !hasSuitableHotbarTool(player, st)) {
+        if (st.isToolRequired() && !hasSuitableHotbarTool(player, st)) {
             return -1.0;
         }
         double speed = bestHotbarSpeed(player, st);

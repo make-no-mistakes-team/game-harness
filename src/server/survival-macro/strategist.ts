@@ -474,12 +474,16 @@ export function composeMacroStrategist(options: StrategistOptions) {
         const visibleHostiles = st.combat?.visibleThreatCount ?? 0;
         const freshHostileOnset = visibleHostiles > 0 && prevVisibleHostiles === 0
           && now - lastHostileRequestAt >= 25_000;
-        const criticalCombat = st.health < 12 || Boolean(st.combat?.trapped)
-          || (visibleHostiles >= 2 && !st.combat?.armed);
+        const criticalCombat = visibleHostiles > 0 && !st.combat?.shelterSealed && (
+          st.health < 12
+          || Boolean(st.combat?.trapped)
+          || (visibleHostiles >= 2 && !st.combat?.armed)
+        );
         const urgent = criticalCombat || lastFailed || freshHostileOnset;
+        const cooldownMs = (criticalCombat || freshHostileOnset) ? MIN_COOLDOWN_MS : (lastFailed ? 8_000 : 18_000);
         const shouldCall = (!midDescent || urgent)
           && requests < options.maxRequests
-          && now - lastRequestAt >= (urgent ? MIN_COOLDOWN_MS : 18_000)
+          && now - lastRequestAt >= cooldownMs
           && (requests === 0 || (queueLow && key !== lastTriggerKey) || (urgent && key !== lastTriggerKey)
               || (st.queuedTasks.length === 0 && now - lastRequestAt >= 25_000));
 

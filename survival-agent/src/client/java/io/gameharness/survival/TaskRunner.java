@@ -476,11 +476,16 @@ final class TaskRunner {
                 }
                 return;
             }
-            // If we spotted distant tree leaves (canopy up to 64m away), head toward those trees!
+            // If we spotted distant tree leaves (canopy up to 64m away), steer toward them through exploreForResources
+            // so stuck-wall detection & pit climb-out still run if we are inside a shallow hole/pit!
             BlockPos leaves = perception.nearestObserved(perception.observedLeaves(), feet, 64.0, blacklistedTargets);
-            if (leaves != null && leaves.getSquaredDistance(feet) > 16.0) {
-                exploreHeadingRad = Math.atan2(leaves.getZ() - feet.getZ(), leaves.getX() - feet.getX());
-                walkDryHeading(player, world, exploreHeadingRad, currentTick, "heading toward visible trees");
+            if (leaves != null && leaves.getSquaredDistance(feet) > 16.0
+                    && exploreStuckTicks == 0 && exploreFlipCount == 0 && !exploreClimbingOut) {
+                double leafRad = Math.atan2(leaves.getZ() - feet.getZ(), leaves.getX() - feet.getX());
+                if (!isHeadingIntoWaterOrWall(player, world, leafRad)) {
+                    exploreHeadingRad = leafRad;
+                }
+                exploreForResources(player, world, currentTick, "heading toward visible trees");
                 return;
             }
             // Smoothly look around & walk over dry land to spot trees!

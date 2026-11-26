@@ -351,9 +351,10 @@ final class TaskRunner {
             route.clear();
         }
 
-        boolean underground = world.getLightLevel(net.minecraft.world.LightType.SKY, feet) == 0;
+        boolean underground = world.getLightLevel(net.minecraft.world.LightType.SKY, feet) <= 10
+            || hasRockRoofAbove(world, feet);
         if (activeTargetBlock == null) {
-            // If underground inside a cave/tunnel, climb/staircase back up to the surface instead of walking into stone walls!
+            // If underground inside a cave/tunnel/pocket, climb/staircase back up to the surface instead of walking into walls!
             if (underground) {
                 Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
                 int surfaceY = Math.max(feet.getY() + 8, 66);
@@ -400,13 +401,22 @@ final class TaskRunner {
         }
         noMineProgressTicks = 0;
 
-        // Navigate toward log (use mining pathfinder if underground so we can dig/staircase out to surface trees!)
+        // Navigate toward log (use mining pathfinder if underground OR inside a pit where surface route can't climb out!)
         Pathfinder.Options opts = underground
             ? Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true)
             : Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
         RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.6), opts, currentTick);
         statusText = "approaching tree";
         if (st == RouteExecutor.Status.STUCK) {
+            if (!underground) {
+                // Might be standing in a sunlit 2-deep pit: try climbing out with mining-capable A* before giving up on the tree!
+                RouteExecutor.Status esc = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.6),
+                    Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
+                if (esc != RouteExecutor.Status.STUCK) {
+                    statusText = "climbing out toward tree";
+                    return;
+                }
+            }
             blacklistedTargets.add(activeTargetBlock);
             activeTargetBlock = null;
         }

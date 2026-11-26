@@ -31,11 +31,12 @@ Available task kinds:
 
 Strategic rules:
 1. Respect Minecraft's tech tree: wood -> crafting_table + wooden_pickaxe -> cobblestone -> stone_pickaxe + furnace (+ stone_sword for safety!) -> coal/torches + iron_ore -> smelt raw_iron -> iron_pickaxe -> diamond_ore (3 diamonds) -> diamond_pickaxe.
-2. Keep wood/sticks in reserve before descending deep underground (so you can craft iron_pickaxe or diamond_pickaxe underground without climbing back up!).
+2. Keep wood/sticks in reserve AND a spare stone_pickaxe before descending deep underground (so iron_pickaxe durability is conserved for ores/diamonds instead of breaking on stone/deepslate, and diamond_pickaxe can be crafted underground!).
 3. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
-4. If health is low (< 12) or food is low (<= 10) and no food is carried, prioritize gather_food (or smelt raw_meat) when safe before risky mining.
-5. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
-6. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
+4. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.
+5. During long smelts (activeFurnace present), the local player automatically mines nearby ore/stone or chops nearby wood when safe and returns before smelting finishes — do not interrupt an active smelt unless urgent.
+6. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
+7. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
 
 const TASK_KINDS = [
   "gather_wood", "mine_stone", "mine_ore", "craft", "smelt",

@@ -280,7 +280,7 @@ final class GuiHands {
                 }
                 pendingRecipe = null;
                 if (screenOpenedBeatPending) {
-                    waitUntilNs = System.nanoTime() + randMs(170, 250);
+                    waitUntilNs = System.nanoTime() + randMs(90, 140);
                     screenOpenedBeatPending = false;
                 }
             } else if (pendingHotbarSwap) {
@@ -290,7 +290,7 @@ final class GuiHands {
                 }
                 pendingHotbarSwap = false;
                 if (screenOpenedBeatPending) {
-                    waitUntilNs = System.nanoTime() + randMs(160, 230);
+                    waitUntilNs = System.nanoTime() + randMs(85, 130);
                     screenOpenedBeatPending = false;
                 }
             } else if (pendingFurnaceLoad) {
@@ -307,7 +307,7 @@ final class GuiHands {
                 }
                 pendingFurnaceLoad = false;
                 if (screenOpenedBeatPending) {
-                    waitUntilNs = System.nanoTime() + randMs(180, 260);
+                    waitUntilNs = System.nanoTime() + randMs(95, 145);
                     screenOpenedBeatPending = false;
                 }
             } else if (pendingFurnaceCollect) {
@@ -328,14 +328,14 @@ final class GuiHands {
                     return;
                 }
                 if (screenOpenedBeatPending) {
-                    waitUntilNs = System.nanoTime() + randMs(180, 260);
+                    waitUntilNs = System.nanoTime() + randMs(95, 145);
                     screenOpenedBeatPending = false;
                 }
             } else {
-                // Queue drained — wait a natural beat before closing the GUI so item transfers are clearly visible!
+                // Queue drained — short natural beat before closing GUI so item transfers stay readable!
                 long now = System.nanoTime();
                 if (closeAfterNs == 0L) {
-                    closeAfterNs = now + randMs(180, 250);
+                    closeAfterNs = now + randMs(100, 150);
                     return;
                 }
                 if (now < closeAfterNs) return;
@@ -349,7 +349,7 @@ final class GuiHands {
         return (minMs + pacingRng.nextInt(Math.max(1, maxMs - minMs + 1))) * 1_000_000L;
     }
 
-    /** Called every render frame (60fps) for smooth, natural human-paced GUI cursor motion and clicks! */
+    /** Called every render frame (60fps) for smooth, skilled human-paced GUI cursor motion and clicks! */
     void renderFrame() {
         if (state != State.WORKING) return;
         if (!(client.currentScreen instanceof HandledScreen<?> screen)) return;
@@ -383,23 +383,22 @@ final class GuiHands {
 
         if (!pointer.matches(slotLeft, slotTop, 16.0, 16.0, scaleX, scaleY)) {
             pointer.plan(now, curGuiX, curGuiY, slotLeft, slotTop, 16.0, 16.0, scaleX, scaleY,
-                false, pointer.vx * 0.30, pointer.vy * 0.30, nextX, nextY);
+                false, pointer.vx * 0.35, pointer.vy * 0.35, nextX, nextY);
         }
-        // Unhurried, readable human pointer glide (~0.76x base speed so every arc & deceleration is clearly visible!)
-        long pacedNow = actionStartedNs + (long) ((now - actionStartedNs) * 0.76);
+        // Balanced skilled-human pointer speed (~1.05x base Bezier curve — smooth, crisp, never abrupt!)
+        long pacedNow = actionStartedNs + (long) ((now - actionStartedNs) * 1.05);
         pointer.advance(pacedNow);
         movePointerTo(pointer.x, pointer.y);
 
-        // Wait for pointer to settle cleanly inside the target slot before clicking (no abrupt mid-flight snap-clicks!)
         boolean readyToClick = pointer.settled
-            || (pointer.braking && pointer.inside(pointer.x, pointer.y) && (now - actionStartedNs) >= 135_000_000L);
+            || (pointer.braking && pointer.inside(pointer.x, pointer.y) && (now - actionStartedNs) >= 85_000_000L);
         if (!clickedActive && readyToClick) {
             executeClick(screen, activeAction, pointer.x, pointer.y);
             clickedActive = true;
-            // Varied human inter-click rhythm: slightly brisker placing adjacent grid items, unhurried on pickups/outputs
+            // Balanced varied human inter-click rhythm
             boolean rapidPlace = activeAction.kind() == ClickKind.RIGHT && next != null && next.kind() == ClickKind.RIGHT;
             boolean takingResult = activeAction.kind() == ClickKind.SHIFT_RESULT;
-            waitUntilNs = now + (rapidPlace ? randMs(85, 130) : (takingResult ? randMs(150, 220) : randMs(115, 175)));
+            waitUntilNs = now + (rapidPlace ? randMs(60, 95) : (takingResult ? randMs(100, 145) : randMs(80, 125)));
             activeAction = null;
         }
     }

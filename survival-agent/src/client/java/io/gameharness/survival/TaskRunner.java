@@ -85,6 +85,8 @@ final class TaskRunner {
     private int smeltBatchSize;
     private boolean smeltLoaded;
     private boolean smeltCollecting;
+    private BlockPos smeltChoreTarget;
+    private int smeltChoreNoProgressTicks;
     private boolean recoveringWorkstation;
     private BlockPos workstationToRecover;
     private double exploreHeadingRad = 0.7;
@@ -134,6 +136,8 @@ final class TaskRunner {
     List<Task> queuedTasks() { return new ArrayList<>(queue); }
     List<TaskReceipt> recentReceipts() { return new ArrayList<>(recentReceipts); }
     int rockBrokenCount() { return rockBrokenCount; }
+    BlockPos activeSmeltFurnacePos() { return smeltLoaded ? placedFurnacePos : null; }
+    int activeSmeltRemainingTicks(int currentTick) { return smeltLoaded ? Math.max(0, smeltReadyTick - currentTick) : 0; }
 
     /** Accept a new macro plan from the asynchronous LLM strategist without stalling! */
     void applyModelPlan(List<Task> tasks, boolean replaceQueue, Boolean safeMode) {
@@ -844,13 +848,34 @@ final class TaskRunner {
             return;
         }
 
-        // Wait attentively while smelting (look around naturally to watch for hostiles!)
+        // While smelting: if >7s remain and healthy, do productive nearby work within ~11m of the furnace
+        // (mine nearby coal/iron ore, chop nearby logs, or mine nearby stone/widen workspace), then return in time!
         if (smeltLoaded && currentTick < smeltReadyTick) {
+            int remTicks = smeltReadyTick - currentTick;
+            double distToFurnaceSq = player.getBlockPos().getSquaredDistance(furnace);
+            boolean canDoProductiveChore = remTicks > 140
+                && player.getHealth() >= 13.0f
+                && perception.visibleHostiles().isEmpty()
+                && distToFurnaceSq <= 12.0 * 12.0;
+
+            if (canDoProductiveChore && doProductiveSmeltChore(player, world, furnace, currentTick, remTicks)) {
+                return;
+            }
+
+            // Otherwise (<= 7s left, low HP, or no useful chore nearby): walk back to furnace & watch attentively!
+            smeltChoreTarget = null;
+            if (distToFurnaceSq > 3.8 * 3.8) {
+                navigateToward(player, Pathfinder.Goal.interactReach(furnace, 3.2),
+                    Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
+                statusText = "returning to furnace (" + Math.max(0, remTicks / 20) + "s)";
+                return;
+            }
             float scanYaw = (float) (player.getYaw() + Math.sin(currentTick * 0.04) * 18.0);
             motor.lookAtAngles(scanYaw, 2.0f, Motor.LookMode.SCAN);
-            statusText = "waiting for furnace (" + Math.max(0, (smeltReadyTick - currentTick) / 20) + "s)";
+            statusText = "waiting for furnace (" + Math.max(0, remTicks / 20) + "s)";
             return;
         }
+        smeltChoreTarget = null;
 
         // Walk into reach of furnace and open it!
         if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(furnace)) > Motor.REACH_SQ) {
@@ -1408,6 +1433,113 @@ final class TaskRunner {
             }
         }
         return best;
+    }
+
+    /**
+     * Productive opportunistic work while a furnace is actively cooking nearby:
+     * mines nearby coal/iron ore, chops nearby logs if low on wood, or widens nearby stone within 10m of the furnace.
+     * Returns true if productive work was executed this tick; false to fall back to waiting by the furnace.
+     */
+    private boolean doProductiveSmeltChore(ClientPlayerEntity player, ClientWorld world,
+                                           BlockPos furnace, int currentTick, int remTicks) {
+        // Validate existing chore target (must stay close to furnace and still be a valid mineable block)
+        if (smeltChoreTarget != null) {
+            BlockState st = world.getBlockState(smeltChoreTarget);
+            if (st.isAir() || !st.getFluidState().isEmpty()
+                    || smeltChoreTarget.equals(furnace)
+                    || smeltChoreTarget.equals(furnace.down())
+                    || smeltChoreTarget.equals(placedTablePos)
+                    || smeltChoreTarget.getSquaredDistance(furnace) > 10.5 * 10.5
+                    || blacklistedTargets.contains(smeltChoreTarget)) {
+                smeltChoreTarget = null;
+                smeltChoreNoProgressTicks = 0;
+                route.clear();
+            }
+        }
+
+        if (smeltChoreTarget == null) {
+            smeltChoreTarget = pickProductiveSmeltChoreTarget(player, world, furnace);
+            smeltChoreNoProgressTicks = 0;
+            route.clear();
+        }
+        if (smeltChoreTarget == null) return false;
+
+        int remSec = Math.max(0, remTicks / 20);
+        if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(smeltChoreTarget)) <= Motor.REACH_SQ) {
+            boolean broken = motor.mineBlock(smeltChoreTarget, true, true);
+            statusText = "mining nearby while smelting (" + remSec + "s)";
+            if (broken) {
+                rockBrokenCount++;
+                perception.markOreRetired(smeltChoreTarget);
+                blacklistedTargets.add(smeltChoreTarget);
+                smeltChoreTarget = null;
+                smeltChoreNoProgressTicks = 0;
+            } else if (motor.breakingProgress() > 0.01f) {
+                smeltChoreNoProgressTicks = 0;
+            } else if (++smeltChoreNoProgressTicks > 40) {
+                blacklistedTargets.add(smeltChoreTarget);
+                smeltChoreTarget = null;
+                smeltChoreNoProgressTicks = 0;
+            }
+            return true;
+        }
+
+        Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+        RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.interactReach(smeltChoreTarget, 3.2), opts, currentTick);
+        statusText = "gathering nearby while smelting (" + remSec + "s)";
+        if (st == RouteExecutor.Status.STUCK) {
+            blacklistedTargets.add(smeltChoreTarget);
+            smeltChoreTarget = null;
+            route.clear();
+        }
+        return true;
+    }
+
+    private BlockPos pickProductiveSmeltChoreTarget(ClientPlayerEntity player, ClientWorld world, BlockPos furnace) {
+        BlockPos feet = player.getBlockPos();
+        BlockPos underFeet = feet.down();
+        int pickTier = bestPickaxeTier(player);
+
+        // 1. Nearby visible/revealed iron ore (if stone+ pickaxe) or coal ore (if wooden+ pickaxe) within 9.5m of furnace
+        if (pickTier >= 2) {
+            for (BlockPos pos : perception.nearestOreTargets(Perception.OreKind.IRON, furnace, 4, blacklistedTargets)) {
+                if (pos.getSquaredDistance(furnace) <= 9.5 * 9.5 && !perception.isNearKnownLava(pos.getX(), pos.getY(), pos.getZ())) {
+                    return pos;
+                }
+            }
+        }
+        if (pickTier >= 1 && GuiHands.countItem(player, Items.COAL) < 16) {
+            for (BlockPos pos : perception.nearestOreTargets(Perception.OreKind.COAL, furnace, 4, blacklistedTargets)) {
+                if (pos.getSquaredDistance(furnace) <= 9.5 * 9.5 && !perception.isNearKnownLava(pos.getX(), pos.getY(), pos.getZ())) {
+                    return pos;
+                }
+            }
+        }
+        // 2. Nearby visible logs if carrying fewer than 6 logs
+        if (GuiHands.countLogs(player) < 6) {
+            BlockPos log = perception.nearestObserved(perception.observedLogs(), furnace, 9.5, blacklistedTargets);
+            if (log != null && Math.abs(log.getY() - feet.getY()) <= 3) {
+                return log;
+            }
+        }
+        // 3. Nearby exposed stone block (if pickaxe carried & low-to-moderate cobblestone) — never under feet or furnace!
+        if (pickTier >= 1 && GuiHands.countStone(player) < 64) {
+            BlockPos bestStone = null;
+            double bestDistSq = 7.5 * 7.5;
+            for (BlockPos pos : perception.observedStone()) {
+                if (blacklistedTargets.contains(pos) || pos.equals(underFeet) || pos.equals(furnace) || pos.equals(furnace.down())) continue;
+                if (pos.getY() < feet.getY() || pos.getY() > feet.getY() + 2) continue;
+                double dFurn = pos.getSquaredDistance(furnace);
+                if (dFurn > bestDistSq) continue;
+                if (!isStoneBlock(world.getBlockState(pos))) continue;
+                if (perception.isNearKnownLava(pos.getX(), pos.getY(), pos.getZ())) continue;
+                if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(pos)) <= Motor.REACH_SQ && motor.findAimPoint(pos) == null) continue;
+                bestDistSq = dFurn;
+                bestStone = pos;
+            }
+            if (bestStone != null) return bestStone;
+        }
+        return null;
     }
 
     private BlockPos findPlacementSpotNearPlayer(ClientPlayerEntity player, ClientWorld world) {

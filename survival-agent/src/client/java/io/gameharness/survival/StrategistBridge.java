@@ -93,6 +93,15 @@ final class StrategistBridge {
         root.addProperty("safeExcavation", runner.isSafeExcavationMode());
         root.addProperty("combatFlowActive", perception.isCombatFlowActive());
         root.addProperty("diagnosticOreReveal", perception.isDiagnosticRevealOres());
+        BlockPos cookingPos = runner.activeSmeltFurnacePos();
+        if (cookingPos != null) {
+            JsonObject f = new JsonObject();
+            f.addProperty("x", cookingPos.getX());
+            f.addProperty("y", cookingPos.getY());
+            f.addProperty("z", cookingPos.getZ());
+            f.addProperty("remainingSec", runner.activeSmeltRemainingTicks((int) tick) / 20);
+            root.add("activeFurnace", f);
+        }
 
         // Inventory counts
         JsonObject inv = new JsonObject();

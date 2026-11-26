@@ -100,10 +100,13 @@ final class GuiHands {
     private boolean clickedActive;
     private long actionStartedNs;
     private long waitUntilNs;
+    private long closeAfterNs;
+    private boolean screenOpenedBeatPending;
     private double curGuiX, curGuiY;
     private boolean curPosInit;
     private boolean closeWhenDone;
     private int jobTicks;
+    private final java.util.Random pacingRng = new java.util.Random();
 
     // Pending job descriptors
     private RecipeId pendingRecipe;
@@ -134,6 +137,9 @@ final class GuiHands {
         pendingFurnaceCollect = false;
         needOpenInventory = false;
         closeWhenDone = false;
+        closeAfterNs = 0L;
+        waitUntilNs = 0L;
+        screenOpenedBeatPending = false;
         state = State.IDLE;
     }
 
@@ -236,7 +242,7 @@ final class GuiHands {
         if (player == null) { fail("no_player"); return; }
 
         jobTicks++;
-        if (jobTicks > 240) { fail("gui_timeout"); return; }
+        if (jobTicks > 480) { fail("gui_timeout"); return; }
 
         // Step 1: Open inventory if needed
         if (needOpenInventory) {
@@ -246,6 +252,7 @@ final class GuiHands {
             }
             if (client.currentScreen instanceof InventoryScreen) {
                 needOpenInventory = false;
+                screenOpenedBeatPending = true;
             } else {
                 sendKey(GLFW_KEY_ESCAPE);
                 return;
@@ -256,6 +263,9 @@ final class GuiHands {
         if (!(client.currentScreen instanceof HandledScreen<?> screen)) {
             if (jobTicks > 15) fail("screen_not_open");
             return;
+        }
+        if (jobTicks == 1) {
+            screenOpenedBeatPending = true;
         }
 
         // Step 3: Build click queue once screen is open & synced
@@ -269,12 +279,20 @@ final class GuiHands {
                     return;
                 }
                 pendingRecipe = null;
+                if (screenOpenedBeatPending) {
+                    waitUntilNs = System.nanoTime() + randMs(170, 250);
+                    screenOpenedBeatPending = false;
+                }
             } else if (pendingHotbarSwap) {
                 if (!planHotbarSwapActions(screen, pendingHotbarPredicate)) {
                     fail("item_not_in_backpack");
                     return;
                 }
                 pendingHotbarSwap = false;
+                if (screenOpenedBeatPending) {
+                    waitUntilNs = System.nanoTime() + randMs(160, 230);
+                    screenOpenedBeatPending = false;
+                }
             } else if (pendingFurnaceLoad) {
                 if (!(screen instanceof FurnaceScreen) || !(screen.getScreenHandler() instanceof FurnaceScreenHandler fsh)) {
                     fail("not_furnace_screen");
@@ -288,6 +306,10 @@ final class GuiHands {
                     return;
                 }
                 pendingFurnaceLoad = false;
+                if (screenOpenedBeatPending) {
+                    waitUntilNs = System.nanoTime() + randMs(180, 260);
+                    screenOpenedBeatPending = false;
+                }
             } else if (pendingFurnaceCollect) {
                 if (!(screen instanceof FurnaceScreen) || !(screen.getScreenHandler() instanceof FurnaceScreenHandler fsh)) {
                     fail("not_furnace_screen");
@@ -305,15 +327,29 @@ final class GuiHands {
                     finish();
                     return;
                 }
+                if (screenOpenedBeatPending) {
+                    waitUntilNs = System.nanoTime() + randMs(180, 260);
+                    screenOpenedBeatPending = false;
+                }
             } else {
-                // Queue drained!
+                // Queue drained — wait a natural beat before closing the GUI so item transfers are clearly visible!
+                long now = System.nanoTime();
+                if (closeAfterNs == 0L) {
+                    closeAfterNs = now + randMs(180, 250);
+                    return;
+                }
+                if (now < closeAfterNs) return;
                 finish();
                 return;
             }
         }
     }
 
-    /** Called every render frame (60fps) for smooth, brisk human-paced GUI cursor motion and clicks! */
+    private long randMs(int minMs, int maxMs) {
+        return (minMs + pacingRng.nextInt(Math.max(1, maxMs - minMs + 1))) * 1_000_000L;
+    }
+
+    /** Called every render frame (60fps) for smooth, natural human-paced GUI cursor motion and clicks! */
     void renderFrame() {
         if (state != State.WORKING) return;
         if (!(client.currentScreen instanceof HandledScreen<?> screen)) return;
@@ -347,18 +383,23 @@ final class GuiHands {
 
         if (!pointer.matches(slotLeft, slotTop, 16.0, 16.0, scaleX, scaleY)) {
             pointer.plan(now, curGuiX, curGuiY, slotLeft, slotTop, 16.0, 16.0, scaleX, scaleY,
-                false, pointer.vx * 0.35, pointer.vy * 0.35, nextX, nextY);
+                false, pointer.vx * 0.30, pointer.vy * 0.30, nextX, nextY);
         }
-        // Advance pointer smoothly (slightly brisker than default so GUI crafting feels snappy & human!)
-        long fastNow = actionStartedNs + (long) ((now - actionStartedNs) * 1.45);
-        pointer.advance(fastNow);
+        // Unhurried, readable human pointer glide (~0.76x base speed so every arc & deceleration is clearly visible!)
+        long pacedNow = actionStartedNs + (long) ((now - actionStartedNs) * 0.76);
+        pointer.advance(pacedNow);
         movePointerTo(pointer.x, pointer.y);
 
-        if (!clickedActive && (pointer.settled || (pointer.braking && pointer.inside(pointer.x, pointer.y)))) {
+        // Wait for pointer to settle cleanly inside the target slot before clicking (no abrupt mid-flight snap-clicks!)
+        boolean readyToClick = pointer.settled
+            || (pointer.braking && pointer.inside(pointer.x, pointer.y) && (now - actionStartedNs) >= 135_000_000L);
+        if (!clickedActive && readyToClick) {
             executeClick(screen, activeAction, pointer.x, pointer.y);
             clickedActive = true;
-            // Short natural settle between clicks (55ms = ~1 tick)
-            waitUntilNs = now + 55_000_000L;
+            // Varied human inter-click rhythm: slightly brisker placing adjacent grid items, unhurried on pickups/outputs
+            boolean rapidPlace = activeAction.kind() == ClickKind.RIGHT && next != null && next.kind() == ClickKind.RIGHT;
+            boolean takingResult = activeAction.kind() == ClickKind.SHIFT_RESULT;
+            waitUntilNs = now + (rapidPlace ? randMs(85, 130) : (takingResult ? randMs(150, 220) : randMs(115, 175)));
             activeAction = null;
         }
     }
@@ -482,6 +523,20 @@ final class GuiHands {
 
         // Only stack executions > 1 when all items for each cell come from a single stack (avoids mixed-species collision!)
         int effExecs = recipe == RecipeId.PLANKS ? executions : (recipe == RecipeId.TORCH ? Math.min(executions, 4) : 1);
+        // Clamp multi-execution batch to what's actually available in inventory so e.g. 1 stick still crafts 4 torches!
+        if (effExecs > 1) {
+            for (char sym : new char[]{'l', 'p', 's', 'r', 'c', 'i', 'd', 'f'}) {
+                int perExec = 0;
+                for (char s : syms) if (s == sym) perExec++;
+                if (perExec == 0) continue;
+                int totalHave = 0;
+                for (int i = 0; i < invSlots.size(); i++) {
+                    if (matchesSymbol(invSlots.get(i).getStack(), sym, lockedSpecies)) totalHave += avail[i];
+                }
+                effExecs = Math.min(effExecs, totalHave / perExec);
+            }
+            if (effExecs <= 0) return false;
+        }
 
         // Group cells by symbol so we pick up a stack once and right-click drop into each matching cell
         for (char sym : new char[]{'l', 'p', 's', 'r', 'c', 'i', 'd', 'f'}) {

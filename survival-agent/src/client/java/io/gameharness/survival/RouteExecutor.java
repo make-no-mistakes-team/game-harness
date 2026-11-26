@@ -73,6 +73,11 @@ final class RouteExecutor {
         return plan != null && !plan.isEmpty() && stepIndex < plan.steps().size();
     }
 
+    /** True while actively executing a PILLAR step so mid-jump skyLight shifts never abort block placement at apex! */
+    boolean isMidPillar() {
+        return hasPlan() && plan.steps().get(stepIndex).kind() == Pathfinder.MoveKind.PILLAR;
+    }
+
     Pathfinder.Plan currentPlan() { return plan; }
 
     Status tick(int currentTick, boolean allowTorches) {

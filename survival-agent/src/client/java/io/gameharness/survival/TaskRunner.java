@@ -461,8 +461,7 @@ final class TaskRunner {
             route.clear();
         }
 
-        boolean underground = world.getLightLevel(net.minecraft.world.LightType.SKY, feet) <= 10
-            || hasRockRoofAbove(world, feet);
+        boolean underground = isUndergroundOrRoofed(player, world);
         if (activeTargetBlock == null) {
             // If underground inside a cave/tunnel/pocket, climb/staircase back up to the surface instead of walking into walls!
             if (underground) {
@@ -2337,8 +2336,9 @@ final class TaskRunner {
 
     // ===================== NAVIGATION & HELPERS =====================
 
-    /** True whenever the player is underground OR under a dirt/stone roof (never stops short at y=59!). */
+    /** True whenever the player is underground OR under a dirt/stone roof (never stops short or aborts mid-pillar!). */
     private boolean isUndergroundOrRoofed(ClientPlayerEntity player, ClientWorld world) {
+        if (route.isMidPillar()) return true;
         BlockPos feet = player.getBlockPos();
         if (world.getLightLevel(net.minecraft.world.LightType.SKY, feet) < 12) return true;
         return hasRockRoofAbove(world, feet);

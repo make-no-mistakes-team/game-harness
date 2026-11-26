@@ -305,7 +305,8 @@ final class TaskRunner {
         int maxTicks = (active.kind() == TaskKind.MINE_ORE && !perception.isDiagnosticRevealOres())
             ? 9000
             : ((active.kind() == TaskKind.MINE_ORE || active.kind() == TaskKind.DIG_DOWN
-                || active.kind() == TaskKind.DESCEND_DROP || active.kind() == TaskKind.EXPLORE_CAVE) ? 6000 : 2400);
+                || active.kind() == TaskKind.DESCEND_DROP || active.kind() == TaskKind.EXPLORE_CAVE) ? 6000
+                : (active.kind() == TaskKind.MINE_STONE ? 3600 : 2400));
         if (activeTicks > maxTicks) {
             if (descent != null && descent.isActivelyDescending()) descent.clearActive();
             finishActive("timeout", "task exceeded time limit", currentTick);

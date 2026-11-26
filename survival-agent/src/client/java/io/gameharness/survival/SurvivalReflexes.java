@@ -88,6 +88,7 @@ final class SurvivalReflexes {
 
     void resetForLife() {
         activeStatus = null;
+        combatStance = CombatPlanner.CombatStance.AUTO;
         eating = false;
         eatingTicks = 0;
         hurtLookTicks = 0;
@@ -768,6 +769,9 @@ final class SurvivalReflexes {
                 return true;
             }
             shelterState = ShelterState.NONE;
+            if (combatStance == CombatPlanner.CombatStance.SHELTER) {
+                combatStance = CombatPlanner.CombatStance.AUTO;
+            }
             return false;
         }
 
@@ -1046,6 +1050,9 @@ final class SurvivalReflexes {
         BlockPos feet = player.getBlockPos();
         if (shelterUnsealTicks > 140 || (shelterAnchor != null && feet.getSquaredDistance(shelterAnchor) >= 3.5)) {
             shelterState = ShelterState.NONE;
+            if (combatStance == CombatPlanner.CombatStance.SHELTER) {
+                combatStance = CombatPlanner.CombatStance.AUTO;
+            }
             return false;
         }
 
@@ -1059,15 +1066,34 @@ final class SurvivalReflexes {
             }
             int blockSlot = motor.findHotbarShelterBlock();
             if (blockSlot >= 0) {
-                motor.requestJump();
-                motor.lookAtAngles(player.getYaw(), 86f, Motor.LookMode.FINE);
-                if (player.getY() >= feet.getY() + 0.85) {
-                    motor.placeBlockAt(feet, blockSlot);
+                Vec3d center = Vec3d.ofBottomCenter(feet);
+                if (Math.hypot(player.getX() - center.x, player.getZ() - center.z) > 0.15) {
+                    motor.moveToward(center, false, false, true, false);
+                } else {
+                    player.getInventory().selectedSlot = blockSlot;
+                    Vec3d downPoint = new Vec3d(feet.getX() + 0.5, feet.getY() - 0.01, feet.getZ() + 0.5);
+                    motor.lookAtPoint(downPoint, Motor.LookMode.FINE);
+                    boolean aimedAtFloor = player.getPitch() >= 84.0f
+                        && client.crosshairTarget instanceof net.minecraft.util.hit.BlockHitResult bhr
+                        && bhr.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
+                        && bhr.getBlockPos().equals(feet.down())
+                        && bhr.getSide() == Direction.UP;
+                    if (aimedAtFloor) {
+                        if (player.isOnGround()) {
+                            motor.requestJump();
+                        }
+                        if (player.getY() >= feet.getY() + 1.01) {
+                            motor.placeBlockAgainst(feet.down(), Direction.UP, downPoint, blockSlot);
+                        }
+                    }
                 }
                 activeStatus = "pillaring out of burrow";
                 return true;
             }
             shelterState = ShelterState.NONE;
+            if (combatStance == CombatPlanner.CombatStance.SHELTER) {
+                combatStance = CombatPlanner.CombatStance.AUTO;
+            }
             return false;
         }
 
@@ -1098,6 +1124,8 @@ final class SurvivalReflexes {
             BlockState s1 = world.getBlockState(feet.up().offset(d));
             if (Perception.isUnbreakable(s0) || Perception.isUnbreakable(s1)) continue;
             float h = s0.getHardness(world, feet.offset(d)) + s1.getHardness(world, feet.up().offset(d));
+            if (s0.isToolRequired()) h += 20.0f;
+            if (s1.isToolRequired()) h += 20.0f;
             if (h < bestHardness) {
                 bestHardness = h;
                 best = d;

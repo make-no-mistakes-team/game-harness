@@ -467,8 +467,13 @@ final class TaskRunner {
             if (underground) {
                 Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
                 int surfaceY = Math.max(feet.getY() + 8, 66);
-                navigateToward(player, Pathfinder.Goal.climbToY(surfaceY), opts, currentTick);
+                RouteExecutor.Status cst = navigateToward(player, Pathfinder.Goal.climbToY(surfaceY), opts, currentTick);
                 statusText = "climbing to surface for wood";
+                if (cst == RouteExecutor.Status.STUCK) {
+                    // Bare-handed in a stone ravine with no scaffolds: walk along the floor to find a dirt slope or exit!
+                    route.clear();
+                    exploreForResources(player, world, currentTick, "seeking ravine exit for wood");
+                }
                 return;
             }
             // If we spotted distant tree leaves (canopy up to 64m away), head toward those trees!

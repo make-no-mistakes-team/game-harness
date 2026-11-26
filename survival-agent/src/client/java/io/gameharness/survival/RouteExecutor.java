@@ -96,13 +96,14 @@ final class RouteExecutor {
         }
 
         // Advance stepIndex if we already arrived at step.to (or skipped ahead naturally while sprinting!)
-        advanceArrivedSteps(player, currentTick);
+        advanceArrivedSteps(player, world, currentTick);
         if (stepIndex >= plan.steps().size()) {
             return Status.COMPLETE;
         }
 
-        // Opportunistic torch placement in dark underground tunnels
-        if (allowTorches && currentTick - lastTorchTick >= 40 && player.isOnGround()) {
+        // Opportunistic torch placement in dark underground tunnels (skip during PILLAR so we don't occupy our own pillar cell!)
+        if (allowTorches && currentTick - lastTorchTick >= 40 && player.isOnGround()
+                && plan.steps().get(stepIndex).kind() != Pathfinder.MoveKind.PILLAR) {
             BlockPos feet = player.getBlockPos();
             if (world.getLightLevel(LightType.SKY, feet) == 0
                     && world.getLightLevel(LightType.BLOCK, feet) <= 2
@@ -186,7 +187,7 @@ final class RouteExecutor {
                                 if (player.isOnGround()) {
                                     motor.requestJump();
                                 }
-                                if (player.getY() >= placePos.getY() + 1.00) {
+                                if (player.getY() >= placePos.getY() + 1.01) {
                                     motor.placeBlockAgainst(placePos.down(), net.minecraft.util.math.Direction.UP, downPoint, scaffoldSlot);
                                 }
                             }
@@ -246,13 +247,15 @@ final class RouteExecutor {
         return Status.RUNNING;
     }
 
-    private void advanceArrivedSteps(ClientPlayerEntity player, int currentTick) {
+    private void advanceArrivedSteps(ClientPlayerEntity player, ClientWorld world, int currentTick) {
         List<Pathfinder.Step> steps = plan.steps();
         // Check if we're already at a slightly later step along a pure walking segment
         int lookMax = Math.min(steps.size() - 1, stepIndex + 2);
         for (int i = lookMax; i >= stepIndex; i--) {
             Pathfinder.Step s = steps.get(i);
             if (i > stepIndex && (!s.toBreak().isEmpty() || !s.toPlace().isEmpty())) continue;
+            // Never mark a PILLAR/BRIDGE step complete in mid-air before its scaffold block is actually placed!
+            if (i == stepIndex && !allPlacementsSolid(world, s)) continue;
             if (reached(player, s.to(), s.kind())) {
                 if (s.kind() == Pathfinder.MoveKind.STAIR_DOWN) {
                     int dx = s.to().getX() - s.from().getX();
@@ -272,10 +275,20 @@ final class RouteExecutor {
         }
     }
 
+    private static boolean allPlacementsSolid(ClientWorld world, Pathfinder.Step s) {
+        for (BlockPos p : s.toPlace()) {
+            if (!Perception.isSolidSupport(world.getBlockState(p))) return false;
+        }
+        return true;
+    }
+
     private static boolean reached(ClientPlayerEntity player, BlockPos dest, Pathfinder.MoveKind kind) {
         double dx = player.getX() - (dest.getX() + 0.5);
         double dz = player.getZ() - (dest.getZ() + 0.5);
         double dy = player.getY() - dest.getY();
+        if (kind == Pathfinder.MoveKind.PILLAR) {
+            return (dx * dx + dz * dz) <= 0.44 * 0.44 && dy >= -0.05 && dy <= 0.65;
+        }
         double horizTol = (kind == Pathfinder.MoveKind.WALK || kind == Pathfinder.MoveKind.DIAGONAL) ? 0.58 : 0.44;
         return (dx * dx + dz * dz) <= horizTol * horizTol && Math.abs(dy) <= 0.65;
     }

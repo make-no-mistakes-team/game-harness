@@ -408,6 +408,12 @@ final class TaskRunner {
         if (activeTargetBlock != null) {
             if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(activeTargetBlock)) <= Motor.REACH_SQ
                     && motor.findAimPoint(activeTargetBlock) != null) {
+                BlockPos headroomFirst = findHeadroomBlockerForLowTarget(player, world, activeTargetBlock);
+                if (headroomFirst != null) {
+                    motor.mineBlock(headroomFirst, true, false);
+                    statusText = "clearing headroom before mining stone";
+                    return;
+                }
                 boolean broken = motor.mineBlock(activeTargetBlock, true, true);
                 statusText = "mining stone";
                 if (broken) {
@@ -429,8 +435,14 @@ final class TaskRunner {
             RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.interactReach(activeTargetBlock, 3.4), opts, currentTick);
             statusText = "walking to stone";
             if (st == RouteExecutor.Status.COMPLETE) {
-                // Within reach but occluded — chip away or reselect!
+                // Within reach but occluded — clear upper front headroom first if digging low, then mine!
                 if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(activeTargetBlock)) <= Motor.REACH_SQ) {
+                    BlockPos headroomFirst = findHeadroomBlockerForLowTarget(player, world, activeTargetBlock);
+                    if (headroomFirst != null) {
+                        motor.mineBlock(headroomFirst, true, false);
+                        statusText = "clearing headroom before mining stone";
+                        return;
+                    }
                     boolean broken = motor.mineBlock(activeTargetBlock, true, true);
                     statusText = "mining stone";
                     if (broken) {
@@ -578,6 +590,12 @@ final class TaskRunner {
                 if (immediateOre.equals(activeTargetBlock)) activeTargetBlock = null;
                 return;
             }
+            BlockPos headroomFirst = findHeadroomBlockerForLowTarget(player, world, immediateOre);
+            if (headroomFirst != null) {
+                motor.mineBlock(headroomFirst, true, false);
+                statusText = "clearing headroom for " + active.target() + " ore";
+                return;
+            }
             boolean broken = motor.mineBlock(immediateOre, true);
             statusText = "mining " + active.target() + " ore";
             if (broken) {
@@ -592,12 +610,18 @@ final class TaskRunner {
         }
 
         // Check if activeTargetBlock itself is ALREADY within direct reach!
-        // Mine continuously every tick (chipping any occluding stone block in front if needed!) — NEVER stall in navigateToward!
+        // Clear upper-front headroom first when digging low ahead so we always create a walkable 2-high opening!
         if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(activeTargetBlock)) <= Motor.REACH_SQ) {
             if (perception.isNearKnownLava(activeTargetBlock.getX(), activeTargetBlock.getY(), activeTargetBlock.getZ())) {
                 blacklistedTargets.add(activeTargetBlock);
                 activeTargetBlock = null;
                 route.clear();
+                return;
+            }
+            BlockPos headroomFirst = findHeadroomBlockerForLowTarget(player, world, activeTargetBlock);
+            if (headroomFirst != null) {
+                motor.mineBlock(headroomFirst, true, false);
+                statusText = "clearing headroom for " + active.target() + " ore";
                 return;
             }
             boolean broken = motor.mineBlock(activeTargetBlock, true, true);
@@ -643,20 +667,58 @@ final class TaskRunner {
         }
     }
 
+    /**
+     * When directly mining a block at or below feet level ahead of us, ensure the upper-front face block
+     * (headroom) is cleared first so we never dig an unwalkable 1-block mousehole we cannot step forward into!
+     */
+    private BlockPos findHeadroomBlockerForLowTarget(ClientPlayerEntity player, ClientWorld world, BlockPos target) {
+        BlockPos feet = player.getBlockPos();
+        if (target.getY() > feet.getY()) return null;
+        int dx = target.getX() - feet.getX();
+        int dz = target.getZ() - feet.getZ();
+        if (dx == 0 && dz == 0) return null;
+
+        int stepX = feet.getX() + (Math.abs(dx) >= Math.abs(dz) ? Integer.signum(dx) : 0);
+        int stepZ = feet.getZ() + (Math.abs(dz) > Math.abs(dx) ? Integer.signum(dz) : 0);
+        BlockPos[] candidates = {
+            new BlockPos(stepX, feet.getY() + 1, stepZ),
+            new BlockPos(target.getX(), feet.getY() + 1, target.getZ())
+        };
+        for (BlockPos cand : candidates) {
+            if (cand.equals(target)) continue;
+            BlockState st = world.getBlockState(cand);
+            if (Perception.isPassable(st) || !st.getFluidState().isEmpty()) continue;
+            if (Perception.isUnbreakable(st) || Perception.isHazardBlock(st)) continue;
+            if (st.isOf(Blocks.CRAFTING_TABLE) || st.isOf(Blocks.FURNACE) || st.isOf(Blocks.OBSIDIAN)) continue;
+            if (perception.isNearKnownLava(cand.getX(), cand.getY(), cand.getZ())) continue;
+            if (perception.isNearKnownFluidAboveOrSide(cand.getX(), cand.getY(), cand.getZ())) continue;
+            if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(cand)) > Motor.REACH_SQ) continue;
+            if (motor.findAimPoint(cand) != null) return cand;
+        }
+        return null;
+    }
+
     private BlockPos findBestStoneTarget(ClientPlayerEntity player, ClientWorld world) {
         BlockPos feet = player.getBlockPos();
-        // 1. First look for any directly aimable stone block already within reach (not our own standing support!)
+        // 1. Prefer directly aimable stone within reach, strongly favoring face-level (dy=+1) BEFORE feet/low blocks
+        //    so we always carve a clean walkable 2-high gallery instead of a 1-high ankle hole!
         BlockPos underFeet = feet.down();
         BlockPos bestImmediate = null;
-        double bestImmDist = Double.POSITIVE_INFINITY;
+        double bestImmScore = Double.POSITIVE_INFINITY;
         for (BlockPos pos : perception.observedStone()) {
             if (blacklistedTargets.contains(pos) || pos.equals(underFeet)) continue;
             double dSq = player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(pos));
             if (dSq > Motor.REACH_SQ) continue;
             if (!isStoneBlock(world.getBlockState(pos))) continue;
             if (perception.isNearKnownLava(pos.getX(), pos.getY(), pos.getZ())) continue;
-            if (motor.findAimPoint(pos) != null && dSq < bestImmDist) {
-                bestImmDist = dSq;
+            if (motor.findAimPoint(pos) == null) continue;
+            int dy = pos.getY() - feet.getY();
+            boolean upperSolid = !Perception.isPassable(world.getBlockState(new BlockPos(pos.getX(), feet.getY() + 1, pos.getZ())));
+            if (dy < 0 && upperSolid) continue; // never dig under a solid face block!
+            double heightPenalty = dy == 1 ? 0.0 : (dy == 0 ? (upperSolid ? 3.5 : 1.0) : (dy < 0 ? 4.5 : 1.8));
+            double score = Math.sqrt(dSq) + heightPenalty;
+            if (score < bestImmScore) {
+                bestImmScore = score;
                 bestImmediate = pos;
             }
         }
@@ -1641,6 +1703,12 @@ final class TaskRunner {
 
         int remSec = Math.max(0, remTicks / 20);
         if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(smeltChoreTarget)) <= Motor.REACH_SQ) {
+            BlockPos headroomFirst = findHeadroomBlockerForLowTarget(player, world, smeltChoreTarget);
+            if (headroomFirst != null) {
+                motor.mineBlock(headroomFirst, true, false);
+                statusText = "clearing headroom while smelting (" + remSec + "s)";
+                return true;
+            }
             boolean broken = motor.mineBlock(smeltChoreTarget, true, true);
             statusText = "mining nearby while smelting (" + remSec + "s)";
             if (broken) {

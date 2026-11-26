@@ -130,6 +130,7 @@ final class TaskRunner {
     private int waterFillAimStableTicks;
     private int waterFillCooldownTicks;
     private BlockPos placedGravelPos;
+    private int oreTargetTicks;
 
     TaskRunner(MinecraftClient client, Motor motor, Perception perception,
                Pathfinder pathfinder, RouteExecutor route, GuiHands gui,
@@ -789,17 +790,25 @@ final class TaskRunner {
             // Clearing route while activeTargetBlock == null would wipe descent/branch-mining every tick!
             if (activeTargetBlock != null) {
                 branchWaypoint = null;
+                oreTargetTicks = 0;
                 route.clear();
             }
         }
 
-        // If we can already see the target block and it's NOT that ore anymore (already mined!), retire AND blacklist it!
+        // Skip & blacklist targets that are already mined OR submerged/adjacent to water or lava (prevents riverbed yo-yo!)
         if (activeTargetBlock != null) {
             BlockState observed = perception.getObserved(activeTargetBlock);
-            if (observed != null && !matchesOreBlock(observed, oreKind)) {
-                perception.markOreRetired(activeTargetBlock);
+            boolean floodedOrLava = perception.isNearKnownFluidAboveOrSide(
+                    activeTargetBlock.getX(), activeTargetBlock.getY(), activeTargetBlock.getZ())
+                || perception.isNearKnownLava(
+                    activeTargetBlock.getX(), activeTargetBlock.getY(), activeTargetBlock.getZ());
+            if ((observed != null && !matchesOreBlock(observed, oreKind)) || floodedOrLava) {
+                if (observed != null && !matchesOreBlock(observed, oreKind)) {
+                    perception.markOreRetired(activeTargetBlock);
+                }
                 blacklistedTargets.add(activeTargetBlock);
                 activeTargetBlock = null;
+                oreTargetTicks = 0;
                 route.clear();
                 statusText = "selecting next " + active.target() + " ore";
                 return;
@@ -886,6 +895,16 @@ final class TaskRunner {
             return;
         }
         noMineProgressTicks = 0;
+
+        // Bound pursuit of any single unreachable or shoreline-blocked ore target so we never yo-yo!
+        if (++oreTargetTicks > 400) {
+            blacklistedTargets.add(activeTargetBlock);
+            activeTargetBlock = null;
+            oreTargetTicks = 0;
+            route.clear();
+            statusText = "deferring unreachable " + active.target() + " ore";
+            return;
+        }
 
         // Never start digging down into rock from inside water or a flooded swamp shoreline!
         if (activeTargetBlock.getY() < player.getBlockY() - 1 && isWetSurfaceSpot(player, world)) {

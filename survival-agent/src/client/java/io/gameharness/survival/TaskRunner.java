@@ -2631,8 +2631,8 @@ final class TaskRunner {
                         break;
                     }
                     if (Perception.isSolidSupport(st)) {
-                        // Reward walkable dry terrain (dy in -2..+1); penalize steep unreachable cliff faces (dy >= 2)
-                        if (dy >= 2) {
+                        // Penalize sheer cliffs immediately ahead (dist == 2, dy >= 2), NOT gentle hills rising farther out!
+                        if (dist <= 2 && dy >= 2) {
                             score -= 10.0;
                         } else {
                             score += 5.0;

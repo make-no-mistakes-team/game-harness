@@ -183,6 +183,20 @@ final class SurvivalReflexes {
             return true;
         }
 
+        // 1b. Falling gravel/sand suffocation emergency — immediately mine eye-level block!
+        if (player.isInsideWall()) {
+            abortShelter(60);
+            closeScreenIfOpen();
+            BlockPos headPos = player.getBlockPos().up();
+            BlockPos feetPos = player.getBlockPos();
+            BlockState headSt = world.getBlockState(headPos);
+            BlockPos toDig = (!headSt.isAir() && headSt.getFluidState().isEmpty() && !Perception.isUnbreakable(headSt))
+                ? headPos : feetPos;
+            motor.mineBlock(toDig, true, false);
+            activeStatus = "clearing suffocating block";
+            return true;
+        }
+
         // 2. Drowning / underwater breath emergency!
         if (player.isSubmergedInWater() && player.getAir() < 210) {
             shelterState = ShelterState.NONE;

@@ -1429,9 +1429,22 @@ final class TaskRunner {
     private void tickExploreCave(ClientPlayerEntity player, ClientWorld world, int currentTick) {
         boolean lavaSearch = "lava".equalsIgnoreCase(active.target()) || "lava_pool".equalsIgnoreCase(active.target());
         if (lavaSearch) {
-            if (portal != null && (portal.hasObservedLavaPoolSite(player, world) || perception.observedLava().size() >= 10)) {
+            if (portal != null && portal.hasObservedLavaPoolSite(player, world)) {
                 finishActive("completed", "spotted lava pool for portal casting", currentTick);
                 return;
+            }
+            // If we spotted lava sources in the distance, step closer once so Perception maps the entire rim!
+            if (perception.observedLava().size() >= 4 && activeTicks < 240) {
+                BlockPos nearestLava = perception.nearestObserved(perception.observedLava(), player.getBlockPos(), 32.0, null);
+                if (nearestLava != null && player.getBlockPos().getSquaredDistance(nearestLava) > 4.5 * 4.5) {
+                    Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+                    RouteExecutor.Status lst = navigateToward(player, Pathfinder.Goal.near(nearestLava.up(), 3.8), opts, currentTick);
+                    statusText = "surveying observed lava pool";
+                    if (lst != RouteExecutor.Status.STUCK) {
+                        return;
+                    }
+                    route.clear();
+                }
             }
             int targetY = active.count() != 0 ? active.count() : -54;
             if (caves == null) {

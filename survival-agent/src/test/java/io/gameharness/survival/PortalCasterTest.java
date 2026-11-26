@@ -127,4 +127,43 @@ final class PortalCasterTest {
         assertEquals(62, site.foot0().getY());
         assertEquals(Direction.SOUTH, site.inward());
     }
+
+    @Test
+    void acceptsIrregularUndergroundDeepslateLavaPoolWithOverheadCaveCeilingAndNotchedRim() {
+        // Real y=-54 underground cave lava pool (plus/oval shaped ~16 lava blocks, 2-deep under a0/a3,
+        // stepped deepslate rim, 1-block floor notch on bank1, and cave ceiling at y=-51..-50 requiring >14 clears!)
+        Set<BlockPos> lava = new HashSet<>();
+        for (int x = 0; x <= 3; x++) {
+            for (int z = 0; z <= 3; z++) {
+                if ((x == 0 || x == 3) && z == 3) continue; // irregular corners
+                lava.add(new BlockPos(x, -54, z));
+            }
+        }
+        // Make a0 and a3 sit over 2-deep lava (-55 is also lava beneath x=0 and x=3!), while a1/a2 have solid deepslate floor!
+        Set<BlockPos> deepLava = Set.of(new BlockPos(0, -55, 0), new BlockPos(3, -55, 0));
+        // 1-block air notch on bank1 at (2, -54, -1) with solid floor at -55
+        BlockPos rimNotch = new BlockPos(2, -54, -1);
+
+        PortalCaster.CellProbe probe = new PortalCaster.CellProbe() {
+            @Override public boolean isStillLava(BlockPos pos) { return lava.contains(pos) || deepLava.contains(pos); }
+            @Override public boolean isSolid(BlockPos pos) {
+                if (lava.contains(pos) || deepLava.contains(pos) || pos.equals(rimNotch)) return false;
+                // Floor below -54, stepped bank at z <= -1 up to -53, cave ceiling at y >= -51
+                return pos.getY() <= -54
+                    || (pos.getZ() <= -1 && pos.getY() <= -53)
+                    || pos.getY() >= -51;
+            }
+            @Override public boolean isPassableAir(BlockPos pos) {
+                return !isStillLava(pos) && !isSolid(pos);
+            }
+            @Override public boolean isClearableDryBlock(BlockPos pos) {
+                return isSolid(pos) && pos.getY() >= -53;
+            }
+        };
+
+        PortalCaster.ShoreSite site = PortalCaster.findBestShoreSite(probe, lava, new BlockPos(1, -52, -2));
+        assertNotNull(site, "Natural irregular y=-54 cave lava pool with ceiling clears and notched rim should match");
+        assertEquals(-54, site.foot0().getY());
+        assertEquals(Direction.SOUTH, site.inward());
+    }
 }

@@ -191,6 +191,18 @@ final class PortalCaster {
             return false;
         }
 
+        /** Shore work-pad floor cells (bank1 + bank2 at y=poolY) that must be solid dry ground before casting. */
+        List<BlockPos> bankFillCells() {
+            List<BlockPos> out = new ArrayList<>(8);
+            for (int i = 0; i < 4; i++) {
+                out.add(foot0.offset(along, i).offset(shore(), 2));
+            }
+            for (int i = 0; i < 4; i++) {
+                out.add(foot0.offset(along, i).offset(shore()));
+            }
+            return out;
+        }
+
         /** Ordered top-down list of work-pad & overhead cells that must be clear air before casting. */
         List<BlockPos> bankClearCells() {
             List<BlockPos> out = new ArrayList<>(36);
@@ -205,7 +217,7 @@ final class PortalCaster {
                     out.add(foot0.offset(along, i).offset(shore()).up(up));
                 }
             }
-            for (int up = 4; up >= 2; up--) {
+            for (int up = 4; up >= 1; up--) {
                 for (int i = 0; i < 4; i++) {
                     out.add(foot0.offset(along, i).up(up));
                 }
@@ -352,24 +364,21 @@ final class PortalCaster {
         for (BlockPos candidateA0 : stillLava) {
             int poolY = candidateA0.getY();
             for (Direction inward : HORIZONTALS) {
-                Direction shore = inward.getOpposite();
-                // Require candidateA0 to be directly on the shore rim
-                if (!probe.isSolid(candidateA0.offset(shore))) continue;
                 Direction along = inward.rotateYCounterclockwise(); // right-handed: e.g. inward=SOUTH -> along=EAST!
                 ShoreSite cand = new ShoreSite(candidateA0, along, inward);
-                int clearBlocks = countRequiredBankClears(probe, cand, stillLava, poolY);
-                if (clearBlocks < 0) continue;
+                int prepCost = countRequiredBankPrep(probe, cand, stillLava, poolY);
+                if (prepCost < 0) continue;
 
-                // Score: prefer close to player, flat air banks (0 clears), centered along pool rim, and rich in nearby lava sources
+                // Score: prefer close to player, flat air banks (0 prep), centered along pool rim, and rich in nearby lava sources
                 double dist = Math.sqrt(cand.a1().getSquaredDistance(playerFeet));
                 int nearbyLava = 0;
                 for (BlockPos lv : stillLava) {
-                    if (lv.getY() == poolY && lv.getSquaredDistance(cand.a1()) <= 36.0) nearbyLava++;
+                    if (lv.getY() == poolY && lv.getSquaredDistance(cand.a1()) <= 100.0) nearbyLava++;
                 }
                 if (nearbyLava < 10) continue;
                 double centerBonus = probe.isStillLava(cand.a0().offset(cand.backAlong()))
                     && probe.isStillLava(cand.a3().offset(along)) ? -2.5 : 0.0;
-                double score = dist + clearBlocks * 2.5 - Math.min(20, nearbyLava) * 0.15 + centerBonus;
+                double score = dist + prepCost * 2.5 - Math.min(20, nearbyLava) * 0.15 + centerBonus;
                 if (score < bestScore) {
                     bestScore = score;
                     best = cand;
@@ -380,19 +389,37 @@ final class PortalCaster {
     }
 
     /**
-     * Returns the number of dry blocks to clear on the shore/overhead (0..14), or -1 if invalid.
-     * Supports both flat diagnostic pools (0 clears) and natural Survival lava pools with 1-2 block stone/dirt rims!
+     * Returns weighted shore-preparation cost (cleared blocks + 2 * floor fills), or -1 if invalid.
+     * Supports flat diagnostic pools (0 prep), natural raised-rim surface pools, and irregular underground y=-54 caves!
      */
-    private static int countRequiredBankClears(CellProbe probe, ShoreSite s, Set<BlockPos> stillLava, int poolY) {
+    private static int countRequiredBankPrep(CellProbe probe, ShoreSite s, Set<BlockPos> stillLava, int poolY) {
         int clearBlocks = 0;
-        // 1. All 4 base cells a0..a3 must be still lava sources with solid floor at poolY-1 and poolY-2,
-        //    exposed air directly above lava (poolY+1), and air or dry clearable rock overhead (poolY+2..poolY+4).
+        int floorFills = 0;
+
+        // 0. Passive water pockets (waterFoot0, waterFoot1) must have solid floors and must NOT leak sideways into lava!
+        if (!probe.isSolid(s.waterFoot0().down()) || !probe.isSolid(s.waterFoot1().down())) return -1;
+        if (stillLava.contains(s.waterFoot0().offset(s.backAlong()))
+                || stillLava.contains(s.waterFoot1().offset(s.along()))) {
+            return -1;
+        }
+
+        // 1. Passive feet a0 & a3 must be still lava (floor below a0/a3 can be solid OR deeper lava!).
+        //    Interior base cells a1 & a2 may be still lava, passable air, OR clearable dry rock (always mined for trench!),
+        //    with solid rock at poolY-1 and poolY-2 so bottom threshold pours #1 & #2 stay dry and never leak downward!
         for (int i = 0; i < 4; i++) {
             BlockPos base = s.foot0().offset(s.along(), i);
-            if (!stillLava.contains(base)) return -1;
-            if (!probe.isSolid(base.down(1))) return -1;
-            if ((i == 1 || i == 2) && !probe.isSolid(base.down(2))) return -1;
-            if (!probe.isPassableAir(base.up(1))) return -1;
+            if (i == 0 || i == 3) {
+                if (!stillLava.contains(base)) return -1;
+            } else {
+                if (!stillLava.contains(base) && !probe.isPassableAir(base) && !probe.isClearableDryBlock(base)) {
+                    return -1;
+                }
+                if (!probe.isSolid(base.down(1)) || !probe.isSolid(base.down(2))) return -1;
+            }
+            if (!probe.isPassableAir(base.up(1))) {
+                if (probe.isClearableDryBlock(base.up(1))) clearBlocks++;
+                else return -1;
+            }
             for (int up = 2; up <= 4; up++) {
                 BlockPos overhead = base.up(up);
                 if (probe.isPassableAir(overhead)) continue;
@@ -402,11 +429,19 @@ final class PortalCaster {
                     return -1;
                 }
             }
-            // Dry solid shore directly behind each base cell (with 2-deep walkable dry apron;
-            // allow natural 1-2 block raised stone/dirt banks that CLEAR_BANK will level cleanly!)
+            // Dry solid shore directly behind each base cell (2-deep apron; allow up to 4 floor fills on uneven rims
+            // and stepped cave walls that CLEAR_BANK will level cleanly!)
             BlockPos bank1 = base.offset(s.shore());
             BlockPos bank2 = base.offset(s.shore(), 2);
-            if (!probe.isSolid(bank1) || !probe.isSolid(bank2)) return -1;
+            for (BlockPos b : new BlockPos[] { bank1, bank2 }) {
+                if (!probe.isSolid(b)) {
+                    if (probe.isPassableAir(b) && probe.isSolid(b.down())) {
+                        floorFills++;
+                    } else {
+                        return -1;
+                    }
+                }
+            }
             for (int up = 1; up <= 3; up++) {
                 BlockPos b1 = bank1.up(up);
                 if (!probe.isPassableAir(b1)) {
@@ -421,14 +456,14 @@ final class PortalCaster {
                     }
                 }
             }
-            if (clearBlocks > 14) return -1;
+            if (clearBlocks > 36 || floorFills > 4) return -1;
         }
         // 2. Solid stone/floor beneath the backstop cells (a1.offset(inward).down(), a2.offset(inward).down())
         //    so mining the bottom threshold trench cannot leak side lava from underneath!
         if (!probe.isSolid(s.a1().offset(s.inward()).down()) || !probe.isSolid(s.a2().offset(s.inward()).down())) {
             return -1;
         }
-        return clearBlocks;
+        return clearBlocks + floorFills * 2;
     }
 
     private CellProbe worldProbe(ClientWorld world) {
@@ -540,12 +575,14 @@ final class PortalCaster {
             // Stage 2: zero-flood in-basin backstop casting -> dry trench mining -> bottom threshold pours #1 & #2
             case PLACE_S1 -> tickPlaceCobble(player, world, site.s1(), site.a1().offset(site.shore()).up(), null, null, true, Stage.PLACE_S2, "clearing interior lava #1");
             case PLACE_S2 -> tickPlaceCobble(player, world, site.s2(), site.a2().offset(site.shore()).up(), null, null, true, Stage.MINE_S1, "clearing interior lava #2");
-            case MINE_S1 -> tickMineSingleBlock(player, world, site.s1(), site.a1().offset(site.shore()).up(), Stage.WATER_BACK1, "opening basin #1 for backstop");
+            case MINE_S1 -> tickMineSingleBlock(player, world, site.s1(), site.a1().offset(site.shore()).up(),
+                isSolidBackstop(world, site.a1().offset(site.inward())) ? Stage.MINE_S2 : Stage.WATER_BACK1, "opening basin #1 for backstop");
             case WATER_BACK1 -> tickPlaceWater(player, world, site.waterBack1(), site.a1().down(), Direction.UP,
                 site.a1().offset(site.shore()).up(), null, null, Stage.WAIT_BACK1, "casting obsidian backstop #1");
             case WAIT_BACK1 -> tickWaitObsidian(player, world, site.a1().offset(site.inward()), false, Stage.RECLAIM_BACK1, "solidifying obsidian backstop #1");
             case RECLAIM_BACK1 -> tickReclaimWater(player, world, site.waterBack1(), site.a1().offset(site.shore()).up(), null, null, Stage.MINE_S2, "reclaiming backstop #1 water");
-            case MINE_S2 -> tickMineSingleBlock(player, world, site.s2(), site.a2().offset(site.shore()).up(), Stage.WATER_BACK2, "opening basin #2 for backstop");
+            case MINE_S2 -> tickMineSingleBlock(player, world, site.s2(), site.a2().offset(site.shore()).up(),
+                isSolidBackstop(world, site.a2().offset(site.inward())) ? Stage.MINE_TRENCH : Stage.WATER_BACK2, "opening basin #2 for backstop");
             case WATER_BACK2 -> tickPlaceWater(player, world, site.waterBack2(), site.a2().down(), Direction.UP,
                 site.a2().offset(site.shore()).up(), null, null, Stage.WAIT_BACK2, "casting obsidian backstop #2");
             case WAIT_BACK2 -> tickWaitObsidian(player, world, site.a2().offset(site.inward()), false, Stage.RECLAIM_BACK2, "solidifying obsidian backstop #2");
@@ -621,14 +658,14 @@ final class PortalCaster {
 
     private Stage determineResumeStage(ClientWorld world) {
         if (!world.getBlockState(site.a0()).isOf(Blocks.OBSIDIAN)) {
-            if (findNextBankClearBlock(world) != null) return Stage.CLEAR_BANK;
+            if (findNextBankFillCell(world) != null || findNextBankClearBlock(world) != null) return Stage.CLEAR_BANK;
             return Stage.MINE_FOOT0_PIT;
         }
         if (!world.getBlockState(site.a3()).isOf(Blocks.OBSIDIAN)) return Stage.MINE_FOOT1_PIT;
         if (!world.getBlockState(site.a1().down()).isOf(Blocks.OBSIDIAN)
                 || !world.getBlockState(site.a2().down()).isOf(Blocks.OBSIDIAN)) {
-            if (!world.getBlockState(site.a1().offset(site.inward())).isOf(Blocks.OBSIDIAN)) return Stage.PLACE_S1;
-            if (!world.getBlockState(site.a2().offset(site.inward())).isOf(Blocks.OBSIDIAN)) return Stage.MINE_S2;
+            if (!isSolidBackstop(world, site.a1().offset(site.inward()))) return Stage.PLACE_S1;
+            if (!isSolidBackstop(world, site.a2().offset(site.inward()))) return Stage.MINE_S2;
             return Stage.MINE_TRENCH;
         }
         if (!world.getBlockState(site.a0().up(1)).isOf(Blocks.OBSIDIAN)) return Stage.MINE_DRAIN1;
@@ -702,6 +739,22 @@ final class PortalCaster {
         return RunStatus.RUNNING;
     }
 
+    private static boolean isSolidBackstop(ClientWorld world, BlockPos pos) {
+        BlockState st = world.getBlockState(pos);
+        return Perception.isSolidSupport(st) && st.getFluidState().isEmpty();
+    }
+
+    private BlockPos findNextBankFillCell(ClientWorld world) {
+        if (site == null) return null;
+        for (BlockPos p : site.bankFillCells()) {
+            BlockState st = world.getBlockState(p);
+            if (!Perception.isSolidSupport(st) && Perception.isSolidSupport(world.getBlockState(p.down()))) {
+                return p;
+            }
+        }
+        return null;
+    }
+
     private BlockPos findNextBankClearBlock(ClientWorld world) {
         if (site == null) return null;
         for (BlockPos p : site.bankClearCells()) {
@@ -716,13 +769,47 @@ final class PortalCaster {
 
     private RunStatus tickClearBank(ClientPlayerEntity player, ClientWorld world) {
         statusText = "clearing lava shore work pad";
-        BlockPos target = findNextBankClearBlock(world);
-        if (target == null) {
+        if (stageTicks > 800) {
+            // Proceed even if a stubborn overhead block remained
             setStage(Stage.MINE_FOOT0_PIT);
             return RunStatus.RUNNING;
         }
-        if (stageTicks > 280) {
-            // Proceed even if a stubborn overhead block remained
+        // 1. Fill any 1-block notch/dip in bank1 or bank2 at y=poolY so the dry shore pad & water-pocket walls are solid!
+        BlockPos fillTarget = findNextBankFillCell(world);
+        if (fillTarget != null) {
+            statusText = "leveling lava shore floor";
+            int cobbleSlot = ensureCobbleHotbar(player);
+            if (cobbleSlot >= 0) {
+                if (motor.findPlacementHit(fillTarget) != null) {
+                    motor.requestSneak();
+                    if (bucketCooldownTicks <= 0 && motor.placeBlockAt(fillTarget, cobbleSlot)) {
+                        bucketCooldownTicks = 5;
+                    }
+                    return RunStatus.RUNNING;
+                }
+                Pathfinder.Options opts = Pathfinder.Options.mining(TaskRunner.scaffoldCount(player), player.getHealth() > 10f, true);
+                if (!route.hasPlan() || activeRouteDest == null || !activeRouteDest.equals(fillTarget)) {
+                    Pathfinder.Plan plan = pathfinder.search(perception, player, player.getBlockPos(),
+                        Pathfinder.Goal.interactReach(fillTarget, 3.2), opts);
+                    if (!plan.isEmpty()) {
+                        route.setPlan(plan);
+                        activeRouteDest = fillTarget;
+                    } else {
+                        moveToDryGroundSpot(player, world, fillTarget.offset(site.shore()).up(), false, true);
+                    }
+                } else {
+                    RouteExecutor.Status st = route.tick(totalTicks, true);
+                    if (st == RouteExecutor.Status.COMPLETE || st == RouteExecutor.Status.STUCK || st == RouteExecutor.Status.INVALIDATED) {
+                        route.clear();
+                        activeRouteDest = null;
+                    }
+                }
+                return RunStatus.RUNNING;
+            }
+        }
+        // 2. Clear raised bank blocks & overhead cave rock top-down!
+        BlockPos target = findNextBankClearBlock(world);
+        if (target == null) {
             setStage(Stage.MINE_FOOT0_PIT);
             return RunStatus.RUNNING;
         }
@@ -1463,24 +1550,27 @@ final class PortalCaster {
         BlockPos best = null;
         double bestScore = Double.POSITIVE_INFINITY;
         BlockPos feet = player.getBlockPos();
-        int standY = lavaPos.getY() + 1;
-        for (int dx = -2; dx <= 2; dx++) {
-            for (int dz = -2; dz <= 2; dz++) {
-                if (dx == 0 && dz == 0) continue;
-                int distSq = dx * dx + dz * dz;
-                if (distSq > 5) continue;
-                BlockPos cand = new BlockPos(lavaPos.getX() + dx, standY, lavaPos.getZ() + dz);
-                if (!isSafeStandingCell(world, cand)) continue;
-                // Don't stand on our active water source cell!
-                if (cand.equals(activeWaterPos)) continue;
-                double dPlayer = Math.sqrt(cand.getSquaredDistance(feet));
-                // Strongly prefer directly adjacent dry rim cells (distSq <= 2) so no intermediate curb occludes the lava!
-                double adjPenalty = distSq <= 2 ? 0.0 : 3.5;
-                double wetPenalty = world.getBlockState(cand).getFluidState().isEmpty() ? 0.0 : 4.0;
-                double score = dPlayer + Math.sqrt(distSq) * 0.8 + adjPenalty + wetPenalty;
-                if (score < bestScore) {
-                    bestScore = score;
-                    best = cand;
+        for (int dy = 1; dy <= 2; dy++) {
+            int standY = lavaPos.getY() + dy;
+            for (int dx = -2; dx <= 2; dx++) {
+                for (int dz = -2; dz <= 2; dz++) {
+                    if (dx == 0 && dz == 0) continue;
+                    int distSq = dx * dx + dz * dz;
+                    if (distSq > 5) continue;
+                    BlockPos cand = new BlockPos(lavaPos.getX() + dx, standY, lavaPos.getZ() + dz);
+                    if (!isSafeStandingCell(world, cand)) continue;
+                    // Don't stand on our active water source cell!
+                    if (cand.equals(activeWaterPos)) continue;
+                    double dPlayer = Math.sqrt(cand.getSquaredDistance(feet));
+                    // Strongly prefer directly adjacent dry rim cells (distSq <= 2) at poolY+1 so no intermediate curb occludes the lava!
+                    double adjPenalty = distSq <= 2 ? 0.0 : 3.5;
+                    double wetPenalty = world.getBlockState(cand).getFluidState().isEmpty() ? 0.0 : 4.0;
+                    double elevPenalty = (dy - 1) * 1.6;
+                    double score = dPlayer + Math.sqrt(distSq) * 0.8 + adjPenalty + wetPenalty + elevPenalty;
+                    if (score < bestScore) {
+                        bestScore = score;
+                        best = cand;
+                    }
                 }
             }
         }

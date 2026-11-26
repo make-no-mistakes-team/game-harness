@@ -43,6 +43,7 @@ public final class AgentClient implements ClientModInitializer {
     private Pathfinder pathfinder;
     private RouteExecutor route;
     private GuiHands gui;
+    private SafeDescent descent;
     private SurvivalReflexes reflexes;
     private TaskRunner tasks;
     private StrategistBridge strategist;
@@ -100,8 +101,9 @@ public final class AgentClient implements ClientModInitializer {
         pathfinder = new Pathfinder();
         route = new RouteExecutor(client, motor, perception);
         gui = new GuiHands(client);
-        reflexes = new SurvivalReflexes(client, motor, perception, gui);
-        tasks = new TaskRunner(client, motor, perception, pathfinder, route, gui, reflexes, goal);
+        descent = new SafeDescent(client, motor, perception, gui);
+        reflexes = new SurvivalReflexes(client, motor, perception, gui, descent);
+        tasks = new TaskRunner(client, motor, perception, pathfinder, route, gui, reflexes, descent, goal);
         strategist = StrategistBridge.open(directory, goal);
         pauses = new AgentPauseEpisodes(directory, 0);
     }
@@ -166,6 +168,7 @@ public final class AgentClient implements ClientModInitializer {
 
         // 3. Tick perception (sight rays + optical sight + combat flow + optional diagnostic ore scan)
         perception.tick((int) tick);
+        descent.tickTelemetry(player, client.world, (int) tick);
 
         // 4. Poll any new macro plan from the async LLM strategist!
         if (strategist != null) {
@@ -179,9 +182,10 @@ public final class AgentClient implements ClientModInitializer {
                     int holdSec = plan.tasks().get(0).count() > 0 ? Math.min(30, plan.tasks().get(0).count()) : 10;
                     reflexes.requestManualShelter(holdSec * 20);
                 }
-                tasks.applyModelPlan(plan.tasks(), plan.replaceQueue(), plan.safeExcavation());
+                tasks.applyModelPlan(plan.tasks(), plan.replaceQueue(), plan.safeExcavation(), plan.descentMethod());
                 appendEvent("model_plan_applied", plan.planId()
                     + " [stance=" + (plan.combatStance().isEmpty() ? "unchanged" : plan.combatStance())
+                    + ", descent=" + (plan.descentMethod() == null ? "unchanged" : plan.descentMethod().wireName())
                     + "]: " + plan.rationale());
             }
         }
@@ -199,7 +203,7 @@ public final class AgentClient implements ClientModInitializer {
 
         // 7. Periodically publish state to LLM strategist & progress.json to run.ts!
         if (strategist != null && (tick % 15 == 0 || tick <= 2)) {
-            strategist.publishState(player, client.world, perception, tasks, reflexes, life, tick);
+            strategist.publishState(player, client.world, perception, tasks, reflexes, descent, life, tick);
         }
         long nowMs = System.currentTimeMillis();
         if (tick % 5 == 0 || nowMs - lastProgressWriteMs >= 250) {
@@ -257,6 +261,26 @@ public final class AgentClient implements ClientModInitializer {
         obj.addProperty("life", respawns + 1);
         obj.addProperty("life_phase", alive ? "playing" : "death_screen");
         obj.addProperty("rock_broken", tasks == null ? 0 : tasks.rockBrokenCount());
+        if (descent != null) {
+            SafeDescent.Overlook ov = descent.lastOverlook();
+            obj.addProperty("descent_method", descent.activeMethodName());
+            obj.addProperty("descent_phase", descent.activePhaseName());
+            obj.addProperty("descent_preferred", descent.preferredMethod().wireName());
+            obj.addProperty("descent_completed", descent.descentCompletedEver());
+            obj.addProperty("descent_refused", descent.refusedHazard());
+            obj.addProperty("descent_drop_depth", ov == null ? 0 : ov.dropDepth());
+            obj.addProperty("descent_landing_surface", ov == null ? "none" : ov.landingSurface().wireName());
+            obj.addProperty("water_clutch_landed", descent.waterClutchLandedEver());
+            obj.addProperty("water_reclaimed", descent.waterReclaimedEver());
+            obj.addProperty("boat_dropped", descent.boatDroppedEver());
+            obj.addProperty("boat_reclaimed", descent.boatReclaimedEver());
+            obj.addProperty("stair_steps_carved", descent.stairStepsCarved());
+            obj.addProperty("edge_blocks_placed", descent.edgeBlocksPlaced());
+            obj.addProperty("fall_damage_taken", Math.round(descent.fallDamageTaken() * 100.0) / 100.0);
+            obj.addProperty("damage_taken", Math.round(descent.totalDamageTaken() * 100.0) / 100.0);
+            obj.addProperty("min_y", Math.round(descent.minY() * 100.0) / 100.0);
+            obj.addProperty("max_y", Math.round(descent.maxY() * 100.0) / 100.0);
+        }
         if (alive) {
             obj.addProperty("x", player.getX());
             obj.addProperty("y", player.getY());

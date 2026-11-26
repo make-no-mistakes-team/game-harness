@@ -25,6 +25,7 @@ Available task kinds:
 - smelt: place/use furnace to smelt raw_iron into iron_ingot or raw_meat into cooked meat. target="raw_iron"|"raw_meat", count=desired total cooked/smelted items.
 - gather_food: harvest visible berries or hunt visible food animals. target="food", count=desired food count (e.g. 4).
 - dig_down: dig a safe navigable staircase down to a target Y level (count=targetY, e.g. 16 for iron or -54 for diamonds).
+- descend_drop: evaluate and safely descend a nearby high drop, ravine, or giant cavern overlook. target="auto"|"water_pour"|"water_clutch"|"boat_drop"|"cliff_stair"|"edge_blocks"|"avoid", count=targetFloorY (or 0 to descend to the observed cavern floor).
 - explore: explore terrain to find trees, stone, caves, or food animals. target="explore", count=20.
 - navigate: 3D A* navigate to x,y,z within count blocks.
 - collect_drops: pick up nearby dropped items.
@@ -42,32 +43,45 @@ Strategic rules:
 2. Keep wood/sticks in reserve (at least 2 sticks OR >= 2 planks / 1 log remaining AFTER crafting iron_pickaxe/spare tools!) AND a spare stone_pickaxe before descending deep underground, so iron_pickaxe durability is conserved and diamond_pickaxe can be crafted immediately underground the instant you mine 3 diamonds!
 3. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
 4. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals. When healthy and well-armed, use "auto", "defensive", or "aggressive".
-5. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.
-6. During long smelts (activeFurnace present), the local player automatically mines nearby ore/stone or chops nearby wood when safe and returns before smelting finishes — do not interrupt an active smelt unless urgent.
-7. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
-8. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
+5. When state.descent.nearbyDrop is true, inspect state.descent (dropDepth, floorObserved, landingSurface, landingLava, landingHostiles, hasCliffWall, hasSteppedShelf, and descent.gear) and set descentMethod (and optionally queue a descend_drop task):
+   - NEVER pick water_clutch or boat_drop if landingLava is true or floorObserved is false (use "avoid", "water_pour", or "cliff_stair" instead).
+   - Pick "water_clutch" (with waterBucket and clear dry solid floor) for fast MLG descent, or "water_pour" for a reusable waterfall column (especially when deep or floor is uncertain).
+   - Pick "boat_drop" when carrying a boat over a clear dry cavern floor for zero fall damage.
+   - Pick "cliff_stair" when lacking water/boat or when landing is dark/hostile and a cliff wall + pickaxe are available.
+   - Pick "edge_blocks" on stepped shelves/chasms when carrying scaffold blocks (cobblestone/dirt).
+   - Pick "avoid" if descending into lava or an unlit hostile swarm at low HP.
+6. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.
+7. During long smelts (activeFurnace present), the local player automatically mines nearby ore/stone or chops nearby wood when safe and returns before smelting finishes — do not interrupt an active smelt unless urgent.
+8. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
+9. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
 
 const TASK_KINDS = [
   "gather_wood", "mine_stone", "mine_ore", "craft", "smelt",
-  "gather_food", "dig_down", "explore", "navigate", "collect_drops", "build_shelter",
+  "gather_food", "dig_down", "descend_drop", "explore", "navigate", "collect_drops", "build_shelter",
 ] as const;
 
 const COMBAT_STANCES = ["auto", "aggressive", "defensive", "flee", "shelter"] as const;
 type CombatStance = (typeof COMBAT_STANCES)[number];
 
+const DESCENT_METHODS = [
+  "auto", "water_pour", "water_clutch", "boat_drop", "cliff_stair", "edge_blocks", "avoid",
+] as const;
+type DescentMethod = (typeof DESCENT_METHODS)[number];
+
 const PLAN_TOOL: Tool = {
   name: "submit_survival_plan",
-  description: "Submit an ordered macro task queue (1-5 tasks), combat stance, and excavation safety preference for the local Survival player.",
+  description: "Submit an ordered macro task queue (1-5 tasks), combat stance, excavation safety preference, and high-drop descent method for the local Survival player.",
   strict: true,
   parameters: {
     type: "object",
     additionalProperties: false,
-    required: ["rationale", "replaceQueue", "excavationMode", "combatStance", "tasks"],
+    required: ["rationale", "replaceQueue", "excavationMode", "combatStance", "descentMethod", "tasks"],
     properties: {
       rationale: { type: "string", description: "Concise 1-2 sentence explanation of the macro plan." },
       replaceQueue: { type: "boolean", description: "True to replace queued tasks now; false to append smoothly." },
       excavationMode: { type: "string", enum: ["safe_staircase", "fast"] },
       combatStance: { type: "string", enum: [...COMBAT_STANCES] },
+      descentMethod: { type: "string", enum: [...DESCENT_METHODS], description: "Preferred method for high drops/caverns (use 'auto' when no drop is active)." },
       tasks: {
         type: "array",
         minItems: 1,
@@ -130,6 +144,18 @@ interface LiveState {
     threats: { kind: string; dist: number; occluded: boolean }[];
   };
   appliedPlan?: { planId: string; tick: number };
+  descent?: {
+    nearbyDrop: boolean;
+    dropDepth: number;
+    floorObserved: boolean;
+    landingSurface: string;
+    landingY: number;
+    landingLava: boolean;
+    landingHostiles: number;
+    recommendedMethod: string;
+    activeMethod: string;
+    activePhase: string;
+  };
 }
 
 interface ParsedPlan {
@@ -137,6 +163,7 @@ interface ParsedPlan {
   replaceQueue: boolean;
   excavationMode: "safe_staircase" | "fast";
   combatStance: CombatStance;
+  descentMethod: DescentMethod;
   tasks: { kind: string; target: string; count: number; x: number | null; y: number | null; z: number | null }[];
 }
 
@@ -146,6 +173,7 @@ function parsePlanArgs(raw: string): ParsedPlan | null {
     if (!o || typeof o !== "object" || typeof o.rationale !== "string" || typeof o.replaceQueue !== "boolean") return null;
     if (o.excavationMode !== "safe_staircase" && o.excavationMode !== "fast") return null;
     const combatStance: CombatStance = COMBAT_STANCES.includes(o.combatStance) ? o.combatStance : "auto";
+    const descentMethod: DescentMethod = DESCENT_METHODS.includes(o.descentMethod) ? o.descentMethod : "auto";
     if (!Array.isArray(o.tasks) || o.tasks.length < 1 || o.tasks.length > 5) return null;
     const tasks = [];
     for (const t of o.tasks) {
@@ -156,7 +184,14 @@ function parsePlanArgs(raw: string): ParsedPlan | null {
       if (x === undefined || y === undefined || z === undefined) return null;
       tasks.push({ kind: t.kind, target: t.target, count: t.count, x, y, z });
     }
-    return { rationale: o.rationale.slice(0, 400), replaceQueue: o.replaceQueue, excavationMode: o.excavationMode, combatStance, tasks };
+    return {
+      rationale: o.rationale.slice(0, 400),
+      replaceQueue: o.replaceQueue,
+      excavationMode: o.excavationMode,
+      combatStance,
+      descentMethod,
+      tasks,
+    };
   } catch {
     return null;
   }
@@ -280,6 +315,9 @@ export function composeMacroStrategist(options: StrategistOptions) {
     const threatBucket = Math.min(3, (st.combat?.visibleThreatCount ?? 0) + (st.combat?.occludedThreatCount ?? 0));
     const trapped = st.combat?.trapped ? 1 : 0;
     const sheltered = st.combat?.shelterSealed ? 1 : 0;
+    const dropKey = st.descent?.nearbyDrop
+      ? `${st.descent.landingSurface}:${st.descent.landingLava ? "lava" : "ok"}`
+      : "none";
     return JSON.stringify([
       st.life,
       tier,
@@ -289,6 +327,7 @@ export function composeMacroStrategist(options: StrategistOptions) {
       threatBucket,
       trapped,
       sheltered,
+      dropKey,
       st.queuedTasks.length === 0 ? "empty" : "queued",
       lastReceipt ? `${lastReceipt.id}:${lastReceipt.outcome}` : "none",
     ]);
@@ -359,6 +398,7 @@ export function composeMacroStrategist(options: StrategistOptions) {
         replaceQueue: parsed.replaceQueue,
         excavationMode: parsed.excavationMode,
         combatStance: parsed.combatStance,
+        descentMethod: parsed.descentMethod,
         tasks: parsed.tasks,
       };
       const tmp = join(stratDir, `.plan-${planId}.tmp`);
@@ -382,6 +422,7 @@ export function composeMacroStrategist(options: StrategistOptions) {
         rationale: parsed.rationale,
         excavationMode: parsed.excavationMode,
         combatStance: parsed.combatStance,
+        descentMethod: parsed.descentMethod,
         tasks: parsed.tasks,
       });
     } catch (err) {
@@ -422,11 +463,13 @@ export function composeMacroStrategist(options: StrategistOptions) {
 
         const key = computeTriggerKey(st);
         const now = Date.now();
+        const midDescent = Boolean(st.descent?.activePhase && st.descent.activePhase !== "idle");
         const queueLow = st.queuedTasks.length <= 1;
         const lastFailed = st.recentReceipts.at(-1)?.outcome === "failed";
         const activeHostiles = (st.combat?.visibleThreatCount ?? 0) > 0;
         const urgent = st.health < 12 || lastFailed || activeHostiles;
-        const shouldCall = requests < options.maxRequests
+        const shouldCall = (!midDescent || urgent)
+          && requests < options.maxRequests
           && now - lastRequestAt >= (urgent ? MIN_COOLDOWN_MS : 12_000)
           && (requests === 0 || (queueLow && key !== lastTriggerKey) || (urgent && key !== lastTriggerKey)
               || (st.queuedTasks.length === 0 && now - lastRequestAt >= 25_000));

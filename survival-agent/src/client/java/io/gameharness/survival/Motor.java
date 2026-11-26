@@ -412,6 +412,17 @@ final class Motor {
     void requestSneak() { wantSneak = true; }
     void requestHoldUse() { wantUse = true; }
 
+    /** Direct boat steering controls (boats turn via left/right keys and row via forward/back). */
+    void steerBoat(boolean forward, boolean back, boolean left, boolean right) {
+        wantForward = forward;
+        wantBack = back;
+        wantLeft = left;
+        wantRight = right;
+        wantSprint = false;
+        wantJump = false;
+        wantSneak = false;
+    }
+
     /**
      * Find a natural, reachable, off-center point on a visible face of `pos`.
      * Uses raycasting so we only aim at genuinely visible faces, never dead-center unless required.
@@ -504,8 +515,8 @@ final class Motor {
             if (st.isAir() || !st.getFluidState().isEmpty() || st.isReplaceable()) continue;
             Direction clickFace = dir.getOpposite();
             double[][] uvs = {
-                {0.46, 0.54}, {0.5, 0.5}, {0.32, 0.62}, {0.68, 0.38},
-                {0.2, 0.2}, {0.8, 0.8}, {0.5, 0.15}, {0.5, 0.85}
+                {0.46, 0.54}, {0.5, 0.5}, {0.5, 0.80}, {0.32, 0.62}, {0.68, 0.38},
+                {0.5, 0.22}, {0.2, 0.2}, {0.8, 0.8}, {0.5, 0.15}, {0.5, 0.85}
             };
             for (double[] uv : uvs) {
                 Vec3d pt = pointOnFace(support, clickFace, uv[0], uv[1]);
@@ -638,6 +649,33 @@ final class Motor {
                 && bhr.getType() == HitResult.Type.BLOCK
                 && bhr.getBlockPos().equals(hit.support())
                 && bhr.getSide() == hit.face()
+                && useCooldownTicks <= 0) {
+            if (client.interactionManager != null) {
+                var res = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, bhr);
+                if (res.isAccepted()) {
+                    player.swingHand(Hand.MAIN_HAND);
+                    useCooldownTicks = 3;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Place a block from `hotbarSlot` directly against an explicit visible support face point. */
+    boolean placeBlockAgainst(BlockPos support, Direction face, Vec3d aimPoint, int hotbarSlot) {
+        var player = client.player;
+        var world = client.world;
+        if (player == null || world == null || support == null || face == null || aimPoint == null) return false;
+        if (hotbarSlot < 0 || hotbarSlot > 8) return false;
+
+        player.getInventory().selectedSlot = hotbarSlot;
+        lookAtPoint(aimPoint, LookMode.FINE);
+        HitResult ch = client.crosshairTarget;
+        if (ch instanceof BlockHitResult bhr
+                && bhr.getType() == HitResult.Type.BLOCK
+                && bhr.getBlockPos().equals(support)
+                && bhr.getSide() == face
                 && useCooldownTicks <= 0) {
             if (client.interactionManager != null) {
                 var res = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, bhr);
@@ -938,6 +976,15 @@ final class Motor {
         if (player == null) return -1;
         for (int i = 0; i < 9; i++) {
             if (player.getInventory().getStack(i).isOf(item)) return i;
+        }
+        return -1;
+    }
+
+    int findHotbarBoat() {
+        var player = client.player;
+        if (player == null) return -1;
+        for (int i = 0; i < 9; i++) {
+            if (SafeDescent.isBoatStack(player.getInventory().getStack(i))) return i;
         }
         return -1;
     }

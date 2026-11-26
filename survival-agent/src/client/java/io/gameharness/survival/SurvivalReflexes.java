@@ -40,12 +40,11 @@ final class SurvivalReflexes {
     private final Motor motor;
     private final Perception perception;
     private final GuiHands gui;
+    private final SafeDescent descent;
 
     private String activeStatus;
     private boolean eating;
     private int eatingTicks;
-    private BlockPos placedClutchWater;
-    private int clutchReclaimTicks;
     private int hurtLookTicks;
     private float hurtLookYaw;
 
@@ -79,19 +78,18 @@ final class SurvivalReflexes {
     private boolean shelterEverRoofed;
     private Direction unsealDir = Direction.NORTH;
 
-    SurvivalReflexes(MinecraftClient client, Motor motor, Perception perception, GuiHands gui) {
+    SurvivalReflexes(MinecraftClient client, Motor motor, Perception perception, GuiHands gui, SafeDescent descent) {
         this.client = client;
         this.motor = motor;
         this.perception = perception;
         this.gui = gui;
+        this.descent = descent;
     }
 
     void resetForLife() {
         activeStatus = null;
         eating = false;
         eatingTicks = 0;
-        placedClutchWater = null;
-        clutchReclaimTicks = 0;
         hurtLookTicks = 0;
         creeperRetreatTicks = 0;
         recentBlockTicks = 0;
@@ -160,28 +158,7 @@ final class SurvivalReflexes {
             strafeSign = -strafeSign;
         }
 
-        // 0. If we just landed a water-bucket clutch, scoop the water back up!
-        if (placedClutchWater != null) {
-            clutchReclaimTicks++;
-            if (clutchReclaimTicks > 35 || !world.getBlockState(placedClutchWater).getFluidState().isIn(FluidTags.WATER)) {
-                placedClutchWater = null;
-            } else {
-                int bucketSlot = motor.findHotbarItem(Items.BUCKET);
-                if (bucketSlot >= 0) {
-                    player.getInventory().selectedSlot = bucketSlot;
-                    motor.lookAtPoint(Vec3d.ofCenter(placedClutchWater), Motor.LookMode.COMBAT);
-                    if (motor.currentAimErrorDeg() < 18.0 && client.interactionManager != null) {
-                        client.interactionManager.interactItem(player, Hand.MAIN_HAND);
-                        player.swingHand(Hand.MAIN_HAND);
-                    }
-                    activeStatus = "reclaiming clutch water";
-                    return true;
-                }
-                placedClutchWater = null;
-            }
-        }
-
-        // 1. Lava / fire emergency!
+        // 0. Lava / fire emergency!
         if (player.isInLava() || (player.isOnFire() && perception.isNearKnownLava(
                 player.getBlockX(), player.getBlockY(), player.getBlockZ()))) {
             shelterState = ShelterState.NONE;
@@ -191,20 +168,14 @@ final class SurvivalReflexes {
             return true;
         }
 
-        // 2. Water-bucket MLG fall clutch!
-        if (!player.isOnGround() && !player.isTouchingWater()
-                && player.getVelocity().y < -0.56 && player.fallDistance > 3.5f) {
-            int waterSlot = motor.findHotbarItem(Items.WATER_BUCKET);
-            if (waterSlot >= 0) {
-                closeScreenIfOpen();
-                if (tryWaterClutch(player, world, waterSlot)) {
-                    activeStatus = "water-bucket fall clutch";
-                    return true;
-                }
-            }
+        // 1. Reactive water-bucket MLG fall clutch & reclaim (delegated to SafeDescent; skips active intentional descent / boat rides!)
+        if (descent != null && descent.tickReactiveFallClutch(player, world, currentTick)) {
+            closeScreenIfOpen();
+            activeStatus = descent.statusText();
+            return true;
         }
 
-        // 3. Drowning / underwater breath emergency!
+        // 2. Drowning / underwater breath emergency!
         if (player.isSubmergedInWater() && player.getAir() < 160) {
             shelterState = ShelterState.NONE;
             closeScreenIfOpen();
@@ -1142,38 +1113,6 @@ final class SurvivalReflexes {
         }
         Vec3d bestExit = findSafeEscapeDirection(player, world, player.getPos(), true);
         motor.moveToward(bestExit, true, true, false, false);
-    }
-
-    private boolean tryWaterClutch(ClientPlayerEntity player, ClientWorld world, int waterSlot) {
-        BlockPos feet = player.getBlockPos();
-        BlockPos landing = null;
-        for (int dy = 1; dy <= 10; dy++) {
-            BlockPos probe = feet.down(dy);
-            BlockState st = world.getBlockState(probe);
-            if (st.getFluidState().isIn(FluidTags.WATER)) return false;
-            if (Perception.isSolidSupport(st)) {
-                landing = probe;
-                break;
-            }
-        }
-        if (landing == null) return false;
-        player.getInventory().selectedSlot = waterSlot;
-        Vec3d aim = Vec3d.ofCenter(landing).add(0, 0.5, 0);
-        motor.lookAtPoint(aim, Motor.LookMode.COMBAT);
-
-        double distToGround = player.getY() - (landing.getY() + 1.0);
-        if (distToGround <= 4.3 && player.getPitch() > 68f) {
-            HitResult ch = client.crosshairTarget;
-            if (ch instanceof BlockHitResult bhr && bhr.getType() == HitResult.Type.BLOCK && client.interactionManager != null) {
-                var res = client.interactionManager.interactItem(player, Hand.MAIN_HAND);
-                if (res.isAccepted()) {
-                    player.swingHand(Hand.MAIN_HAND);
-                    placedClutchWater = bhr.getBlockPos().offset(bhr.getSide());
-                    clutchReclaimTicks = 0;
-                }
-            }
-        }
-        return true;
     }
 
     private void handleDrownEscape(ClientPlayerEntity player, ClientWorld world) {

@@ -38,6 +38,7 @@ final class TaskRunner {
         SMELT,
         GATHER_FOOD,
         DIG_DOWN,
+        DESCEND_DROP,
         EXPLORE,
         NAVIGATE,
         COLLECT_DROPS,
@@ -63,6 +64,7 @@ final class TaskRunner {
     private final RouteExecutor route;
     private final GuiHands gui;
     private final SurvivalReflexes reflexes;
+    private final SafeDescent descent;
     private final String goal;
 
     private final ArrayDeque<Task> queue = new ArrayDeque<>();
@@ -101,7 +103,7 @@ final class TaskRunner {
 
     TaskRunner(MinecraftClient client, Motor motor, Perception perception,
                Pathfinder pathfinder, RouteExecutor route, GuiHands gui,
-               SurvivalReflexes reflexes, String goal) {
+               SurvivalReflexes reflexes, SafeDescent descent, String goal) {
         this.client = client;
         this.motor = motor;
         this.perception = perception;
@@ -109,6 +111,7 @@ final class TaskRunner {
         this.route = route;
         this.gui = gui;
         this.reflexes = reflexes;
+        this.descent = descent;
         this.goal = goal;
     }
 
@@ -131,6 +134,7 @@ final class TaskRunner {
         dropChaseEntityId = -1;
         dropChaseTicks = 0;
         noMineProgressTicks = 0;
+        if (descent != null) descent.resetForLife();
     }
 
     void setSafeExcavationMode(boolean safe) { this.safeExcavationMode = safe; }
@@ -144,13 +148,18 @@ final class TaskRunner {
     int activeSmeltRemainingTicks(int currentTick) { return smeltLoaded ? Math.max(0, smeltReadyTick - currentTick) : 0; }
 
     /** Accept a new macro plan from the asynchronous LLM strategist without stalling! */
-    void applyModelPlan(List<Task> tasks, boolean replaceQueue, Boolean safeMode) {
+    void applyModelPlan(List<Task> tasks, boolean replaceQueue, Boolean safeMode, SafeDescent.Method descentMethod) {
         if (safeMode != null) this.safeExcavationMode = safeMode;
+        if (descent != null && descentMethod != null) {
+            descent.setPreferredMethod(descentMethod);
+        }
         if (tasks == null || tasks.isEmpty()) return;
         if (replaceQueue) {
             queue.clear();
-            // Interrupt active task cleanly when strategist explicitly replaces the queue (don't abort mid-GUI click or loaded furnace!)
-            if (active != null && !gui.isBusy() && !smeltLoaded) {
+            // Interrupt active task cleanly when strategist explicitly replaces the queue
+            // (never abort mid-GUI click, loaded furnace, or mid-air/mid-descent maneuver!)
+            boolean descentBusy = descent != null && descent.isActivelyDescending();
+            if (active != null && !gui.isBusy() && !smeltLoaded && !descentBusy) {
                 Task firstNew = tasks.get(0);
                 boolean sameActive = active.kind() == firstNew.kind()
                     && java.util.Objects.equals(active.target(), firstNew.target())
@@ -180,7 +189,7 @@ final class TaskRunner {
 
         // 1. Always pick up reachable valuable dropped items right next to us (<= 6m, cumulative cap so jumping never resets it!)
         if (active != null) activeTicks++;
-        if (active == null || (active.kind() != TaskKind.CRAFT && active.kind() != TaskKind.SMELT)) {
+        if (active == null || (active.kind() != TaskKind.CRAFT && active.kind() != TaskKind.SMELT && active.kind() != TaskKind.DESCEND_DROP)) {
             ItemEntity nearbyValuable = findNearbyValuableDrop(player, 6.0);
             if (nearbyValuable != null) {
                 int eid = nearbyValuable.getId();
@@ -247,8 +256,9 @@ final class TaskRunner {
             return;
         }
 
-        int maxTicks = (active.kind() == TaskKind.MINE_ORE || active.kind() == TaskKind.DIG_DOWN) ? 6000 : 2400;
+        int maxTicks = (active.kind() == TaskKind.MINE_ORE || active.kind() == TaskKind.DIG_DOWN || active.kind() == TaskKind.DESCEND_DROP) ? 6000 : 2400;
         if (activeTicks > maxTicks) {
+            if (descent != null && descent.isActivelyDescending()) descent.clearActive();
             finishActive("timeout", "task exceeded time limit", currentTick);
             return;
         }
@@ -262,6 +272,7 @@ final class TaskRunner {
             case SMELT -> tickSmelt(player, world, currentTick);
             case GATHER_FOOD -> tickGatherFood(player, world, currentTick);
             case DIG_DOWN -> tickDigDown(player, world, currentTick);
+            case DESCEND_DROP -> tickDescendDrop(player, world, currentTick);
             case EXPLORE -> tickExplore(player, world, currentTick);
             case NAVIGATE -> tickNavigate(player, world, currentTick);
             case COLLECT_DROPS -> tickCollectDrops(player, world, currentTick);
@@ -977,8 +988,31 @@ final class TaskRunner {
     private void tickDigDown(ClientPlayerEntity player, ClientWorld world, int currentTick) {
         int targetY = active.pos() != null ? active.pos().getY() : active.count();
         if (player.getBlockY() <= targetY) {
+            if (descent != null && descent.isActivelyDescending()) descent.clearActive();
             finishActive("completed", "reached y=" + player.getBlockY(), currentTick);
             return;
+        }
+        // If already executing a SafeDescent maneuver into an encountered giant cavern/drop, let it finish!
+        if (descent != null && descent.isActivelyDescending()) {
+            SafeDescent.RunStatus ds = descent.tickActiveDescent(player, world, currentTick);
+            statusText = descent.statusText();
+            if (ds == SafeDescent.RunStatus.COMPLETED || ds == SafeDescent.RunStatus.REFUSED || ds == SafeDescent.RunStatus.FAILED) {
+                route.clear();
+            }
+            return;
+        }
+        // If we encounter a real observed sharp cavern drop (> 4 blocks) while digging down, evaluate SafeDescent!
+        if (descent != null && player.getBlockY() > targetY + 4 && activeTicks > 10) {
+            SafeDescent.Overlook ov = descent.lastOverlook();
+            if (ov != null && ov.dropDepth() >= 5 && (!ov.floorObserved() || ov.landingY() >= targetY - 12)) {
+                SafeDescent.Decision dec = descent.lastDecision();
+                if (dec.shouldDescend() || ov.landingLava()) {
+                    route.clear();
+                    descent.startDescent(player, world, descent.preferredMethod(), targetY, active.pos());
+                    statusText = descent.statusText();
+                    return;
+                }
+            }
         }
         if (isWetSurfaceSpot(player, world)) {
             route.clear();
@@ -990,6 +1024,30 @@ final class TaskRunner {
         statusText = "digging staircase to y=" + targetY;
         if (st == RouteExecutor.Status.STUCK) {
             finishActive("partial", "stuck digging down at y=" + player.getBlockY(), currentTick);
+        }
+    }
+
+    private void tickDescendDrop(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        if (descent == null) {
+            finishActive("failed", "descent subsystem unavailable", currentTick);
+            return;
+        }
+        if (!descent.isActivelyDescending()) {
+            SafeDescent.Method req = SafeDescent.Method.parse(active.target());
+            int desiredY = active.pos() != null ? active.pos().getY()
+                : (active.count() != 0 ? active.count() : Integer.MIN_VALUE);
+            descent.startDescent(player, world, req, desiredY, active.pos());
+        }
+        SafeDescent.RunStatus ds = descent.tickActiveDescent(player, world, currentTick);
+        statusText = descent.statusText().isEmpty() ? "descending cavern drop" : descent.statusText();
+        switch (ds) {
+            case COMPLETED -> finishActive("completed",
+                "descended via " + descent.activeMethodName() + " to y=" + player.getBlockY(), currentTick);
+            case REFUSED -> finishActive("refused",
+                "refused unsafe drop: " + descent.refusedHazard(), currentTick);
+            case FAILED -> finishActive("failed",
+                "descent failed at y=" + player.getBlockY(), currentTick);
+            default -> {}
         }
     }
 

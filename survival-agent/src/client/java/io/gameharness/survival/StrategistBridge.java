@@ -34,6 +34,7 @@ final class StrategistBridge {
         boolean replaceQueue,
         Boolean safeExcavation,
         String combatStance,
+        SafeDescent.Method descentMethod,
         List<TaskRunner.Task> tasks
     ) {}
 
@@ -74,7 +75,7 @@ final class StrategistBridge {
     }
 
     void publishState(ClientPlayerEntity player, ClientWorld world, Perception perception,
-                      TaskRunner runner, SurvivalReflexes reflexes, int life, long tick) {
+                      TaskRunner runner, SurvivalReflexes reflexes, SafeDescent descent, int life, long tick) {
         if (closed || player == null || world == null) return;
         JsonObject root = new JsonObject();
         root.addProperty("v", 2);
@@ -210,6 +211,37 @@ final class StrategistBridge {
         combat.add("threats", threatArr);
         root.add("combat", combat);
 
+        // High-drop / cavern overlook assessment & descent gear telemetry (strictly observed geometry!)
+        if (descent != null) {
+            JsonObject dObj = new JsonObject();
+            SafeDescent.Overlook ov = descent.lastOverlook();
+            SafeDescent.Decision dec = descent.lastDecision();
+            dObj.addProperty("nearbyDrop", ov != null && ov.dropDepth() > 3);
+            dObj.addProperty("dropDepth", ov == null ? 0 : ov.dropDepth());
+            dObj.addProperty("floorObserved", ov != null && ov.floorObserved());
+            dObj.addProperty("landingSurface", ov == null ? "none" : ov.landingSurface().wireName());
+            dObj.addProperty("landingY", ov != null && ov.floorObserved() ? ov.landingY() : (int) Math.floor(player.getY()));
+            dObj.addProperty("landingLava", ov != null && ov.landingLava());
+            dObj.addProperty("landingHazard", ov != null && ov.landingHazard());
+            dObj.addProperty("landingHostiles", ov == null ? 0 : ov.landingHostiles());
+            dObj.addProperty("hasCliffWall", ov != null && ov.cliffWallDir() != null);
+            dObj.addProperty("hasSteppedShelf", ov != null && ov.hasSteppedShelf());
+            dObj.addProperty("recommendedMethod", ov == null ? "none" : dec.method().wireName());
+            dObj.addProperty("preferredMethod", descent.preferredMethod().wireName());
+            dObj.addProperty("activeMethod", descent.activeMethodName());
+            dObj.addProperty("activePhase", descent.activePhaseName());
+            dObj.addProperty("refusedHazard", descent.refusedHazard());
+
+            JsonObject gear = new JsonObject();
+            gear.addProperty("waterBucket", GuiHands.countItem(player, net.minecraft.item.Items.WATER_BUCKET) > 0);
+            gear.addProperty("boat", SafeDescent.countBoats(player) > 0);
+            gear.addProperty("canCraftBoat", SafeDescent.canCraftBoat(player));
+            gear.addProperty("pickaxe", TaskRunner.hasAnyPickaxe(player));
+            gear.addProperty("scaffolds", TaskRunner.scaffoldCount(player));
+            dObj.add("gear", gear);
+            root.add("descent", dObj);
+        }
+
         if (!lastAppliedPlanId.isEmpty()) {
             JsonObject app = new JsonObject();
             app.addProperty("planId", lastAppliedPlanId);
@@ -278,6 +310,10 @@ final class StrategistBridge {
             else if ("fast".equals(m)) safeMode = false;
         }
         String combatStance = str(obj, "combatStance");
+        SafeDescent.Method descentMethod = null;
+        if (obj.has("descentMethod") && !obj.get("descentMethod").isJsonNull()) {
+            descentMethod = SafeDescent.Method.parse(obj.get("descentMethod").getAsString());
+        }
         List<TaskRunner.Task> tasks = new ArrayList<>();
         if (obj.has("tasks") && obj.get("tasks").isJsonArray()) {
             int idx = 0;
@@ -297,7 +333,7 @@ final class StrategistBridge {
                 tasks.add(new TaskRunner.Task(planId + "-" + (++idx), kind, target, count, pos, safe, "model"));
             }
         }
-        return new IncomingPlan(planId, rationale, replace, safeMode, combatStance, tasks);
+        return new IncomingPlan(planId, rationale, replace, safeMode, combatStance, descentMethod, tasks);
     }
 
     private static TaskRunner.TaskKind parseKind(String raw) {

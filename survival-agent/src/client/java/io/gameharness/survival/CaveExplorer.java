@@ -415,6 +415,9 @@ final class CaveExplorer {
             double dz = p.getZ() - playerFeet.getZ();
             double dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
             if (dist < 2.5) continue;
+            // While still far above our target ore depth, do not chase upward cave shelves/overhangs
+            // (e.g. climbing toward y=75 while searching for y=16 iron or y=-54 lava)!
+            if (playerFeet.getY() > targetOreY + 14 && dy > 4) continue;
 
             double score = 0.0;
             // Strongly prefer going DEEPER toward targetOreY!
@@ -456,6 +459,13 @@ final class CaveExplorer {
                                            int ticksSinceNewSector, int ticksSinceDeeper,
                                            boolean hasVisibleTargetOre) {
         if (hasVisibleTargetOre) return CaveVerdict.CONTINUE_EXPLORING;
+        int deepThreshold = targetOreY <= -20 ? -18 : 26;
+        // Hard cap on lingering in a shallow horizontal cave pocket without descending deeper:
+        // if we are still far above target depth and haven't gone a single block deeper in ~25s,
+        // stop chasing horizontal ledges and either exit to scout or dig down!
+        if (deepestY > deepThreshold && currentY > targetOreY + 18 && ticksSinceDeeper >= 500) {
+            return CaveVerdict.EXIT_SHALLOW_CAVE;
+        }
         if (hasUnvisitedFrontier && ticksSinceNewSector < 260) {
             return CaveVerdict.CONTINUE_EXPLORING;
         }
@@ -464,7 +474,6 @@ final class CaveExplorer {
             return CaveVerdict.CONTINUE_EXPLORING;
         }
         // Frontier exhausted or stalled inside this cave: check whether this cave actually got deep!
-        int deepThreshold = targetOreY <= -20 ? -18 : 26;
         if (deepestY <= deepThreshold || currentY <= deepThreshold) {
             return CaveVerdict.TRANSITION_DEEP_MINE;
         }

@@ -39,6 +39,23 @@ final class CaveExplorerTest {
     }
 
     @Test
+    void shallowCaveAbandonsHorizontalWanderingWhenNotGettingDeeper() {
+        CaveExplorer.CaveVerdict verdict = CaveExplorer.classifyCaveVerdict(
+            58, 56, 16, true, 40, 520, false);
+        assertEquals(CaveExplorer.CaveVerdict.EXIT_SHALLOW_CAVE, verdict);
+    }
+
+    @Test
+    void frontierScorerRejectsHighUpwardLedgesWhileFarAboveTargetDepth() {
+        BlockPos player = new BlockPos(0, 60, 0);
+        List<CaveExplorer.FrontierCandidate> cands = List.of(
+            new CaveExplorer.FrontierCandidate(new BlockPos(6, 72, 2), 0, true, false, false),
+            new CaveExplorer.FrontierCandidate(new BlockPos(-5, 68, 4), 2, true, false, false)
+        );
+        assertNull(CaveExplorer.scoreBestFrontier(cands, player, 0f, 16));
+    }
+
+    @Test
     void shallowCaveContinuesWhileVisibleOreRemains() {
         CaveExplorer.CaveVerdict verdict = CaveExplorer.classifyCaveVerdict(
             52, 46, 16, false, 300, 300, true);

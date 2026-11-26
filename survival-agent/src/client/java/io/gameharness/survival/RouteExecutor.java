@@ -196,6 +196,13 @@ final class RouteExecutor {
                 return Status.RUNNING;
             }
         }
+        // If a STEP_UP has been snagged against the ledge edge for > 18 ticks, briefly step back toward step.from
+        // to get clean run-up alignment instead of rubbing endlessly against the corner!
+        if (step.kind() == Pathfinder.MoveKind.STEP_UP && ticksOnStep >= 18 && ticksOnStep % 24 < 5
+                && !player.isTouchingWater() && player.getY() < step.to().getY() - 0.15) {
+            motor.moveToward(Vec3d.ofBottomCenter(step.from()), false, false, false, true);
+            return Status.RUNNING;
+        }
         boolean needJump = shouldJump(player, world, step);
         boolean canSprint = canSprintSegment(player, stepIndex);
         boolean sneak = step.kind() == Pathfinder.MoveKind.BRIDGE;
@@ -261,24 +268,26 @@ final class RouteExecutor {
                 || player.horizontalCollision;
         }
         if (step.kind() == Pathfinder.MoveKind.STEP_UP) {
+            if (!motor.hasJumpHeadroom(player)) return false;
             double dist = Math.hypot(player.getX() - (step.to().getX() + 0.5), player.getZ() - (step.to().getZ() + 0.5));
             boolean belowLedge = player.getY() < step.to().getY() - 0.08;
-            // Jump crisply right as we reach the ledge edge (0.30..1.15m) or on contact — never prematurely!
-            return belowLedge && ((dist < 1.15 && dist > 0.30) || player.horizontalCollision);
+            // Jump crisply right as we reach the ledge edge (0.25..1.18m) or on contact — never prematurely!
+            return belowLedge && ((dist < 1.18 && dist > 0.25) || player.horizontalCollision);
         }
         // Proactive seamless jump when the NEXT step is a STEP_UP and we're closing in smoothly
         if (plan != null && stepIndex + 1 < plan.steps().size()) {
             Pathfinder.Step next = plan.steps().get(stepIndex + 1);
             if (next.kind() == Pathfinder.MoveKind.STEP_UP && next.toBreak().isEmpty()) {
                 double nextDist = Math.hypot(player.getX() - (next.to().getX() + 0.5), player.getZ() - (next.to().getZ() + 0.5));
-                if (player.getY() < next.to().getY() - 0.08 && nextDist < 1.10 && player.isOnGround()) {
+                if (player.getY() < next.to().getY() - 0.08 && nextDist < 1.10 && player.isOnGround()
+                        && motor.hasJumpHeadroom(player)) {
                     return true;
                 }
             }
         }
         if (player.horizontalCollision && player.isOnGround() && step.toBreak().isEmpty()) {
-            // Only jump on collision if there's headroom above us so we don't head-bonk a low ceiling
-            return Perception.isPassable(world.getBlockState(player.getBlockPos().up(2)));
+            // Only jump on collision if there's genuine bounding-box headroom above us!
+            return motor.hasJumpHeadroom(player);
         }
         return false;
     }

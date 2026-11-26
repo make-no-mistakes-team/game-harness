@@ -1858,6 +1858,19 @@ final class TaskRunner {
         if (stuck) {
             // Force a decisive turn away from the jammed heading and avoid re-picking the same wall!
             exploreFlipCount++;
+            // If repeatedly trapped in a tight pit/overhang (3+ consecutive stuck turns), climb cleanly out via A*!
+            if (exploreFlipCount >= 3) {
+                Pathfinder.Options climbOpts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+                RouteExecutor.Status cst = navigateToward(player, Pathfinder.Goal.climbToY(feet.getY() + 3), climbOpts, currentTick);
+                statusText = "climbing out of tight terrain";
+                if (cst == RouteExecutor.Status.COMPLETE || cst == RouteExecutor.Status.STUCK) {
+                    exploreFlipCount = 0;
+                    exploreStuckTicks = 0;
+                    exploreLastPos = curPos;
+                    route.clear();
+                }
+                return;
+            }
             double turnOffset = (exploreFlipCount % 2 == 1 ? 1.0 : -1.0) * (Math.PI * 0.62 + (exploreFlipCount % 3) * 0.25);
             exploreHeadingRad = pickBestDryHeading(player, world, exploreHeadingRad + turnOffset, true);
             exploreStuckTicks = 0;
@@ -1891,8 +1904,8 @@ final class TaskRunner {
         }
 
         // Crisp 3-point shoulder-width proactive jump over 1-block ledges (never bonk solid low ceilings!)
-        boolean stepUpAhead = shouldStepUpAlongHeading(player, world, headingRad);
-        boolean headroomClear = Perception.isPassable(world.getBlockState(player.getBlockPos().up(2)));
+        boolean headroomClear = motor.hasJumpHeadroom(player);
+        boolean stepUpAhead = headroomClear && shouldStepUpAlongHeading(player, world, headingRad);
         boolean jump = stepUpAhead || (player.horizontalCollision && headroomClear) || player.isTouchingWater();
 
         // Gently pan gaze left/right (+/- 28 deg) while sprinting forward to scan horizon for forests/caves
@@ -2041,12 +2054,13 @@ final class TaskRunner {
         return bestRad;
     }
 
-    /** True when player is in water or on a flooded surface shoreline (bad place to start digging down!). */
+    /** True when player is in water or on a flooded OPEN-SURFACE shoreline (never triggers inside underground caves!). */
     private boolean isWetSurfaceSpot(ClientPlayerEntity player, ClientWorld world) {
         if (player.isTouchingWater() || player.isSubmergedInWater()) return true;
         BlockPos feet = player.getBlockPos();
-        if (feet.getY() < 56 || world.getLightLevel(net.minecraft.world.LightType.SKY, feet) == 0) {
-            return false; // already safely underground below sea level
+        // Inside a shaded cave/tunnel or below sea level, mining pathfinder handles nearby puddles directly!
+        if (feet.getY() < 60 || world.getLightLevel(net.minecraft.world.LightType.SKY, feet) < 12) {
+            return false;
         }
         int wetNeighbors = 0;
         for (int dx = -2; dx <= 2; dx++) {

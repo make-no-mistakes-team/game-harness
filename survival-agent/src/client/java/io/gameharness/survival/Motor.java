@@ -123,11 +123,13 @@ final class Motor {
             return;
         }
         var opts = client.options;
+        var player = client.player;
+        boolean safeJump = wantJump && (player == null || player.isTouchingWater() || hasJumpHeadroom(player));
         opts.forwardKey.setPressed(wantForward);
         opts.backKey.setPressed(wantBack);
         opts.leftKey.setPressed(wantLeft);
         opts.rightKey.setPressed(wantRight);
-        opts.jumpKey.setPressed(wantJump);
+        opts.jumpKey.setPressed(safeJump);
         opts.sprintKey.setPressed(wantSprint && wantForward);
         opts.sneakKey.setPressed(wantSneak);
         opts.attackKey.setPressed(wantAttack);
@@ -410,7 +412,16 @@ final class Motor {
     }
 
     private boolean canJumpNow(ClientPlayerEntity player) {
-        return player.isTouchingWater() || (player.isOnGround() && jumpCooldownTicks <= 0);
+        if (player.isTouchingWater()) return true;
+        return player.isOnGround() && jumpCooldownTicks <= 0 && hasJumpHeadroom(player);
+    }
+
+    /** Vanilla-exact collision check: never jump when a solid ceiling sits directly above the player's head! */
+    boolean hasJumpHeadroom(ClientPlayerEntity player) {
+        var world = client.world;
+        if (player == null || world == null) return true;
+        if (player.isTouchingWater()) return true;
+        return world.isSpaceEmpty(player, player.getBoundingBox().offset(0, 0.30, 0));
     }
 
     void requestJump() { wantJump = true; }

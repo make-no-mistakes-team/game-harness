@@ -410,20 +410,30 @@ final class GuiHands {
             pointer.plan(now, curGuiX, curGuiY, slotLeft, slotTop, 16.0, 16.0, scaleX, scaleY,
                 false, pointer.vx * 0.35, pointer.vy * 0.35, nextX, nextY);
         }
-        // Balanced skilled-human pointer speed (~1.05x base Bezier curve — smooth, crisp, never abrupt!)
-        long pacedNow = actionStartedNs + (long) ((now - actionStartedNs) * 1.05);
-        pointer.advance(pacedNow);
+        // Per-stroke human speed, wrist-arc curvature, and landing variability are planned natively in AgentGuiPointer!
+        pointer.advance(now);
+        pointer.observe(now, pointer.x, pointer.y);
         movePointerTo(pointer.x, pointer.y);
 
         boolean readyToClick = pointer.settled
-            || (pointer.braking && pointer.inside(pointer.x, pointer.y) && (now - actionStartedNs) >= 85_000_000L);
+            || (pointer.braking && pointer.inside(pointer.x, pointer.y) && (now - actionStartedNs) >= 75_000_000L);
         if (!clickedActive && readyToClick) {
             executeClick(screen, activeAction, pointer.x, pointer.y);
             clickedActive = true;
-            // Balanced varied human inter-click rhythm
+            // Organic varied human inter-click rhythm (including occasional tiny visual-check micro-beats!)
             boolean rapidPlace = activeAction.kind() == ClickKind.RIGHT && next != null && next.kind() == ClickKind.RIGHT;
             boolean takingResult = activeAction.kind() == ClickKind.SHIFT_RESULT;
-            waitUntilNs = now + (rapidPlace ? randMs(60, 95) : (takingResult ? randMs(100, 145) : randMs(80, 125)));
+            long pauseNs;
+            if (pacingRng.nextInt(100) < 12) {
+                pauseNs = randMs(185, 265); // occasional natural glance/check pause
+            } else if (rapidPlace) {
+                pauseNs = randMs(48, 118);
+            } else if (takingResult) {
+                pauseNs = randMs(92, 185);
+            } else {
+                pauseNs = randMs(70, 168);
+            }
+            waitUntilNs = now + pauseNs;
             activeAction = null;
         }
     }

@@ -46,6 +46,7 @@ final class Pathfinder {
 
     record Options(
         boolean allowDigging,
+        boolean allowTerrainDigging, // false on surface: may only clear leaves/snow, never dig dirt trenches!
         boolean allowPlacing,
         boolean allowHypotheses,
         boolean allowFoliageDrop,
@@ -54,15 +55,15 @@ final class Pathfinder {
         int scaffoldCount
     ) {
         static Options surface(int scaffolds, boolean healthy) {
-            return new Options(true, scaffolds > 0, false, healthy, true, healthy ? 3 : 2, scaffolds);
+            return new Options(true, false, scaffolds > 0, false, healthy, true, healthy ? 3 : 2, scaffolds);
         }
 
         static Options mining(int scaffolds, boolean healthy, boolean safeStaircase) {
-            return new Options(true, scaffolds > 0, true, healthy, safeStaircase, healthy ? 3 : 2, scaffolds);
+            return new Options(true, true, scaffolds > 0, true, healthy, safeStaircase, healthy ? 3 : 2, scaffolds);
         }
 
         static Options flee(int scaffolds) {
-            return new Options(false, false, false, true, true, 3, scaffolds);
+            return new Options(false, false, false, false, true, true, 3, scaffolds);
         }
     }
 
@@ -399,7 +400,7 @@ final class Pathfinder {
         if (dstFeet > 0) { breaks.add(new BlockPos(nx, ny, nz)); digCost += dstFeet; }
 
         if (!breaks.isEmpty() && !opts.allowDigging) return;
-        double base = inWater ? 11.0 : 8.2;
+        double base = inWater ? 10.0 : 7.0;
         out.add(new Step(from, new BlockPos(nx, ny, nz), MoveKind.STEP_UP, breaks, List.of(), base + digCost));
     }
 
@@ -543,8 +544,10 @@ final class Pathfinder {
 
         if (st.isOf(Blocks.SNOW) || st.isOf(Blocks.SNOW_BLOCK)) return 4.0;
         if (st.getBlock() instanceof LeavesBlock) return 6.0; // cheap to clear blocking tree leaves
+        // Surface navigation must walk over hills instead of carving pointless dirt/rock trenches!
+        if (!opts.allowTerrainDigging) return -1.0;
         if (st.isIn(BlockTags.DIRT) || st.isOf(Blocks.GRAVEL) || st.isOf(Blocks.SAND) || st.isOf(Blocks.CLAY)) {
-            return 9.0 + gravelPenalty;
+            return 14.0 + gravelPenalty;
         }
         if (st.isIn(BlockTags.LOGS)) return 18.0;
         if (st.isOf(Blocks.OBSIDIAN)) return -1.0; // never casually tunnel through obsidian!

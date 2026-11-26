@@ -2577,24 +2577,27 @@ final class TaskRunner {
         double dx = Math.cos(rad);
         double dz = Math.sin(rad);
         int by = player.getBlockY();
-        // Immediate 1-2 block steep wall check (cannot walk or 1-block jump over a 2-high solid wall!)
-        for (double dist = 1.0; dist <= 2.2; dist += 1.0) {
-            int bx = (int) Math.floor(player.getX() + dx * dist);
-            int bz = (int) Math.floor(player.getZ() + dz * dist);
-            BlockState atFeet = world.getBlockState(new BlockPos(bx, by, bz));
-            BlockState atHead = world.getBlockState(new BlockPos(bx, by + 1, bz));
-            if (!Perception.isPassable(atFeet) && !Perception.isPassable(atHead)) return true;
-        }
+        // Immediate 1-block sheer wall check (cannot walk or 1-block jump over a 2-high wall right in front of feet!)
+        int bx1 = (int) Math.floor(player.getX() + dx * 1.15);
+        int bz1 = (int) Math.floor(player.getZ() + dz * 1.15);
+        BlockState atFeet = world.getBlockState(new BlockPos(bx1, by, bz1));
+        BlockState atHead = world.getBlockState(new BlockPos(bx1, by + 1, bz1));
+        if (!Perception.isPassable(atFeet) && !Perception.isPassable(atHead)) return true;
+
+        // Track surface elevation step-by-step so gentle 1-block-per-step hillsides are climbable while sheer cliffs & water are avoided!
+        int prevY = by;
         for (int dist = 2; dist <= 6; dist += 2) {
             int bx = (int) Math.floor(player.getX() + dx * dist);
             int bz = (int) Math.floor(player.getZ() + dz * dist);
-            for (int dy = 1; dy >= -3; dy--) {
-                BlockState st = perception.getObserved(bx, by + dy, bz);
+            for (int dy = 3; dy >= -3; dy--) {
+                BlockState st = perception.getObserved(bx, prevY + dy, bz);
                 if (st == null) continue;
                 if (!st.getFluidState().isEmpty()) return true;
                 if (Perception.isSolidSupport(st)) {
-                    // Steep wall >= 2 blocks high right ahead?
-                    if (dy >= 1 && Perception.isSolidSupport(perception.getObserved(bx, by + dy + 1, bz))) return true;
+                    int surfY = prevY + dy + 1;
+                    // Sheer cliff rising >= 3 blocks over 2 horizontal blocks (with solid wall above)?
+                    if (surfY - prevY >= 3 && Perception.isSolidSupport(perception.getObserved(bx, surfY, bz))) return true;
+                    prevY = surfY;
                     break;
                 }
             }
@@ -2613,49 +2616,59 @@ final class TaskRunner {
             // Continuity preference unless we're explicitly escaping a blocked heading
             double score = avoidCurrent ? -Math.cos(rad - currentRad) * 6.0 : Math.cos(rad - currentRad) * 3.0;
 
-            // Check immediate 1..2 block passability (walls >= 2 blocks high get strongly penalized!)
+            // Check immediate 1-block passability (2-high walls right in front of feet get strongly penalized!)
             boolean blockedClose = false;
-            for (double d = 1.0; d <= 2.2; d += 1.0) {
-                int bx = (int) Math.floor(player.getX() + dx * d);
-                int bz = (int) Math.floor(player.getZ() + dz * d);
-                BlockState f = world.getBlockState(new BlockPos(bx, by, bz));
-                BlockState h = world.getBlockState(new BlockPos(bx, by + 1, bz));
-                BlockState h2 = world.getBlockState(new BlockPos(bx, by + 2, bz));
-                if (!Perception.isPassable(f) && !Perception.isPassable(h)) {
-                    score -= 45.0;
-                    blockedClose = true;
-                    break;
-                }
-                if (!Perception.isPassable(f) && !Perception.isPassable(h2)) {
-                    score -= 30.0; // cannot jump up onto 1-block ledge due to low ceiling
-                    blockedClose = true;
-                    break;
-                }
+            int bx1 = (int) Math.floor(player.getX() + dx * 1.15);
+            int bz1 = (int) Math.floor(player.getZ() + dz * 1.15);
+            BlockState f = world.getBlockState(new BlockPos(bx1, by, bz1));
+            BlockState h = world.getBlockState(new BlockPos(bx1, by + 1, bz1));
+            BlockState h2 = world.getBlockState(new BlockPos(bx1, by + 2, bz1));
+            if (!Perception.isPassable(f) && !Perception.isPassable(h)) {
+                score -= 45.0;
+                blockedClose = true;
+            } else if (!Perception.isPassable(f) && !Perception.isPassable(h2)) {
+                score -= 30.0; // cannot jump up onto 1-block ledge due to low ceiling
+                blockedClose = true;
             }
             if (blockedClose) {
                 if (score > bestScore) { bestScore = score; bestRad = rad; }
                 continue;
             }
 
+            // Follow terrain elevation progressively so sloped mountain/hill terrain scores cleanly instead of trapping us on flat ledges!
+            int colY = by;
             for (int dist = 2; dist <= 14; dist += 2) {
                 int bx = (int) Math.floor(player.getX() + dx * dist);
                 int bz = (int) Math.floor(player.getZ() + dz * dist);
-                for (int dy = 2; dy >= -4; dy--) {
-                    BlockState st = perception.getObserved(bx, by + dy, bz);
+                boolean foundSurface = false;
+                for (int dy = 3; dy >= -4; dy--) {
+                    BlockState st = perception.getObserved(bx, colY + dy, bz);
                     if (st == null) continue;
                     if (!st.getFluidState().isEmpty()) {
                         score -= 18.0; // strongly avoid ocean/rivers!
+                        foundSurface = true;
                         break;
                     }
                     if (Perception.isSolidSupport(st)) {
-                        // Penalize sheer cliffs immediately ahead (dist == 2, dy >= 2), NOT gentle hills rising farther out!
-                        if (dist <= 2 && dy >= 2) {
-                            score -= 10.0;
+                        int surfY = colY + dy + 1;
+                        int stepRise = surfY - colY;
+                        if (stepRise >= 3) {
+                            score -= 8.0; // sheer cliff
                         } else {
                             score += 5.0;
+                            // When spawned high on rocky mountain peaks (y > 82), gently favor descending toward forested valleys!
+                            if (by > 82 && surfY < colY) {
+                                score += 1.5;
+                            }
                         }
+                        colY = surfY;
+                        foundSurface = true;
                         break;
                     }
+                }
+                if (!foundSurface) {
+                    // Sudden deep drop-off (> 4 blocks below colY) — cautious penalty
+                    score -= 4.0;
                 }
             }
             if (score > bestScore) {

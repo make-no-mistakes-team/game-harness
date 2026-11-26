@@ -1149,9 +1149,9 @@ final class TaskRunner {
             if (torches < 4 && coal >= 1 && (logs * 4 + planks + sticks >= 2)) {
                 return localTask(TaskKind.CRAFT, "torch", 8, null);
             }
-            // Keep at least 2 sticks / planks before going down to deep Y=-54
-            if (sticks < 2 && planks < 2 && logs == 0 && player.getBlockY() > 40) {
-                return localTask(TaskKind.GATHER_WOOD, "logs", 2, null);
+            // Always keep at least 2 sticks (or wood to craft them) before descending for diamonds!
+            if (sticks < 2 && planks < 2 && logs == 0) {
+                return localTask(TaskKind.GATHER_WOOD, "logs", 3, null);
             }
             return localTask(TaskKind.MINE_ORE, "diamond", needDiamonds, null);
         }

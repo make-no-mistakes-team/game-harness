@@ -511,9 +511,10 @@ final class Pathfinder {
         BlockState st = p.getObserved(x, y, z);
         if (st == null) {
             if (!opts.allowHypotheses || !opts.allowDigging) return -1.0;
-            // Explicit terrain hypothesis: unobserved underground cell assumed diggable rock/soil
-            // Allow at or below player's current elevation (+2 headroom) regardless of mountain altitude!
-            if (player != null && y > player.getBlockY() + 2) return -1.0;
+            // Explicit terrain hypothesis: unobserved underground cell assumed diggable rock/soil.
+            // Allow digging both downward AND upward back to surface elevation (up to Y=66 or playerY+16)!
+            int maxHypY = player != null ? Math.max(player.getBlockY() + 16, 66) : 66;
+            if (y > maxHypY) return -1.0;
             return 14.0 + estimatedStoneDigTicks(player) * 0.4;
         }
         if (Perception.isPassable(st) && st.getFluidState().isEmpty()) return 0.0;

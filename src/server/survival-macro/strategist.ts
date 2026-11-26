@@ -39,7 +39,7 @@ Combat stance options (combatStance):
 
 Strategic rules:
 1. Respect Minecraft's tech tree: wood -> crafting_table + wooden_pickaxe -> cobblestone -> stone_pickaxe + furnace (+ stone_sword for safety!) -> coal/torches + iron_ore -> smelt raw_iron -> iron_pickaxe (+ shield when iron & planks allow!) -> diamond_ore (3 diamonds) -> diamond_pickaxe.
-2. Keep wood/sticks in reserve AND a spare stone_pickaxe before descending deep underground (so iron_pickaxe durability is conserved for ores/diamonds instead of breaking on stone/deepslate, and diamond_pickaxe can be crafted underground!).
+2. Keep wood/sticks in reserve (at least 2 sticks OR >= 2 planks / 1 log remaining AFTER crafting iron_pickaxe/spare tools!) AND a spare stone_pickaxe before descending deep underground, so iron_pickaxe durability is conserved and diamond_pickaxe can be crafted immediately underground the instant you mine 3 diamonds!
 3. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
 4. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals. When healthy and well-armed, use "auto", "defensive", or "aggressive".
 5. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.

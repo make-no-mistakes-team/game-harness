@@ -118,6 +118,7 @@ final class TaskRunner {
     private int rockBrokenCount;
     private int soilBlocksBroken;
     private int lastAutoTriageTick = -200;
+    private int lastAutoTorchTick = -300;
     private int waterFillAimStableTicks;
     private int waterFillCooldownTicks;
     private BlockPos placedGravelPos;
@@ -251,6 +252,41 @@ final class TaskRunner {
                 gui.tick();
                 statusText = "clearing cluttered inventory";
                 return;
+            }
+        }
+
+        // 0c. Automatic 2x2 torch crafting when entering pitch-dark underground with coal + wood:
+        //     needs NO crafting table, takes ~2 seconds, and lights up staircases & caves for both navigation & visibility!
+        if (!criticalBusy && client.currentScreen == null && currentTick - lastAutoTorchTick >= 120
+                && player.getBlockY() <= 56
+                && world.getLightLevel(net.minecraft.world.LightType.SKY, player.getBlockPos()) == 0
+                && GuiHands.countItem(player, Items.TORCH) == 0
+                && (GuiHands.countItem(player, Items.COAL) + GuiHands.countItem(player, Items.CHARCOAL)) >= 1) {
+            int sticks = GuiHands.countItem(player, Items.STICK);
+            int planks = GuiHands.countPlanks(player);
+            int logs = GuiHands.countLogs(player);
+            if (sticks >= 1) {
+                lastAutoTorchTick = currentTick;
+                int batch = Math.min(2, Math.min(sticks, GuiHands.countItem(player, Items.COAL) + GuiHands.countItem(player, Items.CHARCOAL)));
+                if (gui.startCraft(GuiHands.RecipeId.TORCH, Math.max(1, batch))) {
+                    gui.tick();
+                    statusText = "crafting torches for dark tunnel";
+                    return;
+                }
+            } else if (planks >= 2) {
+                lastAutoTorchTick = currentTick - 80; // follow up immediately with torch craft once sticks finish!
+                if (gui.startCraft(GuiHands.RecipeId.STICK, 1)) {
+                    gui.tick();
+                    statusText = "crafting sticks for torches";
+                    return;
+                }
+            } else if (logs >= 1) {
+                lastAutoTorchTick = currentTick - 80;
+                if (gui.startCraft(GuiHands.RecipeId.PLANKS, 1)) {
+                    gui.tick();
+                    statusText = "crafting planks for torches";
+                    return;
+                }
             }
         }
 
@@ -1784,12 +1820,20 @@ final class TaskRunner {
             return;
         }
 
-        // 4. No gravel observed yet: scout caves/terrain (gravel is super common along riverbanks and inside caves!)
-        if (caves != null && (player.getBlockY() <= 54 || caves.countUnexploredEntrances() > 0)) {
+        // 4. No gravel observed yet:
+        //    - If genuinely inside an open cave with unvisited frontiers, explore the cave for gravel veins!
+        //    - If underground in a man-made shaft with NO open cave frontiers, climb back up to the sunny surface
+        //      where riverbanks, beaches, gravel hills, water sources, and surface caves/lava pools are abundant!
+        //    - Otherwise scout the surface for riverbanks & gravel patches!
+        BlockPos feet = player.getBlockPos();
+        if (caves != null && (caves.mode() == CaveExplorer.Mode.EXPLORING_CAVE
+                || caves.countNearbyUnvisitedFrontiers(perception, feet, 24.0) > 0)) {
             tickCaveSearch(player, world, Perception.OreKind.IRON, 24, currentTick);
-            statusText = "searching caves & banks for gravel";
+            statusText = "searching open cave for gravel";
+        } else if (isUndergroundWithoutCave(player, world)) {
+            climbToSurface(player, world, currentTick, "climbing to surface to find gravel banks");
         } else {
-            exploreForResources(player, world, currentTick, "scouting for gravel");
+            exploreForResources(player, world, currentTick, "scouting surface & banks for gravel");
         }
     }
 
@@ -1824,7 +1868,11 @@ final class TaskRunner {
             }
         }
         if (waterTarget == null) {
-            exploreForResources(player, world, currentTick, "searching for water source");
+            if (isUndergroundWithoutCave(player, world)) {
+                climbToSurface(player, world, currentTick, "climbing to surface to find water");
+            } else {
+                exploreForResources(player, world, currentTick, "searching for water source");
+            }
             return;
         }
 
@@ -1860,7 +1908,10 @@ final class TaskRunner {
         }
 
         waterFillAimStableTicks = 0;
-        Pathfinder.Options opts = Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
+        boolean underground = world.getLightLevel(net.minecraft.world.LightType.SKY, feet) < 8;
+        Pathfinder.Options opts = underground
+            ? Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true)
+            : Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
         RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(waterTarget.up(), 2.8), opts, currentTick);
         statusText = "walking to water source";
         if (st == RouteExecutor.Status.STUCK) {
@@ -1907,6 +1958,14 @@ final class TaskRunner {
     }
 
     private void tickExplore(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        if (isUndergroundWithoutCave(player, world)) {
+            if (activeTicks > 650) {
+                finishActive("completed", "finished climbing toward surface", currentTick);
+                return;
+            }
+            climbToSurface(player, world, currentTick, "climbing out to surface to explore");
+            return;
+        }
         if (activeTicks > 300) {
             finishActive("completed", "explored terrain", currentTick);
             return;
@@ -2177,11 +2236,37 @@ final class TaskRunner {
 
     // ===================== NAVIGATION & HELPERS =====================
 
+    private boolean isUndergroundWithoutCave(ClientPlayerEntity player, ClientWorld world) {
+        BlockPos feet = player.getBlockPos();
+        if (feet.getY() >= 58) return false;
+        if (world.getLightLevel(net.minecraft.world.LightType.SKY, feet) >= 8) return false;
+        if (caves != null && (caves.mode() == CaveExplorer.Mode.EXPLORING_CAVE
+                || caves.countNearbyUnvisitedFrontiers(perception, feet, 24.0) > 0)) {
+            return false;
+        }
+        return true;
+    }
+
+    private void climbToSurface(ClientPlayerEntity player, ClientWorld world, int currentTick, String label) {
+        statusText = label;
+        int surfaceTargetY = Math.max(64, player.getBlockY() + 6);
+        Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+        RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.climbToY(surfaceTargetY), opts, currentTick);
+        if (st == RouteExecutor.Status.STUCK) {
+            // Try a slightly nearer upward step if a rock lip blocked the full surface climb
+            route.clear();
+            navigateToward(player, Pathfinder.Goal.climbToY(player.getBlockY() + 4), opts, currentTick);
+        }
+    }
+
     private RouteExecutor.Status navigateToward(ClientPlayerEntity player, Pathfinder.Goal navGoal,
                                                 Pathfinder.Options opts, int currentTick) {
         if (!route.hasPlan()) {
             if (replanCooldown > 0) return RouteExecutor.Status.RUNNING;
-            Pathfinder.Plan plan = pathfinder.search(perception, player, player.getBlockPos(), navGoal, opts);
+            Pathfinder.Options effectiveOpts = opts.allowTerrainDigging()
+                ? opts.withStairHint(route.stairHintDx(currentTick), route.stairHintDz(currentTick))
+                : opts;
+            Pathfinder.Plan plan = pathfinder.search(perception, player, player.getBlockPos(), navGoal, effectiveOpts);
             if (plan.isEmpty()) {
                 if (plan.complete()) return RouteExecutor.Status.COMPLETE;
                 replanCooldown = 6;

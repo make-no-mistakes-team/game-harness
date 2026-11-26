@@ -52,18 +52,33 @@ final class Pathfinder {
         boolean allowFoliageDrop,
         boolean safeStaircase,
         int maxDrop,
-        int scaffoldCount
+        int scaffoldCount,
+        int preferStairDx,
+        int preferStairDz
     ) {
+        Options(boolean allowDigging, boolean allowTerrainDigging, boolean allowPlacing,
+                boolean allowHypotheses, boolean allowFoliageDrop, boolean safeStaircase,
+                int maxDrop, int scaffoldCount) {
+            this(allowDigging, allowTerrainDigging, allowPlacing, allowHypotheses,
+                allowFoliageDrop, safeStaircase, maxDrop, scaffoldCount, 0, 0);
+        }
+
+        Options withStairHint(int dx, int dz) {
+            if (dx == preferStairDx && dz == preferStairDz) return this;
+            return new Options(allowDigging, allowTerrainDigging, allowPlacing, allowHypotheses,
+                allowFoliageDrop, safeStaircase, maxDrop, scaffoldCount, dx, dz);
+        }
+
         static Options surface(int scaffolds, boolean healthy) {
-            return new Options(true, false, scaffolds > 0, false, healthy, true, healthy ? 3 : 2, scaffolds);
+            return new Options(true, false, scaffolds > 0, false, healthy, true, healthy ? 3 : 2, scaffolds, 0, 0);
         }
 
         static Options mining(int scaffolds, boolean healthy, boolean safeStaircase) {
-            return new Options(true, true, scaffolds > 0, true, healthy, safeStaircase, healthy ? 3 : 2, scaffolds);
+            return new Options(true, true, scaffolds > 0, true, healthy, safeStaircase, healthy ? 3 : 2, scaffolds, 0, 0);
         }
 
         static Options flee(int scaffolds) {
-            return new Options(false, false, false, false, true, true, 3, scaffolds);
+            return new Options(false, false, false, false, true, true, 3, scaffolds, 0, 0);
         }
     }
 
@@ -441,9 +456,16 @@ final class Pathfinder {
 
         // Second: staircase excavation down by 1 block! (Clear (nx,y+1,nz), (nx,y,nz), (nx,y-1,nz) -> stand at (nx,y-1,nz) on (nx,y-2,nz))
         if (!opts.allowDigging || !opts.allowTerrainDigging) return;
-        // NEVER reverse back into the immediately previous column on STAIR_DOWN — that creates an unwalkable 1x2 vertical chimney!
+        int cdx = nx - from.getX();
+        int cdz = nz - from.getZ();
+        // NEVER reverse back into the immediately previous column on STAIR_DOWN — neither within a plan
+        // NOR across replans (preferStairDx/Dz) — otherwise A* destroys its own stair tread and drills a 1x2 vertical chimney!
         if (prevStep != null && (prevStep.kind() == MoveKind.STAIR_DOWN || prevStep.kind() == MoveKind.DROP)
                 && nx == prevStep.from().getX() && nz == prevStep.from().getZ()) {
+            return;
+        }
+        if (prevStep == null && (opts.preferStairDx != 0 || opts.preferStairDz != 0)
+                && cdx == -opts.preferStairDx && cdz == -opts.preferStairDz) {
             return;
         }
         int ny = y - 1;
@@ -469,14 +491,23 @@ final class Pathfinder {
         if (cLow > 0) { breaks.add(new BlockPos(nx, ny, nz)); digCost += cLow; }
 
         if (breaks.isEmpty()) return;
-        // Favor continuing straight along the same walkable 45-degree staircase heading!
+        // Never dig strictly the floor block of an already 2-tall empty column (vertical chimney undercutting!)
+        if (cHead == 0.0 && cMid == 0.0) return;
+        // Favor continuing straight along the same walkable 45-degree staircase heading across steps AND replans,
+        // and strongly penalize undercutting a column whose y+1 is already air (which would chew into our own stairs!).
         double turnPenalty = 0.0;
         if (prevStep != null && prevStep.kind() == MoveKind.STAIR_DOWN) {
             int pdx = prevStep.to().getX() - prevStep.from().getX();
             int pdz = prevStep.to().getZ() - prevStep.from().getZ();
-            int cdx = nx - from.getX();
-            int cdz = nz - from.getZ();
             if (pdx != cdx || pdz != cdz) turnPenalty = 12.0;
+        } else if (prevStep == null && (opts.preferStairDx != 0 || opts.preferStairDz != 0)) {
+            if (opts.preferStairDx != cdx || opts.preferStairDz != cdz) turnPenalty = 12.0;
+        }
+        if (cHead == 0.0 && cMid > 0.0) {
+            BlockState aboveHead = p.getObserved(nx, y + 2, nz);
+            if (aboveHead != null && Perception.isPassable(aboveHead)) {
+                turnPenalty += 28.0;
+            }
         }
         out.add(new Step(from, new BlockPos(nx, ny, nz), MoveKind.STAIR_DOWN, breaks, List.of(), 7.5 + digCost + turnPenalty));
     }

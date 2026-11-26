@@ -101,4 +101,30 @@ final class PortalCasterTest {
         };
         assertNull(PortalCaster.findBestShoreSite(probe, tinyLava, new BlockPos(1, 64, -1)));
     }
+
+    @Test
+    void acceptsNaturalRaisedRimLavaPoolWithClearableBank() {
+        // Natural lake_lava_surface: lava at y=62, surrounding grass/stone rim rises 1 block to y=63!
+        Set<BlockPos> lava = new HashSet<>();
+        for (int x = 0; x <= 4; x++) {
+            for (int z = 0; z <= 3; z++) {
+                lava.add(new BlockPos(x, 62, z));
+            }
+        }
+        PortalCaster.CellProbe probe = new PortalCaster.CellProbe() {
+            @Override public boolean isStillLava(BlockPos pos) { return lava.contains(pos); }
+            @Override public boolean isSolid(BlockPos pos) { return !lava.contains(pos) && pos.getY() <= 63; }
+            @Override public boolean isPassableAir(BlockPos pos) {
+                return pos.getY() >= 64 || (pos.getY() == 63 && lava.contains(pos.down()));
+            }
+            @Override public boolean isClearableDryBlock(BlockPos pos) {
+                return pos.getY() == 63 && !lava.contains(pos) && !lava.contains(pos.down());
+            }
+        };
+
+        PortalCaster.ShoreSite site = PortalCaster.findBestShoreSite(probe, lava, new BlockPos(2, 64, -2));
+        assertNotNull(site, "Natural surface lava pool with 1-block raised rim should match via CLEAR_BANK");
+        assertEquals(62, site.foot0().getY());
+        assertEquals(Direction.SOUTH, site.inward());
+    }
 }

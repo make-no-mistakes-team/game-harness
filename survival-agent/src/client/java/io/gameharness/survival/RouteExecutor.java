@@ -30,11 +30,28 @@ final class RouteExecutor {
     private int totalStuckTicks;
     private Vec3d lastProgressPos;
     private int lastTorchTick = -200;
+    private int lastStairDx;
+    private int lastStairDz;
+    private int lastStairTick = -1000;
 
     RouteExecutor(MinecraftClient client, Motor motor, Perception perception) {
         this.client = client;
         this.motor = motor;
         this.perception = perception;
+    }
+
+    int stairHintDx(int currentTick) {
+        return currentTick - lastStairTick <= 240 ? lastStairDx : 0;
+    }
+
+    int stairHintDz(int currentTick) {
+        return currentTick - lastStairTick <= 240 ? lastStairDz : 0;
+    }
+
+    void clearStairHint() {
+        lastStairDx = 0;
+        lastStairDz = 0;
+        lastStairTick = -1000;
     }
 
     void setPlan(Pathfinder.Plan newPlan) {
@@ -79,7 +96,7 @@ final class RouteExecutor {
         }
 
         // Advance stepIndex if we already arrived at step.to (or skipped ahead naturally while sprinting!)
-        advanceArrivedSteps(player);
+        advanceArrivedSteps(player, currentTick);
         if (stepIndex >= plan.steps().size()) {
             return Status.COMPLETE;
         }
@@ -211,7 +228,7 @@ final class RouteExecutor {
         return Status.RUNNING;
     }
 
-    private void advanceArrivedSteps(ClientPlayerEntity player) {
+    private void advanceArrivedSteps(ClientPlayerEntity player, int currentTick) {
         List<Pathfinder.Step> steps = plan.steps();
         // Check if we're already at a slightly later step along a pure walking segment
         int lookMax = Math.min(steps.size() - 1, stepIndex + 2);
@@ -219,6 +236,17 @@ final class RouteExecutor {
             Pathfinder.Step s = steps.get(i);
             if (i > stepIndex && (!s.toBreak().isEmpty() || !s.toPlace().isEmpty())) continue;
             if (reached(player, s.to(), s.kind())) {
+                if (s.kind() == Pathfinder.MoveKind.STAIR_DOWN) {
+                    int dx = s.to().getX() - s.from().getX();
+                    int dz = s.to().getZ() - s.from().getZ();
+                    if (dx != 0 || dz != 0) {
+                        lastStairDx = dx;
+                        lastStairDz = dz;
+                        lastStairTick = currentTick;
+                    }
+                } else if (s.kind() == Pathfinder.MoveKind.STEP_UP || s.kind() == Pathfinder.MoveKind.PILLAR) {
+                    clearStairHint();
+                }
                 stepIndex = i + 1;
                 ticksOnStep = 0;
                 return;

@@ -44,6 +44,7 @@ public final class AgentClient implements ClientModInitializer {
     private RouteExecutor route;
     private GuiHands gui;
     private SafeDescent descent;
+    private CaveExplorer caves;
     private SurvivalReflexes reflexes;
     private TaskRunner tasks;
     private StrategistBridge strategist;
@@ -102,8 +103,9 @@ public final class AgentClient implements ClientModInitializer {
         route = new RouteExecutor(client, motor, perception);
         gui = new GuiHands(client);
         descent = new SafeDescent(client, motor, perception, gui);
+        caves = new CaveExplorer();
         reflexes = new SurvivalReflexes(client, motor, perception, gui, descent);
-        tasks = new TaskRunner(client, motor, perception, pathfinder, route, gui, reflexes, descent, goal);
+        tasks = new TaskRunner(client, motor, perception, pathfinder, route, gui, reflexes, descent, caves, goal);
         strategist = StrategistBridge.open(directory, goal);
         pauses = new AgentPauseEpisodes(directory, 0);
     }
@@ -169,6 +171,11 @@ public final class AgentClient implements ClientModInitializer {
         // 3. Tick perception (sight rays + optical sight + combat flow + optional diagnostic ore scan)
         perception.tick((int) tick);
         descent.tickTelemetry(player, client.world, (int) tick);
+        int skyLight = client.world.getLightLevel(net.minecraft.world.LightType.SKY, player.getBlockPos());
+        caves.recordPlayerPosition(player.getBlockPos(), skyLight, (int) tick);
+        if (tick % 4 == 0) {
+            caves.ingestObservations(perception.observedCaveSights(), player.getBlockPos(), skyLight, (int) tick);
+        }
 
         // 4. Poll any new macro plan from the async LLM strategist!
         if (strategist != null) {
@@ -203,7 +210,7 @@ public final class AgentClient implements ClientModInitializer {
 
         // 7. Periodically publish state to LLM strategist & progress.json to run.ts!
         if (strategist != null && (tick % 15 == 0 || tick <= 2)) {
-            strategist.publishState(player, client.world, perception, tasks, reflexes, descent, life, tick);
+            strategist.publishState(player, client.world, perception, tasks, reflexes, descent, caves, life, tick);
         }
         long nowMs = System.currentTimeMillis();
         if (tick % 5 == 0 || nowMs - lastProgressWriteMs >= 250) {

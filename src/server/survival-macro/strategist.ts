@@ -26,6 +26,7 @@ Available task kinds:
 - gather_food: harvest visible berries or hunt visible food animals. target="food", count=desired food count (e.g. 4).
 - dig_down: dig a safe navigable staircase down to a target Y level (count=targetY, e.g. 16 for iron or -54 for diamonds).
 - descend_drop: evaluate and safely descend a nearby high drop, ravine, or giant cavern overlook. target="auto"|"water_pour"|"water_clutch"|"boat_drop"|"cliff_stair"|"edge_blocks"|"avoid", count=targetFloorY (or 0 to descend to the observed cavern floor).
+- explore_cave: scout the surface for cave entrances and ravines, enter and explore deep passages for exposed ores, and exit shallow dead-end caves to search for deeper caves or ravines. target="iron"|"diamond"|"coal", count=desired target Y (e.g. 16 for iron, -54 for diamond).
 - explore: explore terrain to find trees, stone, caves, or food animals. target="explore", count=20.
 - navigate: 3D A* navigate to x,y,z within count blocks.
 - collect_drops: pick up nearby dropped items.
@@ -41,7 +42,7 @@ Combat stance options (combatStance):
 Strategic rules:
 1. Respect Minecraft's tech tree: wood -> crafting_table + wooden_pickaxe -> cobblestone -> stone_pickaxe + furnace (+ stone_sword for safety!) -> coal/torches + iron_ore -> smelt raw_iron -> iron_pickaxe (+ shield when iron & planks allow!) -> diamond_ore (3 diamonds) -> diamond_pickaxe.
 2. Keep wood/sticks in reserve (at least 2 sticks OR >= 4 planks / 2 logs remaining AFTER crafting iron_pickaxe/spare tools!) AND a spare stone_pickaxe before descending deep underground, so iron_pickaxe durability is conserved on deepslate and diamond_pickaxe can be crafted immediately underground the instant you mine 3 diamonds!
-3. When diagnosticOreReveal is false and environment.ores has no listed coordinates for coal/iron/diamond, still queue mine_ore ("coal"|"iron"|"diamond") — the local player automatically descends safely to optimal depth (Y=48 coal, Y=16 iron, Y=-54 diamond) and branch-mines/explores caves honestly until ore is spotted.
+3. When diagnosticOreReveal is false and environment.ores has no listed coordinates for coal/iron/diamond, still queue mine_ore ("coal"|"iron"|"diamond") or explore_cave — the local player automatically scouts the surface for cave entrances and ravines, enters and explores deep caves for exposed ores, leaves shallow dead-end caves to find deeper ones, and transitions to safe staircase + cardinal branch-mining (Y=16 iron, Y=-54 diamond) once deep underground or if no surface caves are nearby. Carry torches (when coal is available) and a water bucket or boat when iron/wood allow so deep ravines and caverns can be descended safely!
 4. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
 5. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals. When healthy and well-armed, use "auto", "defensive", or "aggressive".
 6. When state.descent.nearbyDrop is true, inspect state.descent (dropDepth, floorObserved, landingSurface, landingLava, landingHostiles, hasCliffWall, hasSteppedShelf, and descent.gear) and set descentMethod (and optionally queue a descend_drop task):
@@ -58,7 +59,7 @@ Strategic rules:
 
 const TASK_KINDS = [
   "gather_wood", "mine_stone", "mine_ore", "craft", "smelt",
-  "gather_food", "dig_down", "descend_drop", "explore", "navigate", "collect_drops", "build_shelter",
+  "gather_food", "dig_down", "descend_drop", "explore_cave", "explore", "navigate", "collect_drops", "build_shelter",
 ] as const;
 
 const COMBAT_STANCES = ["auto", "aggressive", "defensive", "flee", "shelter"] as const;

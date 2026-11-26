@@ -75,7 +75,7 @@ final class StrategistBridge {
     }
 
     void publishState(ClientPlayerEntity player, ClientWorld world, Perception perception,
-                      TaskRunner runner, SurvivalReflexes reflexes, SafeDescent descent, int life, long tick) {
+                      TaskRunner runner, SurvivalReflexes reflexes, SafeDescent descent, CaveExplorer caves, int life, long tick) {
         if (closed || player == null || world == null) return;
         JsonObject root = new JsonObject();
         root.addProperty("v", 2);
@@ -240,6 +240,30 @@ final class StrategistBridge {
             gear.addProperty("scaffolds", TaskRunner.scaffoldCount(player));
             dObj.add("gear", gear);
             root.add("descent", dObj);
+        }
+
+        // Honest cave mouth, ravine, and underground frontier telemetry
+        if (caves != null) {
+            JsonObject cObj = new JsonObject();
+            cObj.addProperty("mode", caves.mode().wireName());
+            boolean inCave = world.getLightLevel(net.minecraft.world.LightType.SKY, feet) <= 8 || feet.getY() <= 52;
+            cObj.addProperty("inCave", inCave);
+            cObj.addProperty("unexploredEntrances", caves.countUnexploredEntrances());
+            cObj.addProperty("unvisitedFrontiers", caves.countUnvisitedFrontiers(perception, feet));
+            cObj.addProperty("deepestSeenY", caves.deepestObservedCaveY(perception));
+            cObj.addProperty("exhaustedCaves", caves.exhaustedCaveCount());
+            CaveExplorer.Entrance nearestEnt = caves.pickBestSurfaceEntrance(feet);
+            if (nearestEnt != null) {
+                JsonObject ne = new JsonObject();
+                ne.addProperty("x", nearestEnt.pos.getX());
+                ne.addProperty("y", nearestEnt.pos.getY());
+                ne.addProperty("z", nearestEnt.pos.getZ());
+                ne.addProperty("dist", Math.round(Math.sqrt(nearestEnt.pos.getSquaredDistance(feet))));
+                ne.addProperty("ravineLike", nearestEnt.ravineLike);
+                ne.addProperty("minSeenY", nearestEnt.minSeenY);
+                cObj.add("nearestEntrance", ne);
+            }
+            root.add("caves", cObj);
         }
 
         if (!lastAppliedPlanId.isEmpty()) {

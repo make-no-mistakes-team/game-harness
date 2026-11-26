@@ -64,6 +64,9 @@ final class Perception {
 
     record ObservedBlock(BlockState state, int tick, boolean combatFlow) {}
 
+    /** Genuinely sight-observed cave opening, ravine chasm, or underground passage air cell. */
+    record CaveSight(BlockPos pos, int minFloorY, int skyLight, boolean ravineLike, int tick) {}
+
     record RememberedHostile(
         int entityId,
         CombatPlanner.ThreatKind kind,
@@ -108,6 +111,7 @@ final class Perception {
     private final Set<BlockPos> observedBerries = new HashSet<>();
     private final Set<BlockPos> observedTables = new HashSet<>();
     private final Set<BlockPos> observedFurnaces = new HashSet<>();
+    private final Map<Long, CaveSight> observedCaveSights = new HashMap<>(256);
 
     // Explicitly gated diagnostic-only ore targets (NEVER used for terrain/caves/lava!)
     private final Set<BlockPos> diagCoal = new HashSet<>();
@@ -264,7 +268,19 @@ final class Perception {
             recordObserved(hitPos, hitState, false);
             // Air/space immediately in front of the hit face is also clearly seen along the ray
             BlockPos front = hitPos.offset(solidHit.getSide());
-            recordObserved(front, world.getBlockState(front), false);
+            BlockState frontState = world.getBlockState(front);
+            recordObserved(front, frontState, false);
+
+            // Honest cave mouth, ravine, and underground passage detection from visible rock + air faces!
+            if (isCaveWallBlock(hitState) && frontState.isAir() && frontState.getFluidState().isEmpty()) {
+                int sky = world.getLightLevel(net.minecraft.world.LightType.SKY, front);
+                boolean ravineDrop = isNaturalCaveRock(hitState)
+                    && front.getY() <= player.getBlockY() - 5
+                    && front.getY() <= 60;
+                if (sky <= 10 || ravineDrop) {
+                    recordCaveSight(front, sky, ravineDrop);
+                }
+            }
 
             // Sample a few empty cells along the visible ray segment (up to 8m) so air corridors are known to A*
             double dist = eye.distanceTo(solidHit.getPos());
@@ -726,6 +742,38 @@ final class Perception {
         observedWater.removeIf(pos -> pos.getSquaredDistance(p) > 64 * 64);
         observedLava.removeIf(pos -> pos.getSquaredDistance(p) > 64 * 64);
         observedBerries.removeIf(pos -> pos.getSquaredDistance(p) > 64 * 64);
+        observedCaveSights.entrySet().removeIf(e ->
+            e.getValue().pos().getSquaredDistance(p) > 72 * 72 || (tick - e.getValue().tick()) > 3600);
+    }
+
+    private void recordCaveSight(BlockPos front, int skyLight, boolean ravineLike) {
+        // Quantize to 2x2x2 cells so cave memory stays compact & fast while keeping crisp geometry
+        long bucket = BlockPos.asLong(front.getX() >> 1, front.getY() >> 1, front.getZ() >> 1);
+        CaveSight prev = observedCaveSights.get(bucket);
+        int floorY = prev == null ? front.getY() : Math.min(prev.minFloorY(), front.getY());
+        boolean ravine = ravineLike || (prev != null && prev.ravineLike());
+        int bestSky = prev == null ? skyLight : Math.min(prev.skyLight(), skyLight);
+        if (observedCaveSights.size() < 900 || prev != null) {
+            observedCaveSights.put(bucket, new CaveSight(front.toImmutable(), floorY, bestSky, ravine, tick));
+        }
+    }
+
+    private static boolean isNaturalCaveRock(BlockState st) {
+        Block b = st.getBlock();
+        return b == Blocks.STONE || b == Blocks.DEEPSLATE || b == Blocks.TUFF
+            || b == Blocks.ANDESITE || b == Blocks.DIORITE || b == Blocks.GRANITE
+            || b == Blocks.CALCITE || b == Blocks.DRIPSTONE_BLOCK || b == Blocks.GRAVEL
+            || b == Blocks.COAL_ORE || b == Blocks.DEEPSLATE_COAL_ORE
+            || b == Blocks.IRON_ORE || b == Blocks.DEEPSLATE_IRON_ORE
+            || b == Blocks.COPPER_ORE || b == Blocks.DEEPSLATE_COPPER_ORE
+            || b == Blocks.GOLD_ORE || b == Blocks.DEEPSLATE_GOLD_ORE
+            || b == Blocks.DIAMOND_ORE || b == Blocks.DEEPSLATE_DIAMOND_ORE;
+    }
+
+    private static boolean isCaveWallBlock(BlockState st) {
+        if (isNaturalCaveRock(st)) return true;
+        Block b = st.getBlock();
+        return b == Blocks.DIRT || b == Blocks.COARSE_DIRT || b == Blocks.CLAY || b == Blocks.SANDSTONE;
     }
 
     private void trimOldMemory(BlockPos playerPos) {
@@ -768,6 +816,7 @@ final class Perception {
     Set<BlockPos> observedBerries() { return observedBerries; }
     Set<BlockPos> observedTables() { return observedTables; }
     Set<BlockPos> observedFurnaces() { return observedFurnaces; }
+    java.util.Collection<CaveSight> observedCaveSights() { return observedCaveSights.values(); }
 
     /** Returns nearest observed ore of `kind`, or if diagnostic ore reveal is active, nearest diagnostic ore! */
     List<BlockPos> nearestOreTargets(OreKind kind, BlockPos from, int limit, Set<BlockPos> skip) {

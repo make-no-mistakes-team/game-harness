@@ -39,6 +39,7 @@ final class TaskRunner {
         GATHER_FOOD,
         DIG_DOWN,
         DESCEND_DROP,
+        EXPLORE_CAVE,
         EXPLORE,
         NAVIGATE,
         COLLECT_DROPS,
@@ -65,6 +66,7 @@ final class TaskRunner {
     private final GuiHands gui;
     private final SurvivalReflexes reflexes;
     private final SafeDescent descent;
+    private final CaveExplorer caves;
     private final String goal;
 
     private final ArrayDeque<Task> queue = new ArrayDeque<>();
@@ -109,7 +111,7 @@ final class TaskRunner {
 
     TaskRunner(MinecraftClient client, Motor motor, Perception perception,
                Pathfinder pathfinder, RouteExecutor route, GuiHands gui,
-               SurvivalReflexes reflexes, SafeDescent descent, String goal) {
+               SurvivalReflexes reflexes, SafeDescent descent, CaveExplorer caves, String goal) {
         this.client = client;
         this.motor = motor;
         this.perception = perception;
@@ -118,6 +120,7 @@ final class TaskRunner {
         this.gui = gui;
         this.reflexes = reflexes;
         this.descent = descent;
+        this.caves = caves;
         this.goal = goal;
     }
 
@@ -146,6 +149,7 @@ final class TaskRunner {
         dropChaseTicks = 0;
         noMineProgressTicks = 0;
         if (descent != null) descent.resetForLife();
+        if (caves != null) caves.resetForLife();
     }
 
     void setSafeExcavationMode(boolean safe) { this.safeExcavationMode = safe; }
@@ -294,7 +298,8 @@ final class TaskRunner {
 
         int maxTicks = (active.kind() == TaskKind.MINE_ORE && !perception.isDiagnosticRevealOres())
             ? 9000
-            : ((active.kind() == TaskKind.MINE_ORE || active.kind() == TaskKind.DIG_DOWN || active.kind() == TaskKind.DESCEND_DROP) ? 6000 : 2400);
+            : ((active.kind() == TaskKind.MINE_ORE || active.kind() == TaskKind.DIG_DOWN
+                || active.kind() == TaskKind.DESCEND_DROP || active.kind() == TaskKind.EXPLORE_CAVE) ? 6000 : 2400);
         if (activeTicks > maxTicks) {
             if (descent != null && descent.isActivelyDescending()) descent.clearActive();
             finishActive("timeout", "task exceeded time limit", currentTick);
@@ -311,6 +316,7 @@ final class TaskRunner {
             case GATHER_FOOD -> tickGatherFood(player, world, currentTick);
             case DIG_DOWN -> tickDigDown(player, world, currentTick);
             case DESCEND_DROP -> tickDescendDrop(player, world, currentTick);
+            case EXPLORE_CAVE -> tickExploreCave(player, world, currentTick);
             case EXPLORE -> tickExplore(player, world, currentTick);
             case NAVIGATE -> tickNavigate(player, world, currentTick);
             case COLLECT_DROPS -> tickCollectDrops(player, world, currentTick);
@@ -342,7 +348,7 @@ final class TaskRunner {
             if (underground) {
                 Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
                 int surfaceY = Math.max(feet.getY() + 8, 66);
-                navigateToward(player, Pathfinder.Goal.reachY(surfaceY), opts, currentTick);
+                navigateToward(player, Pathfinder.Goal.climbToY(surfaceY), opts, currentTick);
                 statusText = "climbing to surface for wood";
                 return;
             }
@@ -622,65 +628,18 @@ final class TaskRunner {
         }
 
         if (activeTargetBlock == null) {
-            // Never start digging down from water or a flooded surface shoreline!
-            if (isWetSurfaceSpot(player, world)) {
-                route.clear();
-                exploreForResources(player, world, currentTick, "moving to dry land before mining " + active.target());
-                return;
-            }
-            // No known ore target — descend safely to prime vanilla 1.21.4 depth, then dig cardinal 1x2 branch tunnels!
             int targetY = switch (oreKind) {
                 case COAL -> 48;
                 case IRON -> 16;
                 case DIAMOND -> -54;
             };
-            Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, safeExcavationMode);
-            if (player.getBlockY() > targetY + 3 && descentLateralTicks <= 0) {
-                RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.reachY(targetY), opts, currentTick);
-                statusText = "descending to y=" + targetY + " for " + active.target();
-                if (st == RouteExecutor.Status.STUCK) {
-                    // Hit lava/water aquifer or unbreakable barrier while descending: step laterally before continuing down!
-                    branchDirIndex = (branchDirIndex + 1) & 3;
-                    descentLateralTicks = 90;
-                    branchWaypoint = null;
-                    route.clear();
-                }
-            } else {
-                if (descentLateralTicks > 0) descentLateralTicks--;
-                // Cardinal 1x2 branch-mining gallery (2x faster & half the pickaxe wear of diagonal tunnels!)
-                int[][] dirs = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
-                BlockPos feet = player.getBlockPos();
-                if (branchWaypoint == null || feet.getSquaredDistance(branchWaypoint) <= 2.5 * 2.5
-                        || Math.abs(branchWaypoint.getY() - feet.getY()) > 4) {
-                    if (branchWaypoint != null && ++branchLegSegments >= 4) {
-                        // Every ~64m, jog sideways 4 blocks and reverse direction (classic parallel strip mine!)
-                        branchDirIndex = (branchDirIndex + 1) & 3;
-                        branchLegSegments = 0;
-                        int[] side = dirs[branchDirIndex];
-                        branchWaypoint = feet.add(side[0] * 4, 0, side[1] * 4);
-                        branchDirIndex = (branchDirIndex + 1) & 3;
-                    } else {
-                        int[] d = dirs[branchDirIndex];
-                        int desiredY = Math.max(targetY, Math.min(feet.getY(), targetY + 3));
-                        branchWaypoint = new BlockPos(feet.getX() + d[0] * 16, desiredY, feet.getZ() + d[1] * 16);
-                    }
-                    route.clear();
-                }
-                RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(branchWaypoint, 2.2), opts, currentTick);
-                statusText = descentLateralTicks > 0
-                    ? "routing around hazard for " + active.target()
-                    : "branch mining at y=" + feet.getY() + " for " + active.target();
-                if (st == RouteExecutor.Status.STUCK) {
-                    // Turn 90 degrees cleanly around lava lake / cave wall / fluid pocket!
-                    branchDirIndex = (branchDirIndex + 1) & 3;
-                    branchLegSegments = 0;
-                    branchWaypoint = null;
-                    route.clear();
-                } else if (st == RouteExecutor.Status.COMPLETE) {
-                    branchWaypoint = null;
-                    route.clear();
-                }
+            // In honest unassisted mode, scout surface for cave mouths & ravines, explore deep caves for exposed ore,
+            // exit shallow dead-end caves to seek bigger caves/ravines, and fall back to deep branch mining when appropriate!
+            if (!perception.isDiagnosticRevealOres() && caves != null) {
+                tickCaveSearch(player, world, oreKind, targetY, currentTick);
+                return;
             }
+            tickDescentAndBranchMine(player, world, active.target(), targetY, currentTick);
             return;
         }
 
@@ -1205,6 +1164,352 @@ final class TaskRunner {
             case FAILED -> finishActive("failed",
                 "descent failed at y=" + player.getBlockY(), currentTick);
             default -> {}
+        }
+    }
+
+    private void tickExploreCave(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        Perception.OreKind oreKind = parseOreKind(active.target());
+        int targetY = active.count() != 0 ? active.count() : switch (oreKind) {
+            case COAL -> 48;
+            case IRON -> 16;
+            case DIAMOND -> -54;
+        };
+        // If we already spotted visible target ore while exploring, finish cleanly so mine_ore grabs it!
+        if (!perception.nearestOreTargets(oreKind, player.getBlockPos(), 1, blacklistedTargets).isEmpty()) {
+            finishActive("completed", "spotted visible " + active.target() + " ore in cave", currentTick);
+            return;
+        }
+        if (caves == null) {
+            tickDescentAndBranchMine(player, world, active.target(), targetY, currentTick);
+            return;
+        }
+        tickCaveSearch(player, world, oreKind, targetY, currentTick);
+    }
+
+    /**
+     * Human-like cave & ravine search loop (100% perception-honest):
+     * 1) Scout surface for shaded cave mouths & deep ravines (preferring ravines and deep openings)
+     * 2) Enter caves, opportunistically mine useful nearby exposed coal/iron along the way, and follow deep frontiers
+     * 3) Use SafeDescent when encountering deep safe cavern/ravine drops
+     * 4) Exit shallow dead-end caves back to surface to find larger/deeper caves or ravines
+     * 5) Transition cleanly to cardinal branch-mining once already deep underground or after surface scouting times out
+     */
+    private void tickCaveSearch(ClientPlayerEntity player, ClientWorld world,
+                                Perception.OreKind desiredOre, int targetY, int currentTick) {
+        BlockPos feet = player.getBlockPos();
+        int skyLight = world.getLightLevel(net.minecraft.world.LightType.SKY, feet);
+        boolean insideCave = skyLight <= 8 || feet.getY() <= 52;
+
+        // 0. If currently executing a SafeDescent into a cavern or ravine, let it finish cleanly!
+        if (descent != null && descent.isActivelyDescending()) {
+            SafeDescent.RunStatus ds = descent.tickActiveDescent(player, world, currentTick);
+            statusText = descent.statusText();
+            if (ds == SafeDescent.RunStatus.COMPLETED || ds == SafeDescent.RunStatus.REFUSED || ds == SafeDescent.RunStatus.FAILED) {
+                route.clear();
+            }
+            return;
+        }
+
+        // 1. Opportunistically mine close visible useful coal or iron inside a cave so shallow caves still pay off!
+        if (insideCave && caves.mode() == CaveExplorer.Mode.EXPLORING_CAVE) {
+            BlockPos bonusOre = findOpportunisticCaveOre(player, world, desiredOre);
+            if (bonusOre != null) {
+                if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(bonusOre)) <= Motor.REACH_SQ
+                        && motor.findAimPoint(bonusOre) != null) {
+                    BlockPos headroomFirst = findHeadroomBlockerForLowTarget(player, world, bonusOre);
+                    if (headroomFirst != null) {
+                        motor.mineBlock(headroomFirst, true, false);
+                        statusText = "clearing headroom for cave ore";
+                        return;
+                    }
+                    boolean broken = motor.mineBlock(bonusOre, true, true);
+                    statusText = "mining exposed cave ore";
+                    if (broken) {
+                        rockBrokenCount++;
+                        perception.markOreRetired(bonusOre);
+                        blacklistedTargets.add(bonusOre);
+                        noMineProgressTicks = 0;
+                    } else if (motor.breakingProgress() > 0.01f) {
+                        noMineProgressTicks = 0;
+                    } else if (++noMineProgressTicks > 45) {
+                        blacklistedTargets.add(bonusOre);
+                        noMineProgressTicks = 0;
+                    }
+                    return;
+                }
+                RouteExecutor.Status bst = navigateToward(player, Pathfinder.Goal.interactReach(bonusOre, 3.3),
+                    Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
+                statusText = "approaching exposed cave ore";
+                if (bst == RouteExecutor.Status.STUCK) {
+                    blacklistedTargets.add(bonusOre);
+                    route.clear();
+                }
+                return;
+            }
+        }
+
+        switch (caves.mode()) {
+            case APPROACHING_ENTRANCE -> {
+                CaveExplorer.Entrance ent = caves.activeEntrance();
+                if (ent == null || ent.exhausted) {
+                    caves.setMode(CaveExplorer.Mode.SURFACE_SCOUT, currentTick);
+                    route.clear();
+                    return;
+                }
+                double distSq = feet.getSquaredDistance(ent.pos);
+                // Reached the cave mouth or ravine lip? Enter and scan the interior!
+                if (insideCave || distSq <= 4.5 * 4.5) {
+                    caves.beginExploringCave(feet, currentTick);
+                    caves.beginGlance(player.getYaw(), 14);
+                    route.clear();
+                    statusText = ent.ravineLike ? "inspecting ravine opening" : "entering cave mouth";
+                    return;
+                }
+                // Check SafeDescent if we arrived right at a ravine rim overlooking a deep drop
+                if (tryStartCaveSafeDescent(player, world, targetY)) return;
+
+                Pathfinder.Options opts = distSq <= 12.0 * 12.0
+                    ? Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true)
+                    : Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f);
+                RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(ent.pos, 2.8), opts, currentTick);
+                statusText = ent.ravineLike
+                    ? "heading to ravine (" + (int) Math.round(Math.sqrt(distSq)) + "m)"
+                    : "heading to cave entrance (" + (int) Math.round(Math.sqrt(distSq)) + "m)";
+                if (st == RouteExecutor.Status.STUCK) {
+                    caves.markActiveEntranceExhausted(currentTick);
+                    caves.setMode(CaveExplorer.Mode.SURFACE_SCOUT, currentTick);
+                    route.clear();
+                }
+            }
+
+            case EXPLORING_CAVE -> {
+                // Brief natural pause-glance at cave bends to map dark branches & ores on walls
+                if (caves.tickGlance()) {
+                    float phase = (14 - caves.glanceTicks()) / 14.0f;
+                    float sweep = (float) Math.sin(phase * Math.PI * 2.0) * 46.0f;
+                    motor.lookAtAngles(caves.glanceBaseYaw() + sweep, 14.0f, Motor.LookMode.SCAN);
+                    statusText = "scanning cave passages (y=" + feet.getY() + ")";
+                    return;
+                }
+
+                // If overlooking a safe deep cavern/ravine drop, use SafeDescent (waterfall / boat / cliff stair / edge blocks)!
+                if (tryStartCaveSafeDescent(player, world, targetY)) return;
+
+                BlockPos frontier = caves.activeFrontier();
+                if (frontier != null && (caves.isVisitedOrUnreachable(frontier) || feet.getSquaredDistance(frontier) <= 2.6 * 2.6)) {
+                    caves.setActiveFrontier(null);
+                    frontier = null;
+                    route.clear();
+                    caves.beginGlance(player.getYaw(), 10);
+                }
+                if (frontier == null) {
+                    frontier = caves.selectBestCaveFrontier(perception, feet, player.getYaw(), targetY);
+                    if (frontier != null) {
+                        caves.setActiveFrontier(frontier);
+                        route.clear();
+                    }
+                }
+
+                CaveExplorer.CaveVerdict verdict = caves.evaluateCurrentCave(
+                    feet.getY(), targetY, frontier != null, false, currentTick);
+                if (verdict == CaveExplorer.CaveVerdict.EXIT_SHALLOW_CAVE) {
+                    caves.markActiveEntranceExhausted(currentTick);
+                    caves.setMode(CaveExplorer.Mode.EXITING_SHALLOW_CAVE, currentTick);
+                    route.clear();
+                    statusText = "leaving shallow dead-end cave";
+                    return;
+                }
+                if (verdict == CaveExplorer.CaveVerdict.TRANSITION_DEEP_MINE) {
+                    caves.setMode(CaveExplorer.Mode.DEEP_BRANCH_MINE, currentTick);
+                    route.clear();
+                    statusText = "deep cave ended; starting branch mine";
+                    return;
+                }
+
+                if (frontier == null) {
+                    // Brief look around to discover any newly visible passage before re-evaluating
+                    caves.beginGlance(player.getYaw() + 90f, 12);
+                    statusText = "checking cave branches";
+                    return;
+                }
+
+                int fTicks = caves.incrementFrontierTicks();
+                Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+                RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(frontier, 2.2), opts, currentTick);
+                statusText = "exploring cave toward y=" + frontier.getY() + " (" + desiredOre.name().toLowerCase() + ")";
+                if (st == RouteExecutor.Status.STUCK || fTicks > 220) {
+                    caves.markFrontierUnreachable(frontier);
+                    route.clear();
+                } else if (st == RouteExecutor.Status.COMPLETE) {
+                    caves.setActiveFrontier(null);
+                    caves.beginGlance(player.getYaw(), 10);
+                    route.clear();
+                }
+            }
+
+            case EXITING_SHALLOW_CAVE -> {
+                if (skyLight >= 13 && feet.getY() >= 56) {
+                    caves.finishExitToSurface(currentTick);
+                    exploreHeadingRad += Math.PI * 0.65;
+                    route.clear();
+                    statusText = "exited shallow cave; scouting surface";
+                    return;
+                }
+                Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
+                BlockPos exitPos = caves.caveEntryPos();
+                Pathfinder.Goal exitGoal = (exitPos != null && feet.getSquaredDistance(exitPos) > 4.0 * 4.0 && exitPos.getY() >= feet.getY() - 2)
+                    ? Pathfinder.Goal.near(exitPos, 2.5)
+                    : Pathfinder.Goal.climbToY(Math.max(feet.getY() + 14, 66));
+                RouteExecutor.Status st = navigateToward(player, exitGoal, opts, currentTick);
+                statusText = "climbing out of shallow cave (y=" + feet.getY() + ")";
+                if (st == RouteExecutor.Status.STUCK || st == RouteExecutor.Status.COMPLETE) {
+                    // If entry waypoint wasn't sunlit enough, staircase straight up to daylight!
+                    RouteExecutor.Status upSt = navigateToward(player, Pathfinder.Goal.climbToY(Math.max(feet.getY() + 14, 68)), opts, currentTick);
+                    if (upSt == RouteExecutor.Status.STUCK) {
+                        caves.setMode(CaveExplorer.Mode.DEEP_BRANCH_MINE, currentTick);
+                        route.clear();
+                    }
+                }
+            }
+
+            case SURFACE_SCOUT -> {
+                if (insideCave) {
+                    caves.beginExploringCave(feet, currentTick);
+                    route.clear();
+                    return;
+                }
+                CaveExplorer.Entrance ent = caves.pickBestSurfaceEntrance(feet);
+                if (ent != null) {
+                    caves.beginApproachEntrance(ent, currentTick);
+                    route.clear();
+                    statusText = ent.ravineLike ? "spotted ravine!" : "spotted cave mouth!";
+                    return;
+                }
+                // After ~70s of surface scouting without spotting a cave/ravine (or 3 exhausted shallow caves),
+                // transition smoothly into a safe staircase & cardinal branch mine!
+                if (caves.surfaceScoutTimedOut(currentTick, 1400) || caves.exhaustedCaveCount() >= 3) {
+                    caves.setMode(CaveExplorer.Mode.DEEP_BRANCH_MINE, currentTick);
+                    route.clear();
+                    statusText = "no deep caves nearby; digging staircase";
+                    return;
+                }
+                exploreForResources(player, world, currentTick, "scouting surface for caves & ravines");
+                // Tilt gaze slightly downward over hillsides/cliffs so cave mouths and ravines pop right into sight!
+                float moveYaw = (float) (Math.toDegrees(Math.atan2(Math.sin(exploreHeadingRad), Math.cos(exploreHeadingRad))) - 90.0);
+                float scanOffset = (float) (Math.sin(currentTick * 0.065) * 38.0);
+                motor.lookAtAngles(moveYaw + scanOffset, 12.0f, Motor.LookMode.NORMAL);
+            }
+
+            case DEEP_BRANCH_MINE -> {
+                // If our staircase/branch mine breaks into a genuinely open downward cavern, explore that cave!
+                if (caves.countUnvisitedFrontiers(perception, feet) >= 6) {
+                    BlockPos deepCave = caves.selectBestCaveFrontier(perception, feet, player.getYaw(), targetY);
+                    if (deepCave != null && deepCave.getY() <= feet.getY() - 3) {
+                        caves.beginExploringCave(feet, currentTick);
+                        caves.setActiveFrontier(deepCave);
+                        route.clear();
+                        statusText = "broke into deep cave; exploring";
+                        return;
+                    }
+                }
+                tickDescentAndBranchMine(player, world, desiredOre.name().toLowerCase(), targetY, currentTick);
+            }
+        }
+    }
+
+    private boolean tryStartCaveSafeDescent(ClientPlayerEntity player, ClientWorld world, int targetY) {
+        if (descent == null || player.getBlockY() <= targetY + 4) return false;
+        SafeDescent.Overlook ov = descent.lastOverlook();
+        if (ov == null || ov.dropDepth() < 5 || ov.landingLava() || !ov.floorObserved()) return false;
+        if (ov.landingY() < targetY - 14) return false;
+        SafeDescent.Decision dec = descent.lastDecision();
+        if (!dec.shouldDescend()) return false;
+        route.clear();
+        descent.startDescent(player, world, descent.preferredMethod(), targetY, null);
+        statusText = descent.statusText().isEmpty() ? "safely descending into cavern" : descent.statusText();
+        return true;
+    }
+
+    private BlockPos findOpportunisticCaveOre(ClientPlayerEntity player, ClientWorld world, Perception.OreKind desired) {
+        BlockPos feet = player.getBlockPos();
+        int pickTier = bestPickaxeTier(player);
+        // Grab nearby exposed iron while caving for diamonds if low on iron (useful for shield/bucket/spare pickaxe)
+        if (desired == Perception.OreKind.DIAMOND && pickTier >= 2
+                && GuiHands.countItem(player, Items.RAW_IRON) + GuiHands.countItem(player, Items.IRON_INGOT) < 4) {
+            List<BlockPos> iron = perception.nearestOreTargets(Perception.OreKind.IRON, feet, 2, blacklistedTargets);
+            for (BlockPos p : iron) {
+                if (p.getSquaredDistance(feet) <= 7.5 * 7.5 && !perception.isNearKnownLava(p.getX(), p.getY(), p.getZ())) {
+                    return p;
+                }
+            }
+        }
+        // Grab nearby exposed coal ONLY when low on coal & torches (never waste time on extra coal!)
+        if (desired != Perception.OreKind.COAL && pickTier >= 1
+                && GuiHands.countItem(player, Items.COAL) < 6 && GuiHands.countItem(player, Items.TORCH) < 8) {
+            List<BlockPos> coal = perception.nearestOreTargets(Perception.OreKind.COAL, feet, 2, blacklistedTargets);
+            for (BlockPos p : coal) {
+                if (p.getSquaredDistance(feet) <= 7.5 * 7.5 && !perception.isNearKnownLava(p.getX(), p.getY(), p.getZ())) {
+                    return p;
+                }
+            }
+        }
+        return null;
+    }
+
+    private void tickDescentAndBranchMine(ClientPlayerEntity player, ClientWorld world,
+                                          String oreLabel, int targetY, int currentTick) {
+        // Never start digging down from water or a flooded surface shoreline!
+        if (isWetSurfaceSpot(player, world)) {
+            route.clear();
+            exploreForResources(player, world, currentTick, "moving to dry land before mining " + oreLabel);
+            return;
+        }
+        Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, safeExcavationMode);
+        if (player.getBlockY() > targetY + 3 && descentLateralTicks <= 0) {
+            RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.reachY(targetY), opts, currentTick);
+            statusText = "descending to y=" + targetY + " for " + oreLabel;
+            if (st == RouteExecutor.Status.STUCK) {
+                // Hit lava/water aquifer or unbreakable barrier while descending: step laterally before continuing down!
+                branchDirIndex = (branchDirIndex + 1) & 3;
+                descentLateralTicks = 90;
+                branchWaypoint = null;
+                route.clear();
+            }
+        } else {
+            if (descentLateralTicks > 0) descentLateralTicks--;
+            // Cardinal 1x2 branch-mining gallery (2x faster & half the pickaxe wear of diagonal tunnels!)
+            int[][] dirs = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
+            BlockPos feet = player.getBlockPos();
+            if (branchWaypoint == null || feet.getSquaredDistance(branchWaypoint) <= 2.5 * 2.5
+                    || Math.abs(branchWaypoint.getY() - feet.getY()) > 4) {
+                if (branchWaypoint != null && ++branchLegSegments >= 4) {
+                    // Every ~64m, jog sideways 4 blocks and reverse direction (classic parallel strip mine!)
+                    branchDirIndex = (branchDirIndex + 1) & 3;
+                    branchLegSegments = 0;
+                    int[] side = dirs[branchDirIndex];
+                    branchWaypoint = feet.add(side[0] * 4, 0, side[1] * 4);
+                    branchDirIndex = (branchDirIndex + 1) & 3;
+                } else {
+                    int[] d = dirs[branchDirIndex];
+                    int desiredY = Math.max(targetY, Math.min(feet.getY(), targetY + 3));
+                    branchWaypoint = new BlockPos(feet.getX() + d[0] * 16, desiredY, feet.getZ() + d[1] * 16);
+                }
+                route.clear();
+            }
+            RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(branchWaypoint, 2.2), opts, currentTick);
+            statusText = descentLateralTicks > 0
+                ? "routing around hazard for " + oreLabel
+                : "branch mining at y=" + feet.getY() + " for " + oreLabel;
+            if (st == RouteExecutor.Status.STUCK) {
+                // Turn 90 degrees cleanly around lava lake / cave wall / fluid pocket!
+                branchDirIndex = (branchDirIndex + 1) & 3;
+                branchLegSegments = 0;
+                branchWaypoint = null;
+                route.clear();
+            } else if (st == RouteExecutor.Status.COMPLETE) {
+                branchWaypoint = null;
+                route.clear();
+            }
         }
     }
 
@@ -1933,7 +2238,7 @@ final class TaskRunner {
                 }
             }
         }
-        if (pickTier >= 1 && GuiHands.countItem(player, Items.COAL) < 16) {
+        if (pickTier >= 1 && GuiHands.countItem(player, Items.COAL) < 8) {
             for (BlockPos pos : perception.nearestOreTargets(Perception.OreKind.COAL, furnace, 4, blacklistedTargets)) {
                 if (pos.getSquaredDistance(furnace) <= 9.5 * 9.5 && !perception.isNearKnownLava(pos.getX(), pos.getY(), pos.getZ())) {
                     return pos;

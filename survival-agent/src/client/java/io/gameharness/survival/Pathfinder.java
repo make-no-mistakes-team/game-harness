@@ -127,6 +127,17 @@ final class Pathfinder {
             };
         }
 
+        static Goal climbToY(int targetY) {
+            return new Goal() {
+                @Override public boolean isSatisfied(int x, int y, int z) {
+                    return y >= targetY;
+                }
+                @Override public double heuristic(int x, int y, int z) {
+                    return y >= targetY ? 0.0 : (targetY - y) * 34.0;
+                }
+            };
+        }
+
         static Goal awayFrom(BlockPos threat, double safeDist) {
             double sSq = safeDist * safeDist;
             return new Goal() {

@@ -145,9 +145,9 @@ final class RouteExecutor {
                 BlockState st = world.getBlockState(placePos);
                 if (st.isAir() || st.isReplaceable()) {
                     if (step.kind() == Pathfinder.MoveKind.PILLAR) {
-                        // Center over block, jump, look down and place underfoot
+                        // Center tightly (<0.15) over block so hitbox (0.30) never clips adjacent ceiling corners!
                         Vec3d center = Vec3d.ofBottomCenter(step.from());
-                        if (Math.hypot(player.getX() - center.x, player.getZ() - center.z) > 0.25) {
+                        if (Math.hypot(player.getX() - center.x, player.getZ() - center.z) > 0.15) {
                             motor.moveToward(center, false, false, true, false);
                         } else {
                             motor.requestJump();

@@ -272,12 +272,14 @@ final class Perception {
             recordObserved(front, frontState, false);
 
             // Honest cave mouth, ravine, and underground passage detection from visible rock + air faces!
+            // Require genuine rock walls (or very dark sky<=5) so shaded dirt under dark oak trees is never mistaken for a cave!
             if (isCaveWallBlock(hitState) && frontState.isAir() && frontState.getFluidState().isEmpty()) {
                 int sky = world.getLightLevel(net.minecraft.world.LightType.SKY, front);
-                boolean ravineDrop = isNaturalCaveRock(hitState)
+                boolean naturalRock = isNaturalCaveRock(hitState);
+                boolean ravineDrop = naturalRock
                     && front.getY() <= player.getBlockY() - 5
                     && front.getY() <= 60;
-                if (sky <= 10 || ravineDrop) {
+                if ((naturalRock && sky <= 10) || sky <= 5 || ravineDrop) {
                     recordCaveSight(front, sky, ravineDrop);
                 }
             }

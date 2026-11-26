@@ -103,6 +103,7 @@ final class TaskRunner {
     private BlockPos branchWaypoint;
     private int branchLegSegments;
     private int descentLateralTicks;
+    private int exitCaveTicks;
     private double exploreHeadingRad = 0.7;
     private int exploreFlipCount;
     private Vec3d exploreLastPos;
@@ -144,6 +145,7 @@ final class TaskRunner {
         branchWaypoint = null;
         branchLegSegments = 0;
         descentLateralTicks = 0;
+        exitCaveTicks = 0;
         route.clear();
         gui.abort();
         blacklistedTargets.clear();
@@ -1354,9 +1356,15 @@ final class TaskRunner {
                     feet.getY(), targetY, frontier != null, false, currentTick);
                 if (verdict == CaveExplorer.CaveVerdict.EXIT_SHALLOW_CAVE) {
                     caves.markActiveEntranceExhausted(currentTick);
-                    caves.setMode(CaveExplorer.Mode.EXITING_SHALLOW_CAVE, currentTick);
+                    if (caves.exhaustedCaveCount() >= 3) {
+                        caves.setMode(CaveExplorer.Mode.DEEP_BRANCH_MINE, currentTick);
+                        statusText = "3 shallow caves checked; digging staircase";
+                    } else {
+                        exitCaveTicks = 0;
+                        caves.setMode(CaveExplorer.Mode.EXITING_SHALLOW_CAVE, currentTick);
+                        statusText = "leaving shallow dead-end cave";
+                    }
                     route.clear();
-                    statusText = "leaving shallow dead-end cave";
                     return;
                 }
                 if (verdict == CaveExplorer.CaveVerdict.TRANSITION_DEEP_MINE) {
@@ -1388,27 +1396,47 @@ final class TaskRunner {
             }
 
             case EXITING_SHALLOW_CAVE -> {
-                if (skyLight >= 13 && feet.getY() >= 56) {
+                exitCaveTicks++;
+                boolean onSurface = (skyLight >= 11 && feet.getY() >= 56)
+                    || (feet.getY() >= 62 && !hasRockRoofAbove(world, feet));
+                if (onSurface) {
+                    exitCaveTicks = 0;
                     caves.finishExitToSurface(currentTick);
                     exploreHeadingRad += Math.PI * 0.65;
                     route.clear();
                     statusText = "exited shallow cave; scouting surface";
                     return;
                 }
+                if (exitCaveTicks > 240) {
+                    // Thick mountain roof or slow exit — don't stall; start descending cleanly to prime ore depth!
+                    exitCaveTicks = 0;
+                    caves.setMode(CaveExplorer.Mode.DEEP_BRANCH_MINE, currentTick);
+                    route.clear();
+                    statusText = "deep roof above; digging down instead";
+                    return;
+                }
                 Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
                 BlockPos exitPos = caves.caveEntryPos();
-                Pathfinder.Goal exitGoal = (exitPos != null && feet.getSquaredDistance(exitPos) > 4.0 * 4.0 && exitPos.getY() >= feet.getY() - 2)
+                boolean useEntry = exitPos != null && exitCaveTicks < 120
+                    && feet.getSquaredDistance(exitPos) > 4.0 * 4.0 && exitPos.getY() >= feet.getY() - 2;
+                Pathfinder.Goal exitGoal = useEntry
                     ? Pathfinder.Goal.near(exitPos, 2.5)
-                    : Pathfinder.Goal.climbToY(Math.max(feet.getY() + 14, 66));
+                    : Pathfinder.Goal.climbToY(Math.max(feet.getY() + 10, 66));
                 RouteExecutor.Status st = navigateToward(player, exitGoal, opts, currentTick);
                 statusText = "climbing out of shallow cave (y=" + feet.getY() + ")";
-                if (st == RouteExecutor.Status.STUCK || st == RouteExecutor.Status.COMPLETE) {
-                    // If entry waypoint wasn't sunlit enough, staircase straight up to daylight!
-                    RouteExecutor.Status upSt = navigateToward(player, Pathfinder.Goal.climbToY(Math.max(feet.getY() + 14, 68)), opts, currentTick);
-                    if (upSt == RouteExecutor.Status.STUCK) {
+                if (st == RouteExecutor.Status.STUCK) {
+                    if (useEntry) {
+                        // Switch to direct upward staircase on next tick
+                        exitCaveTicks = 120;
+                        route.clear();
+                    } else {
+                        exitCaveTicks = 0;
                         caves.setMode(CaveExplorer.Mode.DEEP_BRANCH_MINE, currentTick);
                         route.clear();
                     }
+                } else if (st == RouteExecutor.Status.COMPLETE && useEntry) {
+                    exitCaveTicks = 120;
+                    route.clear();
                 }
             }
 
@@ -1455,6 +1483,16 @@ final class TaskRunner {
                 tickDescentAndBranchMine(player, world, desiredOre.name().toLowerCase(), targetY, currentTick);
             }
         }
+    }
+
+    /** True if a genuine stone/deepslate/dirt cave roof sits above `feet` (ignoring tree leaves/logs). */
+    private static boolean hasRockRoofAbove(ClientWorld world, BlockPos feet) {
+        for (int dy = 2; dy <= 14; dy++) {
+            BlockState st = world.getBlockState(feet.up(dy));
+            if (st.isAir() || st.getBlock() instanceof LeavesBlock || st.isIn(BlockTags.LOGS)) continue;
+            if (st.blocksMovement()) return true;
+        }
+        return false;
     }
 
     private boolean tryStartCaveSafeDescent(ClientPlayerEntity player, ClientWorld world, int targetY) {

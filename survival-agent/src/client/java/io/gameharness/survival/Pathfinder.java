@@ -491,8 +491,15 @@ final class Pathfinder {
         if (cLow > 0) { breaks.add(new BlockPos(nx, ny, nz)); digCost += cLow; }
 
         if (breaks.isEmpty()) return;
-        // Never dig strictly the floor block of an already 2-tall empty column (vertical chimney undercutting!)
-        if (cHead == 0.0 && cMid == 0.0) return;
+        // Never undercut an enclosed underground 2-tall column (1x2 chimney!), while ALWAYS allowing
+        // starting a fresh staircase down from open flat surface ground (where sky/air extends above)!
+        if (cHead == 0.0 && cMid == 0.0) {
+            BlockState roof3 = p.getObserved(nx, y + 3, nz);
+            BlockState roof4 = p.getObserved(nx, y + 4, nz);
+            boolean enclosedUndergroundRoof = (roof3 != null && !Perception.isPassable(roof3))
+                || (roof4 != null && !Perception.isPassable(roof4));
+            if (enclosedUndergroundRoof) return;
+        }
         // Favor continuing straight along the same walkable 45-degree staircase heading across steps AND replans,
         // and strongly penalize undercutting a column whose y+1 is already air (which would chew into our own stairs!).
         double turnPenalty = 0.0;
@@ -505,7 +512,9 @@ final class Pathfinder {
         }
         if (cHead == 0.0 && cMid > 0.0) {
             BlockState aboveHead = p.getObserved(nx, y + 2, nz);
-            if (aboveHead != null && Perception.isPassable(aboveHead)) {
+            BlockState roof3 = p.getObserved(nx, y + 3, nz);
+            if (aboveHead != null && Perception.isPassable(aboveHead)
+                    && roof3 != null && !Perception.isPassable(roof3)) {
                 turnPenalty += 28.0;
             }
         }

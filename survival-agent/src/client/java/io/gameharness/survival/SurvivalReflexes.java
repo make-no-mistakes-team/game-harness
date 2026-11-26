@@ -53,6 +53,8 @@ final class SurvivalReflexes {
     private CombatPlanner.TacticalAction lastAction = CombatPlanner.TacticalAction.FIGHT;
     private CombatPlanner.EscapeAssessment lastEscape = new CombatPlanner.EscapeAssessment(1, 0, 10.0, 8, false);
     private int creeperRetreatTicks;
+    private int fleeStuckTicks;
+    private Vec3d fleeLastPos;
     private int strafeFlipTicks;
     private int strafeSign = 1;
     private int shieldAdvanceCycle;
@@ -93,6 +95,8 @@ final class SurvivalReflexes {
         eatingTicks = 0;
         hurtLookTicks = 0;
         creeperRetreatTicks = 0;
+        fleeStuckTicks = 0;
+        fleeLastPos = null;
         recentBlockTicks = 0;
         lastShieldDamage = -1;
         lastTrackedHealth = Float.NaN;
@@ -381,6 +385,10 @@ final class SurvivalReflexes {
 
         CombatPlanner.TacticalAction action = CombatPlanner.decideAction(ctx);
         lastAction = action;
+        if (action != CombatPlanner.TacticalAction.FLEE) {
+            fleeStuckTicks = 0;
+            fleeLastPos = null;
+        }
         CombatPlanner.ThreatInfo primary = CombatPlanner.pickPrimaryThreat(threats);
         LivingEntity liveTarget = primary == null ? null : perception.findVisibleHostileById(primary.entityId());
 
@@ -483,6 +491,31 @@ final class SurvivalReflexes {
                 motor.selectShieldFriendlyMainHand();
                 motor.requestHoldUse();
                 activeStatus = "blocking arrow during retreat";
+                return;
+            }
+        }
+        Vec3d pos = player.getPos();
+        if (fleeLastPos == null || Math.hypot(pos.x - fleeLastPos.x, pos.z - fleeLastPos.z) > 0.45) {
+            fleeLastPos = pos;
+            fleeStuckTicks = 0;
+        } else if (++fleeStuckTicks >= 40) {
+            // Physically wedged while fleeing (e.g., narrow cave/staircase blocked by hostile):
+            // seal off immediately if we can shelter, otherwise fight/knock back a non-swelling melee threat!
+            fleeStuckTicks = 0;
+            fleeLastPos = pos;
+            int blocks = Motor.countShelterBlocks(player);
+            boolean canShelter = blocks >= 1 && (blocks >= 4 || Motor.hasDigTool(player));
+            if (canShelter && client.world != null) {
+                beginShelter(player, client.world);
+                if (shelterState != ShelterState.NONE) {
+                    activeStatus = "sealing shelter after blocked retreat";
+                    return;
+                }
+            }
+            CombatPlanner.ThreatInfo primary = CombatPlanner.pickPrimaryThreat(threats);
+            LivingEntity liveTarget = primary == null ? null : perception.findVisibleHostileById(primary.entityId());
+            if (primary != null && liveTarget != null && primary.dist() <= 3.8 && player.getHealth() >= 8.0f) {
+                executeMeleeFight(player, primary, liveTarget, threats, shieldUsable);
                 return;
             }
         }

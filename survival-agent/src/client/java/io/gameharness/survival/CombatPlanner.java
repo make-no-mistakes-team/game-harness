@@ -218,13 +218,20 @@ final class CombatPlanner {
             }
             if (swelling && urgentCreeper.dist() < 6.2) {
                 if (ctx.trapped() && shieldUsable) return TacticalAction.CREEPER_BLOCK;
+                if (ctx.trapped() && canShelter && urgentCreeper.creeperFuse() < 0.35f) {
+                    return TacticalAction.EMERGENCY_SHELTER;
+                }
                 return TacticalAction.FLEE;
             }
             if (ctx.stance() != CombatStance.FLEE && ctx.weaponScore() >= 6.5
                     && ctx.health() >= 10.0f && !ctx.trapped() && urgentCreeper.dist() <= 4.4) {
                 return TacticalAction.CREEPER_KITE;
             }
-            return (ctx.trapped() && shieldUsable) ? TacticalAction.CREEPER_BLOCK : TacticalAction.FLEE;
+            if (ctx.trapped()) {
+                if (shieldUsable) return TacticalAction.CREEPER_BLOCK;
+                if (canShelter) return TacticalAction.EMERGENCY_SHELTER;
+            }
+            return TacticalAction.FLEE;
         }
 
         // 2. Explicit FLEE stance
@@ -315,8 +322,12 @@ final class CombatPlanner {
         double bestDirZ = Math.sin(awayAngle);
         int openBearings = 0;
 
-        for (int i = 0; i < 16; i++) {
-            double ang = awayAngle + (i * Math.PI * 2.0 / 16.0);
+        // Evaluate 16 rays relative to awayAngle PLUS the 4 exact axis-aligned cardinals
+        // so narrow 1-wide staircases and tunnels are never missed by slightly off-axis rays!
+        for (int i = 0; i < 20; i++) {
+            double ang = i < 16
+                ? awayAngle + (i * Math.PI * 2.0 / 16.0)
+                : ((i - 16) * Math.PI * 0.5);
             double dx = Math.cos(ang);
             double dz = Math.sin(ang);
             double awayDot = awayLen > 1e-4 ? (dx * awayX + dz * awayZ) / awayLen : 1.0;

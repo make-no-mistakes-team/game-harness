@@ -150,4 +150,35 @@ final class CombatPlannerTest {
             CombatPlanner.chooseShelterMode(0, 64, 0, 4, true, true, corner)
         );
     }
+
+    @Test
+    void escapeEvaluationFindsNarrowOneWideStaircaseUpward() {
+        // 1-wide staircase ascending North (z = -1, -2, -3, -4 at x = 0, step up +1 Y per Z step);
+        // solid rock walls on x != 0 and ahead south (z >= 1) blocked by an off-axis creeper!
+        CombatPlanner.CellProbe stairNorth = (x, y, z) -> {
+            if (x == 0 && z <= 0 && z >= -5) {
+                int floorY = 54 + (-z) - 1;
+                if (y <= floorY) return CombatPlanner.CellKind.SOLID;
+                if (y <= floorY + 2) return CombatPlanner.CellKind.PASSABLE;
+                return CombatPlanner.CellKind.SOLID;
+            }
+            return CombatPlanner.CellKind.SOLID;
+        };
+        // Creeper slightly off-axis south-east so relative rays miss exact North (-pi/2)
+        var creeper = threat(1, CombatPlanner.ThreatKind.CREEPER, 0.9, 2.2, 2.3, 0.0f, false, false, false, 0);
+        var esc = CombatPlanner.evaluateEscapeBearings(0.5, 54, 0.5, List.of(creeper), stairNorth);
+
+        assertFalse(esc.trapped(), "1-wide cardinal staircase upward should be detected as an open escape route");
+        assertTrue(esc.dirZ() < -0.8, "Escape direction should go straight North up the staircase, got dir=(" + esc.dirX() + ", " + esc.dirZ() + ")");
+    }
+
+    @Test
+    void trappedUnshieldedCreeperTriggersEmergencyShelterWhenBlocksAvailable() {
+        var calmCreeper = threat(1, CombatPlanner.ThreatKind.CREEPER, 0.5, 2.5, 2.1, 0.0f, false, false, false, 0);
+        var trappedNoShield = new CombatPlanner.CombatContext(
+            20f, 20f, 20, false, 4.0, false, false, 0, 27, true, true, -20.0,
+            CombatPlanner.CombatStance.DEFENSIVE, List.of(calmCreeper), false
+        );
+        assertEquals(CombatPlanner.TacticalAction.EMERGENCY_SHELTER, CombatPlanner.decideAction(trappedNoShield));
+    }
 }

@@ -915,13 +915,23 @@ final class Motor {
         if (state.getHardness(null, BlockPos.ORIGIN) == 0.0f) {
             return stack.isEmpty() ? 2.0f : (stack.isDamageable() ? 0.5f : 1.5f);
         }
-        // Prefer the matching tool type; conserve iron/diamond pickaxes on cheap surface stone when carrying a stone pickaxe!
+        // Prefer the matching tool type; conserve iron/diamond pickaxes on stone-tier rock when carrying a stone pickaxe!
         if (state.isIn(BlockTags.PICKAXE_MINEABLE)) {
             if (stack.getItem() instanceof PickaxeItem) {
-                boolean softRock = state.isOf(Blocks.STONE) || state.isOf(Blocks.COBBLESTONE)
+                boolean stoneTierRock = state.isOf(Blocks.STONE) || state.isOf(Blocks.COBBLESTONE)
+                    || state.isOf(Blocks.DEEPSLATE) || state.isOf(Blocks.COBBLED_DEEPSLATE)
                     || state.isOf(Blocks.ANDESITE) || state.isOf(Blocks.DIORITE)
-                    || state.isOf(Blocks.GRANITE) || state.isOf(Blocks.TUFF) || state.isOf(Blocks.COAL_ORE);
-                if (softRock && stack.isOf(Items.STONE_PICKAXE)) return 25.0f;
+                    || state.isOf(Blocks.GRANITE) || state.isOf(Blocks.TUFF)
+                    || state.isOf(Blocks.DRIPSTONE_BLOCK) || state.isOf(Blocks.CALCITE)
+                    || state.isOf(Blocks.SMOOTH_BASALT) || state.isOf(Blocks.BASALT)
+                    || state.isOf(Blocks.COAL_ORE) || state.isOf(Blocks.DEEPSLATE_COAL_ORE)
+                    || state.isOf(Blocks.IRON_ORE) || state.isOf(Blocks.DEEPSLATE_IRON_ORE)
+                    || state.isOf(Blocks.COPPER_ORE) || state.isOf(Blocks.DEEPSLATE_COPPER_ORE);
+                if (stoneTierRock && stack.isOf(Items.STONE_PICKAXE)) return 25.0f;
+                if (stoneTierRock && stack.isOf(Items.IRON_PICKAXE)) {
+                    int remaining = stack.getMaxDamage() - stack.getDamage();
+                    if (remaining <= 16) return 4.0f; // preserve nearly-broken iron pickaxe for diamonds!
+                }
                 return 10.0f + speed;
             }
         } else if (state.isIn(BlockTags.AXE_MINEABLE)) {

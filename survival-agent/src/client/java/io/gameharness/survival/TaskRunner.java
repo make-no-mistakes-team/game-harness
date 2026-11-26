@@ -93,6 +93,12 @@ final class TaskRunner {
     private int smeltChoreNoProgressTicks;
     private boolean recoveringWorkstation;
     private BlockPos workstationToRecover;
+    private int workstationRecoverTicks;
+    private int workstationOpenStuckTicks;
+    private int branchDirIndex;
+    private BlockPos branchWaypoint;
+    private int branchLegSegments;
+    private int descentLateralTicks;
     private double exploreHeadingRad = 0.7;
     private int exploreFlipCount;
     private Vec3d exploreLastPos;
@@ -126,6 +132,11 @@ final class TaskRunner {
         smeltReadyTick = -1;
         recoveringWorkstation = false;
         workstationToRecover = null;
+        workstationRecoverTicks = 0;
+        workstationOpenStuckTicks = 0;
+        branchWaypoint = null;
+        branchLegSegments = 0;
+        descentLateralTicks = 0;
         route.clear();
         gui.abort();
         blacklistedTargets.clear();
@@ -221,18 +232,39 @@ final class TaskRunner {
 
         // 2. If we finished crafting/smelting and want to pick up our temporary workstation, recover it cleanly
         if (recoveringWorkstation && workstationToRecover != null) {
+            workstationRecoverTicks++;
             BlockState st = world.getBlockState(workstationToRecover);
-            if (st.isAir() || (!st.isOf(Blocks.CRAFTING_TABLE) && !st.isOf(Blocks.FURNACE))) {
+            if (st.isAir() || (!st.isOf(Blocks.CRAFTING_TABLE) && !st.isOf(Blocks.FURNACE)) || workstationRecoverTicks > 140) {
                 recoveringWorkstation = false;
                 workstationToRecover = null;
+                workstationRecoverTicks = 0;
                 route.clear();
-            } else if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(workstationToRecover)) <= Motor.REACH_SQ) {
+            } else if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(workstationToRecover)) <= Motor.REACH_SQ
+                    && motor.findAimPoint(workstationToRecover) != null) {
                 motor.mineBlock(workstationToRecover, true);
                 statusText = "picking up workstation";
                 return;
             } else {
-                navigateToward(player, Pathfinder.Goal.interactReach(workstationToRecover, 3.8),
-                    Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f), currentTick);
+                boolean closeOccluded = player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(workstationToRecover)) <= 3.8 * 3.8;
+                Pathfinder.Goal recGoal = closeOccluded
+                    ? Pathfinder.Goal.near(workstationToRecover, 1.45)
+                    : Pathfinder.Goal.interactReach(workstationToRecover, 3.4);
+                RouteExecutor.Status recSt = navigateToward(player, recGoal,
+                    Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
+                if (recSt == RouteExecutor.Status.STUCK || recSt == RouteExecutor.Status.COMPLETE) {
+                    BlockPos blocker = findSafeOccludingBlock(player, world, workstationToRecover);
+                    if (blocker != null) {
+                        motor.mineBlock(blocker, true, false);
+                        statusText = "clearing view to workstation";
+                        return;
+                    }
+                    if (recSt == RouteExecutor.Status.STUCK) {
+                        recoveringWorkstation = false;
+                        workstationToRecover = null;
+                        workstationRecoverTicks = 0;
+                        route.clear();
+                    }
+                }
                 statusText = "approaching workstation to recover";
                 return;
             }
@@ -248,6 +280,10 @@ final class TaskRunner {
             activeTargetBlock = null;
             smeltLoaded = false;
             smeltCollecting = false;
+            workstationOpenStuckTicks = 0;
+            branchWaypoint = null;
+            branchLegSegments = 0;
+            descentLateralTicks = 0;
             route.clear();
         }
 
@@ -256,7 +292,9 @@ final class TaskRunner {
             return;
         }
 
-        int maxTicks = (active.kind() == TaskKind.MINE_ORE || active.kind() == TaskKind.DIG_DOWN || active.kind() == TaskKind.DESCEND_DROP) ? 6000 : 2400;
+        int maxTicks = (active.kind() == TaskKind.MINE_ORE && !perception.isDiagnosticRevealOres())
+            ? 9000
+            : ((active.kind() == TaskKind.MINE_ORE || active.kind() == TaskKind.DIG_DOWN || active.kind() == TaskKind.DESCEND_DROP) ? 6000 : 2400);
         if (activeTicks > maxTicks) {
             if (descent != null && descent.isActivelyDescending()) descent.clearActive();
             finishActive("timeout", "task exceeded time limit", currentTick);
@@ -511,6 +549,24 @@ final class TaskRunner {
         if (!ensureToolInHotbar(player, st -> pickaxeTier(st.getItem()) >= reqTier)) {
             return; // hotbar swap in progress
         }
+        // When mining diamonds, keep a stone pickaxe in hotbar too (if carried in backpack) to preserve iron pickaxe durability on deepslate!
+        if (oreKind == Perception.OreKind.DIAMOND && GuiHands.countItem(player, Items.STONE_PICKAXE) > 0
+                && motor.findHotbarItem(Items.STONE_PICKAXE) < 0) {
+            if (!ensureToolInHotbar(player, st -> st.isOf(Items.STONE_PICKAXE))) {
+                statusText = "moving stone pickaxe to hotbar";
+                return;
+            }
+        }
+        // If unassisted diamond branch-mining burns through our spare stone pickaxe and iron pickaxe is getting low,
+        // pause cleanly to craft a fresh stone pickaxe from carried cobblestone + wood instead of breaking our iron pickaxe!
+        if (oreKind == Perception.OreKind.DIAMOND && activeTargetBlock == null
+                && GuiHands.countItem(player, Items.STONE_PICKAXE) == 0
+                && GuiHands.countStone(player) >= 3
+                && (GuiHands.countItem(player, Items.STICK) >= 2 || GuiHands.countPlanks(player) >= 2 || GuiHands.countLogs(player) >= 1)
+                && remainingIronPickDurability(player) < 90) {
+            finishActive("partial", "crafting spare stone pickaxe to preserve iron pickaxe", currentTick);
+            return;
+        }
 
         // Keep torches in hotbar when underground so RouteExecutor can light dark tunnels
         if ((player.getBlockY() < 64 || world.getLightLevel(net.minecraft.world.LightType.SKY, player.getBlockPos()) == 0)
@@ -544,7 +600,12 @@ final class TaskRunner {
                     activeTargetBlock = cands.get(0);
                 }
             }
-            route.clear();
+            // Only reset the active route when we actually acquired a concrete ore target!
+            // Clearing route while activeTargetBlock == null would wipe descent/branch-mining every tick!
+            if (activeTargetBlock != null) {
+                branchWaypoint = null;
+                route.clear();
+            }
         }
 
         // If we can already see the target block and it's NOT that ore anymore (already mined!), retire AND blacklist it!
@@ -561,22 +622,64 @@ final class TaskRunner {
         }
 
         if (activeTargetBlock == null) {
-            // No known ore target — dig down toward the prime depth for this ore!
+            // Never start digging down from water or a flooded surface shoreline!
+            if (isWetSurfaceSpot(player, world)) {
+                route.clear();
+                exploreForResources(player, world, currentTick, "moving to dry land before mining " + active.target());
+                return;
+            }
+            // No known ore target — descend safely to prime vanilla 1.21.4 depth, then dig cardinal 1x2 branch tunnels!
             int targetY = switch (oreKind) {
                 case COAL -> 48;
                 case IRON -> 16;
                 case DIAMOND -> -54;
             };
             Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, safeExcavationMode);
-            if (player.getBlockY() > targetY + 3) {
-                navigateToward(player, Pathfinder.Goal.reachY(targetY), opts, currentTick);
+            if (player.getBlockY() > targetY + 3 && descentLateralTicks <= 0) {
+                RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.reachY(targetY), opts, currentTick);
                 statusText = "descending to y=" + targetY + " for " + active.target();
+                if (st == RouteExecutor.Status.STUCK) {
+                    // Hit lava/water aquifer or unbreakable barrier while descending: step laterally before continuing down!
+                    branchDirIndex = (branchDirIndex + 1) & 3;
+                    descentLateralTicks = 90;
+                    branchWaypoint = null;
+                    route.clear();
+                }
             } else {
-                // Branch mine straight ahead at optimal Y!
-                BlockPos ahead = player.getBlockPos().add((int) Math.round(Math.cos(exploreHeadingRad) * 14), 0,
-                    (int) Math.round(Math.sin(exploreHeadingRad) * 14));
-                navigateToward(player, Pathfinder.Goal.near(ahead, 2.5), opts, currentTick);
-                statusText = "branch mining for " + active.target();
+                if (descentLateralTicks > 0) descentLateralTicks--;
+                // Cardinal 1x2 branch-mining gallery (2x faster & half the pickaxe wear of diagonal tunnels!)
+                int[][] dirs = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
+                BlockPos feet = player.getBlockPos();
+                if (branchWaypoint == null || feet.getSquaredDistance(branchWaypoint) <= 2.5 * 2.5
+                        || Math.abs(branchWaypoint.getY() - feet.getY()) > 4) {
+                    if (branchWaypoint != null && ++branchLegSegments >= 4) {
+                        // Every ~64m, jog sideways 4 blocks and reverse direction (classic parallel strip mine!)
+                        branchDirIndex = (branchDirIndex + 1) & 3;
+                        branchLegSegments = 0;
+                        int[] side = dirs[branchDirIndex];
+                        branchWaypoint = feet.add(side[0] * 4, 0, side[1] * 4);
+                        branchDirIndex = (branchDirIndex + 1) & 3;
+                    } else {
+                        int[] d = dirs[branchDirIndex];
+                        int desiredY = Math.max(targetY, Math.min(feet.getY(), targetY + 3));
+                        branchWaypoint = new BlockPos(feet.getX() + d[0] * 16, desiredY, feet.getZ() + d[1] * 16);
+                    }
+                    route.clear();
+                }
+                RouteExecutor.Status st = navigateToward(player, Pathfinder.Goal.near(branchWaypoint, 2.2), opts, currentTick);
+                statusText = descentLateralTicks > 0
+                    ? "routing around hazard for " + active.target()
+                    : "branch mining at y=" + feet.getY() + " for " + active.target();
+                if (st == RouteExecutor.Status.STUCK) {
+                    // Turn 90 degrees cleanly around lava lake / cave wall / fluid pocket!
+                    branchDirIndex = (branchDirIndex + 1) & 3;
+                    branchLegSegments = 0;
+                    branchWaypoint = null;
+                    route.clear();
+                } else if (st == RouteExecutor.Status.COMPLETE) {
+                    branchWaypoint = null;
+                    route.clear();
+                }
             }
             return;
         }
@@ -851,18 +954,12 @@ final class TaskRunner {
                 return;
             }
 
-            // Walk into reach of the crafting table and open it!
-            if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(table)) > Motor.REACH_SQ) {
-                navigateToward(player, Pathfinder.Goal.interactReach(table, 3.3),
-                    Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f), currentTick);
-                statusText = "walking to crafting table";
-                return;
-            }
+            // Walk into clear line-of-sight & reach of the crafting table and open it!
             if (!(client.currentScreen instanceof CraftingScreen)) {
-                motor.interactBlock(table);
-                statusText = "opening crafting table";
+                approachAndInteractWorkstation(player, world, table, currentTick, "walking to crafting table", "opening crafting table");
                 return;
             }
+            workstationOpenStuckTicks = 0;
         }
 
         // Compute how many executions to run
@@ -958,10 +1055,13 @@ final class TaskRunner {
                 return;
             }
 
-            // Otherwise (<= 7s left, low HP, or no useful chore nearby): walk back to furnace & watch attentively!
+            // Otherwise (<= 7s left, low HP, or no useful chore nearby): walk back into clear sight of the furnace!
             smeltChoreTarget = null;
-            if (distToFurnaceSq > 3.8 * 3.8) {
-                navigateToward(player, Pathfinder.Goal.interactReach(furnace, 3.2),
+            if (distToFurnaceSq > 3.2 * 3.2 || motor.findAimPoint(furnace) == null) {
+                Pathfinder.Goal retGoal = distToFurnaceSq <= 3.8 * 3.8
+                    ? Pathfinder.Goal.near(furnace, 1.45)
+                    : Pathfinder.Goal.interactReach(furnace, 3.0);
+                navigateToward(player, retGoal,
                     Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
                 statusText = "returning to furnace (" + Math.max(0, remTicks / 20) + "s)";
                 return;
@@ -973,18 +1073,12 @@ final class TaskRunner {
         }
         smeltChoreTarget = null;
 
-        // Walk into reach of furnace and open it!
-        if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(furnace)) > Motor.REACH_SQ) {
-            navigateToward(player, Pathfinder.Goal.interactReach(furnace, 3.3),
-                Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f), currentTick);
-            statusText = "walking to furnace";
-            return;
-        }
+        // Walk into clear line-of-sight & reach of the furnace and open it!
         if (!(client.currentScreen instanceof FurnaceScreen)) {
-            motor.interactBlock(furnace);
-            statusText = "opening furnace";
+            approachAndInteractWorkstation(player, world, furnace, currentTick, "walking to furnace", "opening furnace");
             return;
         }
+        workstationOpenStuckTicks = 0;
 
         if (smeltLoaded) {
             smeltCollecting = true;
@@ -1013,12 +1107,13 @@ final class TaskRunner {
         // 1. Check visible sweet berry bushes first (quick, safe food!)
         BlockPos berry = perception.nearestObserved(perception.observedBerries(), player.getBlockPos(), 20.0, blacklistedTargets);
         if (berry != null) {
-            if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(berry)) <= Motor.REACH_SQ) {
+            if (player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(berry)) <= Motor.REACH_SQ
+                    && motor.findAimPoint(berry) != null) {
                 motor.interactBlock(berry);
                 statusText = "harvesting sweet berries";
                 return;
             }
-            navigateToward(player, Pathfinder.Goal.interactReach(berry, 3.4),
+            navigateToward(player, Pathfinder.Goal.interactReach(berry, 3.2),
                 Pathfinder.Options.surface(scaffoldCount(player), player.getHealth() > 10f), currentTick);
             statusText = "walking to berry bush";
             return;
@@ -1269,9 +1364,13 @@ final class TaskRunner {
             if (torches < 4 && coal >= 1 && (logs * 4 + planks + sticks >= 2)) {
                 return localTask(TaskKind.CRAFT, "torch", 8, null);
             }
-            // Always keep at least 2 sticks (or wood to craft them) before descending for diamonds!
+            // Keep enough wood for replacement stone pickaxes + final diamond_pickaxe underground!
+            int woodUnits = logs * 4 + planks + sticks;
             if (sticks < 2 && planks < 2 && logs == 0) {
-                return localTask(TaskKind.GATHER_WOOD, "logs", 3, null);
+                return localTask(TaskKind.GATHER_WOOD, "logs", 4, null);
+            }
+            if (!perception.isDiagnosticRevealOres() && player.getBlockY() > 40 && woodUnits < 8) {
+                return localTask(TaskKind.GATHER_WOOD, "logs", 4, null);
             }
             return localTask(TaskKind.MINE_ORE, "diamond", needDiamonds, null);
         }
@@ -1653,6 +1752,89 @@ final class TaskRunner {
             }
         }
         return false;
+    }
+
+    /**
+     * Approach a workstation (furnace or crafting table) until BOTH within reach AND in unobstructed line-of-sight,
+     * walking around corners or carving an obstructing corner rock if occluded, so opening NEVER stalls behind a wall!
+     */
+    private void approachAndInteractWorkstation(ClientPlayerEntity player, ClientWorld world, BlockPos pos,
+                                                int currentTick, String walkLabel, String openLabel) {
+        double eyeDistSq = player.getEyePos().squaredDistanceTo(Vec3d.ofCenter(pos));
+        boolean inReach = eyeDistSq <= Motor.REACH_SQ;
+        boolean hasLos = inReach && motor.findAimPoint(pos) != null;
+
+        if (hasLos && workstationOpenStuckTicks < 35) {
+            workstationOpenStuckTicks++;
+            motor.interactBlock(pos);
+            statusText = openLabel;
+            return;
+        }
+
+        // Either out of reach, occluded behind a corner block, or failed to open from current angle:
+        // route right next to the workstation using mining-capable A* so we walk around corners cleanly!
+        boolean closeOccluded = eyeDistSq <= 3.8 * 3.8;
+        Pathfinder.Goal wsGoal = closeOccluded
+            ? Pathfinder.Goal.near(pos, 1.45)
+            : Pathfinder.Goal.interactReach(pos, 3.1);
+        RouteExecutor.Status st = navigateToward(player, wsGoal,
+            Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true), currentTick);
+
+        if (workstationOpenStuckTicks >= 35 && hasLos && st == RouteExecutor.Status.COMPLETE) {
+            workstationOpenStuckTicks = 0;
+            motor.interactBlock(pos);
+            statusText = openLabel;
+            return;
+        }
+
+        // If already within reach & route couldn't move closer while line-of-sight is still blocked by a corner stone/dirt block,
+        // clear that single safe obstructing corner block to restore direct view of the workstation!
+        if (!hasLos && inReach && (st == RouteExecutor.Status.COMPLETE || st == RouteExecutor.Status.STUCK)) {
+            BlockPos blocker = findSafeOccludingBlock(player, world, pos);
+            if (blocker != null) {
+                motor.mineBlock(blocker, true, false);
+                statusText = "clearing corner to reach workstation";
+                return;
+            }
+        }
+        if (st == RouteExecutor.Status.COMPLETE) {
+            workstationOpenStuckTicks = 0;
+        }
+        statusText = walkLabel;
+    }
+
+    /** Raycast from eye to target workstation center to find a single safe diggable corner block blocking sight. */
+    private BlockPos findSafeOccludingBlock(ClientPlayerEntity player, ClientWorld world, BlockPos target) {
+        Vec3d eye = player.getEyePos();
+        Vec3d center = Vec3d.ofCenter(target);
+        net.minecraft.util.hit.BlockHitResult hit = world.raycast(new net.minecraft.world.RaycastContext(
+            eye, center, net.minecraft.world.RaycastContext.ShapeType.OUTLINE,
+            net.minecraft.world.RaycastContext.FluidHandling.NONE, player));
+        if (hit.getType() != net.minecraft.util.hit.HitResult.Type.BLOCK) return null;
+        BlockPos hp = hit.getBlockPos();
+        if (hp.equals(target) || hp.equals(target.down())) return null;
+        if (eye.squaredDistanceTo(Vec3d.ofCenter(hp)) > Motor.REACH_SQ) return null;
+        BlockState st = world.getBlockState(hp);
+        if (st.isAir() || !st.getFluidState().isEmpty()) return null;
+        if (Perception.isUnbreakable(st) || Perception.isHazardBlock(st)) return null;
+        if (st.isOf(Blocks.CRAFTING_TABLE) || st.isOf(Blocks.FURNACE) || st.isOf(Blocks.CHEST) || st.isOf(Blocks.OBSIDIAN)) {
+            return null;
+        }
+        if (perception.isNearKnownLava(hp.getX(), hp.getY(), hp.getZ())) return null;
+        if (perception.isNearKnownFluidAboveOrSide(hp.getX(), hp.getY(), hp.getZ())) return null;
+        return hp;
+    }
+
+    private static int remainingIronPickDurability(ClientPlayerEntity player) {
+        int best = 0;
+        var inv = player.getInventory();
+        for (int i = 0; i < inv.size(); i++) {
+            ItemStack st = inv.getStack(i);
+            if (st.isOf(Items.IRON_PICKAXE)) {
+                best = Math.max(best, st.getMaxDamage() - st.getDamage());
+            }
+        }
+        return best;
     }
 
     private BlockPos findNearbyWorkstation(ClientPlayerEntity player, ClientWorld world, Block block, double radius) {

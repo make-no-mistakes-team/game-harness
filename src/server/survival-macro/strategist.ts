@@ -40,20 +40,21 @@ Combat stance options (combatStance):
 
 Strategic rules:
 1. Respect Minecraft's tech tree: wood -> crafting_table + wooden_pickaxe -> cobblestone -> stone_pickaxe + furnace (+ stone_sword for safety!) -> coal/torches + iron_ore -> smelt raw_iron -> iron_pickaxe (+ shield when iron & planks allow!) -> diamond_ore (3 diamonds) -> diamond_pickaxe.
-2. Keep wood/sticks in reserve (at least 2 sticks OR >= 2 planks / 1 log remaining AFTER crafting iron_pickaxe/spare tools!) AND a spare stone_pickaxe before descending deep underground, so iron_pickaxe durability is conserved and diamond_pickaxe can be crafted immediately underground the instant you mine 3 diamonds!
-3. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
-4. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals. When healthy and well-armed, use "auto", "defensive", or "aggressive".
-5. When state.descent.nearbyDrop is true, inspect state.descent (dropDepth, floorObserved, landingSurface, landingLava, landingHostiles, hasCliffWall, hasSteppedShelf, and descent.gear) and set descentMethod (and optionally queue a descend_drop task):
+2. Keep wood/sticks in reserve (at least 2 sticks OR >= 4 planks / 2 logs remaining AFTER crafting iron_pickaxe/spare tools!) AND a spare stone_pickaxe before descending deep underground, so iron_pickaxe durability is conserved on deepslate and diamond_pickaxe can be crafted immediately underground the instant you mine 3 diamonds!
+3. When diagnosticOreReveal is false and environment.ores has no listed coordinates for coal/iron/diamond, still queue mine_ore ("coal"|"iron"|"diamond") — the local player automatically descends safely to optimal depth (Y=48 coal, Y=16 iron, Y=-54 diamond) and branch-mines/explores caves honestly until ore is spotted.
+4. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
+5. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals. When healthy and well-armed, use "auto", "defensive", or "aggressive".
+6. When state.descent.nearbyDrop is true, inspect state.descent (dropDepth, floorObserved, landingSurface, landingLava, landingHostiles, hasCliffWall, hasSteppedShelf, and descent.gear) and set descentMethod (and optionally queue a descend_drop task):
    - NEVER pick water_clutch or boat_drop if landingLava is true or floorObserved is false (use "avoid", "water_pour", or "cliff_stair" instead).
    - Pick "water_clutch" (with waterBucket and clear dry solid floor) for fast MLG descent, or "water_pour" for a reusable waterfall column (especially when deep or floor is uncertain).
    - Pick "boat_drop" when carrying a boat over a clear dry cavern floor for zero fall damage.
    - Pick "cliff_stair" when lacking water/boat or when landing is dark/hostile and a cliff wall + pickaxe are available.
    - Pick "edge_blocks" on stepped shelves/chasms when carrying scaffold blocks (cobblestone/dirt).
    - Pick "avoid" if descending into lava or an unlit hostile swarm at low HP.
-6. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.
-7. During long smelts (activeFurnace present), the local player automatically mines nearby ore/stone or chops nearby wood when safe and returns before smelting finishes — do not interrupt an active smelt unless urgent.
-8. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
-9. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
+7. Before descending deep underground, if visibleFoodAnimals > 0 or visibleBerries > 0 and no food is carried, consider a quick gather_food so you can heal from cave damage. Also prioritize gather_food (or smelt raw_meat) whenever health < 12 or food <= 10.
+8. During long smelts (activeFurnace present), the local player automatically mines nearby ore/stone or chops nearby wood when safe and returns before smelting finishes — do not interrupt an active smelt unless urgent.
+9. Do not repeat a failed task unchanged — adapt (e.g., craft missing prerequisite, pick another ore coordinate, gather fuel, or explore).
+10. Queue 2-4 coherent sequential steps ahead so the player transitions smoothly with zero pauses!`;
 
 const TASK_KINDS = [
   "gather_wood", "mine_stone", "mine_ore", "craft", "smelt",

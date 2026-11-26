@@ -535,7 +535,17 @@ final class TaskRunner {
             return;
         }
 
-        // 2. No exposed stone spotted yet — ensure we're on DRY land before digging a staircase down!
+        // 2. No exposed stone spotted yet — avoid burning a wooden pickaxe through 30+ layers of high Badlands terracotta!
+        BlockState groundUnder = world.getBlockState(player.getBlockPos().down());
+        boolean onHighTerracotta = bestPickaxeTier(player) == 1
+            && (groundUnder.isIn(BlockTags.TERRACOTTA) || player.getBlockY() >= 84)
+            && activeTicks < 520;
+        if (onHighTerracotta) {
+            route.clear();
+            exploreForResources(player, world, currentTick, "scouting downhill for exposed stone");
+            return;
+        }
+        // Ensure we're on DRY land before digging a staircase down!
         if (isWetSurfaceSpot(player, world)) {
             route.clear();
             exploreForResources(player, world, currentTick, "moving to dry ground before digging");

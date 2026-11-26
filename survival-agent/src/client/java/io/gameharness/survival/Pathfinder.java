@@ -239,7 +239,7 @@ final class Pathfinder {
             }
 
             neighbors.clear();
-            generateNeighbors(perception, player, cur.x, cur.y, cur.z, opts, neighbors);
+            generateNeighbors(perception, player, cur.x, cur.y, cur.z, cur.viaStep, opts, neighbors);
 
             for (Step step : neighbors) {
                 long nk = step.to().asLong();
@@ -281,7 +281,8 @@ final class Pathfinder {
         return steps;
     }
 
-    private void generateNeighbors(Perception p, ClientPlayerEntity player, int x, int y, int z, Options opts, List<Step> out) {
+    private void generateNeighbors(Perception p, ClientPlayerEntity player, int x, int y, int z,
+                                   Step prevStep, Options opts, List<Step> out) {
         BlockPos from = new BlockPos(x, y, z);
         BlockState feetHere = p.getObserved(x, y, z);
         BlockState belowHere = p.getObserved(x, y - 1, z);
@@ -300,7 +301,7 @@ final class Pathfinder {
             tryStepUp(p, player, from, nx, y + 1, nz, inWater, opts, out);
 
             // 1c. Descend / Drop (1..maxDrop down, or safe foliage drop up to 5 blocks)
-            tryDropOrStairDown(p, player, from, nx, y, nz, standingOnLeaves, opts, out);
+            tryDropOrStairDown(p, player, from, nx, y, nz, standingOnLeaves, prevStep, opts, out);
         }
 
         // 2. Diagonal moves (only when passable without digging, checking both corners so movement is smooth & 360-deg!)
@@ -405,7 +406,7 @@ final class Pathfinder {
     }
 
     private void tryDropOrStairDown(Perception p, ClientPlayerEntity player, BlockPos from, int nx, int y, int nz,
-                                    boolean standingOnLeaves, Options opts, List<Step> out) {
+                                    boolean standingOnLeaves, Step prevStep, Options opts, List<Step> out) {
         // First: check natural drop through already-open column (1..maxDrop, or up to 5 from leaves onto dry ground, or into water!)
         BlockState stepFeet = p.getObserved(nx, y, nz);
         BlockState stepHead = p.getObserved(nx, y + 1, nz);
@@ -439,7 +440,12 @@ final class Pathfinder {
         }
 
         // Second: staircase excavation down by 1 block! (Clear (nx,y+1,nz), (nx,y,nz), (nx,y-1,nz) -> stand at (nx,y-1,nz) on (nx,y-2,nz))
-        if (!opts.allowDigging) return;
+        if (!opts.allowDigging || !opts.allowTerrainDigging) return;
+        // NEVER reverse back into the immediately previous column on STAIR_DOWN — that creates an unwalkable 1x2 vertical chimney!
+        if (prevStep != null && (prevStep.kind() == MoveKind.STAIR_DOWN || prevStep.kind() == MoveKind.DROP)
+                && nx == prevStep.from().getX() && nz == prevStep.from().getZ()) {
+            return;
+        }
         int ny = y - 1;
         BlockState floor = p.getObserved(nx, ny - 1, nz);
         boolean floorOk = floor != null ? Perception.isSolidSupport(floor) : opts.allowHypotheses;
@@ -463,8 +469,16 @@ final class Pathfinder {
         if (cLow > 0) { breaks.add(new BlockPos(nx, ny, nz)); digCost += cLow; }
 
         if (breaks.isEmpty()) return;
-        // Slightly favor staircases underground (clean, safe, walk-back-up capable!)
-        out.add(new Step(from, new BlockPos(nx, ny, nz), MoveKind.STAIR_DOWN, breaks, List.of(), 7.5 + digCost));
+        // Favor continuing straight along the same walkable 45-degree staircase heading!
+        double turnPenalty = 0.0;
+        if (prevStep != null && prevStep.kind() == MoveKind.STAIR_DOWN) {
+            int pdx = prevStep.to().getX() - prevStep.from().getX();
+            int pdz = prevStep.to().getZ() - prevStep.from().getZ();
+            int cdx = nx - from.getX();
+            int cdz = nz - from.getZ();
+            if (pdx != cdx || pdz != cdz) turnPenalty = 12.0;
+        }
+        out.add(new Step(from, new BlockPos(nx, ny, nz), MoveKind.STAIR_DOWN, breaks, List.of(), 7.5 + digCost + turnPenalty));
     }
 
     private void tryDiagonal(Perception p, BlockPos from, int nx, int y, int nz, boolean inWater, List<Step> out) {

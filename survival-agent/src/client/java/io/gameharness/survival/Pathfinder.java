@@ -579,6 +579,8 @@ final class Pathfinder {
         BlockState st = p.getObserved(x, y, z);
         if (st == null) {
             if (!opts.allowHypotheses || !opts.allowDigging) return -1.0;
+            // Never hypothesize digging through unobserved rock without a pickaxe (follow observed open staircases instead!)
+            if (!hasSuitableHotbarTool(player, Blocks.STONE.getDefaultState())) return -1.0;
             // Explicit terrain hypothesis: unobserved underground cell assumed diggable rock/soil.
             // Allow digging both downward AND upward back to surface elevation (up to Y=66 or playerY+16)!
             int maxHypY = player != null ? Math.max(player.getBlockY() + 16, 66) : 66;

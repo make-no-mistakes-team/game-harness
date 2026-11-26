@@ -2135,7 +2135,14 @@ final class TaskRunner {
             return localTask(TaskKind.GATHER_FOOD, "food", 4, null);
         }
 
-        // 1. Early wood & wooden pickaxe
+        // 1. Stone pickaxe immediately whenever we already carry cobblestone + enough wood
+        //    (e.g. if our stone pickaxe broke deep underground while still holding logs/sticks & cobble!)
+        if (pickTier < 2 && stone >= 3 && (hasTable || logs * 4 + planks >= 6) && (logs * 4 + planks + sticks >= 2)) {
+            if (!hasTable) return localTask(TaskKind.CRAFT, "crafting_table", 1, null);
+            return localTask(TaskKind.CRAFT, "stone_pickaxe", 1, null);
+        }
+
+        // 1b. Early wood & wooden pickaxe
         if (pickTier < 1) {
             int woodEquiv = logs * 4 + planks;
             if (woodEquiv < 12) return localTask(TaskKind.GATHER_WOOD, "logs", 4, null);

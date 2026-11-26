@@ -289,6 +289,8 @@ export function composeMacroStrategist(options: StrategistOptions) {
   let lastPlanId = "";
   let lastTriggerKey = "";
   let lastRequestAt = 0;
+  let lastHostileRequestAt = 0;
+  let prevVisibleHostiles = 0;
   let loopTask: Promise<void> | undefined;
   let authHandle: Awaited<ReturnType<typeof openAuthSession>> | undefined;
   let stopped = false;
@@ -469,17 +471,23 @@ export function composeMacroStrategist(options: StrategistOptions) {
         const midDescent = Boolean(st.descent?.activePhase && st.descent.activePhase !== "idle");
         const queueLow = st.queuedTasks.length <= 1;
         const lastFailed = st.recentReceipts.at(-1)?.outcome === "failed";
-        const activeHostiles = (st.combat?.visibleThreatCount ?? 0) > 0;
-        const urgent = st.health < 12 || lastFailed || activeHostiles;
+        const visibleHostiles = st.combat?.visibleThreatCount ?? 0;
+        const freshHostileOnset = visibleHostiles > 0 && prevVisibleHostiles === 0
+          && now - lastHostileRequestAt >= 25_000;
+        const criticalCombat = st.health < 12 || Boolean(st.combat?.trapped)
+          || (visibleHostiles >= 2 && !st.combat?.armed);
+        const urgent = criticalCombat || lastFailed || freshHostileOnset;
         const shouldCall = (!midDescent || urgent)
           && requests < options.maxRequests
-          && now - lastRequestAt >= (urgent ? MIN_COOLDOWN_MS : 12_000)
+          && now - lastRequestAt >= (urgent ? MIN_COOLDOWN_MS : 18_000)
           && (requests === 0 || (queueLow && key !== lastTriggerKey) || (urgent && key !== lastTriggerKey)
               || (st.queuedTasks.length === 0 && now - lastRequestAt >= 25_000));
 
+        prevVisibleHostiles = visibleHostiles;
         if (shouldCall) {
           lastTriggerKey = key;
           lastRequestAt = now;
+          if (visibleHostiles > 0) lastHostileRequestAt = now;
           await callModel(st);
         }
       }

@@ -89,6 +89,8 @@ final class TaskRunner {
     private BlockPos workstationToRecover;
     private double exploreHeadingRad = 0.7;
     private int exploreFlipCount;
+    private Vec3d exploreLastPos;
+    private int exploreStuckTicks;
     private int dropChaseEntityId = -1;
     private int dropChaseTicks;
     private int rockBrokenCount;
@@ -1164,10 +1166,26 @@ final class TaskRunner {
             }
         }
 
-        // 3. Re-evaluate dry-land heading periodically, or immediately if heading leads into water/wall!
+        // 3. Track horizontal exploration progress so we NEVER jam against a 2-block hillside/corner!
+        Vec3d curPos = player.getPos();
+        if (exploreLastPos == null || Math.hypot(curPos.x - exploreLastPos.x, curPos.z - exploreLastPos.z) > 1.4) {
+            exploreLastPos = curPos;
+            exploreStuckTicks = 0;
+        } else {
+            exploreStuckTicks++;
+        }
+
+        boolean stuck = exploreStuckTicks >= 30;
         boolean headingBad = isHeadingIntoWaterOrWall(player, world, exploreHeadingRad);
-        if (activeTicks <= 2 || headingBad || activeTicks % 180 == 0 || player.horizontalCollision) {
-            exploreHeadingRad = pickBestDryHeading(player, world, exploreHeadingRad);
+        if (stuck) {
+            // Force a decisive turn away from the jammed heading and avoid re-picking the same wall!
+            exploreFlipCount++;
+            double turnOffset = (exploreFlipCount % 2 == 1 ? 1.0 : -1.0) * (Math.PI * 0.62 + (exploreFlipCount % 3) * 0.25);
+            exploreHeadingRad = pickBestDryHeading(player, world, exploreHeadingRad + turnOffset, true);
+            exploreStuckTicks = 0;
+            exploreLastPos = curPos;
+        } else if (activeTicks <= 2 || headingBad || activeTicks % 180 == 0 || player.horizontalCollision) {
+            exploreHeadingRad = pickBestDryHeading(player, world, exploreHeadingRad, headingBad || player.horizontalCollision);
         }
 
         walkDryHeading(player, world, exploreHeadingRad, currentTick, label);
@@ -1203,16 +1221,24 @@ final class TaskRunner {
     private boolean isHeadingIntoWaterOrWall(ClientPlayerEntity player, ClientWorld world, double rad) {
         double dx = Math.cos(rad);
         double dz = Math.sin(rad);
+        int by = player.getBlockY();
+        // Immediate 1-2 block steep wall check (cannot walk or 1-block jump over a 2-high solid wall!)
+        for (double dist = 1.0; dist <= 2.2; dist += 1.0) {
+            int bx = (int) Math.floor(player.getX() + dx * dist);
+            int bz = (int) Math.floor(player.getZ() + dz * dist);
+            BlockState atFeet = world.getBlockState(new BlockPos(bx, by, bz));
+            BlockState atHead = world.getBlockState(new BlockPos(bx, by + 1, bz));
+            if (!Perception.isPassable(atFeet) && !Perception.isPassable(atHead)) return true;
+        }
         for (int dist = 2; dist <= 6; dist += 2) {
             int bx = (int) Math.floor(player.getX() + dx * dist);
             int bz = (int) Math.floor(player.getZ() + dz * dist);
-            int by = player.getBlockY();
             for (int dy = 1; dy >= -3; dy--) {
                 BlockState st = perception.getObserved(bx, by + dy, bz);
                 if (st == null) continue;
                 if (!st.getFluidState().isEmpty()) return true;
                 if (Perception.isSolidSupport(st)) {
-                    // Steep wall >= 3 blocks high?
+                    // Steep wall >= 2 blocks high right ahead?
                     if (dy >= 1 && Perception.isSolidSupport(perception.getObserved(bx, by + dy + 1, bz))) return true;
                     break;
                 }
@@ -1221,20 +1247,45 @@ final class TaskRunner {
         return false;
     }
 
-    private double pickBestDryHeading(ClientPlayerEntity player, ClientWorld world, double currentRad) {
+    private double pickBestDryHeading(ClientPlayerEntity player, ClientWorld world, double currentRad, boolean avoidCurrent) {
         double bestRad = currentRad;
         double bestScore = Double.NEGATIVE_INFINITY;
+        int by = player.getBlockY();
         for (int i = 0; i < 12; i++) {
             double rad = currentRad + (i * Math.PI * 2.0 / 12.0);
             double dx = Math.cos(rad);
             double dz = Math.sin(rad);
-            // Small continuity preference for keeping near current direction
-            double score = Math.cos(rad - currentRad) * 3.0;
+            // Continuity preference unless we're explicitly escaping a blocked heading
+            double score = avoidCurrent ? -Math.cos(rad - currentRad) * 6.0 : Math.cos(rad - currentRad) * 3.0;
+
+            // Check immediate 1..2 block passability (walls >= 2 blocks high get strongly penalized!)
+            boolean blockedClose = false;
+            for (double d = 1.0; d <= 2.2; d += 1.0) {
+                int bx = (int) Math.floor(player.getX() + dx * d);
+                int bz = (int) Math.floor(player.getZ() + dz * d);
+                BlockState f = world.getBlockState(new BlockPos(bx, by, bz));
+                BlockState h = world.getBlockState(new BlockPos(bx, by + 1, bz));
+                BlockState h2 = world.getBlockState(new BlockPos(bx, by + 2, bz));
+                if (!Perception.isPassable(f) && !Perception.isPassable(h)) {
+                    score -= 45.0;
+                    blockedClose = true;
+                    break;
+                }
+                if (!Perception.isPassable(f) && !Perception.isPassable(h2)) {
+                    score -= 30.0; // cannot jump up onto 1-block ledge due to low ceiling
+                    blockedClose = true;
+                    break;
+                }
+            }
+            if (blockedClose) {
+                if (score > bestScore) { bestScore = score; bestRad = rad; }
+                continue;
+            }
+
             for (int dist = 2; dist <= 14; dist += 2) {
                 int bx = (int) Math.floor(player.getX() + dx * dist);
                 int bz = (int) Math.floor(player.getZ() + dz * dist);
-                int by = player.getBlockY();
-                for (int dy = 3; dy >= -4; dy--) {
+                for (int dy = 2; dy >= -4; dy--) {
                     BlockState st = perception.getObserved(bx, by + dy, bz);
                     if (st == null) continue;
                     if (!st.getFluidState().isEmpty()) {
@@ -1242,7 +1293,12 @@ final class TaskRunner {
                         break;
                     }
                     if (Perception.isSolidSupport(st)) {
-                        score += 5.0 + Math.max(0, dy) * 1.2; // favor higher dry hills!
+                        // Reward walkable dry terrain (dy in -2..+1); penalize steep unreachable cliff faces (dy >= 2)
+                        if (dy >= 2) {
+                            score -= 10.0;
+                        } else {
+                            score += 5.0;
+                        }
                         break;
                     }
                 }

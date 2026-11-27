@@ -54,7 +54,7 @@ Strategic rules:
 6. Choose excavationMode="safe_staircase" when health < 14, near lava, or descending deep; "fast" only when healthy and clear.
 7. Combat & survival triage: inspect state.combat (visibleThreatCount, threats, armed, shieldEquipped, trapped, scaffoldBlocks, health, hasFood). If health is low (<= 11) and facing multiple/mixed hostiles (or trapped / under-equipped), set combatStance="shelter" (and replaceQueue=true with build_shelter first if blocks are carried!) or combatStance="flee" so the player survives and heals.
 8. When state.descent.nearbyDrop is true, inspect state.descent and set descentMethod ("water_clutch", "water_pour", "boat_drop", "cliff_stair", "edge_blocks", or "avoid" — NEVER water_clutch/boat_drop into lava or unobserved floor).
-9. Prioritize gather_food (or smelt raw_meat) when health < 12 or food <= 10, or before caving when animals/berries are visible.
+9. Prioritize gather_food (or smelt raw_meat) when health < 12 or food <= 10, or while on the surface preparing for deep caving / a lava-pool hunt with foodCount == 0 and animals or berries visible (or food <= 14).
 10. During long smelts (activeFurnace present), do not interrupt unless urgent. Do not repeat a failed task unchanged — adapt! Queue 2-4 coherent steps ahead so transitions stay seamless.`;
 
 const TASK_KINDS = [

@@ -133,6 +133,7 @@ final class TaskRunner {
     private int waterFillStuckTicks;
     private BlockPos placedGravelPos;
     private int oreTargetTicks;
+    private int lavaSurveyTicks;
 
     TaskRunner(MinecraftClient client, Motor motor, Perception perception,
                Pathfinder pathfinder, RouteExecutor route, GuiHands gui,
@@ -181,6 +182,7 @@ final class TaskRunner {
         waterFillCooldownTicks = 0;
         waterFillStuckTicks = 0;
         placedGravelPos = null;
+        lavaSurveyTicks = 0;
         if (descent != null) descent.resetForLife();
         if (caves != null) caves.resetForLife();
         if (portal != null) portal.resetForLife();
@@ -391,6 +393,7 @@ final class TaskRunner {
             branchWaypoint = null;
             branchLegSegments = 0;
             descentLateralTicks = 0;
+            lavaSurveyTicks = 0;
             route.clear();
         }
 
@@ -1341,11 +1344,45 @@ final class TaskRunner {
         exploreForResources(player, world, currentTick, "looking for food");
     }
 
+    /**
+     * Ensures the player has a pickaxe in hotbar for digging/caving, and proactively inserts a local
+     * stone_pickaxe craft ahead of the current task if all stone pickaxes broke underground while materials are carried!
+     * Returns true if ready to mine, false if a hotbar swap or replacement craft paused this tick.
+     */
+    private boolean ensureMiningPickaxeOrCraft(ClientPlayerEntity player, int currentTick) {
+        int tier = bestPickaxeTier(player);
+        boolean canCraftStonePick = GuiHands.countStone(player) >= 3
+            && (GuiHands.countItem(player, Items.STICK) >= 2 || GuiHands.countPlanks(player) >= 2 || GuiHands.countLogs(player) >= 1);
+        if (tier < 1 || (tier < 2 && player.getBlockY() <= 48 && canCraftStonePick)) {
+            if (canCraftStonePick) {
+                Task resume = active;
+                if (resume != null && (queue.isEmpty() || !queue.peekFirst().id().equals(resume.id()))) {
+                    queue.addFirst(resume);
+                }
+                queue.addFirst(new Task("local-repick-" + currentTick, TaskKind.CRAFT, "stone_pickaxe", 1, null, true, "local"));
+                finishActive("partial", "crafting replacement stone pickaxe", currentTick);
+                return false;
+            }
+            if (tier < 1) {
+                finishActive("failed", "out of pickaxes; need replacement pickaxe", currentTick);
+                return false;
+            }
+        }
+        if (!ensureToolInHotbar(player, st -> st.getItem() instanceof net.minecraft.item.PickaxeItem)) {
+            statusText = "moving pickaxe to hotbar";
+            return false;
+        }
+        return true;
+    }
+
     private void tickDigDown(ClientPlayerEntity player, ClientWorld world, int currentTick) {
         int targetY = active.pos() != null ? active.pos().getY() : active.count();
         if (player.getBlockY() <= targetY) {
             if (descent != null && descent.isActivelyDescending()) descent.clearActive();
             finishActive("completed", "reached y=" + player.getBlockY(), currentTick);
+            return;
+        }
+        if (!ensureMiningPickaxeOrCraft(player, currentTick)) {
             return;
         }
         // If already executing a SafeDescent maneuver into an encountered giant cavern/drop, let it finish!
@@ -1427,16 +1464,20 @@ final class TaskRunner {
     }
 
     private void tickExploreCave(ClientPlayerEntity player, ClientWorld world, int currentTick) {
+        if (!ensureMiningPickaxeOrCraft(player, currentTick)) {
+            return;
+        }
         boolean lavaSearch = "lava".equalsIgnoreCase(active.target()) || "lava_pool".equalsIgnoreCase(active.target());
         if (lavaSearch) {
             if (portal != null && portal.hasObservedLavaPoolSite(player, world)) {
                 finishActive("completed", "spotted lava pool for portal casting", currentTick);
                 return;
             }
-            // If we spotted lava sources in the distance, step closer once so Perception maps the entire rim!
-            if (perception.observedLava().size() >= 4 && activeTicks < 240) {
+            // If we spotted lava sources in the distance, step closer so Perception maps the entire rim!
+            if (perception.observedLava().size() >= 4 && lavaSurveyTicks < 240) {
                 BlockPos nearestLava = perception.nearestObserved(perception.observedLava(), player.getBlockPos(), 32.0, null);
                 if (nearestLava != null && player.getBlockPos().getSquaredDistance(nearestLava) > 4.5 * 4.5) {
+                    lavaSurveyTicks++;
                     Pathfinder.Options opts = Pathfinder.Options.mining(scaffoldCount(player), player.getHealth() > 10f, true);
                     RouteExecutor.Status lst = navigateToward(player, Pathfinder.Goal.near(nearestLava.up(), 3.8), opts, currentTick);
                     statusText = "surveying observed lava pool";
@@ -2087,6 +2128,9 @@ final class TaskRunner {
     private void tickCastPortal(ClientPlayerEntity player, ClientWorld world, int currentTick) {
         if (portal == null) {
             finishActive("failed", "portal caster unavailable", currentTick);
+            return;
+        }
+        if (!portal.isActive() && !ensureMiningPickaxeOrCraft(player, currentTick)) {
             return;
         }
         if (!portal.isActive()) {

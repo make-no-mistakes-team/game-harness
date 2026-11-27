@@ -84,6 +84,8 @@ final class TaskRunner {
     private Task active;
     private int activeTicks;
     private int replanCooldown;
+    private int consecutivePlanFailures;
+    private int exploreFallbackUntilTick;
     private int noMineProgressTicks;
     private int occludedTargetTicks;
     private BlockPos lastOccludedTarget;
@@ -462,6 +464,12 @@ final class TaskRunner {
                 return;
             }
         }
+        boolean underground = isUndergroundOrRoofed(player, world);
+        if (currentTick < exploreFallbackUntilTick && !underground) {
+            activeTargetBlock = null;
+            exploreForResources(player, world, currentTick, "repositioning for reachable trees");
+            return;
+        }
         if (activeTargetBlock == null || !world.getBlockState(activeTargetBlock).isIn(BlockTags.LOGS)) {
             BlockPos prev = activeTargetBlock;
             activeTargetBlock = findBestLogTarget(player, world);
@@ -470,7 +478,6 @@ final class TaskRunner {
             }
         }
 
-        boolean underground = isUndergroundOrRoofed(player, world);
         if (activeTargetBlock == null) {
             // If underground inside a cave/tunnel/pocket, climb/staircase back up to the surface instead of walking into walls!
             if (underground) {
@@ -550,9 +557,19 @@ final class TaskRunner {
                     return;
                 }
             }
-            blacklistedTargets.add(activeTargetBlock);
+            blacklistNearbyObserved(perception.observedLogs(), activeTargetBlock, 2, 8);
             activeTargetBlock = null;
             route.clear();
+            if (++consecutivePlanFailures >= 3) {
+                consecutivePlanFailures = 0;
+                replanCooldown = 0;
+                exploreFallbackUntilTick = currentTick + 60;
+                if (!underground) {
+                    exploreForResources(player, world, currentTick, "repositioning for reachable trees");
+                }
+            } else {
+                replanCooldown = 1;
+            }
         }
     }
 
@@ -608,13 +625,17 @@ final class TaskRunner {
         }
 
         // 1. Prefer any directly aimable stone within reach first, then nearest observed stone within 24 blocks!
-        if (activeTargetBlock == null || !isStoneBlock(world.getBlockState(activeTargetBlock))) {
+        if (currentTick >= exploreFallbackUntilTick
+                && (activeTargetBlock == null || !isStoneBlock(world.getBlockState(activeTargetBlock)))) {
             BlockPos prev = activeTargetBlock;
             activeTargetBlock = findBestStoneTarget(player, world);
             noMineProgressTicks = 0;
             if (!Objects.equals(prev, activeTargetBlock)) {
                 route.clear();
             }
+        }
+        if (currentTick < exploreFallbackUntilTick) {
+            activeTargetBlock = null;
         }
 
         if (activeTargetBlock != null) {
@@ -676,8 +697,16 @@ final class TaskRunner {
                     route.clear();
                 }
             } else if (st == RouteExecutor.Status.STUCK) {
-                blacklistedTargets.add(activeTargetBlock);
+                blacklistNearbyObserved(perception.observedStone(), activeTargetBlock, 2, 2);
                 activeTargetBlock = null;
+                route.clear();
+                if (++consecutivePlanFailures >= 3) {
+                    consecutivePlanFailures = 0;
+                    replanCooldown = 0;
+                    exploreFallbackUntilTick = currentTick + 50;
+                } else {
+                    replanCooldown = 1;
+                }
             }
             return;
         }
@@ -938,7 +967,9 @@ final class TaskRunner {
             // If stuck on one target, defer it and try the next nearest ore!
             blacklistedTargets.add(activeTargetBlock);
             activeTargetBlock = null;
+            oreTargetTicks = 0;
             route.clear();
+            replanCooldown = 1;
         }
     }
 
@@ -1930,7 +1961,9 @@ final class TaskRunner {
         }
 
         // 3. Otherwise mine nearest observed natural gravel (riverbanks, beaches, caves, underground!)
-        if (activeTargetBlock == null || !world.getBlockState(activeTargetBlock).isOf(Blocks.GRAVEL)) {
+        if (currentTick < exploreFallbackUntilTick) {
+            activeTargetBlock = null;
+        } else if (activeTargetBlock == null || !world.getBlockState(activeTargetBlock).isOf(Blocks.GRAVEL)) {
             BlockPos prev = activeTargetBlock;
             activeTargetBlock = perception.nearestObserved(perception.observedGravel(), player.getBlockPos(), 44.0, blacklistedTargets);
             if (!Objects.equals(prev, activeTargetBlock)) {
@@ -1963,9 +1996,16 @@ final class TaskRunner {
                     activeTargetBlock = null;
                 }
             } else if (st == RouteExecutor.Status.STUCK) {
-                blacklistedTargets.add(activeTargetBlock);
+                blacklistNearbyObserved(perception.observedGravel(), activeTargetBlock, 2, 2);
                 activeTargetBlock = null;
                 route.clear();
+                if (++consecutivePlanFailures >= 3) {
+                    consecutivePlanFailures = 0;
+                    replanCooldown = 0;
+                    exploreFallbackUntilTick = currentTick + 60;
+                } else {
+                    replanCooldown = 1;
+                }
             }
             return;
         }
@@ -2069,7 +2109,7 @@ final class TaskRunner {
             }
             return;
         }
-        if (waterTarget == null) {
+        if (waterTarget == null || currentTick < exploreFallbackUntilTick) {
             if (isUndergroundWithoutCave(player, world)) {
                 climbToSurface(player, world, currentTick, "climbing to surface to find water");
             } else {
@@ -2100,8 +2140,18 @@ final class TaskRunner {
                     return;
                 }
             }
-            blacklistedTargets.add(waterTarget);
+            blacklistNearbyObserved(perception.observedWater(), waterTarget, 3, 1);
             route.clear();
+            if (++consecutivePlanFailures >= 3) {
+                consecutivePlanFailures = 0;
+                replanCooldown = 0;
+                exploreFallbackUntilTick = currentTick + 60;
+                if (!underground) {
+                    exploreForResources(player, world, currentTick, "repositioning for reachable water");
+                }
+            } else {
+                replanCooldown = 1;
+            }
         }
     }
 
@@ -2476,6 +2526,7 @@ final class TaskRunner {
                 return RouteExecutor.Status.STUCK;
             }
             replanCooldown = 6;
+            consecutivePlanFailures = 0;
             route.setPlan(plan);
         }
         RouteExecutor.Status st = route.tick(currentTick, true);
@@ -3378,7 +3429,22 @@ final class TaskRunner {
         }
         active = null;
         activeTargetBlock = null;
+        consecutivePlanFailures = 0;
+        exploreFallbackUntilTick = 0;
         route.clear();
+    }
+
+    private void blacklistNearbyObserved(Set<BlockPos> observed, BlockPos center, int rXZ, int rY) {
+        if (center == null) return;
+        blacklistedTargets.add(center);
+        if (observed == null || observed.isEmpty()) return;
+        for (BlockPos pos : observed) {
+            if (Math.abs(pos.getX() - center.getX()) <= rXZ
+                    && Math.abs(pos.getZ() - center.getZ()) <= rXZ
+                    && Math.abs(pos.getY() - center.getY()) <= rY) {
+                blacklistedTargets.add(pos);
+            }
+        }
     }
 
     static int bestPickaxeTier(ClientPlayerEntity player) {

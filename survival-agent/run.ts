@@ -416,11 +416,12 @@ async function drainVanillaServer(owned: Owned | undefined) {
   return { shutdownMs: elapsedMs(), escalation, phases, dimensionsSaved: seen.has("dimensions_saved") };
 }
 
-async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
+export async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal,
+    roots: readonly string[] = [RUNS, HISTORIC_RUNS]) {
   const invalid = () => new Error(`Cannot continue from ${parentRun}: expected a unique closed, recorded Survival attempt with a clean save and an eligible goal.`);
   try {
     let runsRoot: string | undefined;
-    for (const candidate of [RUNS, HISTORIC_RUNS]) {
+    for (const candidate of roots) {
       signal.throwIfAborted();
       const found = await lstat(path.join(candidate, parentRun)).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "ENOENT") throw error;
@@ -461,6 +462,8 @@ async function savedWorld(parentRun: string, goal: Goal, signal: AbortSignal) {
     };
     const declaration = await readRecord("declaration.json");
     const outcome = await readRecord("outcome.json");
+    if (declaration.claimScope === "ore-assisted-diagnostic" || declaration.campaignProof === false)
+      throw invalid();
     // Historical declarations keep their original field name; new runs never write it.
     const jarSha256 = historic ? declaration?.pilotJarSha256 : declaration?.agentJarSha256;
     const time = (value: unknown) => typeof value === "string" && Number.isFinite(Date.parse(value));
@@ -1710,7 +1713,7 @@ async function run(goal: Goal, seconds: number, parentRun: string | undefined, d
   }
 }
 
-try {
+if (import.meta.main) try {
   const { args, parallelWorld, revealOres } = readParallelWorld(process.argv.slice(2));
   let diagnosticStrategy: StrategyOptions | undefined;
   const needsDiagnosticModel = args[0] === "--diagnostic-urgent-creeper" ||

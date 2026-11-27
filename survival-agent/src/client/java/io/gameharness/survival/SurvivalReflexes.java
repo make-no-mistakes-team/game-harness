@@ -80,6 +80,7 @@ final class SurvivalReflexes {
     private boolean shelterEverSealed;
     private boolean shelterEverRoofed;
     private Direction unsealDir = Direction.NORTH;
+    private BlockPos burrowPillarBase;
 
     SurvivalReflexes(MinecraftClient client, Motor motor, Perception perception, GuiHands gui, SafeDescent descent) {
         this.client = client;
@@ -110,6 +111,7 @@ final class SurvivalReflexes {
         shelterUnsealTicks = 0;
         shelterCooldownTicks = 0;
         manualShelterTicks = 0;
+        burrowPillarBase = null;
     }
 
     String activeStatus() { return activeStatus; }
@@ -740,6 +742,7 @@ final class SurvivalReflexes {
         shelterState = ShelterState.NONE;
         shelterBuildTicks = 0;
         shelterBlockedTicks = 0;
+        burrowPillarBase = null;
         shelterCooldownTicks = Math.max(shelterCooldownTicks, cooldownTicks);
         if (combatStance == CombatPlanner.CombatStance.SHELTER) {
             combatStance = CombatPlanner.CombatStance.AUTO;
@@ -770,6 +773,7 @@ final class SurvivalReflexes {
         shelterBlockedTicks = 0;
         shelterSealedTicks = 0;
         shelterUnsealTicks = 0;
+        burrowPillarBase = null;
     }
 
     private boolean tickShelter(ClientPlayerEntity player, ClientWorld world, int currentTick) {
@@ -1099,14 +1103,21 @@ final class SurvivalReflexes {
         unsealDir = pickSafeUnsealDir(world, feet);
         shelterState = ShelterState.UNSEALING;
         shelterUnsealTicks = 0;
+        burrowPillarBase = null;
         activeStatus = "unsealing shelter to exit";
         return true;
+    }
+
+    static boolean shouldPlaceBurrowPillarBlock(double playerY, BlockPos pillarBase) {
+        return pillarBase != null && playerY >= pillarBase.getY() + 1.01;
     }
 
     private boolean tickShelterUnseal(ClientPlayerEntity player, ClientWorld world) {
         shelterUnsealTicks++;
         BlockPos feet = player.getBlockPos();
-        if (shelterUnsealTicks > 140 || (shelterAnchor != null && feet.getSquaredDistance(shelterAnchor) >= 3.5)) {
+        boolean escapedBox = shelterAnchor != null && feet.getY() >= shelterStartY && feet.getSquaredDistance(shelterAnchor) >= 3.5;
+        if (shelterUnsealTicks > 140 || escapedBox) {
+            burrowPillarBase = null;
             shelterState = ShelterState.NONE;
             if (combatStance == CombatPlanner.CombatStance.SHELTER) {
                 combatStance = CombatPlanner.CombatStance.AUTO;
@@ -1114,9 +1125,40 @@ final class SurvivalReflexes {
             return false;
         }
 
-        // If burrowed underground (startY > feet.y), break overhead cap and pillar out!
-        if (feet.getY() < shelterStartY) {
-            BlockPos roof = feet.up(2);
+        // If burrowed underground (startY > feet.y) or mid-jump on the final pillar step, break overhead cap and pillar out!
+        if (feet.getY() < shelterStartY || burrowPillarBase != null) {
+            if (burrowPillarBase != null) {
+                boolean placedSolid = Perception.isSolidSupport(world.getBlockState(burrowPillarBase));
+                boolean landedHigher = player.isOnGround() && feet.getY() > burrowPillarBase.getY();
+                if (placedSolid || landedHigher) {
+                    burrowPillarBase = null;
+                    if (feet.getY() >= shelterStartY && player.isOnGround()) {
+                        shelterState = ShelterState.NONE;
+                        if (combatStance == CombatPlanner.CombatStance.SHELTER) {
+                            combatStance = CombatPlanner.CombatStance.AUTO;
+                        }
+                        return false;
+                    }
+                    activeStatus = "pillaring out of burrow";
+                    return true;
+                }
+            }
+            if (burrowPillarBase == null) {
+                if (feet.getY() >= shelterStartY) {
+                    shelterState = ShelterState.NONE;
+                    if (combatStance == CombatPlanner.CombatStance.SHELTER) {
+                        combatStance = CombatPlanner.CombatStance.AUTO;
+                    }
+                    return false;
+                }
+                if (!player.isOnGround()) {
+                    activeStatus = "pillaring out of burrow";
+                    return true;
+                }
+                burrowPillarBase = feet.toImmutable();
+            }
+
+            BlockPos roof = burrowPillarBase.up(2);
             if (!Perception.isPassable(world.getBlockState(roof))) {
                 motor.mineBlock(roof, true, false);
                 activeStatus = "unsealing burrow roof";
@@ -1124,30 +1166,31 @@ final class SurvivalReflexes {
             }
             int blockSlot = motor.findHotbarShelterBlock();
             if (blockSlot >= 0) {
-                Vec3d center = Vec3d.ofBottomCenter(feet);
+                Vec3d center = Vec3d.ofBottomCenter(burrowPillarBase);
                 if (Math.hypot(player.getX() - center.x, player.getZ() - center.z) > 0.15) {
                     motor.moveToward(center, false, false, true, false);
                 } else {
                     player.getInventory().selectedSlot = blockSlot;
-                    Vec3d downPoint = new Vec3d(feet.getX() + 0.5, feet.getY() - 0.01, feet.getZ() + 0.5);
+                    Vec3d downPoint = new Vec3d(burrowPillarBase.getX() + 0.5, burrowPillarBase.getY() - 0.01, burrowPillarBase.getZ() + 0.5);
                     motor.lookAtPoint(downPoint, Motor.LookMode.FINE);
                     boolean aimedAtFloor = player.getPitch() >= 84.0f
                         && client.crosshairTarget instanceof net.minecraft.util.hit.BlockHitResult bhr
                         && bhr.getType() == net.minecraft.util.hit.HitResult.Type.BLOCK
-                        && bhr.getBlockPos().equals(feet.down())
+                        && bhr.getBlockPos().equals(burrowPillarBase.down())
                         && bhr.getSide() == Direction.UP;
                     if (aimedAtFloor) {
                         if (player.isOnGround()) {
                             motor.requestJump();
                         }
-                        if (player.getY() >= feet.getY() + 1.01) {
-                            motor.placeBlockAgainst(feet.down(), Direction.UP, downPoint, blockSlot);
+                        if (shouldPlaceBurrowPillarBlock(player.getY(), burrowPillarBase)) {
+                            motor.placeBlockAgainst(burrowPillarBase.down(), Direction.UP, downPoint, blockSlot);
                         }
                     }
                 }
                 activeStatus = "pillaring out of burrow";
                 return true;
             }
+            burrowPillarBase = null;
             shelterState = ShelterState.NONE;
             if (combatStance == CombatPlanner.CombatStance.SHELTER) {
                 combatStance = CombatPlanner.CombatStance.AUTO;

@@ -551,10 +551,10 @@ final class GuiHands {
             }
         }
 
-        // Gather player inventory slots (indices after crafting output+grid)
+        // Gather main player inventory slots only (0..35): never pull ingredients from armor or offhand slots!
         List<Slot> invSlots = new ArrayList<>();
         for (Slot s : handler.slots) {
-            if (s.inventory == client.player.getInventory()) {
+            if (s.inventory == client.player.getInventory() && s.getIndex() >= 0 && s.getIndex() < 36) {
                 invSlots.add(s);
             }
         }
@@ -783,9 +783,15 @@ final class GuiHands {
                 break;
             }
         }
+        boolean inputAlreadyLoaded = inputSlot.hasStack() && inputSlot.getStack().isOf(input);
         if (srcInput != null && (!inputSlot.hasStack() || inputSlot.getStack().isOf(input))) {
-            int toMove = Math.min(srcInput.getStack().getCount(), maxCount);
-            if (toMove == srcInput.getStack().getCount()) {
+            int space = inputSlot.hasStack()
+                ? inputSlot.getStack().getMaxCount() - inputSlot.getStack().getCount()
+                : srcInput.getStack().getMaxCount();
+            int toMove = Math.min(Math.min(srcInput.getStack().getCount(), maxCount), Math.max(0, space));
+            if (toMove <= 0) {
+                // Input slot already full of this item: nothing to move.
+            } else if (toMove == srcInput.getStack().getCount()) {
                 actions.add(new GuiAction(srcInput, ClickKind.LEFT));
                 actions.add(new GuiAction(inputSlot, ClickKind.LEFT));
             } else {
@@ -815,7 +821,7 @@ final class GuiHands {
                 actions.add(new GuiAction(bestFuel, ClickKind.LEFT));
             }
         }
-        return !actions.isEmpty();
+        return !actions.isEmpty() || inputAlreadyLoaded;
     }
 
     private static Slot findBestFuelSlot(FurnaceScreenHandler handler, net.minecraft.entity.player.PlayerInventory inv) {

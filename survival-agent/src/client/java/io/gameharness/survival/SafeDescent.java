@@ -1795,7 +1795,10 @@ final class SafeDescent {
                 edgeStepTicks = 0;
                 return RunStatus.RUNNING;
             }
-            motor.moveToward(Vec3d.ofBottomCenter(standOn), false, false, true, true);
+            // Vanilla sneak refuses to walk off an edge: only sneak for same-level bridge steps,
+            // never when the placed shelf sits below our feet (that would stall until timeout).
+            boolean stepDown = standOn.getY() < feet.getY();
+            motor.moveToward(Vec3d.ofBottomCenter(standOn), false, false, !stepDown, true);
             statusText = "stepping onto placed shelf block";
             return RunStatus.RUNNING;
         }

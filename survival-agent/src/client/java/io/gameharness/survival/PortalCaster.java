@@ -664,9 +664,10 @@ final class PortalCaster {
         if (!world.getBlockState(site.a3()).isOf(Blocks.OBSIDIAN)) return Stage.MINE_FOOT1_PIT;
         if (!world.getBlockState(site.a1().down()).isOf(Blocks.OBSIDIAN)
                 || !world.getBlockState(site.a2().down()).isOf(Blocks.OBSIDIAN)) {
-            if (!isSolidBackstop(world, site.a1().offset(site.inward()))) return Stage.PLACE_S1;
-            if (!isSolidBackstop(world, site.a2().offset(site.inward()))) return Stage.MINE_S2;
-            return Stage.MINE_TRENCH;
+            return backstopResumeStage(
+                isSolidBackstop(world, site.a1().offset(site.inward())),
+                isSolidBackstop(world, site.a2().offset(site.inward())),
+                world.getBlockState(site.a2()).getFluidState().isIn(FluidTags.LAVA));
         }
         if (!world.getBlockState(site.a0().up(1)).isOf(Blocks.OBSIDIAN)) return Stage.MINE_DRAIN1;
         if (!world.getBlockState(site.a0().up(2)).isOf(Blocks.OBSIDIAN)) return Stage.PLACE_S4;
@@ -675,6 +676,17 @@ final class PortalCaster {
         if (!world.getBlockState(site.a1().up(3)).isOf(Blocks.OBSIDIAN)) return Stage.PLACE_S7;
         if (!world.getBlockState(site.a2().up(3)).isOf(Blocks.OBSIDIAN)) return Stage.WATER_LINTEL2;
         return Stage.DRAIN_INTERIOR;
+    }
+
+    /**
+     * Pure resume decision for the stage-2 backstop sequence. Interior cell a2 must be plugged with
+     * cobble (PLACE_S2) before MINE_S2 whenever it still holds lava; otherwise WATER_BACK2 would pour
+     * onto interior lava and turn a portal interior cell into obsidian.
+     */
+    static Stage backstopResumeStage(boolean a1BackstopSolid, boolean a2BackstopSolid, boolean a2StillLava) {
+        if (!a1BackstopSolid) return Stage.PLACE_S1;
+        if (!a2BackstopSolid) return a2StillLava ? Stage.PLACE_S2 : Stage.MINE_S2;
+        return Stage.MINE_TRENCH;
     }
 
     private void setStage(Stage next) {

@@ -37,6 +37,29 @@ const shoreUse = {
 };
 const netherAdvancement = { criteria: { entered_nether: "2026-11-19 12:00:00 +0000" }, done: true };
 const worlds: string[] = [];
+
+test("diamond pickaxe continuation credits prior diamonds but requires a new craft", async () => {
+    const initial = {
+        "minecraft:mined": { "minecraft:diamond_ore": 1, "minecraft:deepslate_diamond_ore": 2 },
+        "minecraft:picked_up": { "minecraft:diamond": 3 },
+    };
+    const stats = await saveWorld(initial);
+    const before = await readSavedPlayerStats(stats);
+    const progress = { goal: "diamond_pickaxe", alive: true, won: true,
+        inventory: { "minecraft:diamond_pickaxe": 1 } };
+    expect((await verifySurvival(stats, "diamond_pickaxe", progress, false, before)).verified).toBe(false);
+    await writeFile(join(stats, player), JSON.stringify({ stats: {
+        ...initial, "minecraft:crafted": { "minecraft:diamond_pickaxe": 1 },
+    } }));
+    expect(await verifySurvival(stats, "diamond_pickaxe", progress, false, before)).toMatchObject({
+        verified: true, mined: 0, crafted: 1,
+    });
+    const crafted = await readSavedPlayerStats(stats);
+    expect((await verifySurvival(stats, "diamond_pickaxe", progress, false, crafted)).verified).toBe(false);
+    const noMining = await saveWorld({ "minecraft:crafted": { "minecraft:diamond_pickaxe": 1 } });
+    expect((await verifySurvival(noMining, "diamond_pickaxe", progress)).verified).toBe(false);
+    expect((await verifySurvival(noMining, "diamond_pickaxe", progress, false, before)).verified).toBe(false);
+});
 afterEach(async () => {
     for (const world of worlds.splice(0)) await rm(world, { recursive: true, force: true });
 });

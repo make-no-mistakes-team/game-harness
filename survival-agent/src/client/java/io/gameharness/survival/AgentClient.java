@@ -193,7 +193,7 @@ public final class AgentClient implements ClientModInitializer {
                     int holdSec = plan.tasks().get(0).count() > 0 ? Math.min(30, plan.tasks().get(0).count()) : 10;
                     reflexes.requestManualShelter(holdSec * 20);
                 }
-                tasks.applyModelPlan(plan.tasks(), plan.replaceQueue(), plan.safeExcavation(), plan.descentMethod());
+                tasks.applyModelPlan(plan.tasks(), plan.replaceQueue(), plan.safeExcavation(), plan.descentMethod(), (int) tick);
                 appendEvent("model_plan_applied", plan.planId()
                     + " [stance=" + (plan.combatStance().isEmpty() ? "unchanged" : plan.combatStance())
                     + ", descent=" + (plan.descentMethod() == null ? "unchanged" : plan.descentMethod().wireName())
@@ -288,7 +288,7 @@ public final class AgentClient implements ClientModInitializer {
             obj.addProperty("stair_steps_carved", descent.stairStepsCarved());
             obj.addProperty("edge_blocks_placed", descent.edgeBlocksPlaced());
             obj.addProperty("fall_damage_taken", Math.round(descent.fallDamageTaken() * 100.0) / 100.0);
-            obj.addProperty("damage_taken", Math.round(descent.totalDamageTaken() * 100.0) / 100.0);
+            obj.addProperty("descent_damage_taken", Math.round(descent.totalDamageTaken() * 100.0) / 100.0);
             obj.addProperty("min_y", Math.round(descent.minY() * 100.0) / 100.0);
             obj.addProperty("max_y", Math.round(descent.maxY() * 100.0) / 100.0);
         }

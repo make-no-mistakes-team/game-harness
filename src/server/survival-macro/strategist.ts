@@ -285,6 +285,7 @@ export function composeMacroStrategist(options: StrategistOptions) {
   let requests = 0;
   let plansPublished = 0;
   let plansApplied = 0;
+  let seenApplied = "";
   let providerErrors = 0;
   let lastPlanId = "";
   let lastTriggerKey = "";
@@ -446,7 +447,6 @@ export function composeMacroStrategist(options: StrategistOptions) {
   }
 
   async function loop() {
-    let seenApplied = "";
     try {
       authHandle = await openAuthSession(options);
       admission = "admitted";
@@ -511,7 +511,8 @@ export function composeMacroStrategist(options: StrategistOptions) {
       try {
         await loopTask;
         const finalState = await readState();
-        if (finalState?.appliedPlan?.planId === lastPlanId && lastPlanId && plansApplied < plansPublished) {
+        if (finalState?.appliedPlan?.planId === lastPlanId && lastPlanId && lastPlanId !== seenApplied) {
+          seenApplied = lastPlanId;
           plansApplied++;
         }
         await authHandle?.close();

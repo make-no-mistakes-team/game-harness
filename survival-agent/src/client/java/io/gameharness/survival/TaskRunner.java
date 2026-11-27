@@ -136,6 +136,10 @@ final class TaskRunner {
     private BlockPos placedGravelPos;
     private int oreTargetTicks;
     private int lavaSurveyTicks;
+    private int lastTick;
+    private int portalRetryAfterTick;
+    private static final int PORTAL_RETRY_COOLDOWN_TICKS = 1200;
+    private static final int MIN_PORTAL_LAVA_SOURCES = 10;
 
     TaskRunner(MinecraftClient client, Motor motor, Perception perception,
                Pathfinder pathfinder, RouteExecutor route, GuiHands gui,
@@ -185,6 +189,7 @@ final class TaskRunner {
         waterFillStuckTicks = 0;
         placedGravelPos = null;
         lavaSurveyTicks = 0;
+        portalRetryAfterTick = 0;
         if (descent != null) descent.resetForLife();
         if (caves != null) caves.resetForLife();
         if (portal != null) portal.resetForLife();
@@ -202,7 +207,7 @@ final class TaskRunner {
     int activeSmeltRemainingTicks(int currentTick) { return smeltLoaded ? Math.max(0, smeltReadyTick - currentTick) : 0; }
 
     /** Accept a new macro plan from the asynchronous LLM strategist without stalling! */
-    void applyModelPlan(List<Task> tasks, boolean replaceQueue, Boolean safeMode, SafeDescent.Method descentMethod) {
+    void applyModelPlan(List<Task> tasks, boolean replaceQueue, Boolean safeMode, SafeDescent.Method descentMethod, int currentTick) {
         if (safeMode != null) this.safeExcavationMode = safeMode;
         if (descent != null && descentMethod != null) {
             descent.setPreferredMethod(descentMethod);
@@ -220,7 +225,7 @@ final class TaskRunner {
                     && java.util.Objects.equals(active.target(), firstNew.target())
                     && java.util.Objects.equals(active.pos(), firstNew.pos());
                 if (!sameActive) {
-                    finishActive("replaced", "superseded by model plan", 0);
+                    finishActive("replaced", "superseded by model plan", currentTick);
                 }
             }
         }
@@ -233,6 +238,7 @@ final class TaskRunner {
         var player = client.player;
         var world = client.world;
         if (player == null || world == null || !player.isAlive()) return;
+        lastTick = currentTick;
         if (replanCooldown > 0) replanCooldown--;
 
         // 0. If GUI hands are currently active (crafting/furnace/hotbar swap/inventory triage), let GUI finish smoothly!
@@ -787,8 +793,7 @@ final class TaskRunner {
         // pause cleanly to craft a fresh stone pickaxe from carried cobblestone + wood instead of breaking our iron pickaxe!
         if (oreKind == Perception.OreKind.DIAMOND && activeTargetBlock == null
                 && GuiHands.countItem(player, Items.STONE_PICKAXE) == 0
-                && GuiHands.countStone(player) >= 3
-                && (GuiHands.countItem(player, Items.STICK) >= 2 || GuiHands.countPlanks(player) >= 2 || GuiHands.countLogs(player) >= 1)
+                && canCraftStonePickaxeNow(player)
                 && remainingIronPickDurability(player) < 90) {
             finishActive("partial", "crafting spare stone pickaxe to preserve iron pickaxe", currentTick);
             return;
@@ -1080,6 +1085,10 @@ final class TaskRunner {
             finishActive("completed", "crafted planks", currentTick);
             return;
         }
+        if (recipe == GuiHands.RecipeId.BOAT && SafeDescent.countBoats(player) >= desiredTotal) {
+            finishActive("completed", "crafted boat", currentTick);
+            return;
+        }
 
         // Handle GUI outcome if we just finished a craft attempt
         if (gui.state() == GuiHands.State.DONE) {
@@ -1167,6 +1176,7 @@ final class TaskRunner {
 
         // Compute how many executions to run
         int haveNow = recipe == GuiHands.RecipeId.PLANKS ? GuiHands.countPlanks(player)
+            : recipe == GuiHands.RecipeId.BOAT ? SafeDescent.countBoats(player)
             : (recipe.output != null ? GuiHands.countItem(player, recipe.output) : 0);
         int missing = Math.max(1, desiredTotal - haveNow);
         int execs = Math.max(1, (missing + recipe.batch - 1) / recipe.batch);
@@ -1376,14 +1386,36 @@ final class TaskRunner {
     }
 
     /**
-     * Ensures the player has a pickaxe in hotbar for digging/caving, and proactively inserts a local
-     * stone_pickaxe craft ahead of the current task if all stone pickaxes broke underground while materials are carried!
-     * Returns true if ready to mine, false if a hotbar swap or replacement craft paused this tick.
+     * Pure feasibility check for crafting one stone pickaxe from carried materials:
+     * 3 rock, 2 sticks (or 2 planks to make them), and a crafting table that is carried, nearby,
+     * or craftable from 4 more planks. Logs count as 4 planks each.
      */
+    static boolean canCraftStonePickaxe(int stone, int sticks, int planks, int logs, boolean hasTable) {
+        if (stone < 3) return false;
+        int plankSupply = planks + logs * 4;
+        int plankNeed = (sticks >= 2 ? 0 : 2) + (hasTable ? 0 : 4);
+        return plankSupply >= plankNeed;
+    }
+
+    private boolean canCraftStonePickaxeNow(ClientPlayerEntity player) {
+        boolean hasTable = GuiHands.countItem(player, Items.CRAFTING_TABLE) > 0
+            || findNearbyWorkstation(player, client.world, Blocks.CRAFTING_TABLE, 10.0) != null;
+        return canCraftStonePickaxe(GuiHands.countStone(player), GuiHands.countItem(player, Items.STICK),
+            GuiHands.countPlanks(player), GuiHands.countLogs(player), hasTable);
+    }
+
+    /** True if a portal cast is running, or a real pool candidate exists and no recent scan failed. */
+    private boolean portalLavaCandidate(ClientPlayerEntity player) {
+        if (portal == null) return false;
+        if (portal.isActive()) return true;
+        if (lastTick < portalRetryAfterTick) return false;
+        return portal.hasObservedLavaPoolSite(player, client.world)
+            || perception.observedLava().size() >= MIN_PORTAL_LAVA_SOURCES;
+    }
+
     private boolean ensureMiningPickaxeOrCraft(ClientPlayerEntity player, int currentTick) {
         int tier = bestPickaxeTier(player);
-        boolean canCraftStonePick = GuiHands.countStone(player) >= 3
-            && (GuiHands.countItem(player, Items.STICK) >= 2 || GuiHands.countPlanks(player) >= 2 || GuiHands.countLogs(player) >= 1);
+        boolean canCraftStonePick = canCraftStonePickaxeNow(player);
         if (tier < 1 || (tier < 2 && player.getBlockY() <= 48 && canCraftStonePick)) {
             if (canCraftStonePick) {
                 Task resume = active;
@@ -2191,6 +2223,7 @@ final class TaskRunner {
         if (st == PortalCaster.RunStatus.COMPLETED) {
             finishActive("completed", "cast, ignited, and entered nether portal", currentTick);
         } else if (st == PortalCaster.RunStatus.FAILED) {
+            portalRetryAfterTick = currentTick + PORTAL_RETRY_COOLDOWN_TICKS;
             finishActive("failed", "portal casting failed at " + portal.stage().name().toLowerCase(), currentTick);
         }
     }
@@ -2285,7 +2318,7 @@ final class TaskRunner {
         //     and a lava pool is observed (or portal cast is already underway), cast the shore portal immediately!
         if ("nether_portal".equals(goal) && portal != null && PortalCaster.hasCastingKit(player)
                 && (GuiHands.countItem(player, Items.WATER_BUCKET) > 0 || portal.isActive())) {
-            if (portal.isActive() || portal.hasObservedLavaPoolSite(player, client.world) || !perception.observedLava().isEmpty()) {
+            if (portalLavaCandidate(player)) {
                 return localTask(TaskKind.CAST_PORTAL, "shore", 1, null);
             }
             // Carrying full casting kit: scout surface for lava pools & ravines/caves (and descend deep caves to Y=-54 lava lakes!)
@@ -2402,7 +2435,7 @@ final class TaskRunner {
             if (PortalCaster.countSupportBlocks(player) < 12) {
                 return localTask(TaskKind.MINE_STONE, "stone", 16, null);
             }
-            if (portal != null && (portal.hasObservedLavaPoolSite(player, client.world) || !perception.observedLava().isEmpty())) {
+            if (portalLavaCandidate(player)) {
                 return localTask(TaskKind.CAST_PORTAL, "shore", 1, null);
             }
             return localTask(TaskKind.EXPLORE_CAVE, "lava", -54, null);
@@ -2442,7 +2475,7 @@ final class TaskRunner {
         int needDiamonds = "diamond".equals(goal) ? 1 : 3;
         if (diamonds < needDiamonds) {
             // Keep a spare stone pickaxe for digging down through hundreds of blocks of stone so iron pickaxe stays fresh!
-            if (GuiHands.countItem(player, Items.STONE_PICKAXE) == 0 && stone >= 3 && (logs * 4 + planks + sticks >= 2)) {
+            if (GuiHands.countItem(player, Items.STONE_PICKAXE) == 0 && canCraftStonePickaxe(stone, sticks, planks, logs, hasTable)) {
                 return localTask(TaskKind.CRAFT, "stone_pickaxe", 1, null);
             }
             // Keep torches handy for dark underground tunnels

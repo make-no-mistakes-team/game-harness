@@ -87,6 +87,7 @@ interface ProgressSnapshot {
   stair_steps_carved?: number;
   edge_blocks_placed?: number;
   fall_damage_taken?: number;
+  descent_damage_taken?: number;
   damage_taken?: number;
   min_y?: number;
   max_y?: number;
@@ -846,7 +847,8 @@ async function runSingleScenario(scenarioId: string, runDir: string, overrideSec
           metrics.minY = Math.min(metrics.minY, prog.min_y);
         }
         if (typeof prog.fall_damage_taken === "number") metrics.fallDamageTaken = Math.max(metrics.fallDamageTaken, prog.fall_damage_taken);
-        if (typeof prog.damage_taken === "number") metrics.damageTaken = Math.max(metrics.damageTaken, prog.damage_taken);
+        if (typeof prog.descent_damage_taken === "number")
+          metrics.damageTaken = Math.max(metrics.damageTaken, prog.descent_damage_taken);
         if (prog.descent_method && prog.descent_method !== "none") metrics.methodUsed = prog.descent_method;
         if (prog.descent_phase) phasesSet.add(prog.descent_phase);
         if (prog.descent_completed) metrics.descentCompleted = true;

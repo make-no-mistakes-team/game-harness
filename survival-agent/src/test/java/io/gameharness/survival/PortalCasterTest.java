@@ -12,6 +12,14 @@ import org.junit.jupiter.api.Test;
 final class PortalCasterTest {
 
     @Test
+    void resumesSecondPlugBeforeMiningWhenOnlyFirstBackstopIsNaturalRock() {
+        assertEquals(PortalCaster.Stage.PLACE_S2, PortalCaster.backstopResumeStage(true, false, true));
+        assertEquals(PortalCaster.Stage.MINE_S2, PortalCaster.backstopResumeStage(true, false, false));
+        assertEquals(PortalCaster.Stage.PLACE_S1, PortalCaster.backstopResumeStage(false, false, true));
+        assertEquals(PortalCaster.Stage.MINE_TRENCH, PortalCaster.backstopResumeStage(true, true, true));
+    }
+
+    @Test
     void shoreSiteMatchesVerifyTsFormulaAcrossAllFourOrientations() {
         Direction[] inwards = { Direction.SOUTH, Direction.NORTH, Direction.EAST, Direction.WEST };
         for (Direction inward : inwards) {

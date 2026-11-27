@@ -224,8 +224,12 @@ export async function verifySurvival(statsDirectory: string, goal: string, progr
         crafted = delta("crafted", goal);
         pickedUp = delta("picked_up", goal);
         const diamondsPicked = delta("picked_up", "diamond");
+        const diamondSupply = before
+            ? total("mined", "diamond_ore") + total("mined", "deepslate_diamond_ore") >= 3 &&
+                total("picked_up", "diamond") >= 3
+            : mined >= 3 && diamondsPicked >= 3;
         const verified = goal === "diamond" ? mined > 0 && pickedUp > 0
-            : goal === "diamond_pickaxe" ? crafted > 0 && mined >= 3 && diamondsPicked >= 3
+            : goal === "diamond_pickaxe" ? crafted > 0 && diamondSupply
             : crafted > 0;
         return result(verified, verified ? "This attempt's vanilla player statistics corroborate the live inventory" :
             "Saved player statistics do not corroborate a newly achieved goal");

@@ -28,8 +28,14 @@ async function bind(port: number) {
 async function fixture<T>(use: (proof: {
   root: string; world: string; live: string; port: number; startedAt: number;
   laterRun: (slot: "primary" | "parallel") => Promise<void>;
-  open: (options?: { wrongScope?: boolean; active?: boolean }) => ReturnType<typeof openOrphanAutosave>;
-}) => Promise<T>) {
+  open: (options?: { wrongScope?: boolean; active?: boolean; failed?: boolean }) => ReturnType<typeof openOrphanAutosave>;
+}) => Promise<T>, config: {
+  authority?: string;
+  scope?: string;
+  startupLagMs?: number;
+  withOwner?: boolean;
+  withLegacyMarker?: boolean;
+} = {}) {
   const temporary = await mkdtemp(join(tmpdir(), "orphan-autosave-"));
   try {
     const uid = process.getuid!();
@@ -48,8 +54,9 @@ async function fixture<T>(use: (proof: {
     const rootInfo = await lstat(root, { bigint: true });
     const rootCreated = Number(rootInfo.birthtimeNs / 1_000_000n);
     const startedAt = Math.max(runClock, rootCreated);
-    const scopeStarted = rootCreated - 200;
-    const scope = `survival-pair-diamond-${Math.floor(scopeStarted / 1_000)}.scope`;
+    const scopeStarted = rootCreated - (config.startupLagMs ?? 200);
+    const scope = config.scope ?? `survival-pair-diamond-${Math.floor(scopeStarted / 1_000)}.scope`;
+    const authority = config.authority ?? "/tmp/xvfb-run.TEST99/Xauthority";
     const free = await bind(0);
     await free.close();
     const { port } = free;
@@ -67,10 +74,19 @@ async function fixture<T>(use: (proof: {
     await Bun.sleep(12);
     await json(join(root, "declaration.json"), declaration);
     await json(live, {
-      run, active: true, display: ":17341", authority: "/tmp/xvfb-run.TEST99/Xauthority",
+      run, active: true, display: ":17341", authority,
       operatorStop: { directory: `${rootInfo.dev}:${rootInfo.ino}`, token: pathToken },
     });
-    await write(join(root, `runner-stop-${run}`), "");
+    if (config.withOwner) {
+      await json(join(root, "operator-stop-owner.json"), {
+        run, slot: "primary", display: ":17341", authority,
+        authorityId: `${rootInfo.dev}:123456:1795739380035212774`, token: pathToken,
+        pid: 4_194_300, started: "999999999", parent: 1,
+      });
+    }
+    if (config.withLegacyMarker ?? !config.withOwner) {
+      await write(join(root, `runner-stop-${run}`), "");
+    }
     const startup = ["declared", "server_started", "server_ready", "recorder_started", "client_started", "agent_ready"];
     await write(join(root, "history.jsonl"), startup.map((event, i) => JSON.stringify({
       event, at: iso(startedAt + i), elapsedMs: i, ...(event === "agent_ready" ? { tick: 1 } : {}),
@@ -97,7 +113,7 @@ async function fixture<T>(use: (proof: {
     region[3] = 1;
     await write(join(world, "region/r.0.0.mca"), region);
     const bootId = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim().replaceAll("-", "");
-    const open: Parameters<typeof use>[0]["open"] = ({ wrongScope = false, active = false } = {}) => {
+    const open: Parameters<typeof use>[0]["open"] = ({ wrongScope = false, active = false, failed = false } = {}) => {
       const stop = Date.now();
       const manager = {
         _BOOT_ID: bootId, _UID: `${uid}`, _COMM: "systemd", _EXE: "/usr/lib/systemd/systemd", _PID: "1",
@@ -113,13 +129,16 @@ async function fixture<T>(use: (proof: {
         ...manager, MESSAGE_ID: stopMessage, __REALTIME_TIMESTAMP: `${stop * 1_000}`, __MONOTONIC_TIMESTAMP: "11000000",
       };
       const requested = wrongScope ? "unrelated.scope" : scope;
+      const stateLines = failed
+        ? `Id=${requested}\nLoadState=loaded\nActiveState=failed\nSubState=failed\nTransient=yes\nControlGroup=\nInvocationID=${invocationId}\n`
+        : `Id=${requested}\nLoadState=not-found\nActiveState=${active ? "active" : "inactive"}\nSubState=dead\nControlGroup=\n`;
       return openOrphanAutosave({
         runs, live, run, historicRuns: join(temporary, "historic/runs"), goal: "nether_portal",
         scope: requested, signal: AbortSignal.timeout(15_000),
       }, {
         cgroupRoot,
         query: async (command, args) => command === "systemctl"
-          ? `Id=${requested}\nLoadState=not-found\nActiveState=${active ? "active" : "inactive"}\nSubState=dead\nControlGroup=\n`
+          ? stateLines
           : (args.includes("--user-unit") ? [start, end] : [start]).map(row => JSON.stringify(row)).join("\n"),
       });
     };
@@ -225,5 +244,37 @@ test("a newer primary, a displaced live descriptor, and a closing claim each fai
       event: "work_program_goal", at: iso(startedAt + 10), elapsedMs: 10, tick: 45,
     }) + "\n");
     await expect(open()).rejects.toThrow("contains a closing claim");
+  });
+});
+
+test("transient systemd-run scopes with owner metadata, nested TMPDIR Xauthority, startup scan lag, and failed-stopped state verify cleanly", async () => {
+  await fixture(async ({ open, root }) => {
+    const source = await open({ failed: true });
+    try {
+      expect(source.root).toBe(root);
+      expect(source.scope).toBe("run-u4310.scope");
+      await source.assertQuiescent();
+    } finally { await source.close(); }
+  }, {
+    scope: "run-u4310.scope",
+    authority: "/tmp/oacp-1000/120f8eda/run-j1XgOv/xvfb-run.SXZluZ/Xauthority",
+    startupLagMs: 13_200,
+    withOwner: true,
+    withLegacyMarker: false,
+  });
+});
+
+test("transient scopes without an owner record and authority paths with traversal segments are rejected", async () => {
+  await fixture(async ({ open }) => {
+    await expect(open()).rejects.toThrow("exact private primary run identity");
+  }, {
+    scope: "run-u4310.scope",
+    withOwner: false,
+    withLegacyMarker: true,
+  });
+  await fixture(async ({ open }) => {
+    await expect(open()).rejects.toThrow("does not identify this primary run and display");
+  }, {
+    authority: "/tmp/oacp-1000/../xvfb-run.TEST99/Xauthority",
   });
 });

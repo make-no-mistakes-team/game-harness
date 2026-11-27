@@ -102,6 +102,58 @@ const commands = {
       process.exitCode = 1;
     } finally { primary.close(); ledger.close(); second(); }
   `,
+  orphanRelease: `
+    const { Database } = await import("bun:sqlite");
+    const second = await admitRun(17, "diagnostic");
+    const root = "local/survival-pilot/";
+    const primary = new Database(root + "owner.sqlite");
+    const ledger = new Database(root + "admission.sqlite");
+    ledger.exec("UPDATE reservations SET survival = 7, generation = generation + 1");
+    const state = () => ledger.query("SELECT generation, survival, diagnostic FROM reservations").get();
+    const scenario = process.env.CASE;
+    let proofComplete = false;
+    const proof = {
+      kind: "same-boot-orphan-autosave",
+      sourceRun: "2026-11-23T14-05-01.000Z-diamond-Ab1Cd2",
+      priorReserveBytes: scenario === "release-wrong-charge" ? 8 : 7,
+      signal: new AbortController().signal,
+      assertSource() {
+        if (scenario === "release-wrong-source" || scenario === "release-source-raced" && proofComplete)
+          throw new Error("The primary source marker changed.");
+      },
+      async assertQuiescent() {
+        if (scenario === "release-unknown-writer") throw new Error("Cannot prove source writers are gone.");
+        proofComplete = true;
+        try {
+          primary.exec("BEGIN IMMEDIATE");
+        } catch (error) {
+          if (error.code === "SQLITE_BUSY") return;
+          throw error;
+        }
+        primary.exec("ROLLBACK");
+        throw new Error("The final evidence check did not hold the primary lock.");
+      },
+    };
+    if (scenario === "release-active-owner") primary.exec("BEGIN IMMEDIATE");
+    if (scenario === "release-unlocked-secondary") {
+      second();
+      ledger.exec("UPDATE reservations SET diagnostic = 17, generation = generation + 1");
+    }
+    try {
+      const receipt = await storage.releaseOrphanReservation(proof);
+      const afterRelease = state();
+      if (scenario === "release-replay") {
+        ledger.exec("UPDATE reservations SET survival = 7, generation = generation + 1");
+        await storage.releaseOrphanReservation(proof);
+      }
+      second();
+      console.log(JSON.stringify({ receipt, afterRelease, drained: state() }));
+    } catch (error) {
+      console.error(error.message);
+      console.log(JSON.stringify(state()));
+      process.exitCode = 1;
+    } finally { primary.close(); ledger.close(); second(); }
+  `,
   concurrentAdmission: `
     const { Database } = await import("bun:sqlite");
     const primary = await admitRun(11);
@@ -363,6 +415,33 @@ for (const [scenario, reason, attempts, generation] of [
   test(`same-boot recovery refuses ${scenario} without altering either charge`, async () => {
     const result = await withScanner(scenario, "orphanAdmission");
     expect(result).toMatchObject({ code: 1, attempts });
+    expect(result.stderr).toContain(reason);
+    expect(JSON.parse(result.stdout)).toEqual({ generation, survival: 7, diagnostic: 17 });
+  });
+}
+
+test("verified orphan release clears only the attributed primary charge while preserving diagnostic", async () => {
+  const result = await withScanner("release", "orphanRelease");
+  expect(result).toMatchObject({ code: 0, stderr: "", attempts: 1 });
+  expect(JSON.parse(result.stdout)).toEqual({
+    receipt: { sourceRun: "2026-11-23T14-05-01.000Z-diamond-Ab1Cd2", releasedBytes: 7, generation: 3 },
+    afterRelease: { generation: 3, survival: 0, diagnostic: 17 },
+    drained: { generation: 4, survival: 0, diagnostic: 0 },
+  });
+});
+
+for (const [scenario, reason, generation] of [
+  ["release-wrong-charge", "not attributable", 2],
+  ["release-active-owner", "already has an active run", 2],
+  ["release-wrong-source", "source marker changed", 2],
+  ["release-source-raced", "source marker changed", 2],
+  ["release-unknown-writer", "Cannot prove source writers are gone", 2],
+  ["release-unlocked-secondary", "diagnostic run left an unreleased reservation", 4],
+  ["release-replay", "already reattributed", 4],
+] as const) {
+  test(`verified orphan release refuses ${scenario} without altering either charge`, async () => {
+    const result = await withScanner(scenario, "orphanRelease");
+    expect(result).toMatchObject({ code: 1, attempts: 1 });
     expect(result.stderr).toContain(reason);
     expect(JSON.parse(result.stdout)).toEqual({ generation, survival: 7, diagnostic: 17 });
   });

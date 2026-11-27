@@ -7,13 +7,18 @@ import { open } from "node:fs/promises";
 import path from "node:path";
 
 export const orphanScopeName = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,150}\.scope$/;
+const transientScopeName = /^run-(?:u\d+|r[0-9a-f]+)\.scope$/;
+const privateAuthorityPath = /^\/tmp(?:\/[A-Za-z0-9._-]+){0,4}\/xvfb-run\.[A-Za-z0-9]{6,}\/Xauthority$/;
+const isPrivateAuthority = (value: unknown): value is string =>
+  typeof value === "string" && privateAuthorityPath.test(value) &&
+  !value.split("/").some(segment => segment === "." || segment === "..");
 const readFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
 const tokenPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const bootPattern = /^[0-9a-f]{32}$/;
 const startMessage = "39f53479d3a045ac8e11786248231fbf";
 const stopMessage = "9d1aaa27d60140bd96365438aad20286";
 const resourcesMessage = "ae8f7b866b0347b9af31fe1c80b127c0";
-const startWindowMs = 5_000;
+const startWindowMs = 30_000;
 const maxTreeEntries = 100_000;
 const takeOFDLock = `
 import ctypes
@@ -112,7 +117,9 @@ async function requireInactiveScope(proof: ScopeProof, { query, cgroupRoot }: Sy
   const values = Object.fromEntries((await query("systemctl", ["show", "-p", "Id", "-p", "LoadState",
     "-p", "ActiveState", "-p", "SubState", "-p", "Transient", "-p", "ControlGroup", "-p", "InvocationID", scope],
   signal)).trimEnd().split("\n").map(line => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
-  if (values.Id !== scope || values.ActiveState !== "inactive" || values.SubState !== "dead" ||
+  const stopped = (values.ActiveState === "inactive" && values.SubState === "dead") ||
+    (values.ActiveState === "failed" && values.SubState === "failed");
+  if (values.Id !== scope || !stopped ||
       (values.LoadState === "not-found" ? values.ControlGroup !== "" :
         values.LoadState !== "loaded" || values.Transient !== "yes" || values.InvocationID !== proof.invocationId))
     throw new Error("the exact source scope is not confirmed inactive");
@@ -136,7 +143,7 @@ async function requireInactiveScope(proof: ScopeProof, { query, cgroupRoot }: Sy
 
 async function proveScope(scope: string, uid: bigint, bootMs: number, root: string, goal: string, startedAt: number,
     rootCreated: number, markedAt: number, declaredSeconds: unknown, legacyStoppedAt: number | undefined,
-    systemd: SystemdEvidenceSource, signal: AbortSignal): Promise<ScopeProof> {
+    hasOwner: boolean, systemd: SystemdEvidenceSource, signal: AbortSignal): Promise<ScopeProof> {
   const { query } = systemd;
   const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim().replaceAll("-", "");
   const managerCgroup = `/user.slice/user-${uid}.slice/user@${uid}.service`;
@@ -172,10 +179,14 @@ async function proveScope(scope: string, uid: bigint, bootMs: number, root: stri
     path.isAbsolute(row._EXE) && path.basename(row._EXE) === "bun" && row.MESSAGE === root &&
     time(row) >= started && time(row) <= markedAt);
   if (!sourceLine) {
-    // The pre-fence pair runner used an epoch-named interactive scope (no journal
-    // stdout). Bind its unique launch to the private directory birth, declaration,
-    // live inode and native runner-stop marker, not merely to an inactive unit name.
+    // Interactive/piped scopes emit no journal stdout. Bind the unique launch
+    // to the private directory birth, declaration, live inode, and either the
+    // verified operator-stop owner record (modern transient scopes) or the
+    // legacy epoch-named scope + runner-stop marker.
     const expectedScope = `survival-pair-${goal}-${Math.floor(started / 1_000)}.scope`;
+    const scopeMatches = scope === expectedScope || (hasOwner && transientScopeName.test(scope));
+    const stopMarkerMatches = hasOwner ||
+      (legacyStoppedAt !== undefined && legacyStoppedAt >= markedAt && legacyStoppedAt <= stoppedAt);
     const description = typeof start.MESSAGE === "string" && start.MESSAGE.startsWith(`Started ${scope} - `)
       ? start.MESSAGE.slice(`Started ${scope} - `.length) : "";
     const play = /^(?:\/usr\/bin\/env(?: [A-Z_][A-Z_0-9]*=[^\s]+)* )?(?:[^ ]*\/)?bun run play:agent /;
@@ -185,9 +196,9 @@ async function proveScope(scope: string, uid: bigint, bootMs: number, root: stri
       `MESSAGE_ID=${startMessage}`, "_SYSTEMD_USER_UNIT=init.scope", `_UID=${uid}`], signal));
     const launches = competing.filter(row => managerRow(row) && time(row) <= startedAt &&
       typeof row.MESSAGE === "string" && play.test(row.MESSAGE.replace(/^Started [^ ]+ - /, "")));
-    if (scope !== expectedScope || !play.test(description) || !Number.isSafeInteger(declaredSeconds) ||
+    if (!scopeMatches || !play.test(description) || !Number.isSafeInteger(declaredSeconds) ||
         !description.endsWith(` ${goal} ${declaredSeconds}.`) || /--(?:parallel-world|diagnostic|replay-incident)\b/.test(description) ||
-        legacyStoppedAt === undefined || legacyStoppedAt < markedAt || legacyStoppedAt > stoppedAt ||
+        !stopMarkerMatches ||
         launches.length !== 1 || launches[0]!.USER_INVOCATION_ID !== start.USER_INVOCATION_ID)
       throw new Error("the scope does not establish the exact private primary run identity");
   }
@@ -300,7 +311,7 @@ export async function openOrphanSource(input: SourceInput,
   if (marker.run !== run || marker.active !== true || markerScope.directory !== identity(rootEntry) ||
       typeof markerScope.token !== "string" || !tokenPattern.test(markerScope.token) ||
       typeof display !== "string" || !/^:[1-9]\d{1,4}$/.test(display) || Number(display.slice(1)) < 90 ||
-      typeof authority !== "string" || !/^\/tmp\/xvfb-run\.[A-Za-z0-9]{6,}\/Xauthority$/.test(authority))
+      !isPrivateAuthority(authority))
     throw new Error("the private live descriptor does not identify this primary run and display");
   const { result: declaration, entry: declarationEntry } = privateJson(path.join(root, "declaration.json"), uid, device);
   const startedAt = typeof declaration.startedAt === "string" ? Date.parse(declaration.startedAt) : NaN;
@@ -348,7 +359,7 @@ export async function openOrphanSource(input: SourceInput,
     throw new Error("the original runner stop marker is not private");
   if (!hasOwner && !legacy) throw new Error("there is no private primary owner or native runner stop marker");
   const proof = await proveScope(scope, uid, bootMs, root, sourceGoal, startedAt, createdMs(rootEntry),
-    changedMs(markerEntry), limits.wallSeconds, legacy && changedMs(legacy), systemd, signal);
+    changedMs(markerEntry), limits.wallSeconds, legacy && changedMs(legacy), hasOwner, systemd, signal);
 
   function assertNoAlias() {
     const mountinfo = readFileSync("/proc/self/mountinfo", "utf8").trimEnd().split("\n");

@@ -15,7 +15,7 @@ export const artifactLimitBytes = 300_000_000_000;
 type Lane = "survival" | "diagnostic";
 type Reservations = { generation: number } & Record<Lane, number>;
 type CrashReservation = { bootMs: number; startedAtMs: number; priorReserveBytes: number };
-type OrphanReservation = {
+export type OrphanReservation = {
     kind: "same-boot-orphan-autosave";
     sourceRun: string;
     priorReserveBytes: number;
@@ -228,6 +228,87 @@ function recoveryLedgerFiles(ledgerPath: string, kind: "crash" | "orphan") {
         lastWrite: Math.max(ledger.mtimeMs, ledger.ctimeMs) };
 }
 
+type OrphanLedgerFiles = ReturnType<typeof recoveryLedgerFiles>;
+
+function hasOrphanColumn(ledger: Database) {
+    return ledger.query<{ name: string }, []>("PRAGMA table_info(reservations)")
+        .all().some(({ name }) => name === "last_orphan_source");
+}
+
+function assertOrphanLedgerState(
+    ledger: Database,
+    ledgerPath: string,
+    original: OrphanLedgerFiles,
+    orphan: OrphanReservation,
+    state: Reservations,
+    orphanGeneration: number | undefined,
+) {
+    orphan.signal.throwIfAborted();
+    const current = recoveryLedgerFiles(ledgerPath, "orphan");
+    // The second owner can update the same ledger while the original primary is
+    // gone, so its mtime cannot date the primary charge. Bind the exact amount
+    // to the old private live marker instead, under the original primary lock.
+    if (!state.survival || state.survival !== orphan.priorReserveBytes ||
+        current.dev !== original.dev || current.ino !== original.ino ||
+        current.ownerDev !== original.ownerDev || current.ownerIno !== original.ownerIno)
+        throw new Error("The existing reservation is not attributable to the orphan autosave.");
+    if (current.secondIno !== original.secondIno || orphanGeneration !== undefined && state.generation !== orphanGeneration)
+        throw new Error("Lane reservations changed during orphan autosave admission.");
+    if (state.diagnostic && current.secondIno === undefined)
+        throw new Error("The diagnostic lane has a reservation without an owner lock.");
+    const previous = hasOrphanColumn(ledger) && ledger.query<{ last_orphan_source: string | null }, []>(
+        "SELECT last_orphan_source FROM reservations WHERE id = 1").get()?.last_orphan_source;
+    if (previous && previous >= orphan.sourceRun)
+        throw new Error("The orphan autosave reservation was already reattributed.");
+    orphan.assertSource();
+    if (current.secondIno !== undefined) {
+        const secondOwner = tryOwner("diagnostic", false);
+        secondOwner?.close();
+        if (secondOwner && state.diagnostic)
+            throw new Error("The previous diagnostic run left an unreleased reservation; owned writers may still be running.");
+        if (!secondOwner && !state.diagnostic)
+            throw new Error("The diagnostic lane is locked without a shared reservation; wait for its owner to stop.");
+    }
+}
+
+/** Release a stranded primary Survival reservation after proving the orphan run is quiescent. */
+export async function releaseOrphanReservation(orphan: OrphanReservation) {
+    if (orphan.kind !== "same-boot-orphan-autosave")
+        throw new Error("Orphan reservation release requires a same-boot orphan autosave proof.");
+    orphan.signal.throwIfAborted();
+    const ledgerPath = path.join(admissionRoot, "admission.sqlite");
+    const original = recoveryLedgerFiles(ledgerPath, "orphan");
+    const ledger = new Database(ledgerPath, { readwrite: true });
+    let owner: Database | undefined;
+    try {
+        ledger.exec("PRAGMA busy_timeout = 5000");
+        const read = ledger.query<Reservations, []>("SELECT generation, survival, diagnostic FROM reservations WHERE id = 1");
+        let orphanGeneration: number | undefined;
+        const snapshot = ledger.transaction(() => {
+            const state = read.get()!;
+            owner = tryOwner("survival", false);
+            if (!owner) throw new Error("The survival lane already has an active run.");
+            assertOrphanLedgerState(ledger, ledgerPath, original, orphan, state, orphanGeneration);
+            orphanGeneration = state.generation;
+        });
+        const release = ledger.transaction(() => {
+            const state = read.get()!;
+            assertOrphanLedgerState(ledger, ledgerPath, original, orphan, state, orphanGeneration);
+            if (!hasOrphanColumn(ledger)) ledger.exec("ALTER TABLE reservations ADD COLUMN last_orphan_source TEXT");
+            ledger.query("UPDATE reservations SET survival = 0, generation = generation + 1, " +
+                "last_orphan_source = ? WHERE id = 1").run(orphan.sourceRun);
+            return state.generation + 1;
+        });
+        snapshot.immediate();
+        await orphan.assertQuiescent(orphan.signal);
+        const generation = release.immediate();
+        return { sourceRun: orphan.sourceRun, releasedBytes: orphan.priorReserveBytes, generation };
+    } finally {
+        owner?.close();
+        ledger.close();
+    }
+}
+
 function metadataAllocation(file: string) {
     try {
         const entry = lstatSync(file, { bigint: true });
@@ -296,36 +377,9 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival",
             return true;
         };
         let orphanGeneration: number | undefined;
-        const orphanColumn = () => ledger.query<{ name: string }, []>("PRAGMA table_info(reservations)")
-            .all().some(({ name }) => name === "last_orphan_source");
         const checkOrphan = (state: Reservations) => {
             if (!orphan || !original) throw new Error("Missing orphan autosave proof.");
-            orphan.signal.throwIfAborted();
-            const current = recoveryLedgerFiles(ledgerPath, "orphan");
-            // The second owner can update the same ledger while the original primary is
-            // gone, so its mtime cannot date the primary charge. Bind the exact amount
-            // to the old private live marker instead, under the original primary lock.
-            if (!state.survival || state.survival !== orphan.priorReserveBytes ||
-                current.dev !== original.dev || current.ino !== original.ino ||
-                current.ownerDev !== original.ownerDev || current.ownerIno !== original.ownerIno)
-                throw new Error("The existing reservation is not attributable to the orphan autosave.");
-            if (current.secondIno !== original.secondIno || orphanGeneration !== undefined && state.generation !== orphanGeneration)
-                throw new Error("Lane reservations changed during orphan autosave admission.");
-            if (state.diagnostic && current.secondIno === undefined)
-                throw new Error("The diagnostic lane has a reservation without an owner lock.");
-            const previous = orphanColumn() && ledger.query<{ last_orphan_source: string | null }, []>(
-                "SELECT last_orphan_source FROM reservations WHERE id = 1").get()?.last_orphan_source;
-            if (previous && previous >= orphan.sourceRun)
-                throw new Error("The orphan autosave reservation was already reattributed.");
-            orphan.assertSource();
-            if (current.secondIno !== undefined) {
-                const secondOwner = tryOwner("diagnostic", false);
-                secondOwner?.close();
-                if (secondOwner && state.diagnostic)
-                    throw new Error("The previous diagnostic run left an unreleased reservation; owned writers may still be running.");
-                if (!secondOwner && !state.diagnostic)
-                    throw new Error("The diagnostic lane is locked without a shared reservation; wait for its owner to stop.");
-            }
+            assertOrphanLedgerState(ledger, ledgerPath, original, orphan, state, orphanGeneration);
         };
         const snapshot = ledger.transaction(() => {
             const state = read.get()!;
@@ -381,7 +435,7 @@ export async function admitRun(reserveBytes: number, lane: Lane = "survival",
             if (orphan) {
                 // A death before the new live marker is published must not make
                 // the old marker eligible to consume an equal-byte charge again.
-                if (!orphanColumn()) ledger.exec("ALTER TABLE reservations ADD COLUMN last_orphan_source TEXT");
+                if (!hasOrphanColumn(ledger)) ledger.exec("ALTER TABLE reservations ADD COLUMN last_orphan_source TEXT");
                 ledger.query("UPDATE reservations SET survival = ?, generation = generation + 1, " +
                     "last_orphan_source = ? WHERE id = 1").run(reserveBytes, orphan.sourceRun);
             } else {

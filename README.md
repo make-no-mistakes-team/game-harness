@@ -21,7 +21,7 @@ Follow the [setup guide](docs/setup.md) before the first build.
 # Keep credentials, worlds, and private run evidence out of git in this checkout.
 printf '\n/local/\n' >> .git/info/exclude
 bun install --frozen-lockfile
-bun run build:agent
+bun run build
 ```
 
 Launch a fresh Survival run from the terminal:
@@ -30,9 +30,9 @@ Launch a fresh Survival run from the terminal:
 bun run play:agent --strategy model --model PROVIDER/MODEL --macro-requests 160 diamond 7200
 ```
 
-Replace `PROVIDER/MODEL` with an authenticated catalog model, or omit
-`--strategy model` and `--model` for model-free play. Watch the live private
-display in another terminal with `bun run watch:agent`.
+Replace `PROVIDER/MODEL` with an authenticated catalog model. For model-free
+play, use `bun run play:agent diamond 7200` without strategy options. Watch the
+live private display in another terminal with `bun run watch:agent`.
 
 For the minimal desktop launcher and live viewer (account login, EULA consent,
 start/stop, and video stream), run `bun run start`. If Electron reports a

@@ -21,18 +21,13 @@ bun run watch:agent --diagnostic
 | `bun run play:agent --diagnostic-reveal-ores <goal> <seconds>` | Ordinary-world diagnostic with disclosed ore-reveal assistance (`claimScope: "ore-assisted-diagnostic"`, `campaignProof: false`). Cannot feed `--continue-from` as an unassisted campaign. |
 | `bun run play:agent <goal> <seconds> --replay-incident <RUN_BASENAME>` | Replays a closed ordinary save on the diagnostic lane with no fixture edits; see [recovery](recovery.md#incident-replay-diagnostic). |
 
-Per-run JVM heap limits can be set via
-`SURVIVAL_AGENT_{SERVER,CLIENT}_{XMS,XMX}_MIB` (`Xms <= Xmx`). Resolved heap
-settings appear under `limits.jvmHeapsMiB` in `declaration.json` and do not
-bypass host-memory admission or slot ownership.
-
 ## Parallel multi-scenario harnesses
 
 Two standalone harnesses test v2 combat and high-drop descent across multiple
 prepared terrains in parallel. Each scenario creates its own private `Xvfb`
 display, ephemeral loopback port, isolated client directory, 30 fps `screen.mp4`
-recording, and telemetry verification without touching `admission.sqlite` or
-the primary/parallel/diagnostic lane locks:
+recording, and telemetry verification without using the shared admission
+database or primary/parallel/diagnostic lane locks:
 
 | Command | Source and coverage |
 | --- | --- |
@@ -56,7 +51,7 @@ sh mod/gradlew -p mod test
 
 Current JUnit 5 suites under `mod/src/test/java/io/gameharness/survival/` cover
 `CaveExplorerTest`, `CombatPlannerTest`, `InventoryTriageTest`,
-`PortalCasterTest`, and `SafeDescentTest`.
+`PortalCasterTest`, `SafeDescentTest`, and `TaskRunnerTest`.
 
 ## Reading stalls and claim limits
 

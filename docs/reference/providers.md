@@ -7,15 +7,16 @@ credentials never prove account entitlement or gameplay competence.
 
 ## Authentication ownership
 
-Supported connection categories are legitimate API keys and provider-supported
-OAuth or device-code flows. Consumer subscriptions do not automatically grant
-arbitrary API access. GameHarness never scrapes browser sessions or imports
-ambient third-party CLI credentials.
+The current launcher offers provider-supported browser OAuth and device-code
+flows. Consumer subscriptions do not automatically grant arbitrary API access.
+GameHarness never scrapes browser sessions or imports ambient third-party CLI
+credentials.
 
-Credentials are submitted through the trusted loopback UI or auth worker and
-stored in the private auth database; callers receive opaque references and
-redacted status only. Raw keys, tokens, and authorization headers never enter
-prompts, logs, run events, URLs, or frontend state.
+The auth worker completes authorization and the manager stores credentials in
+the private auth database. The frontend receives redacted status and catalog
+choices; selected-account inference sessions resolve credentials directly for
+the SDK. Tokens and authorization headers never enter prompts, logs, run
+events, URLs, or frontend state.
 
 OAuth login validates the provider HTTPS authorization endpoint (rejecting
 embedded credentials, fragments, or unexpected hosts/paths), binds PKCE and
@@ -44,17 +45,16 @@ At run start, `src/strategist/strategist.ts` resolves the explicit
 budget before dispatching each request. Request timeouts, refusals, or
 provider errors never halt the local Java player.
 
-## Usage accounting
+## Request accounting
 
-Each attempt records logical admissions, actual transport attempts, applied
-advice receipts, and SDK-reported token subtotals (`uncached input`, `cache
-read`, `cache write`, and `output`) separately. Missing categories stay `null`
-(unknown), never coerced to zero.
+The strategist records requests, published plans, applied plans, and provider
+errors separately. Each admitted inference call permits one transport
+dispatch, including SDK recovery paths. Shutdown joins inference and checks
+the final applied-plan receipt without counting it twice.
 
-Known cost requires explicit pricing provenance; placeholder zero prices are
-not reported as free inference. A terminal usage record does not confirm clean
-transport drain, and advice receipts establish method application rather than
-verified resource progress.
+The v2 runner does not export token subtotals or monetary cost. Request counts
+do not establish either quantity. Applied-plan receipts establish that advice
+was accepted, not that the player achieved a resource goal.
 
 Sources: [`src/auth/manager.ts`](../../src/auth/manager.ts),
 [`src/auth/session.ts`](../../src/auth/session.ts),

@@ -24,8 +24,8 @@ a hard stop nor permission to delete unregistered historical files. Physical
 disk safety remains a hard stop. Scoped accounting lives in
 [`src/agent/storage.ts`](../../src/agent/storage.ts) and
 [`src/agent/storage-campaign.ts`](../../src/agent/storage-campaign.ts).
-Set `SURVIVAL_AGENT_ARTIFACT_CAMPAIGN=recovery-development` for ordinary runs
-and declared [single-lane diagnostics](../survival/diagnostics.md#single-lane-diagnostics).
+Set `SURVIVAL_AGENT_ARTIFACT_CAMPAIGN=recovery-development` for ordinary runs.
+The runner rejects this campaign setting for diagnostic lanes.
 First activation requires drained lanes and records the historical baseline;
 later admissions preserve it.
 

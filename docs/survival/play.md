@@ -38,9 +38,8 @@ Local execution starts immediately and keeps playing if the strategist is slow,
 abstains, hits its request cap, or loses connectivity. Advice selects a macro
 task or target direction at safe transitions via `StrategistBridge`; it cannot
 inject raw clicks, spend items directly, or pause combat reflexes. Routine
-prompts send goal, inventory, health, hunger, status, and available methods as
-text; repeated stalls can attach a private first-person frame. Requests count
-toward account usage.
+prompts send goal, inventory, health, hunger, visible environment, task queue,
+and available methods as text. Requests count toward account usage.
 
 ## Minimal desktop launcher and viewer
 

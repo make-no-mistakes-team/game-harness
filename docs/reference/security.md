@@ -15,7 +15,7 @@ bypass local safety reflexes.
 | Goal verification statistics | Saved vanilla stats read by [`src/agent/verify.ts`](../../src/agent/verify.ts) only after confirmed clean server closure. |
 | Provider and Minecraft credentials | Private auth store (`src/auth/`, directory mode `0700`, files `0600`) and official Launcher Secret Service lookup (`mod/bootstrap/launcher-auth.py`); never logged, printed, exported, or included in prompts. |
 | Worlds, recordings, and raw logs | Private gitignored roots under `local/runtime/`, `local/survival-agent/`, and `local/survival-pilot/` (or `GAMEHARNESS_DATA_DIR`). |
-| Live video viewers | Read-only loopback HTTP/WebSocket streams (`watch:agent` on `127.0.0.1:4379`/`4382`/`4383` and desktop viewer); viewing grants no gameplay input. |
+| Live video viewers | Read-only loopback HTTP streams (`watch:agent` on `127.0.0.1:4379`/`4382`/`4383` and desktop viewer); viewing grants no gameplay input. |
 
 ## Local transport and desktop shell
 

@@ -1,6 +1,6 @@
 import { SURVIVAL_AGENT_GOALS, SURVIVAL_AGENT_STRATEGIES, type SurvivalAgentGoal,
-  type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../../src/shared/survival-agent-ui.ts";
-import type { AuthState } from "../../src/shared/contracts.ts";
+  type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../../src/shared/goals.ts";
+import type { AuthState } from "../../src/shared/auth-types.ts";
 import { ApiError, fetchSurvivalAgent, startSurvivalAgent, stopSurvivalAgent } from "./api.ts";
 
 const goalNames: Record<SurvivalAgentGoal, string> = {
@@ -11,15 +11,7 @@ const goalNames: Record<SurvivalAgentGoal, string> = {
 const strategyOutcomeLabels: Record<NonNullable<SurvivalAgentSnapshot["strategyOutcome"]>, string> = {
   strategy_applied: "The player used a strategy suggested by the model.",
   no_advice_applied: "No model strategy was applied.",
-  native_effect_completed: "A model action was confirmed in Minecraft.",
-  no_completed_effect: "No model action was confirmed.",
   provider_unavailable: "The model was unavailable.",
-  refused: "The model declined the request.",
-  provider_error: "A model request failed.",
-  budget_limited: "The model reached its request or time limit.",
-  display_lost: "The model lost the live game display.",
-  protocol_fault: "The model could not continue safely.",
-  cleanup_failed: "Model cleanup was not confirmed.",
 };
 
 type VideoState = "waiting" | "live" | "lost";
@@ -29,7 +21,6 @@ type Workspace = {
   errorText(id: string, value: string | null): void;
   openSettings(): void;
   closeSettings(): void;
-  changeView(visible: boolean): void;
   updateControls(): void;
 };
 
@@ -144,7 +135,7 @@ class AgentVideo {
 }
 
 export class SurvivalAgentView {
-  visible = false;
+  visible = true;
   private readonly video: AgentVideo;
   private state: SurvivalAgentSnapshot | null = null;
   private online = false;
@@ -199,11 +190,7 @@ export class SurvivalAgentView {
       ui.openSettings();
       select.focus();
     });
-    el("survival-agent-return").addEventListener("click", () => {
-      if (this.state?.phase !== "ended" || this.locksModel) return;
-      this.show(false);
-      el("new-task").focus({ preventScroll: true });
-    });
+
   }
 
   private get active() {
@@ -226,7 +213,6 @@ export class SurvivalAgentView {
   setModelConflict(conflict: string | null) {
     if (this.conflict === conflict) return;
     this.conflict = conflict;
-    if (conflict && this.state?.phase === "ended" && !this.locksModel) this.show(false);
     this.renderSettings();
   }
 
@@ -307,23 +293,16 @@ export class SurvivalAgentView {
     this.unresolvedStart = false;
     if (this.active) {
       this.startError = null;
-      this.show(true);
       if (matchesSubmittedStart) this.ui.closeSettings();
     }
     else {
       this.stopError = null;
-      if (next.phase === "idle") this.show(false);
       if (next.phase === "ended" && (wasActive || matchesSubmittedStart)) {
         // Require a fresh opt-in for the next world.
         this.ui.el<HTMLSelectElement>("survival-agent-strategy").value = "deterministic";
       }
     }
     this.dialogStart = null;
-  }
-  private show(visible: boolean) {
-    if (visible === this.visible) return;
-    this.visible = visible;
-    this.ui.changeView(visible);
   }
   private renderSettings() {
     const { el, text, errorText } = this.ui, s = this.state;
@@ -421,7 +400,7 @@ export class SurvivalAgentView {
       text("survival-agent-strategy-outcome", strategyOutcome === null ? "" : strategyOutcomeLabels[strategyOutcome]);
       errorText("survival-agent-control-error", this.stopError ?? this.readError);
       el("survival-agent-check").hidden = !this.readError || !this.online;
-      el("survival-agent-choose").hidden = el("survival-agent-return").hidden = !ended;
+      el("survival-agent-choose").hidden = this.active;
       const stop = el<HTMLButtonElement>("survival-agent-stop");
       stop.hidden = ended;
       stop.disabled = !this.online || !this.known || !this.active || s.phase === "stopping" || this.command !== null;

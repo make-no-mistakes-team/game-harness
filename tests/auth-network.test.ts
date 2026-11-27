@@ -5,14 +5,14 @@ import { join } from "node:path";
 import { createServer } from "node:http";
 import type { Socket } from "node:net";
 import { fileURLToPath } from "node:url";
-import { authWorkerEnvironment } from "../src/server/auth-network.ts";
-import { AuthManager } from "../src/server/auth.ts";
+import { authWorkerEnvironment } from "../src/auth/network.ts";
+import { AuthManager } from "../src/auth/manager.ts";
 
 test("browser login exposes the provider HTTPS URL rather than the SDK loopback launch shortcut", async () => {
   const directory = mkdtempSync(join(tmpdir(), "gameharness-browser-auth-"));
   const spawn = Bun.spawn;
   const intercepted = spyOn(Bun, "spawn").mockImplementation(((command: string[], options: object) => {
-    if (!command.some(part => part.endsWith("/auth-worker.ts")))
+    if (!command.some(part => part.endsWith("/worker.ts")))
       throw new Error("Only the isolated OAuth worker may start in this fixture");
     // Substitute only the child/provider seam, keeping real IPC decoding,
     // parent URL validation, state publication and owned cancellation.
@@ -76,7 +76,7 @@ test("OAuth initiation reaches the configured proxy before account sign-in", asy
     [
       process.execPath,
       "--no-env-file",
-      fileURLToPath(new URL("../src/server/auth-worker.ts", import.meta.url)),
+      fileURLToPath(new URL("../src/auth/worker.ts", import.meta.url)),
       "device",
     ],
     { env: network, stdin: "pipe", stdout: "ignore", stderr: "ignore" },

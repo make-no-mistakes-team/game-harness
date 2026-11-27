@@ -11,7 +11,7 @@ const credentialChunks: Buffer[] = [];
 mock.module("node:child_process", () => ({ ...processes,
   spawn(command: string, args: string[]) {
     assert.equal(command, "/usr/bin/python3");
-    assert.ok(args[0]?.endsWith("/native/minecraft/launcher-auth.py"));
+    assert.ok(args[0]?.endsWith("/mod/bootstrap/launcher-auth.py"));
     readers++;
     const reader = new EventEmitter() as processes.ChildProcessWithoutNullStreams;
     reader.stdout = new PassThrough();
@@ -40,40 +40,21 @@ globalThis.fetch = (async (url: string | URL | Request, options?: RequestInit) =
     name: scenario === "mismatch-name" ? "Another" : "Synthetic" });
 }) as typeof fetch;
 
-const { MinecraftClient } = await import("../../src/server/minecraft-client.ts");
-const { preparationFailure } = await import("../../src/server/prepared-source-error.ts");
+const { MinecraftClient } = await import("../../src/minecraft/client.ts");
+const { nativeLaunchFailure } = await import("../../src/minecraft/launch-fault.ts");
+const preparationFailure = (error: unknown) => nativeLaunchFailure(error) ?? { code: "service_failure" };
 const client = new MinecraftClient(process.cwd(), { sourceMinecraft: "/synthetic/never-read" });
 const abort = new AbortController();
 if (scenario === "aborted") abort.abort();
-if (scenario === "bridge") {
-  const { GameBridgeClient } = await import("../../src/server/game-bridge.ts");
-  const { minecraftTestAdapter } = await import("./adapter-contract.ts");
-  const adapter = minecraftTestAdapter();
-  const bridge = new GameBridgeClient(process.cwd(), { sourceMinecraft: "/synthetic/never-read",
-    descriptor: adapter.descriptor, schemas: adapter.schemas, adapter });
-  try {
-    await assert.rejects(bridge.connect({ host: "127.0.0.1", port: 25565, world_id: "fixture",
-      epoch: 1, version: "1.21.4" }), error => {
-      const failure = preparationFailure(error);
-      assert.equal(failure.code, "official_session_unavailable");
-      assert.equal(failure.stage, "native_launch");
-      assert.equal(bridge.snapshot().error, failure.error);
-      return true;
-    });
-    assert.equal(bridge.snapshot().session_id, null);
-    assert.equal(bridge.snapshot().video.frames, 0);
-    assert.equal(readers, 1);
-    assert.equal(requests, 2);
-  } finally { await bridge.close(); }
-} else if (scenario === "ready" || scenario === "recheck") {
+if (scenario === "ready" || scenario === "recheck") {
   assert.equal(await client.assertOfficialSessionReady(abort.signal), undefined);
   assert.equal(readers, 1);
   assert.equal(requests, 2);
   if (scenario === "recheck") {
     // The early pass grants nothing: actual launch must perform the same check again,
     // before any native artifact, filesystem preparation or child can start.
-    await assert.rejects(client.launch({ host: "127.0.0.1", port: 25565, world_id: "fixture", epoch: 1 },
-      1, 2, abort.signal), error => {
+    await assert.rejects(client.launchAgent({ runtimeCache: "/synthetic", port: 25565, goal: "diamond", evidenceDir: "/synthetic",
+      display: ":99", authority: "/synthetic", stillOwned: () => true }, abort.signal), error => {
       assert.deepEqual(preparationFailure(error), { stage: "native_launch", code: "official_session_unavailable",
         error: "The official Launcher Minecraft session is unavailable. Sign in and launch Minecraft 1.21.4 with the official Launcher." });
       return true;

@@ -31,3 +31,5 @@ export async function launchDesktop(): Promise<never> {
   process.once("SIGTERM", close);
   process.exit(await desktop.exited);
 }
+
+if (import.meta.main) await launchDesktop();

@@ -221,7 +221,7 @@ const commands = {
     first();
     const children = ["survival", "diagnostic"].map(lane => Bun.spawn([
       process.execPath, "--no-env-file", "--eval", \`
-        const { admitRun } = await import("./survival-agent/storage.ts");
+        const { admitRun } = await import("./src/agent/storage.ts");
         const release = await admitRun(17, "\${lane}", undefined, { campaign: "recovery-development" });
         console.log("held");
         for await (const line of console) { if (line === "drain") break; }
@@ -282,9 +282,9 @@ async function withScanner(scenario: string, command: keyof typeof commands = "a
   try {
     // Use the real entry point and ledger in a temporary checkout. Only the
     // external scanner's replies are scripted, so no timing race is required.
-    for (const directory of ["survival-agent", "src/evaluation", "bin", "runtime", "reports", "governance", "data"])
+    for (const directory of ["src/agent", "bin", "runtime", "reports", "governance", "data"])
       mkdirSync(join(project, directory), { recursive: true });
-    for (const source of ["survival-agent/storage.ts", "survival-agent/storage-campaign.ts", "src/evaluation/paths.ts"])
+    for (const source of ["src/agent/storage.ts", "src/agent/storage-campaign.ts", "src/agent/paths.ts"])
       copyFileSync(join(import.meta.dir, "..", source), join(project, source));
     const scans = join(project, "scans");
     writeFileSync(scans, "");
@@ -332,12 +332,12 @@ esac
     const child = Bun.spawn([process.execPath, "--no-env-file", "--eval", `
       if (process.env.CASE === "campaign-soft-limit") {
         const { mock } = await import("bun:test");
-        const original = await import("./survival-agent/storage-campaign.ts");
-        mock.module("./survival-agent/storage-campaign.ts", () => ({
+        const original = await import("./src/agent/storage-campaign.ts");
+        mock.module("./src/agent/storage-campaign.ts", () => ({
           ...original, campaignBytes: () => 400_000_000_001,
         }));
       }
-      const storage = await import("./survival-agent/storage.ts");
+      const storage = await import("./src/agent/storage.ts");
       const { diskBytes } = storage;
       const admitRun = ${campaign}
         ? (bytes, lane, recovery) => storage.admitRun(bytes, lane, recovery, { campaign: "recovery-development" })

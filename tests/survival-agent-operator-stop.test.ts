@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openOperatorStop, readOrdinaryLiveRun, requestOperatorStop, serverSaveEvidence } from "../survival-agent/operator-stop.ts";
+import { openOperatorStop, readOrdinaryLiveRun, requestOperatorStop, serverSaveEvidence } from "../src/agent/operator-stop.ts";
 
 test("only a private request for the exact active owner can stop an ordinary run", async () => {
   const root = await mkdtemp(join(tmpdir(), "survival-operator-stop-"));

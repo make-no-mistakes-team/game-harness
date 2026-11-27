@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { javaProxyArguments } from "../src/server/java-network.ts";
+import { javaProxyArguments } from "../src/minecraft/java-network.ts";
 
 const secret = "synthetic-proxy-password-DO-NOT-LOG-84721";
 const selected = {

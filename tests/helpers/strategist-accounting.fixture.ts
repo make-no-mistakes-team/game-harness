@@ -9,7 +9,7 @@ const signal = new AbortController();
 const model = { provider: "fixture", modelId: "accounting" };
 let now = 100_000;
 Date.now = () => now;
-mock.module("../../src/server/auth.ts", () => ({
+mock.module("../../src/auth/manager.ts", () => ({
   AuthManager: { create: async () => ({
     snapshot: () => ({ status: "ready", authenticated: true, provider: model.provider,
       models: [{ id: model.modelId, provider: model.provider }] }),
@@ -26,7 +26,7 @@ mock.module("../../src/server/auth.ts", () => ({
     close: async () => {},
   }) },
 }));
-const { composeMacroStrategist } = await import("../../src/server/survival-macro/strategist.ts");
+const { composeMacroStrategist } = await import("../../src/strategist/strategist.ts");
 async function until<T>(read: () => Promise<T>, accept: (value: T) => boolean) {
   for (let i = 0; i < 150; i++) {
     const value = await read().catch(() => null);

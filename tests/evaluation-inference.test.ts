@@ -8,9 +8,8 @@ import { streamSimple, type AssistantMessage, type RawSseEvent, type SimpleStrea
 import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
-import { AuthManager } from "../src/server/auth.ts";
-import { ProviderUsageCollector } from "../src/server/provider-usage.ts";
-import { singleDispatchCodexStream } from "../src/server/evaluation-inference.ts";
+import { AuthManager } from "../src/auth/manager.ts";
+import { singleDispatchCodexStream } from "../src/auth/inference.ts";
 
 // The explicit baseline executes the same actual SDK/server/assertions before
 // the host fence exists. It is not used by the application or the green run.
@@ -108,7 +107,6 @@ async function fixture(respond: (request: Request, ordinal: number) => Response 
   const model = { ...getBundledModel<"openai-codex-responses">("openai-codex", descriptor.id),
     baseUrl: `http://127.0.0.1:${server.port}/codex/responses`, preferWebsockets: false };
   const stream = options.bounded === false ? streamSimple : await evaluationStream();
-  const usage = new ProviderUsageCollector("loopback-admission");
   const wireEvents: RawSseEvent[] = [];
   let resolutions = 0, delegatedFetches = 0;
   const agent = new Agent({ initialState: { model }, getApiKey: () => async () => ({
@@ -122,7 +120,6 @@ async function fixture(respond: (request: Request, ordinal: number) => Response 
       return fetch(input, init);
     }, onSseEvent: (event, eventModel) => {
       wireEvents.push(event);
-      usage.observe(event, eventModel ?? model);
     },
   }) });
   const messages: AssistantMessage[] = [];
@@ -132,7 +129,7 @@ async function fixture(respond: (request: Request, ordinal: number) => Response 
       streamedText += event.assistantMessageEvent.delta;
     if (event.type === "message_end" && event.message.role === "assistant") messages.push(event.message);
   });
-  return { agent, requests, messages, usage, wireEvents, get resolutions() { return resolutions; },
+  return { agent, requests, messages, wireEvents, get resolutions() { return resolutions; },
     get delegatedFetches() { return delegatedFetches; }, get streamedText() { return streamedText; },
     async close() { agent.abort("Local test cleanup"); await agent.waitForIdle(); await server.stop(true); } };
 }
@@ -148,7 +145,6 @@ for (const status of [503, 429]) test(`evaluation terminates HTTP ${status} with
     expect(f.messages.at(-1)).toMatchObject({ stopReason: "error", errorStatus: status, credentialId: 17 });
     expect(f.messages.at(-1)?.errorMessage).toContain(status === 429 ? "rate limit" : "Local first failure");
     expect(f.messages.at(-1)?.errorMessage).toContain("retry-after-ms=1");
-    expect(f.usage.finish(f.messages.at(-1) ?? null).provider_terminal).toBeNull();
     expect(f.requests[0]?.account).toBe("loopback-account");
   } finally { await f.close(); }
 }, 15000);
@@ -162,7 +158,6 @@ for (const partial of [false, true]) test(`evaluation stream failure ends reques
     expect(f.messages.at(-1)).toMatchObject({ stopReason: "error", credentialId: 17 });
     expect(f.messages.at(-1)?.errorMessage).toContain("Local retryable stream failure");
     expect(f.messages.at(-1)?.errorClassificationMessage).toBe("server_error");
-    expect(f.usage.finish(f.messages.at(-1) ?? null).provider_terminal).toBeNull();
     if (partial) expect(f.streamedText).toContain("Partial local output");
   } finally { await f.close(); }
 }, 15000);
@@ -224,7 +219,6 @@ test("evaluation provider failure rejects completed tool calls without another l
       type: "function_call", call_id: "local-observe-call", name: "observe", arguments: "{}",
     });
     expect(raw.find(event => event.type === "response.failed")?.response.error.code).toBe("stream_read_error");
-    expect(f.usage.finish(f.messages.at(-1) ?? null).provider_terminal).toBeNull();
   } finally { await f.close(); }
 }, 15000);
 
@@ -282,7 +276,6 @@ test("evaluation fences post-stream recovery when a response ends without a term
     expect(f.messages.at(-1)?.errorStatus).toBeUndefined();
     expect(f.messages.at(-1)?.errorMessage).toContain("recovery replay refused");
     expect(f.messages.at(-1)?.errorClassificationMessage).toBe("host_recovery_replay_refused");
-    expect(f.usage.finish(f.messages.at(-1) ?? null).provider_terminal).toBeNull();
   } finally { await f.close(); }
 }, 15000);
 

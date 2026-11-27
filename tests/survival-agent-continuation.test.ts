@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { savedWorld } from "../survival-agent/run.ts";
+import { savedWorld } from "../src/agent/run.ts";
 
 test("ordinary continuation refuses ore-assisted or explicitly non-campaign parents", async () => {
   const root = await mkdtemp(join(tmpdir(), "gameharness-continuation-"));

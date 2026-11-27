@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { prepareAgentAssets, prepareFabricClientClasspath } from "../src/server/minecraft-client.ts";
+import { prepareAgentAssets, prepareFabricClientClasspath } from "../src/minecraft/client.ts";
 
 test("Fabric classpath never requests profile metadata or accepts unverified JARs", async () => {
   const root = await mkdtemp(join(tmpdir(), "fabric-client-classpath-"));

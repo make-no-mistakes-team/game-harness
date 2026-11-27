@@ -3,7 +3,7 @@ import { appendFile, link, mkdir, mkdtemp, readFile, rm, writeFile } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { readCrashAutosave } from "../survival-agent/crash-autosave.ts";
+import { readCrashAutosave } from "../src/agent/crash-autosave.ts";
 
 const run = "2026-01-01T00-00-02.000Z-diamond-Xy4321";
 const parent = "2026-01-01T00-00-01.000Z-iron_pickaxe-abc123";

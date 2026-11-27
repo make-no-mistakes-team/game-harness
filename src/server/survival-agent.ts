@@ -6,12 +6,12 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
-import { requestOperatorStop } from "../../survival-agent/operator-stop.ts";
-import { hasConfirmedModelEffect, survivalModelIdentity, SURVIVAL_AGENT_STRATEGY_OUTCOMES,
-  type SurvivalAgentGoal, type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../shared/survival-agent-ui.ts";
-import { prepareAgentServerArtifact } from "./minecraft-server-artifact.ts";
-import { MODEL_ACTOR_REBUILD } from "./survival-agent-artifact.ts";
-import { AgentVideo, type AgentDisplay } from "./survival-agent-video.ts";
+import { requestOperatorStop } from "../agent/operator-stop.ts";
+import { survivalModelIdentity, SURVIVAL_AGENT_STRATEGY_OUTCOMES,
+  type SurvivalAgentGoal, type SurvivalAgentSnapshot, type SurvivalAgentStart } from "../shared/goals.ts";
+import { prepareAgentServerArtifact } from "../minecraft/server-artifact.ts";
+import { MODEL_ACTOR_REBUILD } from "../minecraft/mod-artifact.ts";
+import { AgentVideo, type AgentDisplay } from "./video.ts";
 
 const SYSTEM_PATH = "/usr/bin:/bin";
 const LIMIT_SECONDS: Record<SurvivalAgentGoal, number> = {
@@ -104,15 +104,11 @@ function modelOutcome(outcome: Record<string, unknown>): SurvivalAgentSnapshot["
   const status = SURVIVAL_AGENT_STRATEGY_OUTCOMES.find(value => value === strategy.outcome);
   if (status === "strategy_applied" || status === "no_advice_applied") {
     if (strategy.control !== "local") return null;
-    const counters = strategy.status as { providerDispatches?: unknown; applied?: unknown } | null;
     if (status === "strategy_applied" && !(strategy.admission === "admitted" &&
-        typeof counters?.applied === "number" && Number.isSafeInteger(counters.applied) && counters.applied > 0 &&
-        typeof counters.providerDispatches === "number" && Number.isSafeInteger(counters.providerDispatches) &&
-        counters.providerDispatches >= counters.applied)) return null;
+        typeof strategy.plansApplied === "number" && Number.isSafeInteger(strategy.plansApplied) && strategy.plansApplied > 0 &&
+        typeof strategy.plansPublished === "number" && Number.isSafeInteger(strategy.plansPublished) &&
+        strategy.plansPublished >= strategy.plansApplied)) return null;
   }
-  if (status === "native_effect_completed" &&
-      (strategy.control === "local" || strategy.admission !== "admitted" || !hasConfirmedModelEffect(strategy.status)))
-    return null;
   return status ?? null;
 }
 
@@ -126,7 +122,7 @@ export function projectSurvivalResult(outcome: Record<string, unknown>, requeste
   const strategy = outcome.strategy as { strategy?: unknown; control?: unknown; model?: unknown } | null;
   const local = strategy?.control === "local" && strategy.strategy === "model" && typeof strategy.model === "string" && strategy.model.includes("/");
   const won = exitCode === 0 && outcome.status === "won" && (outcome.verification as { verified?: unknown } | null)?.verified === true &&
-    (requested === "deterministic" || local || strategyOutcome === "native_effect_completed");
+    (requested === "deterministic" || local);
   return { strategyOutcome, won, local };
 }
 
@@ -267,7 +263,7 @@ export class SurvivalAgent {
     const consents = await Promise.all([...consentPaths].map((directory) => readJson(path.join(directory, "provisioning-consent.json"))));
     if (!consents.some((consent) => consent?.eulaAccepted === true && consent.minecraftVersion === "1.21.4" &&
         consent.eulaUrl === "https://www.minecraft.net/en-us/eula")) throw new AgentLaunchFault(EULA_REQUIRED);
-    if (!await isReadable(path.join(this.root, "survival-agent/build/libs/survival-agent-1.0.jar")))
+    if (!await isReadable(path.join(this.root, "mod/build/libs/survival-agent-1.0.jar")))
       throw new AgentLaunchFault(attempt.strategy === "model" ? MODEL_ACTOR_REBUILD :
         "Build GameHarness with bun run build to install the Minecraft Survival Agent mod, then try again.");
     const version = path.join(homedir(), ".minecraft/versions/1.21.4/1.21.4");
@@ -312,7 +308,7 @@ export class SurvivalAgent {
   }
 
   private async run(attempt: Attempt, tools: { wrapper: string; xvfb: string; ffmpeg: string }, authority: string) {
-    const command = [process.execPath, path.join(this.root, "survival-agent/run.ts")];
+    const command = [process.execPath, path.join(this.root, "src/agent/run.ts")];
     if (attempt.strategy === "model") command.push("--strategy", "model", "--model", survivalModelIdentity(attempt.model!));
     command.push(attempt.goal, String(LIMIT_SECONDS[attempt.goal]));
     const env: NodeJS.ProcessEnv = { PATH: SYSTEM_PATH, GAMEHARNESS_DATA_DIR: this.dataDir };
@@ -401,9 +397,6 @@ export class SurvivalAgent {
         attempt.view.won = won;
         if (outcome.finalStage === "macro_startup" && strategyOutcome === "provider_unavailable")
           return `Could not start model strategy. Check the connected account and selected model ${attempt.view.model}.`;
-        if (attempt.strategy === "model" && !local && strategyOutcome !== "native_effect_completed" &&
-            (outcome.benchmark as { confirmed?: unknown } | null)?.confirmed === true)
-          return "The vanilla goal was verified, but no Model action was confirmed.";
         return outcome.status === "won" && !attempt.view.won ? "The agent’s goal could not be verified." : outcomeStatus(outcome);
       }
     }

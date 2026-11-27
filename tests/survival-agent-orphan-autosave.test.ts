@@ -4,7 +4,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { openOrphanAutosave } from "../survival-agent/crash-autosave.ts";
+import { openOrphanAutosave } from "../src/agent/crash-autosave.ts";
 
 const iso = (ms: number) => new Date(ms).toISOString();
 const prefix = (ms: number) => iso(ms).replaceAll(":", "-");

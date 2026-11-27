@@ -1,135 +1,70 @@
-import type { ServerWebSocket, WebSocketHandler } from "bun";
-import { decodeNativeVideoHeader, MAX_NATIVE_VIDEO_FRAME_BYTES, type NativeVideoHeader } from "../shared/video.ts";
-
-export interface VideoSocketData {
-  expires: number;
-  lastSequence: number | null;
+export interface AgentDisplay {
+  display: string;
+  authority: string;
+  ffmpeg: string;
+  live(): boolean;
 }
 
-export function inspectVideoFrame(
-  frame: Uint8Array,
-  now = Date.now(),
-): NativeVideoHeader | null {
-  const header = decodeNativeVideoHeader(frame);
-  if (
-    !header ||
-    frame.byteLength !== header.headerBytes + header.width * header.height * 4 ||
-    header.capturedAt > now + 2000 ||
-    now - header.capturedAt > 5000
-  )
-    return null;
-  return header;
-}
+const BOUNDARY = "agentframe";
+type Viewer = { close(): Promise<void> };
 
-export class VideoStream {
-  private readonly clients = new Set<ServerWebSocket<VideoSocketData>>();
-  private readonly pendingDrains = new Set<ServerWebSocket<VideoSocketData>>();
-  private frame: Uint8Array | null = null;
-  private header: NativeVideoHeader | null = null;
-  private published = 0;
-  private sends = 0;
-  private queuedSends = 0;
-  private rejectedSends = 0;
-  private backpressureSkips = 0;
-  private drains = 0;
+/** Private Xvfb capture with bounded readers; each viewer starts at its own MIME boundary. */
+export class AgentVideo {
+  private readonly viewers = new Set<Viewer>();
 
-  constructor(private readonly onTiming?: (milliseconds: number) => void) {}
-
-  readonly handlers: WebSocketHandler<VideoSocketData> = {
-    maxPayloadLength: 1024,
-    backpressureLimit: MAX_NATIVE_VIDEO_FRAME_BYTES + 65536,
-    closeOnBackpressureLimit: true,
-    idleTimeout: 60,
-    sendPings: true,
-    open: (socket) => {
-      if (this.clients.size >= 4) {
-        socket.close(1013, "The local viewer limit has been reached");
-        return;
-      }
-      this.clients.add(socket);
-      this.send(socket);
-    },
-    message: (socket) => {
-      socket.close(1008, "The game view is read-only");
-    },
-    drain: (socket) => {
-      this.drains++;
-      if (this.pendingDrains.has(socket)) return;
-      this.pendingDrains.add(socket);
-      // Inline sends here strand queued large frames on Bun 1.3.14.
-      setImmediate(() => {
-        this.pendingDrains.delete(socket);
-        if (this.clients.has(socket) && socket.readyState === WebSocket.OPEN)
-          this.send(socket);
-      });
-    },
-    close: (socket) => {
-      this.clients.delete(socket);
-      this.pendingDrains.delete(socket);
-    },
-  };
-
-  publish(frame: Uint8Array): void {
-    const start = performance.now();
-    const header = inspectVideoFrame(frame);
-    if (!header) return;
-    this.published++;
-    this.frame = frame;
-    this.header = header;
-    for (const client of this.clients) this.send(client);
-    this.onTiming?.(performance.now() - start);
+  open(source: AgentDisplay, signal: AbortSignal, expires: number, headers: Record<string, string>): Response | null {
+    if (this.viewers.size >= 2 || signal.aborted || expires <= Date.now() || !source.live()) return null;
+    const child = Bun.spawn([source.ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+      "-f", "x11grab", "-framerate", "15", "-draw_mouse", "1", "-video_size", "1280x720",
+      "-i", `${source.display}+0,0`, "-an", "-vf", "scale=960:540", "-c:v", "mjpeg",
+      "-threads", "2", "-q:v", "5", "-f", "mpjpeg", "-boundary_tag", BOUNDARY, "pipe:1"], {
+      env: { PATH: "/usr/bin:/bin", XAUTHORITY: source.authority },
+      stdin: "ignore", stdout: "pipe", stderr: "ignore",
+    });
+    const reader = child.stdout.getReader();
+    let controller: ReadableStreamDefaultController<Uint8Array>;
+    let closing: Promise<void> | undefined;
+    let expiry: ReturnType<typeof setTimeout>;
+    const viewer: Viewer = { close: () => {
+      closing ??= (async () => {
+        signal.removeEventListener("abort", abort);
+        clearTimeout(expiry);
+        try { controller.close(); } catch { /* Already cancelled by the reader. */ }
+        if (child.exitCode === null) child.kill("SIGTERM");
+        const force = setTimeout(() => { if (child.exitCode === null) child.kill("SIGKILL"); }, 2000);
+        try {
+          await Promise.allSettled([reader.cancel(), child.exited]);
+        } finally {
+          clearTimeout(force);
+          this.viewers.delete(viewer);
+        }
+      })();
+      return closing;
+    } };
+    const abort = () => { void viewer.close(); };
+    const stream = new ReadableStream<Uint8Array>({
+      start(streamController) { controller = streamController; },
+      async pull(streamController) {
+        try {
+          const frame = await reader.read();
+          if (closing) return;
+          if (frame.done) await viewer.close();
+          else streamController.enqueue(frame.value);
+        } catch { await viewer.close(); }
+      },
+      cancel() { return viewer.close(); },
+    });
+    this.viewers.add(viewer);
+    expiry = setTimeout(abort, expires - Date.now());
+    signal.addEventListener("abort", abort, { once: true });
+    void child.exited.catch(abort);
+    return new Response(stream, {
+      headers: { ...headers, "Cross-Origin-Resource-Policy": "same-origin",
+        "Content-Type": `multipart/x-mixed-replace; boundary=${BOUNDARY}` },
+    });
   }
 
-  clear(): void {
-    this.frame = null;
-    this.header = null;
-    for (const client of this.clients) client.data.lastSequence = null;
-  }
-
-  snapshot() {
-    return {
-      published_frames: this.published,
-      send_attempts: this.sends,
-      queued_sends: this.queuedSends,
-      rejected_sends: this.rejectedSends,
-      backpressure_skips: this.backpressureSkips,
-      drain_events: this.drains,
-      clients: [...this.clients].map((client) => ({
-        ready_state: client.readyState,
-        buffered_bytes: client.getBufferedAmount(),
-        last_sequence: client.data.lastSequence,
-      })),
-    };
-  }
-
-  close(): void {
-    this.clear();
-    for (const client of this.clients)
-      client.close(1001, "GameHarness is closing");
-    this.clients.clear();
-    this.pendingDrains.clear();
-  }
-
-  private send(socket: ServerWebSocket<VideoSocketData>): void {
-    if (socket.data.expires <= Date.now()) {
-      socket.close(1008, "The local session expired");
-      return;
-    }
-    if (
-      !this.frame ||
-      !this.header ||
-      Date.now() - this.header.capturedAt > 5000 ||
-      socket.data.lastSequence === this.header.sequence
-    )
-      return;
-    if (socket.getBufferedAmount() > 0) {
-      this.backpressureSkips++;
-      return;
-    }
-    this.sends++;
-    const result = socket.send(this.frame, false);
-    if (result === -1) this.queuedSends++;
-    else if (result === 0) this.rejectedSends++;
-    if (result !== 0) socket.data.lastSequence = this.header.sequence;
+  async close(): Promise<void> {
+    await Promise.all([...this.viewers].map((viewer) => viewer.close()));
   }
 }

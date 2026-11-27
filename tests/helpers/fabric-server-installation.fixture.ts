@@ -22,10 +22,8 @@ let spawnCount = 0, childClosed = false, childAlive = false;
 let argumentsAtSpawn: string[] = [], preseedBytes: number | null = null, deadlineMs: number | null = null;
 const fetches: string[] = [];
 try {
-  await mkdir(path.join(project, "native/minecraft/build/libs"), { recursive: true, mode: 0o700 });
   await mkdir(path.join(directory, "mods"), { recursive: true, mode: 0o700 });
   await mkdir(cache, { recursive: true, mode: 0o700 });
-  await writeFile(path.join(project, "native/minecraft/build/libs/gameharness-native-1.0.0.jar"), nativeBytes);
   await writeFile(path.join(directory, "mods/fabric-api.jar"), "controlled existing API dependency");
   if (mode === "launcher-only") await writeFile(path.join(directory, "fabric-server-launch.jar"), "incomplete launcher");
   if (mode === "wrong-version") metadata.version = "1.21.3";
@@ -56,12 +54,6 @@ try {
     await symlink(path.join(root, "untouched-user-file"), path.join(directory, "server.jar"));
     await writeFile(path.join(root, "untouched-user-file"), "must not be overwritten");
   }
-  // Replace only the unrelated build-contract dependencies; the provisioning consumer, hash/copy,
-  // HTTP response checks, executable spawn, child closure, and completion validation remain real.
-  mock.module(path.resolve(import.meta.dir, "../../src/server/native-artifact.ts"), () => ({
-    readNativeArtifactContract: async () => ({ artifact_sha256: createHash("sha256").update(nativeBytes).digest("hex"), resource: null }),
-  }));
-  mock.module(path.resolve(import.meta.dir, "../../src/server/native-contract.ts"), () => ({ assertNativeContractFresh: async () => null }));
   const realSpawn = childProcess.spawn;
   mock.module("node:child_process", () => ({ ...childProcess, spawn: (...args: Parameters<typeof realSpawn>) => {
     spawnCount++;
@@ -101,7 +93,7 @@ await chmod(path.join(directory,"fabric-server-launch.jar"),0o664);
 `, { mode: 0o700 });
   process.env.GAMEHARNESS_DATA_DIR = path.join(root, "runtime");
   // The real consumer must load AFTER this subprocess's config and external-dependency mocks.
-  const { prepareFabricServer } = await import("../../src/server/minecraft-client.ts");
+  const { prepareFabricServer } = await import("../../src/minecraft/client.ts");
   const controller = new AbortController();
   const withCache = ["wrong-version", "corrupt", "truncated", "source-symlink", "source-directory-symlink", "source-directory-public", "destination-directory-public", "outside-source", "destination-symlink", "positive", "positive-tamper", "positive-abort"].includes(mode);
   if (mode === "positive-abort") controller.abort();

@@ -2,8 +2,8 @@ import { expect, test } from "bun:test";
 import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { closedParentDeath, LifeLedger, lifeReceiptReader } from "../survival-agent/lives.ts";
-import { readSavedPlayerStats, savedDeathDelta } from "../survival-agent/verify.ts";
+import { closedParentDeath, LifeLedger, lifeReceiptReader } from "../src/agent/lives.ts";
+import { readSavedPlayerStats, savedDeathDelta } from "../src/agent/verify.ts";
 
 function frame(tick: number, deaths: number, phase: "playing" | "death_screen" | "respawn_requested") {
   const alive = phase === "playing";

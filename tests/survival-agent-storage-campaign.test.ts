@@ -4,7 +4,7 @@ import { appendFileSync, linkSync, mkdirSync, mkdtempSync, rmSync, statSync, sym
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { campaignBytes, campaignInventory, campaignRoots, createCampaignTables,
-  developmentArtifactLimitBytes, hasCampaign } from "../survival-agent/storage-campaign.ts";
+  developmentArtifactLimitBytes, hasCampaign } from "../src/agent/storage-campaign.ts";
 
 test("a durable per-inode baseline excludes history without letting its deletion mask new files or in-place growth", async () => {
   const root = mkdtempSync(join(tmpdir(), "artifact-campaign-"));

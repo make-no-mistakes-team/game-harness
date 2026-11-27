@@ -6,8 +6,8 @@ import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
 import type { ApiKeyResolution, ApiKeyResolveContext, ResolvedApiKey } from "@oh-my-pi/pi-ai/auth-retry";
 import { Agent } from "@oh-my-pi/pi-agent-core/agent";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { AuthManager } from "../../src/server/auth.ts";
-import type { InferenceSessionConsumer } from "../../src/server/auth-session.ts";
+import { AuthManager } from "../../src/auth/manager.ts";
+import type { InferenceSessionConsumer } from "../../src/auth/session.ts";
 
 const provider = "openai-codex";
 const modelId = "gpt-6.1-sol";

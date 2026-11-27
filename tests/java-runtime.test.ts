@@ -18,8 +18,8 @@ const executables = Object.freeze({
   dirname: executable("dirname"),
   mkdir: executable("mkdir"),
 });
-const runtimeUrl = new URL("../src/server/minecraft-client.ts", import.meta.url).href;
-const gradlew = fileURLToPath(new URL("../native/minecraft/gradlew", import.meta.url));
+const runtimeUrl = new URL("../src/minecraft/client.ts", import.meta.url).href;
+const gradlew = fileURLToPath(new URL("../mod/gradlew", import.meta.url));
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });

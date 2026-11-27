@@ -15,10 +15,9 @@ test("an independently verified local goal survives an unavailable Model account
 
 test("an applied strategic decision is not an item pickup or victory", () => {
   const reported = { ...local, admission: "admitted", outcome: "strategy_applied" };
-  const run = { status: "interrupted", strategy: { ...reported, status: { providerDispatches: 2, applied: 1 } } };
+  const run = { status: "interrupted", strategy: { ...reported, plansPublished: 2, plansApplied: 1 } };
   expect(projectSurvivalResult(run, "model", 1, MODEL_IDENTITY)).toMatchObject({ won: false, strategyOutcome: "strategy_applied" });
-  expect(projectSurvivalResult({ ...goal, strategy: { ...reported, status: { providerDispatches: 1, applied: 0 } } },
+  expect(projectSurvivalResult({ ...goal, strategy: { ...reported, plansPublished: 1, plansApplied: 0 } },
     "model", 0, MODEL_IDENTITY)).toMatchObject({ won: true, strategyOutcome: null });
-  expect(projectSurvivalResult({ ...goal, strategy: { ...reported, control: "constrained", outcome: "no_completed_effect" } },
-    "model", 0, MODEL_IDENTITY)).toMatchObject({ won: false, strategyOutcome: "no_completed_effect" });
+
 });

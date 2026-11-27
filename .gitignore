@@ -6,10 +6,6 @@
 /.superpowers/
 __pycache__/
 *.py[cod]
-/policies/.venv/
-/policies/build/
-/policies/dist/
-/policies/*.egg-info/
 /PRODUCT.md
 /.impeccable/
 .env
@@ -20,9 +16,7 @@ __pycache__/
 *.key
 *.p12
 *.pfx
-/native/minecraft/.gradle/
-/native/minecraft/build/
-/native/minecraft/bin/
-/survival-*/.gradle/
-/survival-*/build/
-/survival-*/run/
+/mod/.gradle/
+/mod/build/
+/mod/run/
+/survival-pilot/

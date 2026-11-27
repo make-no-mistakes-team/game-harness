@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { appendFile, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -249,6 +249,12 @@ test("a newer primary, a displaced live descriptor, and a closing claim each fai
 
 test("transient systemd-run scopes with owner metadata, nested TMPDIR Xauthority, startup scan lag, and failed-stopped state verify cleanly", async () => {
   await fixture(async ({ open, root }) => {
+    const indexesDir = join(root, "client/native-client/assets/indexes");
+    await mkdir(indexesDir, { recursive: true, mode: 0o700 });
+    const indexFile = join(indexesDir, "19.json");
+    await writeFile(indexFile, "{}");
+    await chmod(indexFile, 0o664);
+    await symlink("/home/example/.minecraft/assets/objects", join(root, "client/native-client/assets/objects"), "dir");
     const source = await open({ failed: true });
     try {
       expect(source.root).toBe(root);
@@ -261,6 +267,13 @@ test("transient systemd-run scopes with owner metadata, nested TMPDIR Xauthority
     startupLagMs: 13_200,
     withOwner: true,
     withLegacyMarker: false,
+  });
+});
+
+test("arbitrary symlinks inside the run tree remain rejected", async () => {
+  await fixture(async ({ open, root }) => {
+    await symlink("/tmp/elsewhere", join(root, "server/world/rogue-link"));
+    await expect(open()).rejects.toThrow("link, unowned file or post-scope change");
   });
 });
 

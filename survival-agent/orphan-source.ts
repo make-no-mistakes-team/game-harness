@@ -371,6 +371,8 @@ export async function openOrphanSource(input: SourceInput,
         throw new Error("the source has a mount alias or process visibility is restricted");
     }
   }
+  const clientAssetsObjects = path.join(root, "client/native-client/assets/objects");
+  const clientAssetsIndexes = path.join(root, "client/native-client/assets/indexes");
   function getSnapshot(activeSignal: AbortSignal, before?: Map<string, string>) {
     let count = 0;
     const snapshot = before ?? new Map<string, string>();
@@ -378,10 +380,24 @@ export async function openOrphanSource(input: SourceInput,
       activeSignal.throwIfAborted();
       if (++count > maxTreeEntries) throw new Error("the primary tree is too large to fence safely");
       const entry = info(file);
-      if (entry.uid !== uid || entry.dev !== device || (entry.mode & 0o022n) ||
-          !(entry.isDirectory() || entry.isFile() && entry.nlink === 1n) || changedMs(entry) > Math.ceil(proof.stoppedAt))
+      const isLauncherAssetLink = file === clientAssetsObjects && entry.isSymbolicLink();
+      const isLauncherAssetIndex = path.dirname(file) === clientAssetsIndexes &&
+        /^[A-Za-z0-9_-]+\.json$/.test(path.basename(file)) && entry.isFile() && entry.nlink === 1n;
+      let signature = stamp(entry);
+      if (isLauncherAssetLink) {
+        const target = readlinkSync(file);
+        if (entry.uid !== uid || entry.dev !== device || changedMs(entry) > Math.ceil(proof.stoppedAt) ||
+            !path.isAbsolute(target) || !target.endsWith("/assets/objects") || inside(target, root))
+          throw new Error("the primary source contains a link, unowned file or post-scope change");
+        signature = `${signature}:${target}`;
+      } else if (isLauncherAssetIndex) {
+        if (entry.uid !== uid || entry.dev !== device || (entry.mode & 0o002n) ||
+            changedMs(entry) > Math.ceil(proof.stoppedAt))
+          throw new Error("the primary source contains a link, unowned file or post-scope change");
+      } else if (entry.uid !== uid || entry.dev !== device || (entry.mode & 0o022n) ||
+          !(entry.isDirectory() || entry.isFile() && entry.nlink === 1n) || changedMs(entry) > Math.ceil(proof.stoppedAt)) {
         throw new Error("the primary source contains a link, unowned file or post-scope change");
-      const signature = stamp(entry);
+      }
       if (before && before.get(file) !== signature) throw new Error("the source metadata changed during recovery");
       if (!before) snapshot.set(file, signature);
       if (entry.isDirectory()) for (const child of readdirSync(file)) walk(path.join(file, child));

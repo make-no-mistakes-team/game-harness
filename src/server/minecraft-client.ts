@@ -316,7 +316,9 @@ export async function prepareAgentAssets(source: string, directory: string, asse
   const indexes = path.join(assets, "indexes");
   await mkdir(assets, { mode: 0o700 });
   await mkdir(indexes, { mode: 0o700 });
-  await copyFile(path.join(installed, "indexes", `${assetIndex}.json`), path.join(indexes, `${assetIndex}.json`));
+  const indexDest = path.join(indexes, `${assetIndex}.json`);
+  await copyFile(path.join(installed, "indexes", `${assetIndex}.json`), indexDest);
+  await chmod(indexDest, 0o600);
   // Vanilla's ResourceIndex only reads these objects. PlayerSkinProvider writes under assets/skins instead.
   await symlink(objects, path.join(assets, "objects"), "dir");
   return assets;

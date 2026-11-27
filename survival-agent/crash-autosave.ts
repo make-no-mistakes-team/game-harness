@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { lstat, open, readdir, readFile } from "node:fs/promises";
+import { lstat, open, readdir, readFile, readlink } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import { SURVIVAL_AGENT_GOALS as GOALS, type SurvivalAgentGoal as Goal } from "../src/shared/survival-agent-ui.ts";
@@ -291,8 +291,29 @@ async function readAutosaveEvidence({
       });
     }
 
+    const clientAssetsObjects = path.join(root, "client/native-client/assets/objects");
+    const clientAssetsIndexes = path.join(root, "client/native-client/assets/indexes");
     let lastActivity = lastEvent, lastSaveWrite = 0;
     async function ownedTree(dir: string) {
+      if (dir === clientAssetsObjects) {
+        signal.throwIfAborted();
+        const entry = await lstat(dir);
+        const target = entry.isSymbolicLink() ? await readlink(dir) : "";
+        if (!entry.isSymbolicLink() || entry.uid !== uid || entry.dev !== device ||
+            !path.isAbsolute(target) || !target.endsWith("/assets/objects") ||
+            target === root || target.startsWith(`${root}${path.sep}`))
+          reject("source must be owned and contain no links");
+        lastActivity = Math.max(lastActivity, activityTime(entry));
+        return;
+      }
+      if (path.dirname(dir) === clientAssetsIndexes && /^[A-Za-z0-9_-]+\.json$/.test(path.basename(dir))) {
+        signal.throwIfAborted();
+        const entry = await lstat(dir);
+        if (!entry.isFile() || entry.uid !== uid || entry.dev !== device || entry.nlink !== 1 || (entry.mode & 0o002))
+          reject("source must be owned and contain no links");
+        lastActivity = Math.max(lastActivity, activityTime(entry));
+        return;
+      }
       const entry = await check(dir);
       lastActivity = Math.max(lastActivity, activityTime(entry));
       if (entry.isDirectory()) {

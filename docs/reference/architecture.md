@@ -1,73 +1,59 @@
 # Architecture and ownership
 
-The primary product is an ordinary Java Survival player with an asynchronous model advisor. Model selection is provider-agnostic; authorization for a particular gameplay test does not restrict the product to that model. Local activity must remain purposeful without waiting for advice. See [Survival play](../survival/play.md) and [behavior](../survival/behavior.md). The generic generated-program GameHarness described here is a retained experimental system. Its model-authored policy boundary is not a restriction on the ordinary Java player's implementation.
+GameHarness pairs a local Java 21 Fabric 1.21.4 Survival player with an
+asynchronous TypeScript strategist and host runner. Model selection is
+provider-agnostic; local gameplay continues without waiting for model replies.
+See [playing Survival](../survival/play.md) and
+[behavior](../survival/behavior.md).
 
-## Ordinary Survival control
+## Repository layout
 
-Local execution owns movement, aiming, tools, inventory and immediate threat
-response. A selected operation resumes before discovery selects another target
-or applies its stationary-start checks. Immediate danger can preempt it.
-Discovery must not alternate its old camera goal with the selected operation's
-goal.
-
-Waiting for a fresh observation is not an instruction to release every key.
-The owner retains safe protective input and continues movement only within its
-checked execution window. Takeoff acknowledgement must not silently withdraw
-the flight input. Once airborne, a forecast is advice for correction; actual
-contact or death determines the landing outcome.
-
-Macro applicability and readiness to adopt are separate. Ordinary movement or
-a temporarily missing view can defer adoption without retiring an unresolved
-strategic preference. At a safe transition, execution rechecks the selected
-method's current premises. A route tied to an old stance remains stance-bound;
-losing that route need not invalidate an unrelated relocation preference.
-
-## Generic GameHarness
-
-The trusted core owns lifecycle, strategic scheduling, authorization, persistence and the action ledger. A trusted GameAdapter owns the raw connection, filtered observations, mechanical capabilities, authentic view and game-specific verification. Generated JavaScript requests bounded capabilities; it cannot mutate the game directly.
-
-The strategist chooses procedures and repairs them. Disclosed helpers may execute selected movement, aiming, inventory transfers or recipes. Generic helpers must not conceal recursive gathering, combat strategy or task completion. Richer controllers require a declared assistance/comparator condition and provenance.
-
-Minecraft Java 1.21.4/Fabric under Java 21 is the first implemented adapter. Descriptor negotiation does not deliver another game or arbitrary trusted-plugin loading. The [context](../architecture/c4-context.md) and [container](../architecture/c4-containers.md) diagrams describe this experimental system.
-
-| Owner | Responsibility |
+| Path | Ownership |
 | --- | --- |
-| `Runtime` | Lifecycle, goal and trusted observation authority; composition seam |
-| `ActionArbiter` | Durable action admission, exclusive leaf-effect lease, retirement |
-| `StrategicPlanner` | Serialized requests, wakes, bounded context and usage |
-| `ReactiveRuntime` | Authored JS/Jev policies, trials and fenced preemption |
-| `SourcePrograms` | Source validation, exact dependency closure and publication |
-| `ProgramOperations` / `ProgramWorkspace` | Named authoring, execution, review and evidence use cases |
-| `SkillManager` | Execution trees, shared budgets, workers and capability broker |
-| `ControlSession` / `SessionEffects` | Executive decisions, keyed tasks, supervision and joined producer switching |
-| `ResidentAnalysis` | Effect-free analysis beside local control |
-| `ExperienceLibrary` | Compatible snapshots, fresh hydration and evidence-qualified reuse |
-| Program evidence/history | Attributable outcomes, immutable revisions and bounded derived views |
+| `mod/` | Fabric 1.21.4 client mod (`mod/gradlew`, `mod/build.gradle`, `mod/settings.gradle`), JUnit 5 suites under `mod/src/test/java/io/gameharness/survival/`, and launcher helpers in `mod/bootstrap/` (`Bootstrap.java`, `launcher-auth.py`). |
+| `src/agent/` | CLI runner (`run.ts`), option parsing (`strategy-options.ts`), SQLite admission/storage (`storage.ts`, `storage-campaign.ts`, `paths.ts`), continuation and recovery (`crash-autosave.ts`, `orphan-source.ts`, `release-orphan.ts`, `operator-stop.ts`), life/pause tracking (`lives.ts`, `pause-evidence.ts`), verification (`verify.ts`), and local stream/review servers (`watch.ts`, `reviews.ts`). |
+| `src/strategist/` | Asynchronous macro strategist (`strategist.ts`) connecting authenticated providers to the Java mod's bridge. |
+| `src/minecraft/` | Managed Fabric client/server launch and artifact handling (`client.ts`, `fabric-profile.ts`, `server-artifact.ts`, `mod-artifact.ts`, `java-network.ts`, `launch-fault.ts`). |
+| `src/auth/` | Provider authentication, credential store, session drain, and inference transport (`manager.ts`, `worker.ts`, `protocol.ts`, `network.ts`, `session.ts`, `inference.ts`). |
+| `src/diagnostics/` | Prepared single-mechanism and parallel test runners (`pool.ts`, `combat.ts`, `descent.ts`). |
+| `src/shared/` | Shared goal and auth contracts (`goals.ts`, `auth-types.ts`). |
+| `src/server/`, `web/`, `desktop/` | Minimal local HTTP/video server (`index.ts`, `survival-agent.ts`, `video.ts`), browser UI, and Electron shell for auth, EULA consent, launch, and live viewing. |
+| `scripts/`, `tests/` | Check and desktop launch scripts (`check.ts`, `dev.ts`, `start.ts`, `desktop.ts`) and Bun test suites. |
 
-Implementations live in [`src/server`](../../src/server/). DTOs and validators own exact fields; these pages explain invariants rather than maintaining a second API schema.
+Private runtime state, credentials, worlds, and recordings stay gitignored
+under `local/runtime/`, `local/survival-agent/`, and `local/survival-pilot/`.
 
-## Process boundaries
+## v2 Java Survival mod
 
-Default Runtime puts `StrategicPlanner`, actual SDK Agent callbacks and retained-context construction in one owned cognition process. The physical host retains native transport, capture/ACK handling, local-program supervision, action arbitration and retirement. An explicitly embedded Agent factory does not establish default-process isolation.
+All gameplay execution runs inside the Minecraft client under
+`mod/src/client/java/io/gameharness/survival/`:
 
-The cognition child reads canonical history readonly and submits bounded ordered metadata. Only the host writes canonical run state or admits tools. Request, turn, role, root, generation, scope and original deadline are checked before and after asynchronous work. A child snapshot cannot grant effects.
+| Module | Responsibility |
+| --- | --- |
+| `AgentClient` | Client tick entry point, lifecycle hooks, telemetry snapshots, and bridge wiring. |
+| `TaskRunner` | Top-level Survival progression loop: wood, stone, ores, crafting, smelting, food, and goal transitions. |
+| `Motor` | Bounded variable-speed camera aiming, gimbal-safe pitch/yaw handling, and movement keys. |
+| `Perception`, `AgentOpticalSight` | Camera-projected block/entity observation, baked-model alpha ray checks, and local terrain memory. |
+| `Pathfinder`, `RouteExecutor` | 3D A* path planning, headroom/staircase checks, pillar execution, and unreachable target blacklisting. |
+| `GuiHands`, `AgentGuiPointer`, `AgentCraftClick`, `AgentFurnaceSync` | Organic cursor movement, inventory/crafting/furnace interactions, and mixed-stack batch clamping. |
+| `SurvivalReflexes`, `CombatPlanner` | Hostile threat scoring, combat-flow escape checks, shielding, creeper kiting, emergency shelters, and gravel suffocation recovery. |
+| `SafeDescent` | Multi-method high-drop and cliff descent (water clutch/pour, boat drop, stairs, edge blocks) with lava/unseen-floor refusal. |
+| `CaveExplorer` | Perception-honest cave, ravine, and descending frontier tracking plus tunnel lighting. |
+| `PortalCaster` | Single-bucket shore-cast Nether portal builder for surface and deep (`y = -54`) lava pools, ignition, and entry. |
+| `InventoryTriage` | Automated clutter disposal while protecting tools, fuel, food, torches, buckets, and ore. |
+| `StrategistBridge`, `AgentPauseEpisodes` | Non-blocking advice intake from `src/strategist/strategist.ts` and pause-window telemetry. |
 
-Operator history/source serialization and SSE publication have a separate readonly process. The authenticated host handles controls, including Stop, and forwards encoded publication bytes. Live publication permits one update in flight and one latest dirty state; binary video retains finite viewers and per-viewer backpressure.
+## Host and UI process boundaries
 
-The derived history writer is a separate owned process, started on first use. Canonical persistence and physical control still share the host. Isolating cognition/publication does not protect control from the host's own stalls.
+`src/agent/run.ts` supervises one attempt at a time per lane: it validates
+admission and artifact budgets via `src/agent/storage.ts`, launches an isolated
+`Xvfb` display, managed 1.21.4 server, FFmpeg recorder, and Fabric client, and
+optionally runs `src/strategist/strategist.ts` alongside play. Clean shutdown
+drains the server and writes `outcome.json` before `src/agent/verify.ts` reads
+saved vanilla statistics.
 
-Factories own partial-startup rollback and joined shutdown. SQLite construction closes partial resources on failure. Importing the server entry creates no application, lock or signal handlers.
-
-## Language and deployment
-
-The reference deployment is local Linux x64: Bun 1.3.14+, TypeScript orchestration, Electron renderer, Java Fabric perception/motors/capture, isolated JavaScript workers and SQLite/immutable files. These are implementation choices, not a supported-platform matrix.
-
-Bounded versioned messages, deadlines, cancellation and authority checks define language-independent seams. A measured native optimization must preserve them; it cannot introduce a second skill format or bypass the adapter. TypeScript is not the per-tick gameplay motor.
-
-Strategic inference, local execution and optional reactive evaluation have independent lifetimes. A provider wait owns no avatar lease. Only a leaf effect owns the foreground lease; parents awaiting children do not. Compatible channels may overlap inside one bounded composite action.
-
-## Delivered and required
-
-Current async `run` uses a bounded body; pure `step`, `analyze` and `library` support pinned local modules. Ordinary async modules with `run(game,args,checkpoint)` and durable serializable task checkpoints remain requirements. They do not grant packages, ambient files/network/processes or saved JavaScript stacks.
-
-Current restart closes interrupted runs safely; it does not transparently continue them. General game checkpoint/reset/restore support, richer knowledge/search/startup bundles and another game require separate delivery evidence. See [recovery](recovery.md), [adapters](adapters.md), [experience](experience.md) and [runtime evidence](../evidence/runtime-processes.md).
+The minimal desktop app (`desktop/` + `web/` + `src/server/`) is a launcher
+and read-only viewer for the same v2 agent, plus account login and EULA setup.
+It never injects raw gameplay input or hijacks a terminal-owned run.
+See [providers](providers.md) and [security](security.md) for auth and
+isolation boundaries.

@@ -1,79 +1,73 @@
 # Survival perception and terrain hypotheses
 
-This page describes the ordinary native Survival player. The separate general
-harness has its own [adapter perception profile](../reference/perception.md).
-Neither should be described as framebuffer-only play.
+The Survival player does not receive hidden chunk maps, buried ore positions,
+world seeds, or server-only state. It is also not framebuffer-only: the client
+combines baked-geometry optical sight, short-range combat flow geometry, and
+explicit local terrain hypotheses.
 
 ## What counts as observed
 
-Outside combat flow, the client admits geometry through current camera
-projection, range, light and ray visibility. Loaded world data is not a map available to the planner.
-Knowing that a chunk contains a block does not make that block observed.
+Outside active combat flow, [`Perception`](../../mod/src/client/java/io/gameharness/survival/Perception.java)
+and [`AgentOpticalSight`](../../mod/src/client/java/io/gameharness/survival/AgentOpticalSight.java)
+admit blocks and entities through current camera projection, range, light, and
+ray visibility. A chunk loaded by Minecraft is not observed until the camera
+actually sees it.
 
-Optical sight uses loaded baked geometry and sprite alpha. Glass and panes can
-transmit sight; leaf gaps depend on the actual texture and graphics mode.
-FAST leaves remain opaque. Near magnified cutouts use the applicable texture
-sampling; uncertain animation/filtering and unsupported models are treated
-conservatively. This is an assisted optical approximation, not an exact GPU
-framebuffer reconstruction.
+Optical sight inspects loaded baked block models and sprite alpha. Glass and
+panes can transmit sight; leaf cutouts depend on the active texture and
+graphics mode (`FAST` leaves stay opaque). Magnified cutouts sample texture
+alpha conservatively, and unsupported models default to opaque. This is a fast
+optical approximation, not GPU framebuffer reconstruction.
 
-Physical contact, collision, placement and vanilla item-use rays remain
-separate. Seeing ore through glass does not permit striking through the glass.
-Seeing ground or water does not establish a traversable route or safe arrival.
+Visual sight, physical reach, collision, and vanilla item-use rays stay
+separate:
 
-A visible face point does not imply a visible block center. Keep the admitted
-point for gaze and revalidation rather than silently replacing it with the
-center. Tool work follows the actual physical first hit: a permitted natural
-leaf mask can be cleared while retaining the observed log goal. Removing
-occupied support requires an explicit descent action, not a generic mining
-exception.
-
-The implementation is in
-[`AgentOpticalSight`](../../survival-agent/src/client/java/io/gameharness/survival/AgentOpticalSight.java)
-and [`AgentBody`](../../survival-agent/src/client/java/io/gameharness/survival/AgentBody.java).
+- Seeing ore through glass or behind leaves does not allow striking through the
+  barrier. Natural leaves blocking a targeted log may be cleared by hand while
+  keeping the log objective.
+- A visible face point is kept for aiming and revalidation instead of being
+  replaced with the block center.
+- Seeing a floor, lava pool, or water surface does not prove a traversable path
+  or safe landing.
+- [`CaveExplorer`](../../mod/src/client/java/io/gameharness/survival/CaveExplorer.java)
+  records caves, ravines, and descending frontiers strictly from observed open
+  space and exposed dark openings, never from unloaded or occluded cavities.
 
 ## Combat flow geometry
 
-Confirmed hostile contact may enable a short-lived native geometry sensor
-within four blocks, including behind the player. It exposes nearby floor,
-steps, walls, ceiling and cliffs only up to the first solid barrier.
-Closed cavities beyond that barrier stay unknown. Block materials, resources,
-containers, items and hidden mobs are not supplied; unidentified liquid
-volumes cannot authorize a dry tread.
+Confirmed hostile contact can activate a short-lived local geometry check
+within four blocks of the player, including behind the camera. It reports
+nearby floor, steps, walls, ceilings, and cliffs only up to the first solid
+barrier; closed cavities beyond solid walls remain unknown.
 
-Flow geometry is not a visual observation. Its fresh, world/player/life-bound
-receipts may support reflexive movement without turning the camera first.
-They expire with the encounter and do not populate the ordinary exploration
-map. Actually traversed contacts remain the player's own experience.
-Ambient sounds or fall damage alone cannot activate flow. Attacks, mining
-and placement still require their normal current contact, reach and effect
-checks.
+Flow geometry exposes no block materials, ores, chests, dropped items, or
+hidden mobs, and unidentified liquid cannot authorize a dry step. Its receipts
+let `CombatPlanner` and `SurvivalReflexes` step back, block, or dodge without
+waiting for a full camera turn. They expire when the encounter ends and never
+populate the exploration map. Ambient sounds or fall damage alone cannot
+activate combat flow; attacks, mining, and block placement still require normal
+reach and contact checks.
 
 ## What counts as inferred
 
-Ordinary excavation can assume that nearby base rock continues; trunk work can
-assume a further log below an observed column. An initial prospect can expect
-base rock beneath soil without claiming to have seen it. Those are explicit,
-local, qualitative hypotheses. They do not reveal a specific hidden ore, its
-location, loot, a guaranteed floor or a return route.
+Ordinary digging and resource work may rely on explicit, qualitative local
+hypotheses:
 
-The belief model consumes admitted observations and actual action/physics
-outcomes. It cannot query hidden terrain to check whether its guess is right.
-An action may proceed under uncertainty. Newly exposed material, falls,
-collisions or fluids can disprove its premise and require another course.
+- Soil caps can conceal base rock when starting stone collection.
+- Base rock continues around an active mine face or downward staircase.
+- A visible tree trunk column may continue one block downward.
 
-Repeated views of the same source do not create unlimited new authority.
-Actual new observations may support another local action. World/life changes
-invalidate old hypotheses; contradictory local experience cannot silently
-become a fresh permit.
+Hypotheses never reveal specific hidden ore, cave pockets, loot, or a
+guaranteed safe floor. When a cut exposes air, water, lava, gravel, or a drop,
+real physics and fresh observations immediately override the assumption and
+trigger descent, retreat, or suffocation recovery.
 
-See [`AgentTerrainBeliefs`](../../survival-agent/src/client/java/io/gameharness/survival/AgentTerrainBeliefs.java)
-for the bounded model and the [behavior contract](behavior.md) for accepted
-risk and purposeful-play requirements.
+World or life transitions clear prior spatial memory and hypotheses. Repeated
+glances at the same unchanged block do not manufacture fresh authority.
 
 ## Keep outcomes separate
 
-A predicted support is not an observed support. A forecast water entry is not
-water contact. Actual arrival does not retroactively prove unseen material.
-Controller claims, inventory gain, verified goal completion and human judgment
-of movement quality remain different evidence.
+A predicted foothold is not a witnessed tread. A planned water clutch is not
+wet contact. Controller intent, inventory changes, verified goal statistics,
+and 1× visual inspection remain distinct evidence classes; see
+[behavior](behavior.md).

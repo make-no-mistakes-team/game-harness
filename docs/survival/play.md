@@ -1,59 +1,56 @@
 # Play ordinary Survival
 
-The Java local player controls movement, mining, tools, inventory and survival.
-A selected model can advise it asynchronously. Neither this implementation nor the
-historical [integration evidence](../evidence/integration-gameplay.md) proves
-diamonds and Nether entry in one fresh campaign. The required behavior and
-claim boundary are in [behavior](behavior.md).
+The Fabric 1.21.4 local player handles movement, mining, crafting, combat,
+descent, and portal construction. A configured model can advise it
+asynchronously. Neither the implementation nor retained
+[Survival evidence](../evidence/survival.md) proves diamonds and Nether entry
+in one fresh campaign yet; see [behavior](behavior.md) for the acceptance bar.
 
-Complete [setup](../setup.md), including Minecraft 1.21.4, official Launcher
-login, explicit EULA consent and server preparation.
+Complete [setup](../setup.md) first (Minecraft 1.21.4, official Launcher login,
+explicit EULA consent, and server download).
 
 ```sh
 bun run build:agent
 bun run play:agent diamond 1800
 ```
 
-The goal choices are `wooden_pickaxe`, `stone_pickaxe`, `iron_pickaxe`,
-`diamond`, and `nether_portal`. Seconds bound this attempt's wall time,
-including startup; the default is 900. The CLI accepts 1–2,147,483 seconds.
-Only a verified result exits 0. Startup, recording, storage, heartbeat and
-progress failures remain distinct outcomes.
+Available goals (owned by [`src/shared/goals.ts`](../../src/shared/goals.ts)):
+`wooden_pickaxe`, `stone_pickaxe`, `iron_pickaxe`, `diamond`,
+`diamond_pickaxe`, and `nether_portal`. The final numeric argument bounds wall
+time in seconds including startup (default `900`, up to `2,147,483`). Only a
+verified goal exits `0`; startup, recording, storage, heartbeat, and progress
+failures report distinct exit states.
 
-## Add model advice
+## Add asynchronous model advice
 
-After connecting the app's OpenAI account:
+After connecting a supported model account in the desktop launcher:
 
 ```sh
-bun run play:agent --strategy model --model PROVIDER/MODEL --macro-requests 8 diamond 1800
+bun run play:agent --strategy model --model PROVIDER/MODEL --macro-requests 160 diamond 7200
 ```
 
-Replace `PROVIDER/MODEL` with a connected model's provider-qualified identifier.
-Put strategy options **before** the goal and continuation flags **after**
-the seconds argument. The default allowance is eight requests for this attempt.
-Choose a finite positive allowance; request, wall-time, evidence and cleanup
-accounting remain per attempt.
+Replace `PROVIDER/MODEL` with a connected provider-qualified model identifier.
+Place strategy flags **before** the goal and continuation/recovery flags
+**after** the seconds argument. The default request budget is `8`; always set a
+finite positive limit per attempt.
 
-Ordinary model advice defaults to local control, live-observation startup and no
-skill-trial worlds. The local player starts immediately and continues when
-the advisor is slow, abstains, reaches its request limit or cannot connect.
-Advice selects a method at a safe decision point; it cannot grant a click,
-spend an item or require combat to wait. A native advice receipt establishes
-method application, not resource acquisition.
+Local execution starts immediately and keeps playing if the strategist is slow,
+abstains, hits its request cap, or loses connectivity. Advice selects a macro
+task or target direction at safe transitions via `StrategistBridge`; it cannot
+inject raw clicks, spend items directly, or pause combat reflexes. Routine
+prompts send goal, inventory, health, hunger, status, and available methods as
+text; repeated stalls can attach a private first-person frame. Requests count
+toward account usage.
 
-Routine advice receives the goal, carried stock, health, hunger, activity and
-available methods as text. Repeated local failures can add a private
-first-person image and a short incident history. The exact transmitted image
-is retained privately. Requests count toward account usage.
+## Minimal desktop launcher and viewer
 
-The desktop equivalent is **Settings → Minecraft Survival Agent**:
-choose a goal and either model-free control or an available model advisor,
-then **Start in new world**. The main view shows the actual client.
-**Stop agent** saves and closes that run; **Choose goal** prepares another
-fresh world. The desktop will not take over a terminal-owned ordinary run.
-Its goal form is not a free-form task editor.
+Run `bun run start` (or `bun run dev` / `bun run desktop`) to open the minimal
+desktop launcher. It handles provider login, Minecraft EULA consent, server
+preparation, goal/strategy selection, start/stop controls, and a read-only live
+view of the active client. It will not take over an already running CLI
+attempt.
 
-## Watch and inspect
+## Watch and inspect runs
 
 In a second terminal:
 
@@ -61,57 +58,53 @@ In a second terminal:
 bun run watch:agent
 ```
 
-Open `http://127.0.0.1:4379/` on the same computer. The read-only stream follows
-the private display and cursor; closing the tab does not stop recording.
-Keep the tab open between attempts. Existing exported review links require
-`bun run review:agent` on the same computer.
+Open `http://127.0.0.1:4379/` locally. Closing the browser tab never stops
+recording; keep it open across attempts. To view exported review packages
+locally, run `bun run review:agent`.
 
-The runner prints the private attempt directory. Inspect `screen.mp4` at
-normal speed, the finalized `outcome.json`, and receipts in `history.jsonl`
-and `events.jsonl`. Never publish raw run paths or private payloads.
-`pauseEvidence` identifies long stops and clusters of short ones;
-provider overlap is separate from useful work. A moving camera or completed
-craft does not prove natural pacing.
+Each launch prints its private attempt directory under `local/survival-agent/`.
+Inspect `screen.mp4` at 1× speed alongside `outcome.json`, `events.jsonl`, and
+`history.jsonl`. Never commit or publish raw run paths or payloads.
+`pauseEvidence` flags long stalls and clusters of short stops separately from
+provider overlap.
 
-## Stop without discarding the save
+## Stop without losing the save
 
-Use the basename printed for this attempt, not a world path:
+Use the printed **run basename** (not a filesystem path):
 
 ```sh
 RUN_BASENAME='replace-with-the-printed-run-basename'
-bun survival-agent/operator-stop.ts "$RUN_BASENAME"
+bun run stop:agent "$RUN_BASENAME"
 ```
 
-Keep the launcher and its private display alive until they exit.
-The command publishes a request; `operator_stop_accepted` is its runner receipt.
-A clean operator stop exits 1 and records `closed` / `interrupted`.
-If the server started, require `operatorStop.serverSaved: true` in the outcome
-and `dimensionsSaved: true` with no escalation in `server_drained`.
-Without these records, saving or cleanup is unconfirmed. Do not kill the
-launcher/display and call it a clean stop.
+Wait for the launcher and its private display to exit cleanly. The script
+([`src/agent/operator-stop.ts`](../../src/agent/operator-stop.ts)) posts a stop
+request; the runner acknowledges it with `operator_stop_accepted`, exits `1`,
+and records `closed` / `interrupted`. Confirm `operatorStop.serverSaved: true`
+in `outcome.json` and `dimensionsSaved: true` with no escalation in
+`server_drained`. Killing the launcher or display directly leaves save closure
+unconfirmed.
 
-Use [clean continuation or explicit recovery](recovery.md) for another attempt
-in that campaign. Reaching an already completed goal by loading its save earns
-no new win.
+To continue or recover a saved campaign, follow [recovery](recovery.md).
+Reloading a save that already finished the requested goal never earns a new
+win.
 
 ## Two independent worlds
 
-The second slot can run an ordinary fresh world or clean continuation:
+Run a second fresh or cleanly continued Survival world in parallel:
 
 ```sh
-bun run play:agent --parallel-world --strategy model --model PROVIDER/MODEL --macro-requests 8 nether_portal 7200
+bun run play:agent --parallel-world --strategy model --model PROVIDER/MODEL --macro-requests 160 nether_portal 7200
 bun run watch:agent --parallel-world
 ```
 
-Its stream is `http://127.0.0.1:4383/`. Displays, worlds, inventory, recording
-and run IDs are separate; neither player sees the other's world.
-The second slot shares capacity with diagnostics and cannot combine with
-recovery, incident replay or skill trials. Both slots share artifact accounting;
-[`storage.ts`](../../survival-agent/storage.ts) owns admission details.
-Development-run authorization and artifact policy are maintained separately in
+The second slot streams on `http://127.0.0.1:4383/` with its own display,
+world, inventory, recording, and run ID. It shares capacity with single-lane
+diagnostics and cannot combine with crash/orphan recovery or incident replay.
+Both slots share artifact accounting owned by
+[`src/agent/storage.ts`](../../src/agent/storage.ts) and governed by
 [model runs](../development/model-runs.md).
 
-A diamond in one world and Nether entry in the other do not satisfy the
-same-campaign objective. Include unsuccessful attempts alongside any win.
-Use [diagnostics](diagnostics.md) only for explicitly prepared or constrained
-experiments; those are separate evidence classes.
+A diamond in one world and Nether entry in another do not satisfy the
+same-campaign target. Report failed attempts alongside successes, and keep
+[diagnostics](diagnostics.md) separate from campaign claims.

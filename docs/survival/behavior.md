@@ -1,153 +1,114 @@
 # Survival behavior and acceptance
 
 The acceptance target is **diamonds and Nether entry in the same fresh Normal
-Survival campaign**, with purposeful local activity independent of model
-latency. The user-reported slow camera, roughly five-second pauses and awkward
-target switches are observed failures to address, not doubts to dismiss with
-passing fixtures. No retained integration result establishes this target.
+Survival campaign**, with purposeful local play independent of model latency.
+User-reported defects — slow camera movement, multi-second stalls, and erratic
+target switching — are ground truth, never overridden by passing unit tests or
+prepared fixtures. No retained run establishes this combined target yet.
 
-The local player owns ordinary movement, tools, crafting, workstations, food
-and immediate defense. The configured model makes asynchronous macro decisions.
-Useful local play continues without a reply. General model-authored GameHarness
-experiments are a separate system, not the ordinary player's policy.
+The local Java mod owns movement, mining, crafting, combat, descent, cave
+exploration, inventory management, and portal casting. A configured model
+advises asynchronously on macro goals; ordinary play continues when advice is
+delayed, absent, or exhausted.
 
 ## What must be visible in play
 
-- Smooth turns with useful variation in speed and effort, rather than a fixed
-  camera trajectory for every action.
-- Reachable aim points away from exact block centers. Mining may begin before
-  the camera fully settles when the actual crosshair already supports a safe
-  strike on the intended block.
-- Continuous travel across local targets and checked treads, without a full
-  stop, complete camera reset or model request at every waypoint.
-- Ordinary travel and exploration use useful arbitrary bearings. The block
-  grid can constrain a cut or placement, not restrict the player's gaze to
-  four directions.
-- Retain a meaningful aim target rather than repeatedly switching a little
-  left and right without useful progress.
-- A healthy player can leave elevated foliage for a witnessed dry landing with
-  modest survivable fall damage; searching forever for a damage-free route is
-  not a safe or useful outcome.
-- Ordinary excavation and descent may rely on explicit terrain hypotheses,
-  not a proof of every future block. Wrong assumptions can cause real falls,
-  lava exposure or death; immediate response uses actual new observations.
-- Threat response that interrupts work: flee, take cover or fight a visible
-  reachable hostile as conditions require. Combat cannot wait for a model.
-- Food seeking, eating and recovery when health/hunger require them.
-  Returning from a bad save at low health must not blindly resume mining.
-- Useful work while advice is pending. Necessary observation, furnace waiting
-  and safety checks are allowed; empty motion is not purposeful activity.
+- Smooth turns with natural variation in speed and effort, not one identical
+  camera trajectory for every gesture.
+- Off-center reachable aim points. Mining may start before the camera fully
+  settles when the live crosshair already hits the intended block safely.
+- Continuous travel across visible or walked treads on arbitrary bearings,
+  without stopping, re-zeroing aim, or calling a model at every waypoint.
+- Stable target commitment rather than oscillating left and right across
+  nearby blocks.
+- Decisive canopy and ledge exits: leave elevated foliage for a witnessed dry
+  landing (even with modest survivable fall damage) rather than wandering a
+  treetop indefinitely.
+- Excavation and descent under explicit local terrain hypotheses, updating
+  immediately from real falls, lava exposure, collisions, or damage.
+- Reflexive threat response that preempts chores: shield, fight, retreat, or
+  seal an emergency shelter without waiting on a model reply.
+- Food seeking, cooking, eating, and healing before resuming deep mining at low
+  health.
+- Useful local work while advice is pending or furnaces smelt. Legitimate waits
+  need no fake fidgeting.
 
-Review the whole recording at 1× alongside movement, contact, look, pause and
-provider receipts. A turn-speed sample, neutralized cancellation, visible
-inventory action or diagnostic portal is not proof of this combined experience.
+Judge full recordings at **1× speed** alongside movement, contact, look, pause,
+and provider receipts.
 
-## Local execution contract
+## Local v2 execution contract
 
-These requirements guide implementation; they are not a successful campaign
-claim. Existing controllers are defined in the
-[`survival` Java package](../../survival-agent/src/client/java/io/gameharness/survival/)
-and the [advisory host](../../src/server/survival-macro/expedition.ts).
-The [perception contract](perception.md) separates observations from hypotheses.
+These rules govern the v2 mod in
+[`mod/src/client/java/io/gameharness/survival/`](../../mod/src/client/java/io/gameharness/survival/)
+and the asynchronous strategist in
+[`src/strategist/strategist.ts`](../../src/strategist/strategist.ts). They
+define required behavior, not a claim of campaign completion. See
+[perception](perception.md) for observation and hypothesis limits.
 
-### Movement and camera
+### Movement, camera, and descent
 
-The local navigator keeps a destination across visible or previously walked
-treads. A route can go sideways, briefly away, up or down; a blocked crossing
-can trigger another local path toward the same destination. A reachable
-vantage supplies a new view, not proof of arrival at the resource.
-Short flat retraces can use backwards/sideways movement over freshly checked
-treads instead of a full turn. A missed frame releases movement keys; it does
-not by itself erase a checked one-block descent by the same player.
+`Pathfinder` and `RouteExecutor` plan 3D routes over witnessed or previously
+walked treads, clearing headroom before lower cuts, rejecting bare-handed digs
+on tool-required stone/sandstone, and cluster-blacklisting unreachable targets.
+`Motor` varies ordinary turn velocity within bounded acceleration while keeping
+gimbal-safe vertical aiming and protected steering for urgent reactions.
 
-Ordinary look motion varies safe gestures while retaining bounded acceleration
-and braking; urgent or precision contexts keep their protected steering.
-Face selection and actual crosshair contact govern mining. These mechanisms
-still require normal-speed footage review against the acceptance above.
+`SafeDescent` handles high drops, cliffs, and steep cave ledges through
+multiple methods: water-bucket clutch or pour-and-descend, boat drops, carved
+cliff stairs, and placed edge blocks, while refusing lava and unseen floors.
+Water escape routes toward dry banks rather than swimming into steep shore
+cliffs or under roofs.
 
-Observed routes retain their actual support/clearance evidence. A local
-hypothesis can instead permit ordinary exploratory digging or a short movement
-under uncertainty; it does not become a witnessed tread or guaranteed return.
-Known hazards take precedence. Newly exposed material, collision, falling,
-fluid contact or damage can disprove the hypothesis and change the next action.
-Placed connectors still need actual placement/stock receipts.
+### Mining, caves, crafting, and inventory
 
-### Supplies, mining and workshops
+`CaveExplorer` tracks observed caves, ravines, and descending frontiers without
+hidden chunk reads, retiring exhausted shallow pockets, breaking into deep
+levels, and auto-crafting torches when lighting dark tunnels.
 
-Timber approach chooses a collectible stance, not merely swing reach.
-Nearby low logs can supply handles and light before departure. The first pick
-takes priority over optional tools. Canopy work should choose useful wood or
-descent before prolonged frontier wandering. The options include a modest fall,
-a carried water bucket, crafting/boarding a suitable boat, a predicted jump
-into visible water, and harvesting down a trunk/opening a stepped exit.
-Inferred continuation of a log column
-is a hypothesis, not knowledge of buried logs or ground. Recheck exposed
-changes and actual landing before repeating.
+`TaskRunner`, `GuiHands`, and `AgentGuiPointer` run timber harvesting, stone
+and ore mining, tool crafting (wooden, stone, iron, and diamond picks plus
+shovels and axes), underground replacement stone pickaxes, and smelting with
+organic cursor pacing. Multi-execution crafts clamp batches to one matching
+ingredient stack to avoid mixed-species craft failures. Longer smelts overlap
+nearby productive chores while tying paid furnace batches to their walked route
+and actual item pickup.
 
-Stone work selects collectible faces. Uncollectible drops prompt a stance
-change; andesite-like substitutes earn no cobblestone credit.
-Repeated unproductive rock prospecting changes ground while the tool still
-has uses. Shaft escape checks reachable side exits and headroom; gravel is
-cleared from beside the column after falling material settles.
-An outlined face can support a short dark egress check from real dry footing;
-darkness, sound or an empty ray never proves safe ground or hidden ore.
-Clearance need not yield resources: an ordinary obstruction may be broken by
-hand when no suitable tool remains. Only actual crack progress grants extra
-mining time; it does not renew an idle movement or placement lease.
+`InventoryTriage` keeps hotbar and main inventory usable during long caving
+runs by discarding low-value clutter while preserving tools, fuel, food,
+torches, buckets, and ore.
 
-The miner stocks light for return, reserves a torch when possible and checks
-placed light plus its item debit before a crossing. It preserves two sticks
-for the first iron pick when affordable, unless replacing the last usable
-pick or lighting an unsafe passage takes precedence. A nearby reachable
-crafting table can be reused after it is seen again.
+### Combat, shelter, and food
 
-### Furnace continuity
+`CombatPlanner` and `SurvivalReflexes` preempt ordinary tasks on hostile
+sighting, actual damage, creeper fuse, or gravel suffocation. Responses include
+shield blocking and advancing, creeper kiting or emergency block placement,
+outmatched dry retreat, and building or burrowing into a sealed shelter when
+cornered. Shelters reset cleanly on exit or respawn, preferring soft exits.
 
-Already carried ore, fuel and a usable furnace permit smelting even if a
-crafting ingredient is still missing. Different supported fuels and smaller
-loads can avoid an unnecessary coal expedition.
-One original input item may justify waiting at the furnace; the last item of
-a larger batch is still part of that larger batch.
-Longer cooks can overlap nearby useful work or watchful waiting. Threats win.
+Hurt or hungry players suspend mining to eat carried safe food, hunt or forage
+visible sources, cook raw meat, and recover health before returning underground.
+Safe food outranks raw chicken and rotten flesh.
 
-A paid batch stays associated with its actual furnace and walked route.
-An old furnace must be reachable by rechecked treads; a flooded/broken route
-can postpone collection. Output is not held inventory until actually taken.
-A completed smelt proves neither a bucket craft nor a resource goal.
+### Shore-cast Nether portal
 
-### Threats, water and food
-
-Actual damage interrupts work, including in water. Sound can prompt a look
-or search for a dry bank, but cannot authorize hitting an unseen mob.
-A creeper escape needs horizontal progress and checked body clearance;
-repeatedly jumping into a wall or blast knockback is not a retreat.
-Outmatched melee calls for dry retreat; a blocked retreat can permit a strike
-at a visible reachable hostile. An unarmed drowned below a dry worksite need
-not be chased. A visible trident or actual hit changes the danger assessment.
-Repeated ranged hits require checked escape/cover; one dodge is not safety.
-
-Water escape rechecks connected older stairs rather than swimming blindly
-up under a roof. One dry step beside a breach is not a new worksite.
-After danger, hurt or hungry players suspend mining, eat suitable carried
-food, pursue visible safe food, or make a bounded search of reachable ground.
-Fruitless terrain scouting cannot own play indefinitely: changing footholds
-or collecting unrelated blocks does not renew it. Keep the healing need and
-current-view food recognition active while ordinary goal work resumes.
-Apples require actual drops; an audible chicken is only a reason to look.
-Safe food takes priority over raw chicken or rotten flesh.
-Pickup, eating and health recovery are separate outcomes.
+`PortalCaster` builds and lights a ten-obsidian Nether portal directly beside a
+surface or deep (`y = -54`) cave lava pool using a water bucket and cobblestone
+supports — clearing raised rims and avoiding lava flooding — then enters the
+ignited portal.
 
 ## Evidence boundary
 
-The actor uses ordinary observations and the bounded
-[combat-flow geometry profile](perception.md#combat-flow-geometry).
-That profile does not disclose hidden block contents, resources, seeds,
-admin state or privileged evaluator records.
-Final verification reads saved vanilla statistics only after closure.
-A diamond win requires live inventory plus newly mined diamond ore and pickup.
-Nether success requires construction, ignition and actual entry, not ten
-obsidian or discovery of an existing portal.
+The player relies on optical sight, [combat-flow geometry](perception.md#combat-flow-geometry),
+and local hypotheses — never hidden block queries, world seeds, or server
+cheats. Goal verification reads saved vanilla statistics after clean server
+closure:
 
-Clean continuations retain campaign provenance but are not uninterrupted
-fresh-attempt results. Prepared trials and model-authored GameHarness results
-remain separately labeled in [integration evidence](../evidence/integration-gameplay.md).
+- `diamond`: live inventory plus newly mined diamond ore and diamond pickup.
+- `diamond_pickaxe`: crafted and carried pickaxe backed by diamond provenance
+  (fresh or valid continuation chain).
+- `nether_portal`: constructed, lit, and entered portal, not ten obsidian or a
+  found ruined portal.
+
+Clean continuations record campaign provenance but are not fresh-world wins.
+Prepared diagnostics and historical outcomes stay separated in
+[diagnostics](diagnostics.md) and [Survival evidence](../evidence/survival.md).

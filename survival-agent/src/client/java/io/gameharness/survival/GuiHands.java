@@ -594,17 +594,22 @@ final class GuiHands {
 
         // Only stack executions > 1 when all items for each cell come from a single stack (avoids mixed-species collision!)
         int effExecs = recipe == RecipeId.PLANKS ? executions : (recipe == RecipeId.TORCH ? Math.min(executions, 4) : 1);
-        // Clamp multi-execution batch to what's actually available in inventory so e.g. 1 stick still crafts 4 torches!
+        // Clamp multi-execution batch to what a single matching stack can supply per cell
+        // (avoids mixed-species collision such as 3 birch_log + 3 oak_log when requesting 4 planks).
         if (effExecs > 1) {
             for (char sym : new char[]{'l', 'p', 's', 'r', 'c', 'i', 'd', 'f'}) {
                 int perExec = 0;
                 for (char s : syms) if (s == sym) perExec++;
                 if (perExec == 0) continue;
                 int totalHave = 0;
+                int maxSlot = 0;
                 for (int i = 0; i < invSlots.size(); i++) {
-                    if (matchesSymbol(invSlots.get(i).getStack(), sym, lockedSpecies)) totalHave += avail[i];
+                    if (matchesSymbol(invSlots.get(i).getStack(), sym, lockedSpecies)) {
+                        totalHave += avail[i];
+                        if (avail[i] > maxSlot) maxSlot = avail[i];
+                    }
                 }
-                effExecs = Math.min(effExecs, totalHave / perExec);
+                effExecs = Math.min(effExecs, Math.min(totalHave / perExec, maxSlot));
             }
             if (effExecs <= 0) return false;
         }
@@ -625,8 +630,8 @@ final class GuiHands {
             for (int i = 0; i < invSlots.size() && cellIdx < symCells.size(); i++) {
                 ItemStack st = invSlots.get(i).getStack();
                 if (avail[i] <= 0 || !matchesSymbol(st, sym, lockedSpecies)) continue;
-                // For effExecs > 1 on logs/planks, skip if a single stack can't fill at least one cell cleanly
-                if (effExecs > 1 && placedInCurrentCell > 0) continue;
+                // For effExecs > 1, require a single stack large enough to fill the entire cell cleanly
+                if (effExecs > 1 && (placedInCurrentCell > 0 || avail[i] < effExecs)) continue;
 
                 Slot src = invSlots.get(i);
                 actions.add(new GuiAction(src, ClickKind.LEFT)); // pick up stack
